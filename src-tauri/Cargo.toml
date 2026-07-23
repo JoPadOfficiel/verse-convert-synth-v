@@ -1,6 +1,6 @@
 [package]
 name = "verse"
-version = "0.1.0"
+version = "0.1.1"
 description = "Convert karaoke, MIDI and score files into Synthesizer V projects with real lyrics"
 authors = ["JoPadOfficiel"]
 license = "MIT"
