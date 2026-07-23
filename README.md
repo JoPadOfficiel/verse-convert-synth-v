@@ -66,26 +66,32 @@ is no phonetic conversion of any kind.
 
 ### Opening an unsigned build
 
-The released binaries are not code-signed with a paid developer certificate,
-so the operating system asks for a one-time confirmation. (Building from source
-yourself produces a local, non-quarantined app, which is why it opens without
-any prompt.)
+The released binaries are not code-signed with a paid Apple/Microsoft developer
+certificate, so the operating system asks for a one-time confirmation. Building
+from source yourself produces a local, non-quarantined app that opens without
+any prompt.
 
-**macOS**
+**Windows** — on the SmartScreen dialog, click **More info > Run anyway**.
 
-- Recommended: **right-click (Control-click) the app > Open**, then click
-  **Open** in the dialog. This works even when the plain double-click is
-  blocked, and only needs to be done once.
-- If macOS still refuses: open **System Settings > Privacy & Security**, scroll
-  to the **Security** section, and click **Open Anyway** next to Verse. This
-  button only appears right *after* a blocked launch attempt (and stays for
-  about an hour), so try to open the app first.
-- Terminal alternative (removes the quarantine flag):
-  `xattr -dr com.apple.quarantine /Applications/Verse.app`
+**macOS** — see Troubleshooting below.
 
-**Windows**
+## Troubleshooting
 
-- On the SmartScreen dialog, click **More info > Run anyway**.
+### macOS says "Verse is damaged and can't be opened"?
+
+This is macOS Gatekeeper. Because the app is downloaded from outside the App
+Store and is not notarized, macOS adds a "quarantine" flag and shows this
+message. **The app is not actually damaged.** In this case the right-click >
+Open trick and the "Open Anyway" button in Settings usually do not appear —
+remove the flag from Terminal instead:
+
+```
+sudo xattr -rd com.apple.quarantine "/Applications/Verse.app"
+```
+
+Adjust the path if you keep Verse elsewhere (for example
+`~/Downloads/Verse.app`). Then open the app normally. This only needs to be
+done once, after installing or updating.
 
 ## Development
 
