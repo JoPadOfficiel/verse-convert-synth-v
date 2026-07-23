@@ -166,3 +166,27 @@ fn queen_synthetic_lyrics_track() {
     );
     assert_eq!(r.placed, 253, "253 syllables");
 }
+
+#[test]
+fn help_mscz_styled_names_are_not_fused() {
+    let Some(r) = conv_auto("help.mscz") else { return };
+    assert!(r.ok, "help.mscz must convert: {:?}", r.msg);
+    // <longName>Batterie ou<br/>persussions<br/>corporelles</longName>:
+    // <br/> must become a space, never fuse the words.
+    assert!(
+        r.tracks.iter().any(|t| t.track.contains("ou persussions corporelles")),
+        "multi-line longName must be collapsed with spaces, got: {:?}",
+        r.tracks.iter().map(|t| t.track.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        r.tracks.iter().all(|t| !t.track.contains("oupersussions")),
+        "words fused across <br/>"
+    );
+}
+
+#[test]
+fn help_mxl_converts() {
+    let Some(r) = conv_auto("help.mxl") else { return };
+    assert!(r.ok, "help.mxl must convert: {:?}", r.msg);
+    assert!(r.placed > 0, "lyrics must be placed");
+}

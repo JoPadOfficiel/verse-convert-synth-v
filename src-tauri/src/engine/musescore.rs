@@ -58,25 +58,38 @@ fn child_text<'a>(n: roxmltree::Node<'a, '_>, tag: &str) -> Option<&'a str> {
     child(n, tag).and_then(|c| c.text()).map(|t| t.trim())
 }
 
-/// Concatenated text of every descendant text node, skipping `<sym>` elements
-/// (their content is a SMuFL glyph name like "space", not lyric text).
-/// Lyrics `<text>` may embed formatting elements (`<font size=..>`, `<b>`,
-/// `<i>`) around or between the words, so a plain first-child `.text()`
-/// misses the syllable. End-trimmed only: control characters and stray
-/// punctuation inside the syllable are cleaned downstream (clean_syllable).
-fn deep_text(n: roxmltree::Node) -> String {
-    fn walk(n: roxmltree::Node, out: &mut String) {
-        for c in n.children() {
-            if c.is_text() {
-                out.push_str(c.text().unwrap_or(""));
-            } else if !c.has_tag_name("sym") {
-                walk(c, out);
-            }
+/// Raw concatenation of every descendant text node, skipping `<sym>` elements
+/// (their content is a SMuFL glyph name like "space", not lyric text) and
+/// turning `<br/>` line breaks into spaces so adjacent words never fuse.
+/// Rich text (`<text>`, names) may embed formatting elements (`<font size=..>`,
+/// `<b>`, `<i>`, `<u>`, `<sup>`, `<sub>`, ...) around or between the words, so
+/// a plain first-child `.text()` misses the content.
+pub(crate) fn deep_text_raw(n: roxmltree::Node, out: &mut String) {
+    for c in n.children() {
+        if c.is_text() {
+            out.push_str(c.text().unwrap_or(""));
+        } else if c.has_tag_name("br") {
+            out.push(' ');
+        } else if !c.has_tag_name("sym") {
+            deep_text_raw(c, out);
         }
     }
+}
+
+/// `deep_text_raw`, end-trimmed. Control characters and stray punctuation
+/// inside the text are cleaned downstream (clean_syllable for lyrics,
+/// collapse_ws for names).
+pub(crate) fn deep_text(n: roxmltree::Node) -> String {
     let mut raw = String::new();
-    walk(n, &mut raw);
+    deep_text_raw(n, &mut raw);
     raw.trim().to_string()
+}
+
+/// Collapses every whitespace run (spaces, tabs, newlines) into one space.
+/// Used for display names, where a two-line MuseScore label must become a
+/// single readable line.
+pub(crate) fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Duration in ticks of a durationType (whole = 4 * div).
@@ -215,10 +228,10 @@ fn playback_order(measures: &[roxmltree::Node]) -> Vec<(usize, u32)> {
 }
 
 pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
+    crate::engine::musicxml::check_nesting(xml)?;
     let opts = roxmltree::ParsingOptions {
         allow_dtd: true,
         nodes_limit: 5_000_000, // bounds the memory cost of a forged XML
-        ..Default::default()
     };
     let doc = roxmltree::Document::parse_with_options(xml, opts)
         .map_err(|e| format!("invalid XML: {}", e))?;
@@ -239,8 +252,13 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         let name = part
             .children()
             .find(|c| c.has_tag_name("Instrument"))
-            .and_then(|i| child_text(i, "longName").map(str::to_string))
-            .or_else(|| child_text(part, "trackName").map(str::to_string))
+            .and_then(|i| child(i, "longName").map(|n| collapse_ws(&deep_text(n))))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                child(part, "trackName")
+                    .map(|n| collapse_ws(&deep_text(n)))
+                    .filter(|s| !s.is_empty())
+            })
             .unwrap_or_default();
         let n_staves = part.children().filter(|c| c.has_tag_name("Staff")).count().max(1);
         for _ in 0..n_staves {
@@ -473,5 +491,192 @@ mod tests {
     fn xml_entities_are_decoded() {
         let midi = parse_mscx(&mscx("<text>rock &amp; roll</text>")).unwrap();
         assert_eq!(lyrics_of(&midi), vec!["rock & roll"]);
+    }
+
+    #[test]
+    fn every_styling_wrapper_yields_its_text() {
+        // Any combination of style tags, nesting, sizes and faces must never
+        // hide the syllable.
+        for (xml, want) in [
+            (r#"<text><b>bold</b></text>"#, "bold"),
+            (r#"<text><i>ital</i></text>"#, "ital"),
+            (r#"<text><u>under</u></text>"#, "under"),
+            (r#"<text><s>strike</s></text>"#, "strike"),
+            (r#"<text><b><i><u>all</u></i></b></text>"#, "all"),
+            (r#"<text><font face="Comic Sans MS"></font><b>mix</b>ed</text>"#, "mixed"),
+            (r#"<text><font size="24"></font><font size="6"></font>tiny</text>"#, "tiny"),
+            (r#"<text>x<sup>2</sup></text>"#, "x2"),
+            (r#"<text>H<sub>2</sub>O</text>"#, "H2O"),
+            (r#"<text><font face="Arial"><b>deep</b></font></text>"#, "deep"),
+            (r#"<text><b>a<sym>space</sym>b</b></text>"#, "ab"),
+            (r#"<text><font size="9.2"/><font face="Edwin"/>self-closed</text>"#, "self-closed"),
+        ] {
+            let midi = parse_mscx(&mscx(xml)).unwrap();
+            assert_eq!(lyrics_of(&midi), vec![want], "input: {}", xml);
+        }
+    }
+
+    #[test]
+    fn styled_track_name_is_read() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part>
+      <Instrument><longName><b>Sopra</b>no</longName></Instrument>
+      <Staff id="1"/>
+    </Part>
+    <Staff id="1">
+      <Measure>
+        <voice>
+          <Chord>
+            <durationType>quarter</durationType>
+            <Note><pitch>60</pitch></Note>
+          </Chord>
+        </voice>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        let names: Vec<String> = midi
+            .tracks
+            .iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|e| match &e.kind {
+                Kind::TrackName(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["Soprano"]);
+    }
+
+    #[test]
+    fn br_separates_words_in_names_and_lyrics() {
+        // Lyric: <br/> must never fuse adjacent words.
+        let midi = parse_mscx(&mscx("<text>a<br/>b</text>")).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["a b"]);
+        // Name: real-world case from tests/fixtures/help.mscz.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part>
+      <Instrument><longName>Batterie ou<br/>persussions<br/>corporelles</longName></Instrument>
+      <Staff id="1"/>
+    </Part>
+    <Staff id="1">
+      <Measure>
+        <voice>
+          <Chord>
+            <durationType>quarter</durationType>
+            <Note><pitch>60</pitch></Note>
+          </Chord>
+        </voice>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        let names: Vec<String> = midi
+            .tracks
+            .iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|e| match &e.kind {
+                Kind::TrackName(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["Batterie ou persussions corporelles"]);
+    }
+
+    #[test]
+    fn multiline_track_name_is_collapsed_to_one_line() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part>
+      <trackName>Soprano
+Melodie</trackName>
+      <Staff id="1"/>
+    </Part>
+    <Staff id="1">
+      <Measure>
+        <voice>
+          <Chord>
+            <durationType>quarter</durationType>
+            <Note><pitch>60</pitch></Note>
+          </Chord>
+        </voice>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        let names: Vec<String> = midi
+            .tracks
+            .iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|e| match &e.kind {
+                Kind::TrackName(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["Soprano Melodie"]);
+    }
+
+    #[test]
+    fn deeply_nested_forged_xml_is_rejected_cleanly() {
+        let mut xml = String::from(r#"<museScore version="3.02"><Score><Division>480</Division>"#);
+        for _ in 0..250 {
+            xml.push_str("<b>");
+        }
+        xml.push('x');
+        for _ in 0..250 {
+            xml.push_str("</b>");
+        }
+        xml.push_str("</Score></museScore>");
+        let err = match parse_mscx(&xml) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a nesting error"),
+        };
+        assert!(err.contains("nesting"), "expected a clean nesting error, got: {}", err);
+    }
+
+    #[test]
+    fn empty_long_name_falls_back_to_track_name() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part>
+      <trackName>Voix</trackName>
+      <Instrument><longName> </longName></Instrument>
+      <Staff id="1"/>
+    </Part>
+    <Staff id="1">
+      <Measure>
+        <voice>
+          <Chord>
+            <durationType>quarter</durationType>
+            <Note><pitch>60</pitch></Note>
+          </Chord>
+        </voice>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        let names: Vec<String> = midi
+            .tracks
+            .iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|e| match &e.kind {
+                Kind::TrackName(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["Voix"]);
     }
 }

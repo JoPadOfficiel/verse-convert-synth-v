@@ -105,8 +105,88 @@ fn child_i64(n: roxmltree::Node, tag: &str) -> Option<i64> {
         .and_then(|t| t.trim().parse::<i64>().ok())
 }
 
+/// Refuses pathologically nested XML before it reaches roxmltree, whose
+/// recursive-descent parser (one native stack frame per level) overflows the
+/// stack and aborts the whole process on a forged file. Real scores nest well
+/// under 30 levels. The scan honors quoted attribute values, comments, CDATA
+/// and processing instructions, so it never miscounts valid documents.
+pub(crate) fn check_nesting(xml: &str) -> Result<(), String> {
+    const MAX_DEPTH: i64 = 200;
+    let b = xml.as_bytes();
+    let mut depth: i64 = 0;
+    let mut i = 0usize;
+    while i + 1 < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        match b[i + 1] {
+            b'/' => {
+                depth -= 1;
+                i += 2;
+            }
+            b'?' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'?' && b[i + 1] == b'>') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'!' => {
+                if b[i..].starts_with(b"<!--") {
+                    i += 4;
+                    while i + 2 < b.len() && &b[i..i + 3] != b"-->" {
+                        i += 1;
+                    }
+                    i += 3;
+                } else if b[i..].starts_with(b"<![CDATA[") {
+                    i += 9;
+                    while i + 2 < b.len() && &b[i..i + 3] != b"]]>" {
+                        i += 1;
+                    }
+                    i += 3;
+                } else {
+                    while i < b.len() && b[i] != b'>' {
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                let mut j = i + 1;
+                let mut quote: u8 = 0;
+                while j < b.len() {
+                    let c = b[j];
+                    if quote != 0 {
+                        if c == quote {
+                            quote = 0;
+                        }
+                    } else if c == b'"' || c == b'\'' {
+                        quote = c;
+                    } else if c == b'>' {
+                        break;
+                    }
+                    j += 1;
+                }
+                if !(j < b.len() && j > 0 && b[j - 1] == b'/') {
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return Err("invalid XML: nesting too deep".into());
+                    }
+                }
+                i = j + 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Text of verse `pass+1` of a note (number attribute of <lyric>),
 /// falling back to verse 1 on later passes.
+/// A lyric may hold several <text> fragments joined by <elision> (multiple
+/// syllables sung on one note). Fragments are concatenated raw (a trailing
+/// space inside a fragment is significant), a whitespace elision separates
+/// two whole words with a space, a glyph elision (undertie) binds them tight,
+/// and the result's whitespace runs collapse to single spaces.
 fn verse_lyric_mxl(note: roxmltree::Node, pass: u32) -> Option<String> {
     let pick = |v: u32| {
         note.children()
@@ -114,9 +194,22 @@ fn verse_lyric_mxl(note: roxmltree::Node, pass: u32) -> Option<String> {
             .find(|ly| {
                 ly.attribute("number").and_then(|t| t.parse::<u32>().ok()).unwrap_or(1) == v
             })
-            .and_then(|ly| ly.children().find(|c| c.has_tag_name("text")))
-            .and_then(|t| t.text())
-            .map(|t| t.trim().to_string())
+            .map(|ly| {
+                let mut raw = String::new();
+                for c in ly.children() {
+                    if c.has_tag_name("text") {
+                        crate::engine::musescore::deep_text_raw(c, &mut raw);
+                    } else if c.has_tag_name("elision") {
+                        // The elision's own text is what the score renders
+                        // between the fragments: whitespace joins two words.
+                        let e = c.text().unwrap_or("");
+                        if !e.is_empty() && e.chars().all(char::is_whitespace) {
+                            raw.push(' ');
+                        }
+                    }
+                }
+                crate::engine::musescore::collapse_ws(&raw)
+            })
             .filter(|t| !t.is_empty())
     };
     pick(pass + 1).or_else(|| if pass > 0 { pick(1) } else { None })
@@ -213,10 +306,10 @@ fn playback_order_mxl(measures: &[roxmltree::Node]) -> Vec<(usize, u32)> {
 }
 
 fn parse_musicxml(xml: &str) -> Result<Midi, String> {
+    check_nesting(xml)?;
     let opts = roxmltree::ParsingOptions {
         allow_dtd: true,
         nodes_limit: 5_000_000, // bounds the memory cost of a forged XML
-        ..Default::default()
     };
     let doc = roxmltree::Document::parse_with_options(xml, opts)
         .map_err(|e| format!("invalid XML: {}", e))?;
@@ -237,15 +330,15 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
     let mut part_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Some(list) = root.children().find(|n| n.has_tag_name("part-list")) {
         for sp in list.children().filter(|n| n.has_tag_name("score-part")) {
-            if let (Some(id), Some(name)) = (
+            if let (Some(id), Some(name_el)) = (
                 sp.attribute("id"),
-                sp.children()
-                    .find(|n| n.has_tag_name("part-name"))
-                    .and_then(|n| n.text()),
+                sp.children().find(|n| n.has_tag_name("part-name")),
             ) {
-                let name = name.trim();
+                let name = crate::engine::musescore::collapse_ws(
+                    &crate::engine::musescore::deep_text(name_el),
+                );
                 if !name.is_empty() {
-                    part_names.insert(id.to_string(), name.to_string());
+                    part_names.insert(id.to_string(), name);
                 }
             }
         }
@@ -359,4 +452,113 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         return Err("no usable part in the MusicXML".into());
     }
     Ok(Midi { ticks_per_beat: tpb, tracks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mxl(lyric_inner: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list>
+    <score-part id="P1"><part-name>Voice</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <lyric number="1">{}</lyric>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#,
+            lyric_inner
+        )
+    }
+
+    fn lyrics_of(midi: &Midi) -> Vec<String> {
+        midi.tracks
+            .iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|e| match &e.kind {
+                Kind::Lyrics(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_lyric_text() {
+        let midi = parse(mxl("<syllabic>single</syllabic><text>la</text>").as_bytes()).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["la"]);
+    }
+
+    #[test]
+    fn elision_keeps_every_text_fragment() {
+        // Two syllables sung on one note: <text>to</text><elision/><text>a</text>
+        let midi = parse(
+            mxl("<syllabic>end</syllabic><text>to</text><elision>\u{203f}</elision><syllabic>begin</syllabic><text>a</text>")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["toa"]);
+    }
+
+    #[test]
+    fn non_standard_nested_markup_is_tolerated() {
+        let midi = parse(mxl("<text><i>hey</i></text>").as_bytes()).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["hey"]);
+    }
+
+    #[test]
+    fn whitespace_elision_joins_two_words_with_a_space() {
+        // Sibelius/Finale write <elision> </elision> when two whole words
+        // share one note: "my love", not the nonword "mylove".
+        let midi = parse(
+            mxl("<syllabic>single</syllabic><text>my</text><elision> </elision><syllabic>single</syllabic><text>love</text>")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["my love"]);
+    }
+
+    #[test]
+    fn trailing_space_inside_a_fragment_survives_elision() {
+        // Some exporters put the joining space inside the first <text>.
+        let midi = parse(
+            mxl("<syllabic>single</syllabic><text>my </text><elision/><syllabic>single</syllabic><text>love</text>")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["my love"]);
+    }
+
+    #[test]
+    fn deeply_nested_forged_xml_is_rejected_cleanly() {
+        let mut xml = String::from("<score-partwise version=\"3.1\">");
+        for _ in 0..250 {
+            xml.push_str("<x>");
+        }
+        xml.push('y');
+        for _ in 0..250 {
+            xml.push_str("</x>");
+        }
+        xml.push_str("</score-partwise>");
+        let err = match parse(xml.as_bytes()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a nesting error"),
+        };
+        assert!(err.contains("nesting"), "expected a clean nesting error, got: {}", err);
+    }
+
+    #[test]
+    fn check_nesting_ignores_comments_cdata_and_quoted_attrs() {
+        // None of these constructs may be miscounted as element depth.
+        let xml = r#"<?xml es="<a><a><a>"?><!-- <a><a><a> --><root attr="<a><a>"><![CDATA[<a><a><a>]]><child/></root>"#;
+        assert!(check_nesting(xml).is_ok());
+    }
 }

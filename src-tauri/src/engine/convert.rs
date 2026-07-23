@@ -52,6 +52,9 @@ fn clean_syllable(t: &str) -> Option<String> {
 }
 
 fn track_name(ev: &[Event]) -> String {
+    // End-trim only: .kar/.mid names must stay byte-identical to the Python
+    // oracle. XML parsers normalize their display names at the source
+    // (musescore.rs / musicxml.rs collapse whitespace runs).
     for e in ev {
         if let Kind::TrackName(t) = &e.kind {
             return t.trim().to_string();
@@ -182,13 +185,16 @@ fn build_track(idx: usize, name: String, notes: Vec<Note>, render: bool, mute: b
     }
 }
 
+/// Lyric tokens of the vocal stream + note-index -> token-index assignment.
+type VocalAssign<'a> = (&'a [(u32, String)], &'a HashMap<usize, usize>);
+
 fn make_track(
     idx: usize,
     name: &str,
     notes: &[(u32, u32, u8)],
     bpt: f64,
     sing: bool,
-    vocal: Option<(&[(u32, String)], &HashMap<usize, usize>)>,
+    vocal: Option<VocalAssign>,
 ) -> SvpTrack {
     let mut svp_notes = Vec::with_capacity(notes.len());
     let mut prev = false;
@@ -450,7 +456,7 @@ pub fn convert_midi_with(
 
     let svp = SvpProject {
         version: 113,
-        time: Time { meter: read_meter(&midi), tempo: read_tempo(&midi, bpt) },
+        time: Time { meter: read_meter(midi), tempo: read_tempo(midi, bpt) },
         render_config: RenderConfig::default(),
         tracks: svp_tracks,
     };
@@ -462,5 +468,18 @@ pub fn convert_midi_with(
         tracks: report,
         n_tracks,
         placed: total_placed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_name_end_trims_only_for_oracle_parity() {
+        // Inner whitespace of .kar/.mid names must survive byte-identical;
+        // XML parsers normalize their names before emitting the event.
+        let ev = vec![Event { tick: 0, kind: Kind::TrackName("  Lead  Vocal  ".into()) }];
+        assert_eq!(track_name(&ev), "Lead  Vocal");
     }
 }
