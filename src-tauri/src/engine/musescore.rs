@@ -58,6 +58,27 @@ fn child_text<'a>(n: roxmltree::Node<'a, '_>, tag: &str) -> Option<&'a str> {
     child(n, tag).and_then(|c| c.text()).map(|t| t.trim())
 }
 
+/// Concatenated text of every descendant text node, skipping `<sym>` elements
+/// (their content is a SMuFL glyph name like "space", not lyric text).
+/// Lyrics `<text>` may embed formatting elements (`<font size=..>`, `<b>`,
+/// `<i>`) around or between the words, so a plain first-child `.text()`
+/// misses the syllable. End-trimmed only: control characters and stray
+/// punctuation inside the syllable are cleaned downstream (clean_syllable).
+fn deep_text(n: roxmltree::Node) -> String {
+    fn walk(n: roxmltree::Node, out: &mut String) {
+        for c in n.children() {
+            if c.is_text() {
+                out.push_str(c.text().unwrap_or(""));
+            } else if !c.has_tag_name("sym") {
+                walk(c, out);
+            }
+        }
+    }
+    let mut raw = String::new();
+    walk(n, &mut raw);
+    raw.trim().to_string()
+}
+
 /// Duration in ticks of a durationType (whole = 4 * div).
 fn duration_ticks(kind: &str, div: i64) -> Option<i64> {
     let whole = 4 * div;
@@ -109,9 +130,9 @@ fn verse_lyric(chord: roxmltree::Node, verse: u32) -> Option<String> {
             .find(|ly| {
                 child_text(*ly, "no").and_then(|t| t.parse::<u32>().ok()).unwrap_or(0) == v
             })
-            .and_then(|ly| child_text(ly, "text"))
+            .and_then(|ly| child(ly, "text"))
+            .map(deep_text)
             .filter(|t| !t.is_empty())
-            .map(str::to_string)
     };
     find(verse).or_else(|| if verse > 0 { find(0) } else { None })
 }
@@ -358,4 +379,99 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         return Err("no usable staff in the MuseScore file".into());
     }
     Ok(Midi { ticks_per_beat: tpb, tracks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mscx(lyric_text_xml: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part>
+      <trackName>Soprano</trackName>
+      <Staff id="1"/>
+    </Part>
+    <Staff id="1">
+      <Measure>
+        <voice>
+          <Chord>
+            <durationType>quarter</durationType>
+            <Lyrics>
+              {}
+            </Lyrics>
+            <Note><pitch>60</pitch></Note>
+          </Chord>
+        </voice>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#,
+            lyric_text_xml
+        )
+    }
+
+    fn lyrics_of(midi: &Midi) -> Vec<String> {
+        midi.tracks
+            .iter()
+            .flat_map(|t| t.iter())
+            .filter_map(|e| match &e.kind {
+                Kind::Lyrics(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_lyric_text() {
+        let midi = parse_mscx(&mscx("<text>let</text>")).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["let"]);
+    }
+
+    #[test]
+    fn lyric_text_with_leading_font_elements() {
+        // MuseScore stores styled lyrics as <font .../> elements inside <text>;
+        // the syllable is a text node placed after them.
+        let midi = parse_mscx(&mscx(
+            r#"<text><font size="9.2"></font><font face="Arial"></font>let</text>"#,
+        ))
+        .unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["let"]);
+    }
+
+    #[test]
+    fn lyric_text_interleaved_with_formatting() {
+        let midi =
+            parse_mscx(&mscx(r#"<text>shi<font face="Arial"></font>ne,</text>"#)).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["shine,"]);
+    }
+
+    #[test]
+    fn empty_formatted_lyric_is_skipped() {
+        let midi = parse_mscx(&mscx(r#"<text><font size="9.2"></font></text>"#)).unwrap();
+        assert!(lyrics_of(&midi).is_empty());
+    }
+
+    #[test]
+    fn sym_glyph_name_is_not_injected() {
+        // <sym> holds a SMuFL glyph identifier, not renderable lyric text.
+        let midi = parse_mscx(&mscx(r#"<text>a<sym>space</sym>b</text>"#)).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["ab"]);
+    }
+
+    #[test]
+    fn pretty_printed_text_is_trimmed() {
+        let midi = parse_mscx(&mscx("<text>\n  <font size=\"9.2\"></font>\n  let\n</text>"))
+            .unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["let"]);
+    }
+
+    #[test]
+    fn xml_entities_are_decoded() {
+        let midi = parse_mscx(&mscx("<text>rock &amp; roll</text>")).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["rock & roll"]);
+    }
 }
