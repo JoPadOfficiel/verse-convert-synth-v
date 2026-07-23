@@ -96,8 +96,13 @@ function Row({
           )}
         </button>
         {item.ok && (
-          <Button size="sm" variant={item.out ? "secondary" : "default"} onClick={() => onDownload(item)}>
-            <DownloadIcon /> {item.out ? "Again" : "Convert"}
+          <Button
+            size="sm"
+            variant={item.out ? "secondary" : "default"}
+            title="Convert and save the .svp next to the source file"
+            onClick={() => onDownload(item)}
+          >
+            <DownloadIcon /> Download
           </Button>
         )}
       </div>
