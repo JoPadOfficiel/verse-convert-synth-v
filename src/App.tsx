@@ -8,6 +8,7 @@ import { FileList } from "@/components/FileList";
 import { Settings } from "@/components/Settings";
 import {
   convertFiles,
+  exportWithDialog,
   pickFiles,
   isSupported,
   type FileResult,
@@ -84,6 +85,20 @@ export default function App() {
     const res = await convertFiles(paths, true, language, outDir, overrides);
     setItems((prev) => prev.map((it) => res.find((r) => r.path === it.path) ?? it));
     setBusy(false);
+  }
+
+  // Single-file "Download": open a Save dialog so the destination is explicit.
+  async function exportOne(it: FileResult) {
+    try {
+      const saved = await exportWithDialog(it, language, overrides[it.path]);
+      if (saved) {
+        setItems((prev) => prev.map((x) => (x.path === it.path ? { ...x, out: saved } : x)));
+      }
+    } catch (e) {
+      setItems((prev) =>
+        prev.map((x) => (x.path === it.path ? { ...x, ok: false, msg: String(e) } : x))
+      );
+    }
   }
 
   async function toggleRole(path: string, trackId: number, sing: boolean) {
@@ -170,7 +185,7 @@ export default function App() {
           </div>
           <FileList
             items={items}
-            onDownload={(it) => saveMany([it.path])}
+            onDownload={exportOne}
             selected={selected}
             onToggleSelect={toggleSelect}
             onToggleRole={toggleRole}

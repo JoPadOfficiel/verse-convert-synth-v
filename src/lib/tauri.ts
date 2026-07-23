@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 
 export type TrackInfo = { id: number; track: string; notes: number; role: string; placed: number };
 
@@ -33,6 +33,37 @@ export async function pickFiles(): Promise<string[]> {
 export async function pickDirectory(): Promise<string | undefined> {
   const res = await open({ directory: true, multiple: false });
   return typeof res === "string" ? res : undefined;
+}
+
+const SEP = (p: string) => (p.includes("\\") ? "\\" : "/");
+
+/** Default output name/path next to the source file. */
+export function defaultSvpPath(sourcePath: string): string {
+  const sep = SEP(sourcePath);
+  const dir = sourcePath.slice(0, sourcePath.lastIndexOf(sep) + 1);
+  const file = sourcePath.slice(sourcePath.lastIndexOf(sep) + 1);
+  const stem = file.replace(/\.[^.]+$/, "");
+  return dir + stem + "_LYRICS.svp";
+}
+
+/** Ask where to save, convert, and write the .svp. Returns the saved path, or
+ *  undefined if the user cancelled. Throws on conversion/write error. */
+export async function exportWithDialog(
+  file: FileResult,
+  language: Language,
+  overrides?: Record<number, boolean>
+): Promise<string | undefined> {
+  const target = await save({
+    defaultPath: defaultSvpPath(file.path),
+    filters: [{ name: "Synthesizer V project", extensions: ["svp"] }],
+  });
+  if (!target) return undefined;
+  return await invoke<string>("export_svp", {
+    path: file.path,
+    target,
+    language,
+    overrides: overrides ?? null,
+  });
 }
 
 export type Language = "english" | "french";

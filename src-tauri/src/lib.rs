@@ -129,6 +129,45 @@ fn process_one(
 
 /// Analyzes and/or converts a list of files.
 /// `write=false` -> analysis only (preview); `write=true` -> writes the .svp files.
+/// Convert a single file and write the .svp to an exact target path chosen by
+/// the user (via a Save dialog on the frontend). Returns the written path.
+#[tauri::command]
+fn export_svp(
+    path: String,
+    target: String,
+    language: Option<String>,
+    overrides: Option<HashMap<String, bool>>,
+) -> Result<String, String> {
+    let ext_ok = Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| SUPPORTED_EXT.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err("unsupported file type".into());
+    }
+    if let Ok(md) = std::fs::metadata(&path) {
+        if md.len() > MAX_INPUT_BYTES {
+            return Err("abnormally large file (rejected for safety)".into());
+        }
+    }
+    let data = std::fs::read(&path).map_err(|e| format!("cannot read file ({})", e))?;
+    let ov: HashMap<usize, bool> = overrides
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| k.parse::<usize>().ok().map(|k| (k, v)))
+        .collect();
+    let lang = language.as_deref().unwrap_or("english");
+    let r = convert_auto_with(&data, lang, Some(&ov));
+    if !r.ok {
+        return Err(r.msg.unwrap_or_else(|| "conversion failed".into()));
+    }
+    let svp = r.svp.ok_or_else(|| "no output produced".to_string())?;
+    let json = serde_json::to_string(&svp).map_err(|e| e.to_string())?;
+    std::fs::write(&target, json).map_err(|e| format!("cannot write file ({})", e))?;
+    Ok(target)
+}
+
 #[tauri::command]
 fn convert_files(
     paths: Vec<String>,
@@ -162,7 +201,7 @@ fn convert_files(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![convert_files])
+        .invoke_handler(tauri::generate_handler![convert_files, export_svp])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

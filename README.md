@@ -64,8 +64,28 @@ is no phonetic conversion of any kind.
 5. In Synthesizer V, use **File > Open** (not Import) on the `.svp`, then
    assign a voice database to each singing track.
 
-Unsigned builds: on macOS, right-click the app and choose Open the first time;
-on Windows, allow the app in the SmartScreen dialog.
+### Opening an unsigned build
+
+The released binaries are not code-signed with a paid developer certificate,
+so the operating system asks for a one-time confirmation. (Building from source
+yourself produces a local, non-quarantined app, which is why it opens without
+any prompt.)
+
+**macOS**
+
+- Recommended: **right-click (Control-click) the app > Open**, then click
+  **Open** in the dialog. This works even when the plain double-click is
+  blocked, and only needs to be done once.
+- If macOS still refuses: open **System Settings > Privacy & Security**, scroll
+  to the **Security** section, and click **Open Anyway** next to Verse. This
+  button only appears right *after* a blocked launch attempt (and stays for
+  about an hour), so try to open the app first.
+- Terminal alternative (removes the quarantine flag):
+  `xattr -dr com.apple.quarantine /Applications/Verse.app`
+
+**Windows**
+
+- On the SmartScreen dialog, click **More info > Run anyway**.
 
 ## Development
 
