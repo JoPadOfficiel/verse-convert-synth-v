@@ -88,6 +88,11 @@ function Row({
                 ? `${item.nTracks} tracks · ${singing} vocal · ${item.placed} syllables`
                 : item.msg}
             </div>
+            {item.out && (
+              <div className="truncate text-xs text-success" title={item.out}>
+                Saved: {item.out}
+              </div>
+            )}
           </div>
           {item.ok && (
             <ChevronRightIcon
