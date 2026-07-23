@@ -1,0 +1,26 @@
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.log
+
+# Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Test fixtures (copyrighted song files are kept local only)
+src-tauri/tests/fixtures/
+
+# OS / editors
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Private local tooling (not part of the open-source project)
+_bmad/
+_bmad-output/
+.agent/
+.agents/
+.claude/
