@@ -3,13 +3,17 @@ use crate::engine::midi::{self, Event, Kind, Midi};
 use crate::engine::svp::*;
 use std::collections::{BTreeMap, HashMap};
 
-const VOCAL_KW: [&str; 9] = [
-    "vox", "voice", "vocal", "voc", "melod", "lead", "chant", "sing", "choir",
+// Track-name heuristics. Includes common French names so scores authored in
+// French (Batterie, Guitare, Ukulele...) classify correctly out of the box.
+const VOCAL_KW: [&str; 15] = [
+    "vox", "voice", "vocal", "voc", "melod", "lead", "chant", "sing", "choir", "voix", "choeur",
+    "ch\u{153}ur", "soprano", "tenor", "baryton",
 ];
-const INSTR_KW: [&str; 23] = [
+const INSTR_KW: [&str; 31] = [
     "guitar", "bass", "drum", "piano", "snare", "hat", "cymbal", "clap", "rim", "kick", "perc",
     "organ", "synth", "string", "brass", "sax", "trumpet", "trombone", "horn", "flute", "violin",
-    "cello", "harp",
+    "cello", "harp", "batterie", "guitare", "ukul", "violon", "trompette", "clavier", "orgue",
+    "fl\u{fb}t",
 ];
 
 pub struct TrackReport {
