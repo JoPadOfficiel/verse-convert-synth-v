@@ -6,6 +6,7 @@ import { latestChangelogRelease } from "../scripts/check-version.mjs";
 test("changelog releases require a complete SemVer heading token", () => {
   for (const heading of [
     "## [0.2.0] - 2026-07-24",
+    "## [0.2.0](https://example.com/compare/v0.1.0...v0.2.0) (2026-07-24)",
     "## 0.2.0 - 2026-07-24",
   ]) {
     assert.deepEqual(latestChangelogRelease(heading), {
@@ -18,6 +19,7 @@ test("changelog releases require a complete SemVer heading token", () => {
     "## [0.2.0 - 2026-07-24",
     "## 0.2.0] - 2026-07-24",
     "## [0.2.0]junk - 2026-07-24",
+    "## [0.2.0](https://example.com/release)junk - 2026-07-24",
     "## 0.2.0junk - 2026-07-24",
   ]) {
     assert.deepEqual(latestChangelogRelease(malformed), {});

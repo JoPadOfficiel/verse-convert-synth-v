@@ -98,7 +98,7 @@ function parseArguments(argv) {
 export function latestChangelogRelease(changelog) {
   for (const line of changelog.split(/\r?\n/)) {
     const heading = line.match(
-      /^##\s+(?:\[((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\]|((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)))(?=\s|$)/,
+      /^##\s+(?:\[((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\](?:\([^)]+\))?|((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)))(?=\s|$)/,
     );
     if (heading) {
       const dateToken = line.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
