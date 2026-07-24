@@ -1,0 +1,56 @@
+name: Release pushed tag
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tag-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve tag to immutable commit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      commit-sha: ${{ steps.resolve.outputs.commit-sha }}
+
+    steps:
+      - name: Check out the pushed tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve annotated or lightweight tag
+        id: resolve
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          commit_sha="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Tag did not resolve to a full commit SHA"
+            exit 1
+          fi
+          echo "commit-sha=${commit_sha}" >> "$GITHUB_OUTPUT"
+
+  build-release:
+    name: Build and publish pushed tag
+    needs:
+      - resolve
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: ${{ github.ref_name }}
+      commit_sha: ${{ needs.resolve.outputs.commit-sha }}
+      publish_release: true
+    secrets: inherit

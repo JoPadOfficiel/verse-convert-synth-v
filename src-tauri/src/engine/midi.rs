@@ -142,12 +142,115 @@ pub enum Jump {
 /// Returns (measure_index, pass_number 0-based) pairs -- the pass determines
 /// which verse is sung. Usual conventions: after a D.S./D.C. jump, repeats
 /// are not replayed and only the last endings are played.
-pub fn unroll(marks: &[MeasureMarks]) -> Vec<(usize, u32)> {
+///
+/// The expansion is bounded to keep hostile repeat counts from exhausting
+/// memory. Exceeding that budget or encountering navigation this projector
+/// cannot represent is an explicit error; a partial playback order is never
+/// returned.
+pub fn unroll(marks: &[MeasureMarks]) -> Result<Vec<(usize, u32)>, String> {
+    const MAX_UNROLLED_MEASURES: usize = 1_000_000;
+    const MAX_UNROLL_STEPS: usize = MAX_UNROLLED_MEASURES * 8 + 16;
+
     let n = marks.len();
     if n == 0 {
-        return vec![];
+        return Ok(vec![]);
     }
-    let mut order: Vec<(usize, u32)> = Vec::with_capacity(n * 2);
+    if n > MAX_UNROLLED_MEASURES {
+        return Err(format!(
+            "score has {n} measures, exceeding the playback expansion budget of \
+             {MAX_UNROLLED_MEASURES}"
+        ));
+    }
+
+    let mut repeat_open = false;
+    for (index, mark) in marks.iter().enumerate() {
+        if mark.end_repeat == 1 {
+            return Err(format!(
+                "repeat ending at measure {index} declares one pass; repeat counts must be \
+                 zero or at least two"
+            ));
+        }
+        if usize::try_from(mark.end_repeat).is_ok_and(|passes| passes > MAX_UNROLLED_MEASURES) {
+            return Err(format!(
+                "repeat ending at measure {index} declares {} passes, exceeding the playback \
+                 expansion budget of {MAX_UNROLLED_MEASURES}",
+                mark.end_repeat
+            ));
+        }
+        if mark
+            .volta
+            .as_ref()
+            .is_some_and(|passes| passes.contains(&0))
+        {
+            return Err(format!(
+                "volta at measure {index} contains pass 0; pass numbers are one-based"
+            ));
+        }
+        if mark.start_repeat {
+            if repeat_open {
+                return Err(format!(
+                    "nested repeat starting at measure {index} is not representable safely"
+                ));
+            }
+            repeat_open = true;
+        }
+        if mark.end_repeat >= 2 {
+            repeat_open = false;
+        }
+    }
+    if repeat_open {
+        return Err("repeat start has no matching repeat ending".into());
+    }
+
+    let jump_sites: Vec<(usize, Jump)> = marks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mark)| mark.jump.map(|jump| (index, jump)))
+        .collect();
+    if jump_sites.len() > 1 {
+        return Err(format!(
+            "multiple navigation jumps are not representable safely (found {})",
+            jump_sites.len()
+        ));
+    }
+    let segno_targets: Vec<usize> = marks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mark)| mark.segno.then_some(index))
+        .collect();
+    let coda_targets: Vec<usize> = marks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mark)| mark.coda.then_some(index))
+        .collect();
+    if let Some((index, jump)) = jump_sites.first().copied() {
+        if matches!(jump, Jump::DsAlFine | Jump::DsAlCoda | Jump::Ds) && segno_targets.len() != 1 {
+            return Err(format!(
+                "D.S. jump at measure {index} requires exactly one segno target; found {}",
+                segno_targets.len()
+            ));
+        }
+        if matches!(jump, Jump::DsAlFine | Jump::DcAlFine) && !marks.iter().any(|mark| mark.fine) {
+            return Err(format!(
+                "al Fine jump at measure {index} has no Fine target"
+            ));
+        }
+        if matches!(jump, Jump::DsAlCoda | Jump::DcAlCoda) {
+            if !marks.iter().any(|mark| mark.to_coda) {
+                return Err(format!(
+                    "al Coda jump at measure {index} has no To Coda point"
+                ));
+            }
+            if coda_targets.len() != 1 {
+                return Err(format!(
+                    "al Coda jump at measure {index} requires exactly one coda target; found {}",
+                    coda_targets.len()
+                ));
+            }
+        }
+    }
+    let mut order: Vec<(usize, u32)> =
+        Vec::with_capacity(n.saturating_mul(2).min(MAX_UNROLLED_MEASURES));
     let mut emitted = vec![0u32; n];
     let mut jumps_left: Vec<u32> = marks
         .iter()
@@ -159,8 +262,16 @@ pub fn unroll(marks: &[MeasureMarks]) -> Vec<(usize, u32)> {
     let mut after_jump = false;
     let mut jump_taken = false;
     let mut jump_mode: Option<Jump> = None;
-    let cap = n * 8 + 16; // anti-loop guard for pathological data
-    while i < n && order.len() < cap {
+    let mut steps = 0usize;
+    while i < n {
+        steps = steps
+            .checked_add(1)
+            .ok_or_else(|| "score playback expansion step counter overflowed".to_string())?;
+        if steps > MAX_UNROLL_STEPS {
+            return Err(format!(
+                "score playback structure did not converge within {MAX_UNROLL_STEPS} steps"
+            ));
+        }
         let m = &marks[i];
         if m.start_repeat {
             if emitted[i] == 0 {
@@ -175,8 +286,16 @@ pub fn unroll(marks: &[MeasureMarks]) -> Vec<(usize, u32)> {
             None => true,
         };
         if play {
+            if order.len() >= MAX_UNROLLED_MEASURES {
+                return Err(format!(
+                    "score playback expansion exceeds the budget of \
+                     {MAX_UNROLLED_MEASURES} measures"
+                ));
+            }
             order.push((i, emitted[i]));
-            emitted[i] += 1;
+            emitted[i] = emitted[i]
+                .checked_add(1)
+                .ok_or_else(|| format!("measure {i} playback count overflowed"))?;
 
             if after_jump
                 && m.fine
@@ -188,7 +307,7 @@ pub fn unroll(marks: &[MeasureMarks]) -> Vec<(usize, u32)> {
                 && m.to_coda
                 && matches!(jump_mode, Some(Jump::DsAlCoda) | Some(Jump::DcAlCoda))
             {
-                if let Some(c) = marks.iter().position(|x| x.coda) {
+                if let Some(c) = coda_targets.first().copied() {
                     i = c; // "To Coda": jump to the coda symbol
                     continue;
                 }
@@ -199,9 +318,7 @@ pub fn unroll(marks: &[MeasureMarks]) -> Vec<(usize, u32)> {
                     after_jump = true;
                     jump_mode = Some(j);
                     i = match j {
-                        Jump::DsAlFine | Jump::DsAlCoda | Jump::Ds => {
-                            marks.iter().position(|x| x.segno).unwrap_or(0)
-                        }
+                        Jump::DsAlFine | Jump::DsAlCoda | Jump::Ds => segno_targets[0],
                         _ => 0, // D.C.: back to the beginning
                     };
                     continue;
@@ -216,7 +333,7 @@ pub fn unroll(marks: &[MeasureMarks]) -> Vec<(usize, u32)> {
         }
         i += 1;
     }
-    order
+    Ok(order)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -519,6 +636,19 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
     p += 2;
     let ntrk = be_u16(data, p) as usize;
     p += 2;
+    if format > 2 {
+        return Err(format!(
+            "unsupported MIDI format {format}; expected 0, 1, or 2"
+        ));
+    }
+    if ntrk == 0 {
+        return Err("MIDI header must declare at least one track".into());
+    }
+    if format == 0 && ntrk != 1 {
+        return Err(format!(
+            "MIDI format 0 must declare exactly one track, found {ntrk}"
+        ));
+    }
     if ntrk > MAX_TRACKS {
         return Err("too many MIDI tracks".into());
     }
@@ -833,8 +963,9 @@ fn classify_text_profile(events: &[Event]) -> MidiTextProfile {
     let has_kmidi = text_events.iter().any(|text| {
         text.text
             .trim_start()
-            .to_ascii_uppercase()
-            .starts_with("@KMIDI")
+            .split_ascii_whitespace()
+            .next()
+            .is_some_and(|control| control.eq_ignore_ascii_case("@KMIDI"))
     });
     let lyric_payloads: Vec<_> = text_events
         .iter()
@@ -843,7 +974,7 @@ fn classify_text_profile(events: &[Event]) -> MidiTextProfile {
     let has_line_control = lyric_payloads
         .iter()
         .any(|text| matches!(text.raw.first().copied(), Some(b'\\') | Some(b'/')));
-    if has_line_control && lyric_payloads.len() >= 2 {
+    if has_line_control && (has_kmidi || lyric_payloads.len() >= 2) {
         MidiTextProfile::KaraokeLyrics
     } else if has_kmidi {
         MidiTextProfile::KaraokeControl
@@ -857,10 +988,14 @@ mod tests {
     use super::*;
 
     fn smf(division: u16, tracks: Vec<Vec<u8>>) -> Vec<u8> {
+        smf_with_format(1, division, tracks)
+    }
+
+    fn smf_with_format(format: u16, division: u16, tracks: Vec<Vec<u8>>) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(b"MThd");
         data.extend_from_slice(&6u32.to_be_bytes());
-        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&format.to_be_bytes());
         data.extend_from_slice(
             &u16::try_from(tracks.len())
                 .expect("test track count fits")
@@ -890,9 +1025,61 @@ mod tests {
     }
 
     #[test]
+    fn unroll_returns_complete_orders_beyond_the_old_heuristic_cap() {
+        let mut marks = vec![MeasureMarks::default()];
+        marks[0].end_repeat = 40;
+        let order = unroll(&marks).expect("finite repeat is representable");
+        assert_eq!(order.len(), 40);
+        assert_eq!(order.first(), Some(&(0, 0)));
+        assert_eq!(order.last(), Some(&(0, 39)));
+    }
+
+    #[test]
+    fn unroll_reports_repeat_counts_over_its_budget() {
+        let mut marks = vec![MeasureMarks::default()];
+        marks[0].end_repeat = 1_000_001;
+        let error = unroll(&marks).expect_err("hostile repeat count must not be truncated");
+        assert!(
+            error.contains("exceeding the playback expansion budget"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn unroll_rejects_navigation_without_an_exact_target() {
+        let mut marks = vec![MeasureMarks::default(); 2];
+        marks[1].jump = Some(Jump::Ds);
+        let error = unroll(&marks).expect_err("D.S. without a segno is ambiguous");
+        assert!(
+            error.contains("requires exactly one segno target"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn zero_ppq_division_is_rejected() {
         let error = parse(&smf(0, vec![Vec::new()])).expect_err("zero PPQ is invalid");
         assert!(error.contains("non-zero"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn midi_header_rejects_invalid_format_and_track_count_combinations() {
+        let error =
+            parse(&smf_with_format(3, 480, vec![Vec::new()])).expect_err("format 3 is invalid");
+        assert!(error.contains("unsupported MIDI format 3"));
+
+        let error = parse(&smf_with_format(1, 480, Vec::new()))
+            .expect_err("a MIDI file needs at least one track");
+        assert!(error.contains("at least one track"));
+
+        let error = parse(&smf_with_format(0, 480, vec![Vec::new(), Vec::new()]))
+            .expect_err("format 0 cannot contain multiple tracks");
+        assert!(error.contains("exactly one track"));
+
+        let parsed = parse(&smf_with_format(0, 480, vec![Vec::new()]))
+            .expect("format 0 with one track is valid");
+        assert_eq!(parsed.format, 0);
+        assert_eq!(parsed.tracks.len(), 1);
     }
 
     #[test]
@@ -945,6 +1132,26 @@ mod tests {
         let midi = parse_with_karaoke_profile(&smf(480, vec![control, other])).unwrap();
         assert_eq!(midi.tracks[0].text_profile, MidiTextProfile::KaraokeControl);
         assert_eq!(midi.tracks[1].text_profile, MidiTextProfile::Generic);
+    }
+
+    #[test]
+    fn kmidi_requires_a_complete_control_token() {
+        let midi = parse(&smf(480, vec![text_meta(0x01, b"@KMIDIEVIL metadata")])).unwrap();
+        assert_eq!(midi.tracks[0].text_profile, MidiTextProfile::Generic);
+        assert_eq!(midi.source_format, SourceFormat::StandardMidi);
+
+        let midi = parse(&smf(480, vec![text_meta(0x01, b" @kmidi KARAOKE FILE")])).unwrap();
+        assert_eq!(midi.tracks[0].text_profile, MidiTextProfile::KaraokeControl);
+        assert_eq!(midi.source_format, SourceFormat::KaraokeMidi);
+    }
+
+    #[test]
+    fn exact_kmidi_marker_qualifies_one_line_controlled_payload_on_its_track() {
+        let mut track = text_meta(0x01, b"@KMIDI KARAOKE FILE");
+        track.extend(text_meta(0x01, b"/one lyric"));
+        let midi = parse(&smf(480, vec![track])).unwrap();
+        assert_eq!(midi.tracks[0].text_profile, MidiTextProfile::KaraokeLyrics);
+        assert_eq!(midi.source_format, SourceFormat::KaraokeMidi);
     }
 
     #[test]

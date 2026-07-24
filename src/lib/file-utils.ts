@@ -22,6 +22,10 @@ const supportedPattern = new RegExp(
 
 export const isSupported = (path: string) => supportedPattern.test(path);
 
+export function uniqueSupportedPaths(paths: string[]): string[] {
+  return [...new Set(paths.filter(isSupported))];
+}
+
 const separator = (path: string) => (path.includes("\\") ? "\\" : "/");
 
 function splitSourcePath(sourcePath: string) {

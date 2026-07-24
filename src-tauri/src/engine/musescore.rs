@@ -11,8 +11,7 @@ use crate::engine::midi::{
 use std::collections::BTreeMap;
 
 pub fn is_musescore_xml(data: &[u8]) -> bool {
-    let n = data.len().min(800);
-    String::from_utf8_lossy(&data[..n]).contains("<museScore")
+    crate::engine::musicxml::xml_bytes_contain_ascii(data, b"<museScore")
 }
 
 pub fn zip_has_mscx(data: &[u8]) -> bool {
@@ -39,7 +38,7 @@ pub fn parse(data: &[u8]) -> Result<Midi, String> {
         let mut f = zip.by_name(&name).map_err(|e| e.to_string())?;
         crate::engine::musicxml::read_zip_entry_capped(&mut f)?
     } else {
-        String::from_utf8_lossy(data).into_owned()
+        crate::engine::musicxml::decode_xml_bytes(data)?
     };
     parse_mscx(&xml)
 }
@@ -48,7 +47,7 @@ fn frac(s: &str) -> Option<(i64, i64)> {
     let mut it = s.trim().split('/');
     let a = it.next()?.trim().parse::<i64>().ok()?;
     let b = it.next()?.trim().parse::<i64>().ok()?;
-    if b <= 0 || a.unsigned_abs() > 1_000_000 || b > 1_000_000 {
+    if it.next().is_some() || b <= 0 || a.unsigned_abs() > 1_000_000 || b > 1_000_000 {
         None
     } else {
         Some((a, b))
@@ -97,34 +96,267 @@ pub(crate) fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Duration in ticks of a durationType (whole = 4 * div).
-fn duration_ticks(kind: &str, div: i64) -> Option<i64> {
-    let whole = 4 * div;
+/// Duration as a rational number of quarter notes.
+fn duration_ratio(kind: &str) -> Option<(i64, i64)> {
     Some(match kind {
-        "long" => whole * 4,
-        "breve" => whole * 2,
-        "whole" => whole,
-        "half" => whole / 2,
-        "quarter" => whole / 4,
-        "eighth" => whole / 8,
-        "16th" => whole / 16,
-        "32nd" => whole / 32,
-        "64th" => whole / 64,
-        "128th" => whole / 128,
-        "256th" => whole / 256,
+        "long" => (16, 1),
+        "breve" => (8, 1),
+        "whole" => (4, 1),
+        "half" => (2, 1),
+        "quarter" => (1, 1),
+        "eighth" => (1, 2),
+        "16th" => (1, 4),
+        "32nd" => (1, 8),
+        "64th" => (1, 16),
+        "128th" => (1, 32),
+        "256th" => (1, 64),
         _ => return None, // "measure" handled separately
     })
 }
 
-fn apply_dots(dur: i64, dots: u32) -> i64 {
-    // 1 dot: x1.5; 2 dots: x1.75; etc.
-    let mut extra = 0i64;
-    let mut half = dur;
-    for _ in 0..dots {
-        half /= 2;
-        extra += half;
+fn checked_ratio_mul(
+    ratio: (i64, i64),
+    numerator: i64,
+    denominator: i64,
+    context: &str,
+) -> Result<(i64, i64), String> {
+    if denominator <= 0 {
+        return Err(format!("{context} has a non-positive denominator"));
     }
-    dur + extra
+    let numerator = i128::from(ratio.0)
+        .checked_mul(i128::from(numerator))
+        .ok_or_else(|| format!("{context} numerator overflow"))?;
+    let denominator = i128::from(ratio.1)
+        .checked_mul(i128::from(denominator))
+        .ok_or_else(|| format!("{context} denominator overflow"))?;
+    let numerator =
+        i64::try_from(numerator).map_err(|_| format!("{context} numerator overflow"))?;
+    let denominator =
+        i64::try_from(denominator).map_err(|_| format!("{context} denominator overflow"))?;
+    let divisor = gcd_i64(numerator.unsigned_abs(), denominator as u64);
+    Ok((
+        numerator / i64::try_from(divisor).unwrap_or(1),
+        denominator / i64::try_from(divisor).unwrap_or(1),
+    ))
+}
+
+fn dotted_ratio(ratio: (i64, i64), dots: u32) -> Result<(i64, i64), String> {
+    let denominator = 1i64
+        .checked_shl(dots)
+        .ok_or_else(|| "MuseScore dot denominator overflow".to_string())?;
+    let numerator = denominator
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or_else(|| "MuseScore dot numerator overflow".to_string())?;
+    checked_ratio_mul(ratio, numerator, denominator, "MuseScore dotted duration")
+}
+
+fn gcd_i64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn include_tick_ratio(
+    scale: &mut i64,
+    source_division: i64,
+    ratio: (i64, i64),
+    context: &str,
+) -> Result<(), String> {
+    if ratio.1 <= 0 {
+        return Err(format!("{context} has a non-positive denominator"));
+    }
+    let base_numerator = i128::from(source_division)
+        .checked_mul(i128::from(ratio.0))
+        .ok_or_else(|| format!("{context} timing overflow"))?;
+    let base_abs =
+        u64::try_from(base_numerator.abs()).map_err(|_| format!("{context} timing overflow"))?;
+    let denominator =
+        u64::try_from(ratio.1).map_err(|_| format!("{context} denominator overflow"))?;
+    let required = denominator / gcd_i64(base_abs, denominator);
+    let current = u64::try_from(*scale).map_err(|_| "MuseScore tick scale overflow")?;
+    let next = current
+        .checked_div(gcd_i64(current, required))
+        .and_then(|value| value.checked_mul(required))
+        .ok_or_else(|| "MuseScore exact tick scale overflow".to_string())?;
+    let next = i64::try_from(next).map_err(|_| "MuseScore exact tick scale overflow")?;
+    let ticks_per_beat = source_division
+        .checked_mul(next)
+        .filter(|value| *value <= i64::from(u16::MAX))
+        .ok_or_else(|| {
+            format!("{context} requires a tick division beyond the supported exact range")
+        })?;
+    *scale = next;
+    debug_assert!(ticks_per_beat > 0);
+    Ok(())
+}
+
+fn exact_ticks(division: i64, ratio: (i64, i64), context: &str) -> Result<i64, String> {
+    if ratio.1 <= 0 {
+        return Err(format!("{context} has a non-positive denominator"));
+    }
+    let numerator = i128::from(division)
+        .checked_mul(i128::from(ratio.0))
+        .ok_or_else(|| format!("{context} timing overflow"))?;
+    let denominator = i128::from(ratio.1);
+    if numerator % denominator != 0 {
+        return Err(format!(
+            "{context} cannot be represented exactly at division {division}"
+        ));
+    }
+    i64::try_from(numerator / denominator).map_err(|_| format!("{context} timing overflow"))
+}
+
+fn musescore_tick_scale(score: roxmltree::Node, source_division: i64) -> Result<i64, String> {
+    let mut scale = 1i64;
+
+    for measure in score
+        .descendants()
+        .filter(|node| node.has_tag_name("Measure"))
+    {
+        if let Some(value) = measure.attribute("len") {
+            let (numerator, denominator) = frac(value)
+                .ok_or_else(|| format!("MuseScore measure len fraction is invalid: {value:?}"))?;
+            include_tick_ratio(
+                &mut scale,
+                source_division,
+                (
+                    4i64.checked_mul(numerator)
+                        .ok_or_else(|| "MuseScore measure len numerator overflow".to_string())?,
+                    denominator,
+                ),
+                "MuseScore measure len",
+            )?;
+        }
+    }
+
+    for voice in score
+        .descendants()
+        .filter(|node| node.has_tag_name("voice"))
+    {
+        let mut tuplet: Option<(i64, i64)> = None;
+        for element in voice.children().filter(|node| node.is_element()) {
+            match element.tag_name().name() {
+                "TimeSig" => {
+                    let numerator = child_text(element, "sigN")
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| "MuseScore TimeSig has an invalid sigN".to_string())?;
+                    let denominator = child_text(element, "sigD")
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| "MuseScore TimeSig has an invalid sigD".to_string())?;
+                    include_tick_ratio(
+                        &mut scale,
+                        source_division,
+                        (
+                            4i64.checked_mul(numerator).ok_or_else(|| {
+                                "MuseScore time-signature numerator overflow".to_string()
+                            })?,
+                            denominator,
+                        ),
+                        "MuseScore time signature",
+                    )?;
+                }
+                "Tuplet" => {
+                    let normal = child_text(element, "normalNotes")
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .filter(|value| (1..=64).contains(value))
+                        .ok_or_else(|| "MuseScore Tuplet has invalid normalNotes".to_string())?;
+                    let actual = child_text(element, "actualNotes")
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .filter(|value| (1..=64).contains(value))
+                        .ok_or_else(|| "MuseScore Tuplet has invalid actualNotes".to_string())?;
+                    tuplet = Some((normal, actual));
+                }
+                "endTuplet" => tuplet = None,
+                "location" => {
+                    let text = child_text(element, "fractions")
+                        .ok_or_else(|| "MuseScore location is missing fractions".to_string())?;
+                    let (numerator, denominator) = frac(text).ok_or_else(|| {
+                        format!("MuseScore location fraction is invalid: {text:?}")
+                    })?;
+                    include_tick_ratio(
+                        &mut scale,
+                        source_division,
+                        (
+                            4i64.checked_mul(numerator).ok_or_else(|| {
+                                "MuseScore location numerator overflow".to_string()
+                            })?,
+                            denominator,
+                        ),
+                        "MuseScore location",
+                    )?;
+                }
+                "Chord" | "Rest" if !is_grace(element) => {
+                    let duration_type = child_text(element, "durationType").ok_or_else(|| {
+                        format!(
+                            "MuseScore {} is missing durationType",
+                            element.tag_name().name()
+                        )
+                    })?;
+                    let ratio = if duration_type == "measure" {
+                        match child_text(element, "duration") {
+                            Some(value) => {
+                                let (numerator, denominator) = frac(value).ok_or_else(|| {
+                                    format!("MuseScore measure duration is invalid: {value:?}")
+                                })?;
+                                Some((
+                                    4i64.checked_mul(numerator).ok_or_else(|| {
+                                        "MuseScore measure duration numerator overflow".to_string()
+                                    })?,
+                                    denominator,
+                                ))
+                            }
+                            None => None,
+                        }
+                    } else {
+                        let dots = child_text(element, "dots")
+                            .map(|value| value.parse::<u32>())
+                            .transpose()
+                            .map_err(|_| "MuseScore dots value is invalid".to_string())?
+                            .unwrap_or(0);
+                        if dots > 4 {
+                            return Err("MuseScore dots value is invalid".into());
+                        }
+                        Some(dotted_ratio(
+                            duration_ratio(duration_type).ok_or_else(|| {
+                                format!("MuseScore durationType is unsupported: {duration_type:?}")
+                            })?,
+                            dots,
+                        )?)
+                    };
+                    if let Some(mut ratio) = ratio {
+                        include_tick_ratio(
+                            &mut scale,
+                            source_division,
+                            ratio,
+                            "MuseScore base duration",
+                        )?;
+                        if let Some((normal, actual)) = tuplet {
+                            ratio = checked_ratio_mul(
+                                ratio,
+                                normal,
+                                actual,
+                                "MuseScore tuplet duration",
+                            )?;
+                        }
+                        include_tick_ratio(
+                            &mut scale,
+                            source_division,
+                            ratio,
+                            "MuseScore note duration",
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(scale)
 }
 
 fn is_grace(chord: roxmltree::Node) -> bool {
@@ -146,7 +378,11 @@ fn is_grace(chord: roxmltree::Node) -> bool {
 
 /// Every lyric lane owned by a MuseScore chord. Selection for a repeat pass is
 /// deferred to the SVP projector so no source verse is discarded here.
-fn chord_lyrics(chord: roxmltree::Node, source_id: &str) -> Result<Vec<Lyric>, String> {
+fn chord_lyrics(
+    chord: roxmltree::Node,
+    source_id: &str,
+    tick_scale: i64,
+) -> Result<Vec<Lyric>, String> {
     chord
         .children()
         .filter(|child| child.has_tag_name("Lyrics"))
@@ -183,9 +419,17 @@ fn chord_lyrics(chord: roxmltree::Node, source_id: &str) -> Result<Vec<Lyric>, S
                 _ => None,
             };
             let extend_ticks = match child_text(lyric_node, "ticks") {
-                Some(text) => Some(text.parse::<i64>().map_err(|_| {
-                    format!("MuseScore lyric extension ticks are invalid: {text:?}")
-                })?),
+                Some(text) => Some(
+                    text.parse::<i64>()
+                        .map_err(|_| {
+                            format!("MuseScore lyric extension ticks are invalid: {text:?}")
+                        })?
+                        .checked_mul(tick_scale)
+                        .ok_or_else(|| {
+                            "MuseScore lyric extension ticks overflow after exact scaling"
+                                .to_string()
+                        })?,
+                ),
                 None => None,
             };
             let extend_fraction = match child_text(lyric_node, "ticks_f") {
@@ -214,7 +458,7 @@ fn chord_lyrics(chord: roxmltree::Node, source_id: &str) -> Result<Vec<Lyric>, S
 }
 
 /// Playback order of the measures: repeats, voltas, D.S./D.C., Coda, Fine.
-fn playback_order(measures: &[roxmltree::Node]) -> Vec<(usize, u32)> {
+fn playback_order(measures: &[roxmltree::Node]) -> Result<Vec<(usize, u32)>, String> {
     let mut marks = vec![MeasureMarks::default(); measures.len()];
     let mut volta_spans: Vec<(usize, usize, Vec<u32>)> = Vec::new();
 
@@ -313,7 +557,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         .descendants()
         .find(|n| n.has_tag_name("Score"))
         .ok_or_else(|| "MuseScore: Score element not found".to_string())?;
-    let div = match child_text(score, "Division") {
+    let source_division = match child_text(score, "Division") {
         Some(value) => value
             .parse::<i64>()
             .ok()
@@ -323,6 +567,10 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         // absent. A present malformed value is never replaced.
         None => 480,
     };
+    let tick_scale = musescore_tick_scale(score, source_division)?;
+    let div = source_division
+        .checked_mul(tick_scale)
+        .ok_or_else(|| "MuseScore exact tick division overflow".to_string())?;
     let tpb = u16::try_from(div).map_err(|_| "MuseScore Division exceeds the SVP time base")?;
 
     #[derive(Clone, Debug, Default)]
@@ -480,7 +728,8 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .map(str::to_string)
             .unwrap_or_else(|| format!("anonymous-{}", tracks.len() + 1));
         let info = staff_info.get(&staff_id).cloned().unwrap_or_default();
-        let mut voice_events: BTreeMap<usize, Vec<Event>> = BTreeMap::new();
+        let mut voice_events: BTreeMap<(usize, Option<usize>), Vec<Event>> = BTreeMap::new();
+        let mut unassigned_chord_lyrics = Vec::new();
 
         let mut measure_start: i64 = 0;
         let mut measure_len: i64 = 4 * div; // 4/4 by default
@@ -489,7 +738,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .children()
             .filter(|n| n.has_tag_name("Measure"))
             .collect();
-        for &(mi, pass) in playback_order(&measures).iter() {
+        for &(mi, pass) in playback_order(&measures)?.iter() {
             let measure = measures[mi];
             let mut this_len = measure_len;
             for (voice_index, voice) in measure
@@ -497,7 +746,6 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 .filter(|n| n.has_tag_name("voice"))
                 .enumerate()
             {
-                let events = voice_events.entry(voice_index).or_default();
                 let mut pos = measure_start;
                 let mut tuplet: Option<(i64, i64)> = None; // (normal, actual)
                 for (element_index, el) in voice.children().filter(|n| n.is_element()).enumerate() {
@@ -527,14 +775,21 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         "MuseScore time-signature denominator is invalid: {denominator_text:?}"
                                     )
                                 })?;
-                            measure_len = 4i64
-                                .checked_mul(div)
-                                .and_then(|value| value.checked_mul(i64::from(numerator)))
-                                .map(|value| value / i64::from(denominator))
-                                .filter(|value| *value > 0)
-                                .ok_or_else(|| {
-                                    "MuseScore time-signature duration overflow".to_string()
-                                })?;
+                            measure_len = exact_ticks(
+                                div,
+                                (
+                                    4i64.checked_mul(i64::from(numerator)).ok_or_else(|| {
+                                        "MuseScore time-signature numerator overflow".to_string()
+                                    })?,
+                                    i64::from(denominator),
+                                ),
+                                "MuseScore time-signature duration",
+                            )?;
+                            if measure_len <= 0 {
+                                return Err(
+                                    "MuseScore time-signature duration is non-positive".into()
+                                );
+                            }
                             this_len = measure_len;
                             push_global_event(
                                 &mut global_events,
@@ -606,11 +861,16 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         "MuseScore location fraction is invalid: {fraction_text:?}"
                                     )
                                 })?;
-                            let delta = 4i64
-                                .checked_mul(div)
-                                .and_then(|value| value.checked_mul(numerator))
-                                .map(|value| value / denominator)
-                                .ok_or_else(|| "MuseScore location overflow".to_string())?;
+                            let delta = exact_ticks(
+                                div,
+                                (
+                                    4i64.checked_mul(numerator).ok_or_else(|| {
+                                        "MuseScore location numerator overflow".to_string()
+                                    })?,
+                                    denominator,
+                                ),
+                                "MuseScore location",
+                            )?;
                             pos = pos
                                 .checked_add(delta)
                                 .ok_or_else(|| "MuseScore cursor overflow".to_string())?;
@@ -647,31 +907,36 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                         "MuseScore measure duration is invalid: {value:?}"
                                                     )
                                                 })?;
-                                            4i64.checked_mul(div)
-                                                .and_then(|ticks| ticks.checked_mul(numerator))
-                                                .map(|ticks| ticks / denominator)
-                                                .ok_or_else(|| {
-                                                    "MuseScore measure duration overflow"
-                                                        .to_string()
-                                                })?
+                                            exact_ticks(
+                                                div,
+                                                (
+                                                    4i64.checked_mul(numerator).ok_or_else(
+                                                        || {
+                                                            "MuseScore measure duration numerator overflow"
+                                                                .to_string()
+                                                        },
+                                                    )?,
+                                                    denominator,
+                                                ),
+                                                "MuseScore measure duration",
+                                            )?
                                         }
                                         None => this_len,
                                     }
                                 } else {
-                                    let base =
-                                        duration_ticks(duration_type, div).ok_or_else(|| {
+                                    let ratio = dotted_ratio(
+                                        duration_ratio(duration_type).ok_or_else(|| {
                                             format!(
                                                 "MuseScore durationType is unsupported: {duration_type:?}"
                                             )
-                                        })?;
-                                    apply_dots(base, dots)
+                                        })?,
+                                        dots,
+                                    )?;
+                                    exact_ticks(div, ratio, "MuseScore note duration")?
                                 }
                             };
                             if let Some((n, a)) = tuplet {
-                                dur =
-                                    dur.checked_mul(n).map(|value| value / a).ok_or_else(|| {
-                                        "MuseScore tuplet duration overflow".to_string()
-                                    })?;
+                                dur = exact_ticks(dur, (n, a), "MuseScore tuplet duration")?;
                             }
                             if !grace && dur <= 0 {
                                 return Err(format!(
@@ -691,10 +956,23 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                 let chord_id = format!(
                                     "mscx:staff:{staff_id}:measure:{mi}:voice:{voice_index}:chord:{element_index}"
                                 );
-                                let lyrics = chord_lyrics(el, &chord_id)?;
-                                for (note_index, note) in
-                                    el.children().filter(|c| c.has_tag_name("Note")).enumerate()
-                                {
+                                let lyrics = chord_lyrics(el, &chord_id, tick_scale)?;
+                                let notes: Vec<_> = el
+                                    .children()
+                                    .filter(|child| child.has_tag_name("Note"))
+                                    .collect();
+                                let polyphonic = notes.len() > 1;
+                                let ambiguous_lyric_ownership = notes.len() != 1;
+                                if ambiguous_lyric_ownership {
+                                    for lyric in &lyrics {
+                                        push_event(
+                                            &mut unassigned_chord_lyrics,
+                                            on,
+                                            Kind::Lyrics(lyric.clone()),
+                                        );
+                                    }
+                                }
+                                for (note_index, note) in notes.into_iter().enumerate() {
                                     let pitch_text = child_text(note, "pitch").ok_or_else(|| {
                                         format!(
                                             "MuseScore Note {note_index} in {chord_id} is missing pitch"
@@ -715,6 +993,10 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         .instruments
                                         .first()
                                         .and_then(|instrument| instrument.channel);
+                                    let chord_member = polyphonic.then_some(note_index);
+                                    let events = voice_events
+                                        .entry((voice_index, chord_member))
+                                        .or_default();
                                     push_event(
                                         events,
                                         on,
@@ -736,10 +1018,11 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                 grace,
                                                 unpitched: None,
                                             },
-                                            // A MuseScore lyric belongs to the chord. Keep
-                                            // exactly one copy instead of duplicating it over
-                                            // every pitch in a chord.
-                                            lyrics: if note_index == 0 {
+                                            // MuseScore owns lyrics at Chord level. A
+                                            // single-note chord has one unambiguous target;
+                                            // a polyphonic chord keeps its lyric standalone
+                                            // and source-only instead of assigning a pitch.
+                                            lyrics: if !ambiguous_lyric_ownership {
                                                 lyrics.clone()
                                             } else {
                                                 Vec::new()
@@ -773,21 +1056,26 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 let (numerator, denominator) = frac(value).ok_or_else(|| {
                     format!("MuseScore measure len fraction is invalid: {value:?}")
                 })?;
-                this_len = 4i64
-                    .checked_mul(div)
-                    .and_then(|ticks| ticks.checked_mul(numerator))
-                    .map(|ticks| ticks / denominator)
-                    .filter(|ticks| *ticks > 0)
-                    .ok_or_else(|| {
-                        "MuseScore measure len is non-positive or overflows".to_string()
-                    })?;
+                this_len = exact_ticks(
+                    div,
+                    (
+                        4i64.checked_mul(numerator).ok_or_else(|| {
+                            "MuseScore measure len numerator overflow".to_string()
+                        })?,
+                        denominator,
+                    ),
+                    "MuseScore measure len",
+                )?;
+                if this_len <= 0 {
+                    return Err("MuseScore measure len is non-positive".into());
+                }
             }
             measure_start = measure_start
                 .checked_add(this_len)
                 .ok_or_else(|| "MuseScore measure timeline overflow".to_string())?;
         }
 
-        for (voice_index, mut events) in voice_events {
+        for ((voice_index, chord_member), mut events) in voice_events {
             sort_and_reindex(&mut events);
             if !events
                 .iter()
@@ -796,9 +1084,23 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 continue;
             }
             let mut track = Track {
-                id: format!("mscx:staff:{staff_id}:voice:{}", voice_index + 1),
+                id: match chord_member {
+                    Some(member) => format!(
+                        "mscx:staff:{staff_id}:voice:{}:polyphonic-member:{}",
+                        voice_index + 1,
+                        member + 1
+                    ),
+                    None => format!("mscx:staff:{staff_id}:voice:{}", voice_index + 1),
+                },
                 name: if info.name.is_empty() {
-                    format!("Staff {staff_id}")
+                    match chord_member {
+                        Some(member) => {
+                            format!("Staff {staff_id} — polyphonic member {}", member + 1)
+                        }
+                        None => format!("Staff {staff_id}"),
+                    }
+                } else if let Some(member) = chord_member {
+                    format!("{} — polyphonic member {}", info.name, member + 1)
                 } else if voice_index == 0 {
                     info.name.clone()
                 } else {
@@ -824,6 +1126,28 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 track.role_hint = TrackRoleHint::Vocal;
             }
             tracks.push(track);
+        }
+        if !unassigned_chord_lyrics.is_empty() {
+            sort_and_reindex(&mut unassigned_chord_lyrics);
+            tracks.push(Track {
+                id: format!("mscx:staff:{staff_id}:chord-lyrics"),
+                name: if info.name.is_empty() {
+                    format!("Staff {staff_id} — unassigned chord lyrics")
+                } else {
+                    format!("{} — unassigned chord lyrics", info.name)
+                },
+                source: TrackSource {
+                    source_track: tracks.len(),
+                    part_id: Some(info.part_id.clone()),
+                    staff_id: Some(staff_id.clone()),
+                    voice: None,
+                },
+                role_hint: TrackRoleHint::Ambiguous,
+                text_profile: MidiTextProfile::Generic,
+                instruments: Vec::new(),
+                instrument: None,
+                events: unassigned_chord_lyrics,
+            });
         }
     }
 
@@ -901,6 +1225,7 @@ fn sort_and_reindex(events: &mut [Event]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
 
     fn mscx(lyric_text_xml: &str) -> String {
         format!(
@@ -931,6 +1256,26 @@ mod tests {
         )
     }
 
+    fn zipped_score(bytes: &[u8]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("score.mscx", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn latin1(value: &str) -> Vec<u8> {
+        value
+            .chars()
+            .map(|character| {
+                u8::try_from(u32::from(character))
+                    .unwrap_or_else(|_| panic!("test encoder does not cover {character:?}"))
+            })
+            .collect()
+    }
+
     fn lyrics_of(midi: &Midi) -> Vec<String> {
         midi.tracks
             .iter()
@@ -951,6 +1296,145 @@ mod tests {
     fn plain_lyric_text() {
         let midi = parse_mscx(&mscx("<text>let</text>")).unwrap();
         assert_eq!(lyrics_of(&midi), vec!["let"]);
+    }
+
+    #[test]
+    fn raw_and_zipped_latin1_follow_the_xml_declaration() {
+        let xml = mscx("<text>café</text>").replace("UTF-8", "ISO-8859-1");
+        let bytes = latin1(&xml);
+        let raw = parse(&bytes).expect("raw MSCX uses its declared encoding");
+        assert_eq!(lyrics_of(&raw), vec!["café"]);
+
+        let archive = zipped_score(&bytes);
+        let zipped = parse(&archive).expect("zipped MSCX uses the entry declaration");
+        assert_eq!(lyrics_of(&zipped), vec!["café"]);
+    }
+
+    #[test]
+    fn musescore_detection_scans_past_long_prologs() {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!--{}-->\n{}",
+            "padding".repeat(200),
+            mscx("<text>let</text>")
+                .split_once("<museScore")
+                .map(|(_, tail)| format!("<museScore{tail}"))
+                .unwrap()
+        );
+        assert!(is_musescore_xml(xml.as_bytes()));
+        assert!(crate::engine::musicxml::looks_like_xml(xml.as_bytes()));
+        let midi = parse(xml.as_bytes()).unwrap();
+        assert_eq!(lyrics_of(&midi), vec!["let"]);
+    }
+
+    #[test]
+    fn fractional_tick_durations_raise_the_exact_timebase_instead_of_truncating() {
+        let xml = mscx("<text>tiny</text>").replace(
+            "<durationType>quarter</durationType>",
+            "<durationType>256th</durationType>",
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(midi.ticks_per_beat, 960);
+        let ticks: Vec<_> = midi.tracks[0]
+            .events
+            .iter()
+            .filter_map(|event| {
+                matches!(event.kind, Kind::NoteOn(_) | Kind::NoteOff(_)).then_some(event.tick)
+            })
+            .collect();
+        assert_eq!(ticks, vec![0, 15]);
+    }
+
+    #[test]
+    fn exact_tuplet_scale_is_computed_before_events_are_emitted() {
+        let xml = mscx("<text>seven</text>").replace(
+            "<Chord>\n            <durationType>quarter</durationType>",
+            "<Tuplet><normalNotes>1</normalNotes><actualNotes>7</actualNotes></Tuplet>\
+             <Chord>\n            <durationType>quarter</durationType>",
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(midi.ticks_per_beat, 3_360);
+        let off = midi.tracks[0]
+            .events
+            .iter()
+            .find_map(|event| matches!(event.kind, Kind::NoteOff(_)).then_some(event.tick))
+            .unwrap();
+        assert_eq!(off, 480);
+    }
+
+    #[test]
+    fn tuplet_scaling_keeps_the_base_duration_exact_too() {
+        let xml = mscx("<text>exact</text>")
+            .replace("<Division>480</Division>", "<Division>3</Division>")
+            .replace(
+                "<Chord>\n            <durationType>quarter</durationType>",
+                "<Tuplet><normalNotes>2</normalNotes><actualNotes>3</actualNotes></Tuplet>\
+                 <Chord>\n            <durationType>eighth</durationType>",
+            );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(midi.ticks_per_beat, 6);
+        let off = midi.tracks[0]
+            .events
+            .iter()
+            .find_map(|event| matches!(event.kind, Kind::NoteOff(_)).then_some(event.tick))
+            .unwrap();
+        assert_eq!(off, 2);
+    }
+
+    #[test]
+    fn unrepresentable_fraction_is_rejected_instead_of_truncated() {
+        let xml = mscx("<text>let</text>").replace(
+            "<Chord>\n            <durationType>quarter</durationType>",
+            "<location><fractions>1/999983</fractions></location>\
+             <Chord>\n            <durationType>quarter</durationType>",
+        );
+        let error = parse_mscx(&xml).expect_err("oversized exact PPQ must be explicit");
+        assert!(
+            error.contains("exact range") || error.contains("tick division"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn polyphonic_chord_lyrics_remain_standalone_and_source_only() {
+        let xml = mscx("<text>ambiguous</text>").replace(
+            "<Note><pitch>60</pitch></Note>",
+            "<Note><pitch>60</pitch></Note><Note><pitch>64</pitch></Note>",
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        let attached_count = midi
+            .tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .filter_map(|event| match &event.kind {
+                Kind::NoteOn(note) => Some(note.lyrics.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        let standalone_count = midi
+            .tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .filter(|event| matches!(event.kind, Kind::Lyrics(_)))
+            .count();
+        assert_eq!(attached_count, 0);
+        assert_eq!(standalone_count, 1);
+        assert_eq!(
+            midi.tracks
+                .iter()
+                .filter(|track| {
+                    track
+                        .events
+                        .iter()
+                        .any(|event| matches!(event.kind, Kind::NoteOn(_)))
+                })
+                .count(),
+            2
+        );
+
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        assert_eq!(outcome.placed, 0);
+        assert!(outcome.svp.unwrap().tracks.is_empty());
     }
 
     #[test]
@@ -1180,10 +1664,14 @@ Melodie</trackName>
 
     #[test]
     fn present_invalid_division_is_rejected_instead_of_replaced() {
-        let xml =
-            mscx("<text>let</text>").replace("<Division>480</Division>", "<Division>0</Division>");
-        let error = parse_mscx(&xml).expect_err("invalid Division must fail");
-        assert!(error.contains("Division"), "unexpected error: {error}");
+        for invalid in ["0", "480.5"] {
+            let xml = mscx("<text>let</text>").replace(
+                "<Division>480</Division>",
+                &format!("<Division>{invalid}</Division>"),
+            );
+            let error = parse_mscx(&xml).expect_err("invalid Division must fail");
+            assert!(error.contains("Division"), "unexpected error: {error}");
+        }
     }
 
     #[test]

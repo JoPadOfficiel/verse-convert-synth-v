@@ -89,6 +89,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ inputs.commit_sha }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -111,7 +112,11 @@ jobs:
               exit 1
             fi
           else
-            echo "Release tag is not published yet; the draft release will create it from ${RELEASE_SHA}."
+            if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+              echo "::error::A published release requires a pre-existing validated tag"
+              exit 1
+            fi
+            echo "Release tag is not published yet; this run may only update a draft."
           fi
           node scripts/check-version.mjs --tag "$RELEASE_TAG"
 
@@ -204,7 +209,7 @@ jobs:
       - name: Upload platform bundles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: verse-${{ matrix.target }}
+          name: verse-platform-${{ matrix.target }}-attempt-${{ github.run_attempt }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/**
           if-no-files-found: error
           compression-level: 0
@@ -229,7 +234,7 @@ jobs:
       - name: Download all platform bundles
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: verse-*
+          pattern: verse-platform-*-attempt-*
           path: downloaded
 
       - name: Assemble release assets and checksums
@@ -237,28 +242,97 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          while IFS= read -r -d '' file; do
-            relative="${file#downloaded/}"
-            target="${relative%%/*}"
-            base="${file##*/}"
-            case "$base" in
-              *.AppImage|*.deb|*.dmg|*.exe|*.msi|*.rpm|*.sig|*.tar.gz|*.zip)
-                destination="release-assets/${target}-${base}"
-                if [[ -e "$destination" ]]; then
-                  echo "::error::Release asset collision: $destination"
-                  exit 1
-                fi
-                cp "$file" "$destination"
-                ;;
-            esac
-          done < <(find downloaded -type f -print0)
-          if ! find release-assets -maxdepth 1 -type f | grep -q .; then
-            echo "::error::No releasable installer was found"
+
+          expected_targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-pc-windows-msvc
+            aarch64-pc-windows-msvc
+          )
+          declare -A latest_attempt=()
+          declare -A latest_directory=()
+
+          shopt -s nullglob
+          artifact_directories=(downloaded/*)
+          shopt -u nullglob
+          if (( ${#artifact_directories[@]} == 0 )); then
+            echo "::error::No platform artifacts were downloaded"
             exit 1
           fi
+
+          for artifact_directory in "${artifact_directories[@]}"; do
+            if [[ ! -d "$artifact_directory" ]]; then
+              echo "::error::Unexpected file in artifact root: $artifact_directory"
+              exit 1
+            fi
+            artifact_name="${artifact_directory#downloaded/}"
+            if [[ ! "$artifact_name" =~ ^verse-platform-(.+)-attempt-([0-9]+)$ ]]; then
+              echo "::error::Unexpected artifact directory: $artifact_name"
+              exit 1
+            fi
+
+            target="${BASH_REMATCH[1]}"
+            attempt="${BASH_REMATCH[2]}"
+            case "$target" in
+              aarch64-apple-darwin|x86_64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc) ;;
+              *)
+                echo "::error::Unexpected release target: $target"
+                exit 1
+                ;;
+            esac
+
+            if [[ -z "${latest_attempt[$target]:-}" ]] \
+              || (( 10#$attempt > 10#${latest_attempt[$target]} )); then
+              latest_attempt["$target"]="$attempt"
+              latest_directory["$target"]="$artifact_directory"
+            fi
+          done
+
+          enumeration_file="$(mktemp)"
+          trap 'rm -f "$enumeration_file"' EXIT
+          for target in "${expected_targets[@]}"; do
+            artifact_directory="${latest_directory[$target]:-}"
+            if [[ -z "$artifact_directory" ]]; then
+              echo "::error::Missing platform artifact for $target"
+              exit 1
+            fi
+
+            installer_count=0
+            find "$artifact_directory" -type f -print0 > "$enumeration_file"
+            while IFS= read -r -d '' file; do
+              base="${file##*/}"
+              case "$base" in
+                *.AppImage|*.deb|*.dmg|*.exe|*.msi|*.rpm|*.tar.gz|*.zip)
+                  destination="release-assets/verse-platform-${target}-${base}"
+                  if [[ -e "$destination" ]]; then
+                    echo "::error::Release asset collision: $destination"
+                    exit 1
+                  fi
+                  cp "$file" "$destination"
+                  installer_count=$((installer_count + 1))
+                  ;;
+                *.sig)
+                  destination="release-assets/verse-platform-${target}-${base}"
+                  if [[ -e "$destination" ]]; then
+                    echo "::error::Release asset collision: $destination"
+                    exit 1
+                  fi
+                  cp "$file" "$destination"
+                  ;;
+              esac
+            done < "$enumeration_file"
+
+            if (( installer_count == 0 )); then
+              echo "::error::No releasable installer found for $target"
+              exit 1
+            fi
+          done
+
           (
             cd release-assets
-            find . -maxdepth 1 -type f -printf '%f\0' \
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
               | sort -z \
               | xargs -0 sha256sum
           ) > release-assets/SHA256SUMS
@@ -270,7 +344,7 @@ jobs:
       - name: Retain assembled release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: verse-${{ inputs.tag }}-release-assets
+          name: verse-release-${{ inputs.tag }}-attempt-${{ github.run_attempt }}
           path: release-assets/*
           if-no-files-found: error
           compression-level: 0
@@ -286,26 +360,135 @@ jobs:
         run: |
           set -euo pipefail
 
+          expected_targets=(
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-pc-windows-msvc
+            aarch64-pc-windows-msvc
+          )
+
+          verify_published_release_assets() {
+            local published_directory
+            local computed_checksums
+            local published_file_list
+            local file
+            local base
+            local target
+            local matched_target
+            local installer_count
+            declare -A installer_counts=()
+
+            published_directory="$(mktemp -d)"
+            computed_checksums="$(mktemp)"
+            published_file_list="$(mktemp)"
+
+            if ! gh release download "$RELEASE_TAG" --dir "$published_directory"; then
+              echo "::error::Unable to download the published release assets"
+              return 1
+            fi
+            if [[ ! -f "$published_directory/SHA256SUMS" ]]; then
+              echo "::error::Published release is missing SHA256SUMS"
+              return 1
+            fi
+
+            (
+              cd "$published_directory"
+              find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+                | sort -z \
+                | xargs -0 sha256sum
+            ) > "$computed_checksums"
+            if ! cmp -s "$published_directory/SHA256SUMS" "$computed_checksums"; then
+              echo "::error::Published release assets do not match SHA256SUMS"
+              return 1
+            fi
+
+            for target in "${expected_targets[@]}"; do
+              installer_counts["$target"]=0
+            done
+            find "$published_directory" -maxdepth 1 -type f -print0 > "$published_file_list"
+            while IFS= read -r -d '' file; do
+              base="${file##*/}"
+              if [[ "$base" == "SHA256SUMS" ]]; then
+                continue
+              fi
+
+              matched_target=""
+              for target in "${expected_targets[@]}"; do
+                if [[ "$base" == "verse-platform-${target}-"* ]]; then
+                  matched_target="$target"
+                  break
+                fi
+              done
+              if [[ -z "$matched_target" ]]; then
+                echo "::error::Unexpected published release asset: $base"
+                return 1
+              fi
+
+              case "$base" in
+                *.AppImage|*.deb|*.dmg|*.exe|*.msi|*.rpm|*.tar.gz|*.zip)
+                  installer_count="${installer_counts[$matched_target]}"
+                  installer_counts["$matched_target"]=$((installer_count + 1))
+                  ;;
+                *.sig) ;;
+                *)
+                  echo "::error::Unexpected published release asset type: $base"
+                  return 1
+                  ;;
+              esac
+            done < "$published_file_list"
+
+            for target in "${expected_targets[@]}"; do
+              if [[ "${installer_counts[$target]}" -eq 0 ]]; then
+                echo "::error::Published release has no installer for $target"
+                return 1
+              fi
+            done
+          }
+
+          verify_remote_release_tag() {
+            local remote_tag
+            local resolved_commit
+
+            remote_tag="$(git ls-remote --refs origin "refs/tags/${RELEASE_TAG}")"
+            if [[ -z "$remote_tag" ]]; then
+              echo "::error::Release tag ${RELEASE_TAG} does not exist on origin"
+              return 1
+            fi
+            git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            resolved_commit="$(
+              git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}"
+            )"
+            if [[ "$resolved_commit" != "$RELEASE_SHA" ]]; then
+              echo "::error::Release tag does not resolve to the requested SHA"
+              return 1
+            fi
+          }
+
           tag_exists=false
           remote_tag="$(git ls-remote --refs origin "refs/tags/${RELEASE_TAG}")"
           if [[ -n "$remote_tag" ]]; then
             tag_exists=true
-            git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            if [[ "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" != "$RELEASE_SHA" ]]; then
-              echo "::error::Existing release tag does not resolve to the requested SHA"
-              exit 1
-            fi
+            verify_remote_release_tag
           fi
 
           release_exists=false
-          release_is_draft="$(
-            gh release list \
-              --limit 1000 \
-              --json isDraft,tagName \
-              --jq ".[] | select(.tagName == \"${RELEASE_TAG}\") | .isDraft"
-          )"
-          if [[ -n "$release_is_draft" ]]; then
+          release_probe_error="$(mktemp)"
+          if release_is_draft="$(
+            gh release view "$RELEASE_TAG" \
+              --json isDraft \
+              --jq '.isDraft' \
+              2> "$release_probe_error"
+          )"; then
             release_exists=true
+          elif grep -Eqi 'release not found|HTTP 404|not found' "$release_probe_error"; then
+            release_is_draft=""
+          else
+            echo "::error::Unable to query release ${RELEASE_TAG}"
+            sed 's/^/  /' "$release_probe_error" >&2
+            exit 1
           fi
 
           if [[ "$release_exists" == "true" && "$release_is_draft" != "true" ]]; then
@@ -313,7 +496,8 @@ jobs:
               echo "::error::Published release exists without its expected remote tag"
               exit 1
             fi
-            echo "Release ${RELEASE_TAG} is already published at ${RELEASE_SHA}; nothing to update."
+            verify_published_release_assets
+            echo "Release ${RELEASE_TAG} is already published and verified at ${RELEASE_SHA}."
             exit 0
           fi
 
@@ -343,24 +527,41 @@ jobs:
               --title "$RELEASE_TAG"
           fi
 
-          mapfile -d '' assets < <(find release-assets -maxdepth 1 -type f -print0)
+          if ! existing_assets="$(
+            gh release view "$RELEASE_TAG" \
+              --json assets \
+              --jq '.assets[].name'
+          )"; then
+            echo "::error::Unable to enumerate existing release assets"
+            exit 1
+          fi
+
+          while IFS= read -r asset_name; do
+            [[ -z "$asset_name" ]] && continue
+            gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes
+          done <<< "$existing_assets"
+
+          shopt -s nullglob
+          assets=(release-assets/*)
+          shopt -u nullglob
+          if (( ${#assets[@]} == 0 )); then
+            echo "::error::No release assets are available to upload"
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if [[ ! -f "$asset" ]]; then
+              echo "::error::Unexpected non-file release asset: $asset"
+              exit 1
+            fi
+          done
           gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
 
           if [[ "$PUBLISH_RELEASE" == "true" ]]; then
-            if [[ "$tag_exists" == "true" ]]; then
-              gh release edit "$RELEASE_TAG" \
-                --draft=false \
-                --target "$RELEASE_SHA" \
-                --verify-tag
-            else
-              gh release edit "$RELEASE_TAG" \
-                --draft=false \
-                --target "$RELEASE_SHA"
-            fi
+            verify_remote_release_tag
+            gh release edit "$RELEASE_TAG" \
+              --draft=false \
+              --target "$RELEASE_SHA" \
+              --verify-tag
 
-            git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-            if [[ "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" != "$RELEASE_SHA" ]]; then
-              echo "::error::Published release tag does not resolve to the requested SHA"
-              exit 1
-            fi
+            verify_remote_release_tag
           fi

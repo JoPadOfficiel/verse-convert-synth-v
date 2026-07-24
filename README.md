@@ -86,9 +86,18 @@ parts must be audible.
 - Continuation markers are emitted only from source lyric-extension evidence.
 - Unpitched percussion and data not representable in SVP remain in the source,
   ledger and full-score audio.
+- UTF-8, UTF-16, ISO-8859-1 and Windows-1252 score XML are decoded from their
+  declared encoding; unsupported declarations fail explicitly.
 - A manual “Vocal SVP” override changes only the requested export
   representation. It does not change the reported source role and does not
-  invent words.
+  invent or copy words from another track.
+
+Verse stops instead of guessing when Synthesizer V cannot express a source
+timing graph exactly. Current explicit failures include time-signature changes
+inside a measure and advanced score navigation with nested repeats, multiple
+jumps, or ambiguous segno/coda targets. Native MuseScore tie/spanner graphs
+remain preserved in the original score and reference mix; MusicXML start/stop
+tie chains are merged in the editable vocal projection.
 
 Verse does not embed or select a commercial Synthesizer V voice database.
 After opening the project, assign a compatible voice to every vocal track.
@@ -133,7 +142,7 @@ Adjust the path if Verse is installed elsewhere.
 Prerequisites:
 
 - Rust stable;
-- Node.js 18 or later;
+- Node.js 22 or later;
 - MuseScore Studio 4 for real audio-rendering gates.
 
 ```sh
@@ -154,6 +163,19 @@ VERSE_MSCZ_GATE="/path/to/score.mscz" \
 VERSE_MXL_GATE="/path/to/score.mxl" \
 cargo test --locked --test source_fidelity
 ```
+
+### Releases
+
+Release Please maintains synchronized versions and `CHANGELOG.md`, creates a
+draft release, and creates its `vMAJOR.MINOR.PATCH` tag before the reusable
+six-platform build starts. The build verifies that exact tag/commit pair,
+assembles stable asset names and checksums, replaces draft assets
+idempotently, and only then publishes.
+
+Repository administrators must enforce immutable/protected `v*` tags in
+GitHub. The workflow revalidates the tag immediately before and after
+publication, but a repository rule is the atomic protection against an
+external force-push during that final API operation.
 
 ### Architecture
 

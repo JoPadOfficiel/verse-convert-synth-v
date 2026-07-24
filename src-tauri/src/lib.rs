@@ -423,6 +423,24 @@ fn export_bundle_blocking(
         .to_string();
     let layout = BundleLayout::new(&destination, &original_name).map_err(CommandErrorDto::from)?;
     let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout);
+    let manifest_warnings: Vec<String> = outcome
+        .tracks
+        .iter()
+        .flat_map(|track| track.warnings.iter())
+        .map(|warning| {
+            let severity = match warning.severity {
+                engine::convert::DiagnosticSeverity::Info => "info",
+                engine::convert::DiagnosticSeverity::Warning => "warning",
+            };
+            match &warning.source_id {
+                Some(source_id) => format!(
+                    "[{severity}:{}] {} (source: {source_id})",
+                    warning.code, warning.message
+                ),
+                None => format!("[{severity}:{}] {}", warning.code, warning.message),
+            }
+        })
+        .collect();
     let project = outcome
         .svp
         .ok_or_else(|| CommandErrorDto::new("CONVERSION_FAILED", "no SVP project produced"))?;
@@ -444,6 +462,7 @@ fn export_bundle_blocking(
             source_bytes,
             project,
             ledger,
+            warnings: manifest_warnings,
         },
         renderer: Arc::new(renderer),
         render_limits: RenderLimits {

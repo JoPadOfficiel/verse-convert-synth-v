@@ -63,6 +63,9 @@ pub struct BundleInput {
     pub source_bytes: Vec<u8>,
     pub project: SvpProject,
     pub ledger: PreservationLedger,
+    /// Source/projection diagnostics that must remain visible after the UI is
+    /// closed. These are copied verbatim into the auditable bundle manifest.
+    pub warnings: Vec<String>,
 }
 
 pub struct BundleRequest {
@@ -145,13 +148,23 @@ pub enum SourceItemKind {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PrimaryDisposition {
     ProjectedExact,
-    Rendered,
-    SourceOnly { reason: String },
+    /// The source item was supplied to the full-score renderer. Its individual
+    /// acoustic contribution cannot be proven from the mixed WAV alone.
+    ReferenceMixCandidate,
+    SourceOnly {
+        reason: String,
+    },
     MetadataOnly,
 }
 
 impl PreservationLedger {
     pub fn validate(&self, allowed_artifacts: &BTreeSet<String>) -> Result<(), BundleError> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(BundleError::InvalidLedger(format!(
+                "unsupported preservation schema version {}",
+                self.schema_version
+            )));
+        }
         let expected: BTreeSet<_> = self.expected_source_ids.iter().cloned().collect();
         if expected.len() != self.expected_source_ids.len() {
             return Err(BundleError::InvalidLedger(
@@ -209,7 +222,7 @@ pub fn build_preservation_ledger(
             &mut entries,
             format!("track:{}", track.id),
             SourceItemKind::Track,
-            PrimaryDisposition::Rendered,
+            PrimaryDisposition::ReferenceMixCandidate,
             artifact_paths(false, true, layout),
         );
         for (index, instrument) in track.instruments.iter().enumerate() {
@@ -222,7 +235,7 @@ pub fn build_preservation_ledger(
                     instrument.id.as_deref().unwrap_or("unnamed")
                 ),
                 SourceItemKind::Instrument,
-                PrimaryDisposition::Rendered,
+                PrimaryDisposition::ReferenceMixCandidate,
                 artifact_paths(false, true, layout),
             );
         }
@@ -233,7 +246,9 @@ pub fn build_preservation_ledger(
                 Kind::NoteOn(_) | Kind::NoteOff(_) if projected => {
                     (PrimaryDisposition::ProjectedExact, true, true)
                 }
-                Kind::NoteOn(_) | Kind::NoteOff(_) => (PrimaryDisposition::Rendered, false, true),
+                Kind::NoteOn(_) | Kind::NoteOff(_) => {
+                    (PrimaryDisposition::ReferenceMixCandidate, false, true)
+                }
                 Kind::Tempo(_) | Kind::TimeSig { .. } if projected => {
                     (PrimaryDisposition::ProjectedExact, true, true)
                 }
@@ -260,7 +275,7 @@ pub fn build_preservation_ledger(
                     false,
                     false,
                 ),
-                _ => (PrimaryDisposition::Rendered, false, true),
+                _ => (PrimaryDisposition::ReferenceMixCandidate, false, true),
             };
             push_entry(
                 &mut entries,
@@ -280,7 +295,7 @@ pub fn build_preservation_ledger(
                         if note_projected {
                             PrimaryDisposition::ProjectedExact
                         } else {
-                            PrimaryDisposition::Rendered
+                            PrimaryDisposition::ReferenceMixCandidate
                         },
                         artifact_paths(note_projected, true, layout),
                     );
@@ -549,6 +564,17 @@ fn export_bundle_with_hook(
         bits_per_sample: wav.bits_per_sample,
         frames: wav.frames,
     };
+    let mut warnings = request.input.warnings;
+    warnings.push(
+        "The audio asset is MuseScore's original full-score reference mix; vocal parts were not removed."
+            .into(),
+    );
+    warnings.push(
+        "Reference-mix candidates were supplied to MuseScore, but an item's individual acoustic contribution cannot be proven from the mixed WAV."
+            .into(),
+    );
+    warnings.sort();
+    warnings.dedup();
     let manifest = BundleManifest {
         schema_version: SCHEMA_VERSION,
         verse_version: env!("CARGO_PKG_VERSION").into(),
@@ -562,10 +588,7 @@ fn export_bundle_with_hook(
             policy: "source-tick-zero".into(),
             svp_blick_offset: 0,
         },
-        warnings: vec![
-            "The audio asset is MuseScore's original full-score reference mix; vocal parts were not removed."
-                .into(),
-        ],
+        warnings,
     };
     let manifest_path = safe_join(&root, &layout.manifest_relative_path)?;
     write_new(
@@ -837,14 +860,17 @@ pub(crate) fn write_bytes_no_replace(destination: &Path, bytes: &[u8]) -> io::Re
             return Err(error);
         }
         #[cfg(unix)]
-        fs::File::open(parent)?.sync_all()?;
+        if let Err(error) = fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
         let committed = rename_no_replace(&temporary, destination);
         if let Err(error) = committed {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
         #[cfg(unix)]
-        fs::File::open(parent)?.sync_all()?;
+        fs::File::open(parent).and_then(|directory| directory.sync_all())?;
         return Ok(());
     }
     Err(last_collision.unwrap_or_else(|| {
@@ -901,6 +927,12 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
             phase: "reopen bundle manifest",
             source,
         })?)?;
+    if manifest.schema_version != SCHEMA_VERSION {
+        return Err(BundleError::Integrity(format!(
+            "unsupported bundle manifest schema version {}",
+            manifest.schema_version
+        )));
+    }
     for record in [&manifest.source, &manifest.project, &manifest.preservation] {
         verify_artifact(root, record)?;
     }
@@ -929,10 +961,20 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
     let tracks = project["tracks"]
         .as_array()
         .ok_or_else(|| BundleError::Integrity("SVP has no tracks array".into()))?;
-    let instrumental = tracks
+    let matching_instrumentals: Vec<_> = tracks
         .iter()
-        .find(|track| track["mainRef"]["isInstrumental"] == serde_json::Value::Bool(true))
-        .ok_or_else(|| BundleError::Integrity("SVP has no instrumental audio track".into()))?;
+        .filter(|track| {
+            track["mainRef"]["isInstrumental"] == serde_json::Value::Bool(true)
+                && track["mainRef"]["audio"]["filename"] == PROJECT_AUDIO_REFERENCE
+        })
+        .collect();
+    if matching_instrumentals.len() != 1 {
+        return Err(BundleError::Integrity(format!(
+            "SVP must contain exactly one bundle-owned instrumental audio track, found {}",
+            matching_instrumentals.len()
+        )));
+    }
+    let instrumental = matching_instrumentals[0];
     if instrumental["mainRef"]["audio"]["filename"] != PROJECT_AUDIO_REFERENCE
         || instrumental["mainRef"]["blickOffset"] != 0
         || instrumental["mainGroup"]["notes"] != serde_json::json!([])
@@ -1246,7 +1288,7 @@ mod tests {
         let entry = DispositionEntry {
             source_id: "track:midi-track-0".into(),
             item_kind: SourceItemKind::Track,
-            disposition: PrimaryDisposition::Rendered,
+            disposition: PrimaryDisposition::ReferenceMixCandidate,
             artifact_paths: vec![
                 layout.source_relative_path.clone(),
                 layout.audio_relative_path.clone(),
@@ -1264,6 +1306,7 @@ mod tests {
                     expected_source_ids: vec![entry.source_id.clone()],
                     entries: vec![entry],
                 },
+                warnings: vec!["[TEST_WARNING] retained diagnostic".into()],
             },
             renderer: Arc::new(FakeRenderer::new(mode)),
             render_limits: RenderLimits {
@@ -1303,6 +1346,38 @@ mod tests {
             sha256_bytes(b"MThd source snapshot")
         );
         assert!(manifest.audio.duration_seconds > 0.0);
+        assert!(manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("[TEST_WARNING]")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verification_selects_the_bundle_owned_audio_reference() {
+        let root = temp_dir("preexisting-instrumental");
+        let mut request = request(&root, FakeMode::Success);
+        append_instrumental_track(
+            &mut request.input.project,
+            "Existing instrumental".into(),
+            "legacy-audio.wav".into(),
+            1.0,
+            0,
+        );
+        let result = export_bundle(request).expect("bundle-owned track is unambiguous");
+        let project: serde_json::Value =
+            serde_json::from_slice(&fs::read(result.project_path).unwrap()).unwrap();
+        assert_eq!(
+            project["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|track| {
+                    track["mainRef"]["audio"]["filename"] == PROJECT_AUDIO_REFERENCE
+                })
+                .count(),
+            1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1455,6 +1530,19 @@ mod tests {
     }
 
     #[test]
+    fn unknown_ledger_schema_is_blocking() {
+        let root = temp_dir("ledger-schema");
+        let mut request = request(&root, FakeMode::Success);
+        request.input.ledger.schema_version = SCHEMA_VERSION + 1;
+        assert!(matches!(
+            export_bundle(request),
+            Err(BundleError::InvalidLedger(_))
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn duplicate_source_ids_are_rejected_instead_of_deduplicated() {
         let allowed = BTreeSet::from(["source/source.mid".to_string()]);
         let entry = DispositionEntry {
@@ -1583,6 +1671,7 @@ mod tests {
                     source_bytes: source_bytes.clone(),
                     project: outcome.svp.expect("SVP projection"),
                     ledger,
+                    warnings: vec![],
                 },
                 renderer: Arc::new(FakeRenderer::new(FakeMode::Success)),
                 render_limits: RenderLimits {

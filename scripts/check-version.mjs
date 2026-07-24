@@ -95,15 +95,46 @@ function parseArguments(argv) {
   return { tag };
 }
 
-function latestChangelogRelease(changelog) {
+export function latestChangelogRelease(changelog) {
   for (const line of changelog.split(/\r?\n/)) {
     const heading = line.match(
-      /^##\s+\[?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\]?/,
+      /^##\s+(?:\[((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\]|((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)))(?=\s|$)/,
     );
     if (heading) {
+      const dateToken = line.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+      let date;
+      if (dateToken) {
+        const year = Number(dateToken[1]);
+        const month = Number(dateToken[2]);
+        const day = Number(dateToken[3]);
+        const leapYear =
+          year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+        const daysInMonth = [
+          31,
+          leapYear ? 29 : 28,
+          31,
+          30,
+          31,
+          30,
+          31,
+          31,
+          30,
+          31,
+          30,
+          31,
+        ];
+        if (
+          month >= 1 &&
+          month <= 12 &&
+          day >= 1 &&
+          day <= daysInMonth[month - 1]
+        ) {
+          date = dateToken[0];
+        }
+      }
       return {
-        version: heading[1],
-        date: line.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0],
+        version: heading[1] ?? heading[2],
+        date,
       };
     }
   }
@@ -182,8 +213,10 @@ function main() {
   );
 }
 
-try {
-  main();
-} catch (error) {
-  fail(error instanceof Error ? error.message : String(error));
+if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
 }

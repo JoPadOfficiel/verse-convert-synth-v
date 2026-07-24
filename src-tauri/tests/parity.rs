@@ -1,35 +1,27 @@
 //! Engine parity tests on real song files, plus pure score-structure tests.
 //!
 //! The song fixtures are copyrighted karaoke/score files and are therefore NOT
-//! committed to the public repository (see .gitignore). File-based tests skip
-//! gracefully when a fixture is absent (e.g. in CI); the unroll tests below
-//! always run.
+//! committed to the public repository (see .gitignore). File-based tests are
+//! explicitly ignored unless requested with `cargo test --test parity -- --ignored`;
+//! once requested, every missing fixture is a hard failure. The unroll tests
+//! below always run.
 use std::collections::HashMap;
 use verse_lib::engine::convert::{convert_auto, convert_bytes, convert_midi_with, ConvertOutcome};
 use verse_lib::engine::midi;
 
-fn read_fixture(name: &str) -> Option<Vec<u8>> {
+fn read_fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
-    match std::fs::read(&path) {
-        Ok(d) => Some(d),
-        Err(_) => {
-            eprintln!("fixture not present, test skipped: {}", name);
-            None
-        }
-    }
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!("required private fixture is unavailable at {path}: {error}")
+    })
 }
 
-fn conv(name: &str) -> Option<ConvertOutcome> {
-    read_fixture(name).map(|d| convert_bytes(&d, "english"))
+fn conv(name: &str) -> ConvertOutcome {
+    convert_bytes(&read_fixture(name), "english")
 }
 
-fn conv_auto(name: &str) -> Option<ConvertOutcome> {
-    read_fixture(name).map(|d| convert_auto(&d, "english"))
-}
-
-fn has_cjk(s: &str) -> bool {
-    s.chars()
-        .any(|c| ('\u{3040}'..='\u{30ff}').contains(&c) || ('\u{4e00}'..='\u{9fff}').contains(&c))
+fn conv_auto(name: &str) -> ConvertOutcome {
+    convert_auto(&read_fixture(name), "english")
 }
 
 #[test]
@@ -41,7 +33,7 @@ fn unroll_repeat_with_voltas() {
     m[3].volta = Some(vec![1]);
     m[3].end_repeat = 2;
     m[4].volta = Some(vec![2]);
-    let order = unroll(&m);
+    let order = unroll(&m).expect("repeat structure is representable");
     // pass 1: 0 1 2 3 -> back; pass 2: 1 2 (3 skipped) 4 5
     assert_eq!(
         order,
@@ -67,7 +59,7 @@ fn unroll_ds_al_coda() {
     m[2].to_coda = true;
     m[3].jump = Some(Jump::DsAlCoda);
     m[4].coda = true;
-    let order = unroll(&m);
+    let order = unroll(&m).expect("D.S. al Coda structure is representable");
     // 0 1 2 3 -> D.S. -> 0 1 2 -> To Coda -> 4 5
     assert_eq!(
         order,
@@ -92,16 +84,15 @@ fn unroll_dc_al_fine() {
     let mut m = vec![MeasureMarks::default(); 4];
     m[1].fine = true;
     m[3].jump = Some(Jump::DcAlFine);
-    let order = unroll(&m);
+    let order = unroll(&m).expect("D.C. al Fine structure is representable");
     // 0 1 2 3 -> D.C. -> 0 1(Fine, stop)
     assert_eq!(order, vec![(0, 0), (1, 0), (2, 0), (3, 0), (0, 1), (1, 1)]);
 }
 
 #[test]
+#[ignore = "requires the private hound_dog.kar fixture"]
 fn hound_dog_multitrack() {
-    let Some(data) = read_fixture("hound_dog.kar") else {
-        return;
-    };
+    let data = read_fixture("hound_dog.kar");
     let parsed = midi::parse(&data).expect("valid KAR/SMF");
     let automatic = convert_midi_with(&parsed, "english", None);
     assert!(automatic.ok, "Hound Dog must convert");
@@ -118,8 +109,8 @@ fn hound_dog_multitrack() {
 
     let r = convert_midi_with(&parsed, "english", Some(&HashMap::from([(10usize, true)])));
     assert_eq!(
-        r.placed, 244,
-        "the explicit Lead Vox override authorizes the unique lyric stream; report: {:?}",
+        r.placed, 0,
+        "a vocal override exports only that track's source-owned lyrics; report: {:?}",
         r.tracks
     );
     let vox = r
@@ -127,20 +118,22 @@ fn hound_dog_multitrack() {
         .iter()
         .find(|t| t.role == "vocal")
         .expect("one singing track");
-    assert_eq!(vox.placed, 244);
+    assert_eq!(vox.placed, 0);
     let svp = r.svp.unwrap();
     for tr in &svp.tracks {
         for n in &tr.main_group.notes {
-            assert!(!has_cjk(&n.lyrics), "no Japanese/Chinese characters");
+            assert!(
+                n.lyrics.is_empty(),
+                "the Words track must not be copied to Lead Vox"
+            );
         }
     }
 }
 
 #[test]
-fn help_kar_harmonies_sing_too() {
-    let Some(data) = read_fixture("help.kar") else {
-        return;
-    };
+#[ignore = "requires the private help.kar fixture"]
+fn help_kar_overrides_export_notes_without_copying_the_words_track() {
+    let data = read_fixture("help.kar");
     let parsed = midi::parse(&data).expect("valid KAR/SMF");
     let automatic = convert_midi_with(&parsed, "english", None);
     assert_eq!(
@@ -152,7 +145,8 @@ fn help_kar_harmonies_sing_too() {
         0,
         "track names must never authorize a cross-track lyric transfer"
     );
-    // The user may explicitly authorize Lead + Harm 1 + Harm 2.
+    // The user may explicitly export Lead + Harm 1 + Harm 2 as vocal notes,
+    // but that never transfers the separate Words track into them.
     let r = convert_midi_with(
         &parsed,
         "english",
@@ -179,23 +173,28 @@ fn help_kar_harmonies_sing_too() {
         .iter()
         .find(|t| t.track.contains("Lead"))
         .expect("Lead track");
-    assert_eq!(lead.placed, 314);
+    assert_eq!(lead.placed, 0);
     assert!(vocal
         .iter()
-        .any(|t| t.track.contains("Harm 1") && t.placed >= 50));
+        .any(|t| t.track.contains("Harm 1") && t.placed == 0));
     assert!(vocal
         .iter()
-        .any(|t| t.track.contains("Harm 2") && t.placed >= 40));
+        .any(|t| t.track.contains("Harm 2") && t.placed == 0));
     // the 3 explicitly selected singing tracks are the only SVP tracks
     let svp = r.svp.unwrap();
+    assert_eq!(svp.tracks.len(), 3);
     assert!(svp.tracks[0].name.contains("Lead") || svp.tracks[0].name.contains("Harm"));
+    assert!(svp
+        .tracks
+        .iter()
+        .flat_map(|track| &track.main_group.notes)
+        .all(|note| note.lyrics.is_empty()));
 }
 
 #[test]
+#[ignore = "requires the private help.mxl fixture"]
 fn musicxml_help_lyrics() {
-    let Some(r) = conv_auto("help.mxl") else {
-        return;
-    };
+    let r = conv_auto("help.mxl");
     assert!(r.ok, "the MusicXML must convert: {:?}", r.msg);
     assert!(
         r.tracks.iter().any(|t| t.role == "vocal"),
@@ -220,11 +219,10 @@ fn musicxml_help_lyrics() {
 }
 
 #[test]
+#[ignore = "requires the private help.mscz fixture"]
 fn musescore_mscz_native() {
     // The user's primary format: the .mscz must convert natively.
-    let Some(r) = conv_auto("help.mscz") else {
-        return;
-    };
+    let r = conv_auto("help.mscz");
     assert!(r.ok, "the .mscz must convert: {:?}", r.msg);
     let vocal = r.tracks.iter().filter(|t| t.role == "vocal").count();
     assert!(vocal >= 3, "the 3 voices must sing, got {}", vocal);
@@ -254,8 +252,9 @@ fn musescore_mscz_native() {
 }
 
 #[test]
+#[ignore = "requires the private queen.kar fixture"]
 fn queen_lyrics_without_source_melody_do_not_create_c4() {
-    let Some(r) = conv("queen.kar") else { return };
+    let r = conv("queen.kar");
     assert!(r.ok, "a lyric-only karaoke file must still be accepted");
     assert_eq!(
         r.n_tracks,
@@ -277,10 +276,9 @@ fn queen_lyrics_without_source_melody_do_not_create_c4() {
 }
 
 #[test]
+#[ignore = "requires the private help.mscz fixture"]
 fn help_mscz_styled_names_are_not_fused() {
-    let Some(r) = conv_auto("help.mscz") else {
-        return;
-    };
+    let r = conv_auto("help.mscz");
     assert!(r.ok, "help.mscz must convert: {:?}", r.msg);
     // <longName>Batterie ou<br/>persussions<br/>corporelles</longName>:
     // <br/> must become a space, never fuse the words.
@@ -298,10 +296,9 @@ fn help_mscz_styled_names_are_not_fused() {
 }
 
 #[test]
+#[ignore = "requires the private help.mxl fixture"]
 fn help_mxl_converts() {
-    let Some(r) = conv_auto("help.mxl") else {
-        return;
-    };
+    let r = conv_auto("help.mxl");
     assert!(r.ok, "help.mxl must convert: {:?}", r.msg);
     assert!(r.placed > 0, "lyrics must be placed");
 }

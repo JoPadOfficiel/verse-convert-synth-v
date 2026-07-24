@@ -327,7 +327,10 @@ fn read_tempo(midi: &Midi, bpt: f64) -> (Vec<Tempo>, BTreeSet<String>) {
     (tempo, evidence)
 }
 
-fn read_meter(midi: &Midi, ticks_per_beat: u16) -> (Vec<Meter>, BTreeSet<String>) {
+fn read_meter(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Meter>, BTreeSet<String>), String> {
+    if ticks_per_beat == 0 {
+        return Err("MIDI PPQ division must be non-zero".into());
+    }
     let mut changes = BTreeMap::new();
     for track in &midi.tracks {
         for event in &track.events {
@@ -350,16 +353,35 @@ fn read_meter(midi: &Midi, ticks_per_beat: u16) -> (Vec<Meter>, BTreeSet<String>
     let mut previous_meter = (4u8, 4u16);
     let mut measure_index = 0u64;
     for (tick, (num, den, source_id)) in changes {
-        let delta = u64::from(tick.saturating_sub(previous_tick));
-        let bar_numerator = u64::from(ticks_per_beat) * 4 * u64::from(previous_meter.0.max(1));
-        if bar_numerator > 0 {
-            measure_index = measure_index.saturating_add(
-                delta.saturating_mul(u64::from(previous_meter.1.max(1))) / bar_numerator,
-            );
+        if num == 0 || den == 0 {
+            return Err(format!(
+                "invalid time signature {num}/{den} at MIDI tick {tick}"
+            ));
         }
+        let delta = u64::from(tick.saturating_sub(previous_tick));
+        let bar_numerator = u128::from(ticks_per_beat) * 4 * u128::from(previous_meter.0);
+        let elapsed_numerator = u128::from(delta) * u128::from(previous_meter.1);
+        if elapsed_numerator % bar_numerator != 0 {
+            let source = source_id
+                .as_deref()
+                .map(|id| format!(" ({id})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "time signature change at MIDI tick {tick}{source} falls inside a \
+                 {}/{} measure; Synthesizer V meter changes require a measure boundary",
+                previous_meter.0, previous_meter.1
+            ));
+        }
+        let elapsed_measures = u64::try_from(elapsed_numerator / bar_numerator)
+            .map_err(|_| "MIDI meter position exceeds the supported range".to_string())?;
+        measure_index = measure_index
+            .checked_add(elapsed_measures)
+            .ok_or_else(|| "MIDI meter position exceeds the supported range".to_string())?;
+        let index = u32::try_from(measure_index)
+            .map_err(|_| "MIDI meter position exceeds the supported range".to_string())?;
         out.push(Meter {
             denominator: u32::from(den),
-            index: u32::try_from(measure_index).unwrap_or(u32::MAX),
+            index,
             numerator: u32::from(num),
         });
         if let Some(source_id) = source_id {
@@ -368,7 +390,7 @@ fn read_meter(midi: &Midi, ticks_per_beat: u16) -> (Vec<Meter>, BTreeSet<String>
         previous_tick = tick;
         previous_meter = (num, den);
     }
-    (out, evidence)
+    Ok((out, evidence))
 }
 
 fn build_track(idx: usize, name: String, notes: Vec<Note>) -> SvpTrack {
@@ -631,43 +653,50 @@ pub fn convert_midi_with(
     language: &str,
     overrides: Option<&HashMap<usize, bool>>,
 ) -> ConvertOutcome {
-    if !matches!(midi.time_base, TimeBase::PulsesPerQuarter(_)) {
-        return ConvertOutcome {
-            ok: false,
-            msg: Some(
+    let fail = |msg: String| ConvertOutcome {
+        ok: false,
+        msg: Some(msg),
+        svp: None,
+        tracks: vec![],
+        n_tracks: 0,
+        placed: 0,
+        projection: ProjectionEvidence::default(),
+    };
+    let tpb = match midi.time_base {
+        TimeBase::PulsesPerQuarter(0) => {
+            return fail("MIDI PPQ division must be non-zero".into());
+        }
+        TimeBase::PulsesPerQuarter(ppq) if midi.ticks_per_beat == 0 => {
+            return fail(format!(
+                "MIDI PPQ division must be non-zero (time base declares {ppq})"
+            ));
+        }
+        TimeBase::PulsesPerQuarter(ppq) if midi.ticks_per_beat != ppq => {
+            return fail(format!(
+                "inconsistent MIDI PPQ values: time base declares {ppq}, \
+                 ticks_per_beat declares {}",
+                midi.ticks_per_beat
+            ));
+        }
+        TimeBase::PulsesPerQuarter(ppq) => ppq,
+        TimeBase::Smpte { .. } => {
+            return fail(
                 "SMPTE-timed MIDI is preserved but SVP projection is not supported yet".into(),
-            ),
-            svp: None,
-            tracks: vec![],
-            n_tracks: 0,
-            placed: 0,
-            projection: ProjectionEvidence::default(),
-        };
-    }
+            );
+        }
+    };
     if midi.format == 2 {
-        return ConvertOutcome {
-            ok: false,
-            msg: Some(
-                "MIDI format 2 contains independent sequences and cannot be flattened safely"
-                    .into(),
-            ),
-            svp: None,
-            tracks: vec![],
-            n_tracks: 0,
-            placed: 0,
-            projection: ProjectionEvidence::default(),
-        };
+        return fail(
+            "MIDI format 2 contains independent sequences and cannot be flattened safely".into(),
+        );
     }
-    let tpb = midi.ticks_per_beat;
-    let bpt = BLICKS_PER_QUARTER / tpb as f64;
-
-    let streams: Vec<(usize, Vec<TimedLyric>)> = midi
-        .tracks
-        .iter()
-        .enumerate()
-        .map(|(index, track)| (index, track_tokens(track)))
-        .filter(|(_, tokens)| !tokens.is_empty())
-        .collect();
+    let bpt = BLICKS_PER_QUARTER / f64::from(tpb);
+    let (meter, meter_evidence) = match read_meter(midi, tpb) {
+        Ok(meter) => meter,
+        Err(error) => {
+            return fail(format!("MIDI meter cannot be projected safely: {error}"));
+        }
+    };
 
     let mut svp_tracks: Vec<SvpTrack> = Vec::new();
     let mut report: Vec<TrackReport> = Vec::new();
@@ -721,7 +750,7 @@ pub fn convert_midi_with(
         }
         let lanes = attached_lanes(&notes);
         let attached = !lanes.is_empty();
-        let mut assignment = if track.text_profile == MidiTextProfile::KaraokeLyrics {
+        let assignment = if track.text_profile == MidiTextProfile::KaraokeLyrics {
             karaoke_assignment(&own_tokens, &notes, tpb)
         } else {
             exact_assignment(&own_tokens, &notes)
@@ -730,24 +759,6 @@ pub fn convert_midi_with(
         let source_vocal = attached || !assignment.is_empty();
         let explicit_override = overrides.and_then(|map| map.get(&index).copied());
         let sing = explicit_override.unwrap_or(source_vocal);
-        if explicit_override == Some(true) && assignment.is_empty() && !attached {
-            if let Some(tokens) = unique_override_lyric_stream(&streams, index) {
-                assignment = if tokens
-                    .first()
-                    .and_then(|token| {
-                        midi.tracks
-                            .iter()
-                            .find(|candidate| candidate.id == token.track_id)
-                    })
-                    .is_some_and(|candidate| {
-                        candidate.text_profile == MidiTextProfile::KaraokeLyrics
-                    }) {
-                    karaoke_assignment(tokens, &notes, tpb)
-                } else {
-                    exact_assignment(tokens, &notes)
-                };
-            }
-        }
         let mut placed = 0usize;
         if sing {
             if lanes.is_empty() {
@@ -801,7 +812,11 @@ pub fn convert_midi_with(
             .iter()
             .filter(|note| note.pitch.is_some() && note.duration > 0)
             .count();
+        let standalone_with_attached_lanes = attached && !own_tokens.is_empty();
         let mut lyric_status = lyric_status(track, placed);
+        if standalone_with_attached_lanes {
+            lyric_status.state = LyricStatusState::Ambiguous;
+        }
         let source_role = source_role(track, source_vocal, source_note_count, &lyric_status);
         let requires_voice_assignment = sing && projectable_notes > 0;
         let export_representation = if requires_voice_assignment {
@@ -818,6 +833,15 @@ pub fn convert_midi_with(
             source_vocal,
             explicit_override,
         );
+        if standalone_with_attached_lanes {
+            warnings.push(report_warning(
+                "STANDALONE_LYRICS_LEFT_SOURCE_ONLY",
+                DiagnosticSeverity::Warning,
+                "Standalone lyric events coexist with note-owned lyric lanes. They remain \
+                 source-only because choosing a lane or duplicating vocal notes would guess.",
+                &track.id,
+            ));
+        }
         if sing
             && placed == 0
             && matches!(
@@ -857,7 +881,6 @@ pub fn convert_midi_with(
         track.disp_color = COLORS[display_order % COLORS.len()].to_string();
     }
 
-    let (meter, meter_evidence) = read_meter(midi, tpb);
     let (tempo, tempo_evidence) = read_tempo(midi, bpt);
     projection.source_ids.extend(meter_evidence);
     projection.source_ids.extend(tempo_evidence);
@@ -877,23 +900,6 @@ pub fn convert_midi_with(
         placed: total_placed,
         projection,
     }
-}
-
-/// Cross-track lyric transfer is a user-authorized operation only. It is
-/// accepted solely when exactly one other qualified source stream exists;
-/// ambiguity is never resolved by track names or token counts.
-fn unique_override_lyric_stream(
-    streams: &[(usize, Vec<TimedLyric>)],
-    track_index: usize,
-) -> Option<&Vec<TimedLyric>> {
-    let candidates: Vec<_> = streams
-        .iter()
-        .filter(|(index, _)| *index != track_index)
-        .collect();
-    if candidates.len() != 1 || candidates[0].1.is_empty() {
-        return None;
-    }
-    Some(&candidates[0].1)
 }
 
 fn exact_assignment(tokens: &[TimedLyric], notes: &[SourceNote]) -> HashMap<usize, TimedLyric> {
@@ -934,7 +940,9 @@ fn karaoke_assignment(
     let mut assignment = HashMap::new();
     let mut note_index = 0usize;
     for token in tokens {
-        while note_index < notes.len() && notes[note_index].pitch.is_none() {
+        while note_index < notes.len()
+            && (notes[note_index].pitch.is_none() || notes[note_index].duration == 0)
+        {
             note_index += 1;
         }
         if note_index >= notes.len() {
@@ -942,7 +950,7 @@ fn karaoke_assignment(
         }
         while note_index + 1 < notes.len() {
             let mut next = note_index + 1;
-            while next < notes.len() && notes[next].pitch.is_none() {
+            while next < notes.len() && (notes[next].pitch.is_none() || notes[next].duration == 0) {
                 next += 1;
             }
             if next >= notes.len()
@@ -1222,6 +1230,36 @@ mod tests {
     }
 
     #[test]
+    fn public_conversion_rejects_zero_or_inconsistent_ppq() {
+        let mut zero_time_base = midi_with(Vec::new());
+        zero_time_base.time_base = TimeBase::PulsesPerQuarter(0);
+        let outcome = convert_midi(&zero_time_base, "english");
+        assert!(!outcome.ok);
+        assert!(outcome
+            .msg
+            .as_deref()
+            .is_some_and(|message| message.contains("non-zero")));
+
+        let mut zero_compatibility_field = midi_with(Vec::new());
+        zero_compatibility_field.ticks_per_beat = 0;
+        let outcome = convert_midi(&zero_compatibility_field, "english");
+        assert!(!outcome.ok);
+        assert!(outcome
+            .msg
+            .as_deref()
+            .is_some_and(|message| message.contains("non-zero")));
+
+        let mut inconsistent = midi_with(Vec::new());
+        inconsistent.ticks_per_beat = 960;
+        let outcome = convert_midi(&inconsistent, "english");
+        assert!(!outcome.ok);
+        assert!(outcome
+            .msg
+            .as_deref()
+            .is_some_and(|message| message.contains("inconsistent")));
+    }
+
+    #[test]
     fn meter_index_comes_from_elapsed_bars_not_change_ordinal() {
         let mut track = Track::new("meter", 0);
         track.events = vec![
@@ -1256,12 +1294,54 @@ mod tests {
                 },
             ),
         ];
-        let (meter, evidence) = read_meter(&midi_with(vec![track]), 480);
+        let (meter, evidence) =
+            read_meter(&midi_with(vec![track]), 480).expect("meter changes are bar-aligned");
         assert_eq!(
             meter.iter().map(|meter| meter.index).collect::<Vec<_>>(),
             vec![0, 2, 3]
         );
         assert_eq!(evidence.len(), 3);
+    }
+
+    #[test]
+    fn mid_measure_meter_change_fails_instead_of_claiming_an_exact_projection() {
+        let mut track = Track::new("meter", 0);
+        track.events = vec![
+            midi::Event::new(
+                0,
+                0,
+                Kind::TimeSig {
+                    num: 4,
+                    den: 4,
+                    clocks_per_click: None,
+                    notated_32nds: None,
+                },
+            ),
+            midi::Event::new(
+                480,
+                1,
+                Kind::TimeSig {
+                    num: 3,
+                    den: 4,
+                    clocks_per_click: None,
+                    notated_32nds: None,
+                },
+            ),
+        ];
+        let midi = midi_with(vec![track]);
+        let error = match read_meter(&midi, 480) {
+            Err(error) => error,
+            Ok(_) => panic!("tick 480 is inside the 4/4 measure"),
+        };
+        assert!(error.contains("falls inside"), "unexpected error: {error}");
+
+        let outcome = convert_midi(&midi, "english");
+        assert!(!outcome.ok);
+        assert!(outcome.svp.is_none());
+        assert!(outcome
+            .msg
+            .as_deref()
+            .is_some_and(|message| message.contains("cannot be projected safely")));
     }
 
     #[test]
@@ -1296,7 +1376,8 @@ mod tests {
         ];
         let midi = midi_with(vec![first, second]);
         let (tempo, tempo_evidence) = read_tempo(&midi, BLICKS_PER_QUARTER / 480.0);
-        let (meter, meter_evidence) = read_meter(&midi, 480);
+        let (meter, meter_evidence) =
+            read_meter(&midi, 480).expect("same-tick meter changes are bar-aligned");
         assert_eq!(tempo.len(), 1);
         assert_eq!(tempo[0].bpm, 89.999955);
         assert_eq!(
@@ -1338,7 +1419,47 @@ mod tests {
     }
 
     #[test]
-    fn lyrics_are_not_transferred_by_a_vocal_sounding_track_name() {
+    fn standalone_lyrics_remain_source_only_when_attached_lanes_exist() {
+        let mut attached = Lyric::text("attached", "owned".into());
+        attached.lane = "1".into();
+        let standalone = Lyric::text("standalone", "event".into());
+        let mut track = Track::new("mixed-lyrics", 0);
+        track.events = note_events("mixed-lyrics", 0, 480, vec![attached]);
+        track.events[1].order = 2;
+        track
+            .events
+            .insert(1, midi::Event::new(0, 1, Kind::Lyrics(standalone.clone())));
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = outcome.svp.as_ref().expect("conversion succeeds");
+        assert_eq!(project.tracks.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "owned");
+        assert_eq!(outcome.placed, 1);
+        assert_eq!(
+            outcome.tracks[0].lyric_status.state,
+            LyricStatusState::Ambiguous
+        );
+        assert!(outcome.tracks[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "STANDALONE_LYRICS_LEFT_SOURCE_ONLY"));
+        assert!(!outcome
+            .projection
+            .source_ids
+            .contains(&standalone_lyric_instance_id(
+                &standalone,
+                "mixed-lyrics",
+                1
+            )));
+        assert!(!outcome
+            .projection
+            .source_ids
+            .contains("event:mixed-lyrics:1"));
+    }
+
+    #[test]
+    fn vocal_override_never_copies_lyrics_from_another_track() {
         let mut lyrics = Track::new("lyrics", 0);
         lyrics.events.push(midi::Event::new(
             0,
@@ -1362,7 +1483,12 @@ mod tests {
         let forced = convert_midi_with(&midi, "english", Some(&HashMap::from([(1usize, true)])));
         let forced_project = forced.svp.expect("explicit override succeeds");
         assert_eq!(forced_project.tracks.len(), 1);
-        assert_eq!(forced_project.tracks[0].main_group.notes[0].lyrics, "let");
+        assert_eq!(forced_project.tracks[0].main_group.notes[0].lyrics, "");
+        assert_eq!(forced.placed, 0);
+        assert!(!forced
+            .projection
+            .source_ids
+            .contains("lyric:word:event:lyrics:0"));
         assert_eq!(
             forced.tracks[1].source_role,
             SourceRole::Ambiguous,
@@ -1404,6 +1530,40 @@ mod tests {
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "");
         assert_eq!(outcome.placed, 0);
+    }
+
+    #[test]
+    fn karaoke_tokens_skip_zero_duration_and_unpitched_notes() {
+        let source_note = |id: &str, onset, duration, pitch| SourceNote {
+            onset,
+            duration,
+            pitch,
+            source_order: 0,
+            end_order: 1,
+            source: midi::NoteSource {
+                id: id.into(),
+                ..midi::NoteSource::default()
+            },
+            lyrics: Vec::new(),
+        };
+        let token = TimedLyric {
+            track_id: "lyrics".into(),
+            tick: 0,
+            order: 0,
+            lyric: Lyric::text("token", "word".into()),
+        };
+        let notes = vec![
+            source_note("zero-duration", 0, 0, Some(60)),
+            source_note("unpitched", 0, 480, None),
+            source_note("projectable", 10, 480, Some(62)),
+        ];
+
+        let assignment = karaoke_assignment(&[token], &notes, 480);
+        assert_eq!(assignment.len(), 1);
+        assert_eq!(
+            assignment.get(&2).map(|timed| &timed.lyric.state),
+            Some(&midi::LyricState::Text("word".into()))
+        );
     }
 
     #[test]

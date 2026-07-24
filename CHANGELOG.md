@@ -23,8 +23,10 @@ entries are maintained by Release Please from Conventional Commits.
   synthetic `la` text.
 - Keep instrumental and percussion material in the full-score reference mix
   without inventing vocal notes or pitches.
-- Preserve repeat occurrences, tempo and meter changes, grace notes, MIDI text
-  bytes, and MusicXML elisions without heuristic reassignment.
+- Preserve supported repeat occurrences, offset/metronome tempos, additive
+  meters, ties, grace notes, MIDI text bytes, and MusicXML elisions without
+  heuristic reassignment; unsupported navigation now fails instead of
+  truncating playback.
 - Reject malformed or ambiguous timing and pitch data instead of silently
   substituting musical values.
 

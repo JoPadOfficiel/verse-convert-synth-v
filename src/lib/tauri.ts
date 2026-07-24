@@ -15,6 +15,7 @@ export {
   defaultSvpPath,
   isAudioUnavailableErrorCode,
   isSupported,
+  uniqueSupportedPaths,
 } from "@/lib/file-utils";
 
 export type SourceRole =

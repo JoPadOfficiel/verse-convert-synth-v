@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "npm run test:frontend",
-    "test:frontend": "node --test tests/frontend-utils.test.mjs",
+    "test:frontend": "node --test tests/*.test.mjs",
     "version:check": "node scripts/check-version.mjs",
     "preview": "vite preview",
     "tauri": "tauri"

@@ -9,15 +9,36 @@ use crate::engine::midi::{
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 
+type MusicXmlVoiceKey = (String, String, usize);
+type MusicXmlTieKey = (String, String, usize, String, Option<String>);
+type MusicXmlVoiceEvents = BTreeMap<MusicXmlVoiceKey, Vec<Event>>;
+
 pub fn is_zip(data: &[u8]) -> bool {
     data.len() >= 2 && &data[0..2] == b"PK"
 }
 
 pub fn looks_like_xml(data: &[u8]) -> bool {
-    let n = data.len().min(400);
-    let head = String::from_utf8_lossy(&data[..n]);
-    let t = head.trim_start();
-    t.starts_with("<?xml") || t.contains("score-partwise") || t.contains("score-timewise")
+    xml_bytes_contain_ascii(data, b"<?xml")
+        || xml_bytes_contain_ascii(data, b"<score-partwise")
+        || xml_bytes_contain_ascii(data, b"<score-timewise")
+        || xml_bytes_contain_ascii(data, b"<museScore")
+}
+
+pub(crate) fn xml_bytes_contain_ascii(data: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if data.windows(needle.len()).any(|window| window == needle) {
+        return true;
+    }
+    let mut utf16_le = Vec::with_capacity(needle.len() * 2);
+    let mut utf16_be = Vec::with_capacity(needle.len() * 2);
+    for byte in needle {
+        utf16_le.extend_from_slice(&[*byte, 0]);
+        utf16_be.extend_from_slice(&[0, *byte]);
+    }
+    data.windows(utf16_le.len())
+        .any(|window| window == utf16_le || window == utf16_be)
 }
 
 /// True if the ZIP archive contains a MusicXML (and not a native MuseScore .mscx).
@@ -84,21 +105,131 @@ fn extract_mxl(data: &[u8]) -> Result<String, String> {
 /// Reads a ZIP entry with a decompressed-size cap (anti zip-bomb).
 pub(crate) fn read_zip_entry_capped(f: &mut impl Read) -> Result<String, String> {
     const MAX: u64 = 64 * 1024 * 1024; // 64 MB, far beyond any real score
-    let mut s = String::new();
+    let mut bytes = Vec::new();
     f.take(MAX + 1)
-        .read_to_string(&mut s)
+        .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if s.len() as u64 > MAX {
+    if bytes.len() as u64 > MAX {
         return Err("abnormally large archive (rejected for safety)".into());
     }
-    Ok(s)
+    decode_xml_bytes(&bytes)
+}
+
+fn xml_declared_encoding(data: &[u8]) -> Option<String> {
+    let data = data.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(data);
+    if !data.starts_with(b"<?xml") {
+        return None;
+    }
+    let end = data
+        .windows(2)
+        .position(|window| window == b"?>")
+        .unwrap_or(data.len());
+    let declaration = String::from_utf8_lossy(&data[..end]);
+    let lower = declaration.to_ascii_lowercase();
+    let start = lower.find("encoding")? + "encoding".len();
+    let tail = declaration.get(start..)?;
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix('=')?.trim_start();
+    let quote = tail.as_bytes().first().copied()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let value = &tail[1..];
+    let end = value.as_bytes().iter().position(|byte| *byte == quote)?;
+    Some(value[..end].trim().to_ascii_lowercase())
+}
+
+fn decode_utf16_xml(data: &[u8], little_endian: bool) -> Result<String, String> {
+    if !data.chunks_exact(2).remainder().is_empty() {
+        return Err("invalid XML: odd-length UTF-16 input".into());
+    }
+    let words = data.chunks_exact(2).map(|chunk| {
+        let bytes = [chunk[0], chunk[1]];
+        if little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    });
+    char::decode_utf16(words)
+        .collect::<Result<String, _>>()
+        .map_err(|_| "invalid XML: malformed UTF-16 input".into())
+}
+
+fn windows_1252_char(byte: u8) -> char {
+    match byte {
+        0x80 => '\u{20ac}',
+        0x82 => '\u{201a}',
+        0x83 => '\u{0192}',
+        0x84 => '\u{201e}',
+        0x85 => '\u{2026}',
+        0x86 => '\u{2020}',
+        0x87 => '\u{2021}',
+        0x88 => '\u{02c6}',
+        0x89 => '\u{2030}',
+        0x8a => '\u{0160}',
+        0x8b => '\u{2039}',
+        0x8c => '\u{0152}',
+        0x8e => '\u{017d}',
+        0x91 => '\u{2018}',
+        0x92 => '\u{2019}',
+        0x93 => '\u{201c}',
+        0x94 => '\u{201d}',
+        0x95 => '\u{2022}',
+        0x96 => '\u{2013}',
+        0x97 => '\u{2014}',
+        0x98 => '\u{02dc}',
+        0x99 => '\u{2122}',
+        0x9a => '\u{0161}',
+        0x9b => '\u{203a}',
+        0x9c => '\u{0153}',
+        0x9e => '\u{017e}',
+        0x9f => '\u{0178}',
+        _ => char::from(byte),
+    }
+}
+
+/// Decodes an XML byte stream according to its BOM and XML declaration.
+/// XML defaults to UTF-8; malformed or unsupported encodings are rejected
+/// explicitly instead of being replaced with U+FFFD.
+pub(crate) fn decode_xml_bytes(data: &[u8]) -> Result<String, String> {
+    if let Some(bytes) = data.strip_prefix(&[0xef, 0xbb, 0xbf]) {
+        return String::from_utf8(bytes.to_vec())
+            .map_err(|_| "invalid XML: malformed UTF-8 input".into());
+    }
+    if let Some(bytes) = data.strip_prefix(&[0xff, 0xfe]) {
+        return decode_utf16_xml(bytes, true);
+    }
+    if let Some(bytes) = data.strip_prefix(&[0xfe, 0xff]) {
+        return decode_utf16_xml(bytes, false);
+    }
+    if data.starts_with(&[b'<', 0, b'?', 0, b'x', 0, b'm', 0, b'l', 0]) {
+        return decode_utf16_xml(data, true);
+    }
+    if data.starts_with(&[0, b'<', 0, b'?', 0, b'x', 0, b'm', 0, b'l']) {
+        return decode_utf16_xml(data, false);
+    }
+
+    match xml_declared_encoding(data).as_deref() {
+        None | Some("utf-8" | "utf8" | "us-ascii" | "ascii") => String::from_utf8(data.to_vec())
+            .map_err(|_| "invalid XML: malformed UTF-8 input".into()),
+        Some("iso-8859-1" | "iso_8859-1" | "latin1" | "latin-1") => {
+            Ok(data.iter().map(|byte| char::from(*byte)).collect())
+        }
+        Some("windows-1252" | "windows1252" | "cp1252") => {
+            Ok(data.iter().map(|byte| windows_1252_char(*byte)).collect())
+        }
+        Some("utf-16" | "utf-16le") => decode_utf16_xml(data, true),
+        Some("utf-16be") => decode_utf16_xml(data, false),
+        Some(encoding) => Err(format!("unsupported XML encoding: {encoding}")),
+    }
 }
 
 pub fn parse(data: &[u8]) -> Result<Midi, String> {
     let xml = if is_zip(data) {
         extract_mxl(data)?
     } else {
-        String::from_utf8_lossy(data).into_owned()
+        decode_xml_bytes(data)?
     };
     parse_musicxml(&xml)
 }
@@ -140,13 +271,21 @@ fn gcd(mut left: u64, mut right: u64) -> u64 {
 fn exact_tick_base(doc: &roxmltree::Document) -> Result<u16, String> {
     let mut value = 1u64;
     let mut found = false;
-    for divisions in doc
+    for node in doc
         .descendants()
         .filter(|node| node.has_tag_name("divisions"))
-        .filter_map(|node| node.text())
-        .filter_map(|text| text.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
     {
+        let text = node
+            .text()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| "MusicXML divisions value is empty".to_string())?;
+        let divisions = text
+            .parse::<u64>()
+            .map_err(|_| format!("MusicXML divisions value is invalid: {text:?}"))?;
+        if divisions == 0 {
+            return Err("MusicXML divisions must be positive".into());
+        }
         found = true;
         value = value
             .checked_div(gcd(value, divisions))
@@ -164,6 +303,282 @@ fn child_i64(n: roxmltree::Node, tag: &str) -> Option<i64> {
         .find(|c| c.has_tag_name(tag))
         .and_then(|c| c.text())
         .and_then(|t| t.trim().parse::<i64>().ok())
+}
+
+fn strict_child_i64(
+    node: roxmltree::Node,
+    tag: &str,
+    context: &str,
+) -> Result<Option<i64>, String> {
+    let Some(child) = node.children().find(|child| child.has_tag_name(tag)) else {
+        return Ok(None);
+    };
+    let text = child
+        .text()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| format!("{context} {tag} is empty"))?;
+    text.parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("{context} {tag} is invalid: {text:?}"))
+}
+
+fn required_child_text<'a>(
+    node: roxmltree::Node<'a, '_>,
+    tag: &str,
+    context: &str,
+) -> Result<&'a str, String> {
+    node.children()
+        .find(|child| child.has_tag_name(tag))
+        .and_then(|child| child.text())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| format!("{context} is missing {tag}"))
+}
+
+fn note_source_duration(note: roxmltree::Node, grace: bool) -> Result<i64, String> {
+    let duration = strict_child_i64(note, "duration", "MusicXML note")?;
+    if grace {
+        return match duration {
+            None | Some(0) => Ok(0),
+            Some(value) => Err(format!(
+                "MusicXML grace note duration must be omitted or zero, got {value}"
+            )),
+        };
+    }
+    duration
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "MusicXML non-grace note duration must be positive".to_string())
+}
+
+fn movement_duration(node: roxmltree::Node, kind: &str) -> Result<i64, String> {
+    strict_child_i64(node, "duration", &format!("MusicXML {kind}"))?
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("MusicXML {kind} duration must be positive"))
+}
+
+fn pitched_key(pitch: roxmltree::Node) -> Result<u8, String> {
+    let step_text = required_child_text(pitch, "step", "MusicXML pitch")?;
+    let step = step_semitone(step_text)
+        .map(i64::from)
+        .ok_or_else(|| format!("MusicXML pitch step is invalid: {step_text:?}"))?;
+    let alter = strict_child_i64(pitch, "alter", "MusicXML pitch")?.unwrap_or(0);
+    let octave = strict_child_i64(pitch, "octave", "MusicXML pitch")?
+        .ok_or_else(|| "MusicXML pitch is missing octave".to_string())?;
+    let midi = octave
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(12))
+        .and_then(|value| value.checked_add(step))
+        .and_then(|value| value.checked_add(alter))
+        .ok_or_else(|| "MusicXML pitch calculation overflow".to_string())?;
+    u8::try_from(midi)
+        .ok()
+        .filter(|value| *value <= 127)
+        .ok_or_else(|| format!("MusicXML pitch is outside the MIDI range: {midi}"))
+}
+
+fn parse_additive_beats(value: &str) -> Result<u64, String> {
+    let mut total = 0u64;
+    let mut found = false;
+    for term in value.split('+') {
+        let term = term.trim();
+        if term.is_empty() {
+            return Err(format!(
+                "MusicXML additive time-signature beats are invalid: {value:?}"
+            ));
+        }
+        let value = term
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                format!("MusicXML additive time-signature beats are invalid: {value:?}")
+            })?;
+        total = total
+            .checked_add(value)
+            .ok_or_else(|| "MusicXML time-signature numerator overflow".to_string())?;
+        found = true;
+    }
+    if !found {
+        return Err("MusicXML time-signature beats are empty".into());
+    }
+    Ok(total)
+}
+
+fn parse_time_signature(time: roxmltree::Node) -> Result<(u8, u16), String> {
+    let elements: Vec<_> = time.children().filter(|node| node.is_element()).collect();
+    let mut index = 0usize;
+    let mut numerator = 0u64;
+    let mut denominator = 1u64;
+    let mut found = false;
+    while index < elements.len() {
+        if !elements[index].has_tag_name("beats") {
+            index += 1;
+            continue;
+        }
+        let beats_text = elements[index]
+            .text()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| "MusicXML time-signature beats are empty".to_string())?;
+        let beats = parse_additive_beats(beats_text)?;
+        let beat_type = elements
+            .get(index + 1)
+            .filter(|node| node.has_tag_name("beat-type"))
+            .and_then(|node| node.text())
+            .map(str::trim)
+            .and_then(|text| text.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                format!("MusicXML time-signature beat-type after {beats_text:?} is invalid")
+            })?;
+        let common = denominator
+            .checked_div(gcd(denominator, beat_type))
+            .and_then(|value| value.checked_mul(beat_type))
+            .ok_or_else(|| "MusicXML time-signature denominator overflow".to_string())?;
+        numerator = numerator
+            .checked_mul(common / denominator)
+            .and_then(|value| {
+                beats
+                    .checked_mul(common / beat_type)
+                    .and_then(|term| value.checked_add(term))
+            })
+            .ok_or_else(|| "MusicXML time-signature numerator overflow".to_string())?;
+        denominator = common;
+        found = true;
+        index += 2;
+    }
+    if !found {
+        return Err("MusicXML time signature has no beats/beat-type pair".into());
+    }
+    Ok((
+        u8::try_from(numerator)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "MusicXML time-signature numerator exceeds 255".to_string())?,
+        u16::try_from(denominator)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "MusicXML time-signature denominator exceeds 65535".to_string())?,
+    ))
+}
+
+fn beat_unit_quarters(value: &str) -> Option<f64> {
+    Some(match value.trim() {
+        "maxima" => 32.0,
+        "long" => 16.0,
+        "breve" => 8.0,
+        "whole" => 4.0,
+        "half" => 2.0,
+        "quarter" => 1.0,
+        "eighth" => 0.5,
+        "16th" => 0.25,
+        "32nd" => 0.125,
+        "64th" => 0.0625,
+        "128th" => 0.03125,
+        "256th" => 0.015625,
+        "512th" => 0.0078125,
+        "1024th" => 0.00390625,
+        _ => return None,
+    })
+}
+
+fn tempo_micros(quarter_bpm: f64) -> Result<u32, String> {
+    if !quarter_bpm.is_finite() || quarter_bpm <= 0.0 {
+        return Err("MusicXML tempo must be a positive finite number".into());
+    }
+    let micros = (60_000_000.0 / quarter_bpm).round();
+    if !(1.0..=f64::from(u32::MAX)).contains(&micros) {
+        return Err("MusicXML tempo exceeds the supported range".into());
+    }
+    Ok(micros as u32)
+}
+
+fn direction_tempo(direction: roxmltree::Node) -> Result<Option<u32>, String> {
+    let sound = if direction.has_tag_name("sound") {
+        Some(direction)
+    } else {
+        direction
+            .descendants()
+            .find(|node| node.has_tag_name("sound"))
+    };
+    if let Some(value) = sound.and_then(|node| node.attribute("tempo")) {
+        let bpm = value
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| format!("MusicXML sound tempo is invalid: {value:?}"))?;
+        return tempo_micros(bpm).map(Some);
+    }
+    if direction.has_tag_name("sound") {
+        return Ok(None);
+    }
+    let Some(metronome) = direction.descendants().find(|node| {
+        node.has_tag_name("metronome")
+            && node
+                .children()
+                .any(|child| child.has_tag_name("per-minute"))
+    }) else {
+        return Ok(None);
+    };
+    let beat_unit_text = metronome
+        .children()
+        .find(|node| node.has_tag_name("beat-unit"))
+        .and_then(|node| node.text())
+        .map(str::trim)
+        .ok_or_else(|| "MusicXML metronome is missing beat-unit".to_string())?;
+    let beat_unit = beat_unit_quarters(beat_unit_text).ok_or_else(|| {
+        format!("MusicXML metronome beat-unit is unsupported: {beat_unit_text:?}")
+    })?;
+    let dots = metronome
+        .children()
+        .filter(|node| node.has_tag_name("beat-unit-dot"))
+        .count();
+    let mut dotted_unit = beat_unit;
+    let mut addition = beat_unit / 2.0;
+    for _ in 0..dots {
+        dotted_unit += addition;
+        addition /= 2.0;
+    }
+    let per_minute_text = metronome
+        .children()
+        .find(|node| node.has_tag_name("per-minute"))
+        .and_then(|node| node.text())
+        .map(str::trim)
+        .ok_or_else(|| "MusicXML metronome is missing per-minute".to_string())?;
+    let per_minute = per_minute_text
+        .parse::<f64>()
+        .map_err(|_| format!("MusicXML metronome per-minute is invalid: {per_minute_text:?}"))?;
+    tempo_micros(per_minute * dotted_unit).map(Some)
+}
+
+fn direction_tick(
+    direction: roxmltree::Node,
+    position: i64,
+    ticks_per_beat: u16,
+    divisions: u32,
+) -> Result<u32, String> {
+    let offset = direction
+        .children()
+        .find(|node| node.has_tag_name("offset"));
+    let delta = match offset {
+        Some(offset) => {
+            let text = offset
+                .text()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| "MusicXML direction offset is empty".to_string())?;
+            let value = text
+                .parse::<i64>()
+                .map_err(|_| format!("MusicXML direction offset is invalid: {text:?}"))?;
+            scale_duration(value, ticks_per_beat, divisions)?
+        }
+        None => 0,
+    };
+    checked_tick(
+        position
+            .checked_add(delta)
+            .ok_or_else(|| "MusicXML direction offset overflows the timeline".to_string())?,
+    )
 }
 
 /// Refuses pathologically nested XML before it reaches roxmltree, whose
@@ -407,10 +822,51 @@ fn note_lyrics(note: roxmltree::Node, source_id: &str) -> Vec<Lyric> {
         .collect()
 }
 
+fn note_ties(note: roxmltree::Node) -> (bool, bool) {
+    let mut starts = false;
+    let mut stops = false;
+    for tie in note
+        .descendants()
+        .filter(|node| node.has_tag_name("tie") || node.has_tag_name("tied"))
+    {
+        match tie.attribute("type") {
+            Some("start") => starts = true,
+            Some("stop") => stops = true,
+            Some("continue") => {
+                starts = true;
+                stops = true;
+            }
+            _ => {}
+        }
+    }
+    (starts, stops)
+}
+
+fn mark_unresolved_ties_source_only(
+    voice_events: &mut MusicXmlVoiceEvents,
+    active_ties: &HashMap<MusicXmlTieKey, String>,
+) {
+    for source_id in active_ties.values() {
+        for events in voice_events.values_mut() {
+            for event in events {
+                match &mut event.kind {
+                    Kind::NoteOn(note) if note.source.id == *source_id => note.key = None,
+                    Kind::NoteOff(note)
+                        if note.source_id.as_deref() == Some(source_id.as_str()) =>
+                    {
+                        note.key = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Playback order of MusicXML measures: repeats (<repeat>), voltas
 /// (<ending>), jumps (<sound> attributes: segno/dalsegno/dacapo/coda/
 /// tocoda/fine).
-fn playback_order_mxl(measures: &[roxmltree::Node]) -> Vec<(usize, u32)> {
+fn playback_order_mxl(measures: &[roxmltree::Node]) -> Result<Vec<(usize, u32)>, String> {
     let mut marks = vec![MeasureMarks::default(); measures.len()];
     let mut open_ending: Option<Vec<u32>> = None;
 
@@ -633,12 +1089,21 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         let mut carried_divisions = 1u32;
         for measure in &measures {
             divisions_at_measure.push(carried_divisions);
-            if let Some(value) = measure
+            let mut declared_divisions = None;
+            for attributes in measure
                 .children()
                 .filter(|node| node.has_tag_name("attributes"))
-                .filter_map(|attributes| child_i64(attributes, "divisions"))
-                .find(|value| *value > 0)
             {
+                if let Some(value) =
+                    strict_child_i64(attributes, "divisions", "MusicXML attributes")?
+                {
+                    if value <= 0 {
+                        return Err("MusicXML divisions must be positive".into());
+                    }
+                    declared_divisions.get_or_insert(value);
+                }
+            }
+            if let Some(value) = declared_divisions {
                 carried_divisions = u32::try_from(value)
                     .map_err(|_| "MusicXML divisions exceed the supported range")?;
                 if let Some(entry) = divisions_at_measure.last_mut() {
@@ -646,81 +1111,74 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 }
             }
         }
-        let mut voice_events: BTreeMap<(String, String), Vec<Event>> = BTreeMap::new();
+        let mut voice_events = MusicXmlVoiceEvents::new();
+        let mut active_ties: HashMap<MusicXmlTieKey, String> = HashMap::new();
+        let mut previous_measure = None;
         let mut mstart: i64 = 0;
 
-        for &(mi, pass) in playback_order_mxl(&measures).iter() {
+        for &(mi, pass) in playback_order_mxl(&measures)?.iter() {
+            if previous_measure.is_some_and(|previous| mi != previous + 1) {
+                mark_unresolved_ties_source_only(&mut voice_events, &active_ties);
+                active_ties.clear();
+            }
+            previous_measure = Some(mi);
             let measure = measures[mi];
             let mut local_div = divisions_at_measure[mi];
             let mut pos: i64 = mstart;
             let mut maxpos: i64 = mstart;
             let mut last_onset: i64 = mstart;
             let mut last_chord_id = String::new();
+            let mut chord_member = 0usize;
             let mut note_index = 0usize;
             for (element_index, node) in measure.children().filter(|n| n.is_element()).enumerate() {
                 match node.tag_name().name() {
                     "attributes" => {
-                        if let Some(v) = child_i64(node, "divisions") {
-                            if v > 0 {
-                                local_div = u32::try_from(v)
-                                    .map_err(|_| "MusicXML divisions exceed the supported range")?;
+                        if let Some(value) =
+                            strict_child_i64(node, "divisions", "MusicXML attributes")?
+                        {
+                            if value <= 0 {
+                                return Err("MusicXML divisions must be positive".into());
                             }
+                            local_div = u32::try_from(value)
+                                .map_err(|_| "MusicXML divisions exceed the supported range")?;
                         }
                         if let Some(time) = node.children().find(|n| n.has_tag_name("time")) {
-                            if let (Some(num), Some(den)) =
-                                (child_i64(time, "beats"), child_i64(time, "beat-type"))
-                            {
-                                let num = u8::try_from(num)
-                                    .ok()
-                                    .filter(|value| *value > 0)
-                                    .ok_or_else(|| {
-                                        "MusicXML time-signature numerator is invalid".to_string()
-                                    })?;
-                                let den = u16::try_from(den)
-                                    .ok()
-                                    .filter(|value| *value > 0)
-                                    .ok_or_else(|| {
-                                        "MusicXML time-signature denominator is invalid".to_string()
-                                    })?;
-                                push_global_event(
-                                    &mut global_events,
-                                    checked_tick(pos)?,
-                                    Kind::TimeSig {
-                                        num,
-                                        den,
-                                        clocks_per_click: None,
-                                        notated_32nds: None,
-                                    },
-                                );
-                            }
+                            let (num, den) = parse_time_signature(time)?;
+                            push_global_event(
+                                &mut global_events,
+                                checked_tick(pos)?,
+                                Kind::TimeSig {
+                                    num,
+                                    den,
+                                    clocks_per_click: None,
+                                    notated_32nds: None,
+                                },
+                            );
                         }
                     }
                     "direction" | "sound" => {
-                        let snd = if node.has_tag_name("sound") {
-                            Some(node)
-                        } else {
-                            node.descendants().find(|n| n.has_tag_name("sound"))
-                        };
-                        if let Some(s) = snd {
-                            if let Some(t) =
-                                s.attribute("tempo").and_then(|v| v.parse::<f64>().ok())
-                            {
-                                if t > 0.0 {
-                                    push_global_event(
-                                        &mut global_events,
-                                        checked_tick(pos)?,
-                                        Kind::Tempo((60_000_000.0 / t) as u32),
-                                    );
-                                }
-                            }
+                        if let Some(micros) = direction_tempo(node)? {
+                            let tick = if node.has_tag_name("direction") {
+                                direction_tick(node, pos, tpb, local_div)?
+                            } else {
+                                checked_tick(pos)?
+                            };
+                            push_global_event(&mut global_events, tick, Kind::Tempo(micros));
                         }
                     }
                     "note" => {
                         let is_chord = node.children().any(|n| n.has_tag_name("chord"));
+                        if is_chord {
+                            chord_member = chord_member.checked_add(1).ok_or_else(|| {
+                                "MusicXML chord member index exceeds the supported range"
+                                    .to_string()
+                            })?;
+                        } else {
+                            chord_member = 0;
+                        }
                         let is_rest = node.children().any(|n| n.has_tag_name("rest"));
-                        let source_duration = child_i64(node, "duration")
-                            .unwrap_or(0)
-                            .clamp(0, 100_000_000);
+                        let is_grace = node.children().any(|child| child.has_tag_name("grace"));
+                        let source_duration = note_source_duration(node, is_grace)?;
                         let duration = scale_duration(source_duration, tpb, local_div)?;
                         let onset = if is_chord { last_onset } else { pos };
                         if !is_rest {
@@ -775,32 +1233,21 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                 midi_unpitched: instrument
                                     .and_then(|instrument| instrument.midi_unpitched),
                             });
-                            let pitch = if let Some(p) =
+                            let pitch = if let Some(pitch_node) =
                                 node.children().find(|n| n.has_tag_name("pitch"))
                             {
-                                let step = p
-                                    .children()
-                                    .find(|n| n.has_tag_name("step"))
-                                    .and_then(|n| n.text())
-                                    .and_then(|value| step_semitone(value.trim()));
-                                let alter = child_i64(p, "alter").unwrap_or(0).clamp(-4, 4) as i32;
-                                let octave = child_i64(p, "octave")
-                                    .filter(|value| (-2..=12).contains(value))
-                                    .and_then(|value| i32::try_from(value).ok());
-                                step.zip(octave).and_then(|(step, octave)| {
-                                    u8::try_from((octave + 1) * 12 + step + alter)
-                                        .ok()
-                                        .filter(|value| *value <= 127)
-                                })
+                                Some(pitched_key(pitch_node)?)
                             } else if unpitched_node.is_some() {
                                 instrument
                                     .and_then(|instrument| instrument.midi_unpitched)
                                     .and_then(|value| value.checked_sub(1))
                             } else {
-                                None
+                                return Err(format!(
+                                    "MusicXML note {source_id:?} has neither pitch nor unpitched"
+                                ));
                             };
                             let events = voice_events
-                                .entry((staff.clone(), voice.clone()))
+                                .entry((staff.clone(), voice.clone(), chord_member))
                                 .or_default();
                             let on = checked_tick(onset)?;
                             let off = checked_tick(
@@ -809,12 +1256,67 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                     .ok_or_else(|| "MusicXML note timing overflow".to_string())?,
                             )?;
                             let channel = instrument.and_then(|instrument| instrument.channel);
+                            let (tie_starts, tie_stops) = note_ties(node);
+                            let tie_pitch = pitch
+                                .map(|value| format!("midi:{value}"))
+                                .or_else(|| {
+                                    unpitched.as_ref().map(|value| {
+                                        format!(
+                                            "unpitched:{}:{}:{}",
+                                            value.display_step.as_deref().unwrap_or("?"),
+                                            value
+                                                .display_octave
+                                                .map(|octave| octave.to_string())
+                                                .as_deref()
+                                                .unwrap_or("?"),
+                                            value
+                                                .midi_unpitched
+                                                .map(|pitch| pitch.to_string())
+                                                .as_deref()
+                                                .unwrap_or("?")
+                                        )
+                                    })
+                                })
+                                .unwrap_or_else(|| format!("unknown:{mi}:{note_index}"));
+                            let tie_key = (
+                                staff.clone(),
+                                voice.clone(),
+                                chord_member,
+                                tie_pitch,
+                                instrument_id.clone(),
+                            );
+                            let continued_source = if tie_stops {
+                                active_ties.get(&tie_key).cloned()
+                            } else {
+                                None
+                            };
+                            if let Some(source_id) = &continued_source {
+                                let previous_off = events.iter_mut().rev().find(|event| {
+                                    matches!(
+                                        &event.kind,
+                                        Kind::NoteOff(note_off)
+                                            if note_off.source_id.as_ref() == Some(source_id)
+                                    )
+                                });
+                                let previous_off = previous_off.ok_or_else(|| {
+                                    format!(
+                                        "MusicXML tie target {source_id:?} has no matching note-off"
+                                    )
+                                })?;
+                                previous_off.tick = off;
+                            }
+                            // A tie continuation is retained as a source-only
+                            // note while the first note's playback duration is
+                            // extended across the chain. This preserves every
+                            // source occurrence without projecting a repeated
+                            // Synthesizer V attack.
+                            let playback_pitch = if tie_stops { None } else { pitch };
                             push_event(
                                 events,
                                 on,
                                 Kind::NoteOn(NoteOn {
                                     channel,
-                                    key: pitch,
+                                    key: playback_pitch,
                                     velocity: None,
                                     source: NoteSource {
                                         id: source_id.clone(),
@@ -824,7 +1326,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                         chord_id: Some(last_chord_id.clone()),
                                         instrument_id,
                                         occurrence: pass,
-                                        grace: source_duration == 0,
+                                        grace: is_grace,
                                         unpitched,
                                     },
                                     lyrics: note_lyrics(node, &source_id),
@@ -835,11 +1337,17 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                 off,
                                 Kind::NoteOff(NoteOff {
                                     channel,
-                                    key: pitch,
+                                    key: playback_pitch,
                                     velocity: None,
-                                    source_id: Some(source_id),
+                                    source_id: Some(source_id.clone()),
                                 }),
                             );
+                            if tie_stops {
+                                active_ties.remove(&tie_key);
+                            }
+                            if tie_starts {
+                                active_ties.insert(tie_key, continued_source.unwrap_or(source_id));
+                            }
                         }
                         if !is_chord {
                             last_onset = onset;
@@ -850,23 +1358,19 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                         note_index += 1;
                     }
                     "backup" => {
-                        let duration = scale_duration(
-                            child_i64(node, "duration")
-                                .unwrap_or(0)
-                                .clamp(0, 100_000_000),
-                            tpb,
-                            local_div,
-                        )?;
-                        pos = pos.saturating_sub(duration).max(mstart);
+                        let duration =
+                            scale_duration(movement_duration(node, "backup")?, tpb, local_div)?;
+                        let next = pos
+                            .checked_sub(duration)
+                            .ok_or_else(|| "MusicXML backup underflows the timeline".to_string())?;
+                        if next < mstart {
+                            return Err("MusicXML backup moves before the measure start".into());
+                        }
+                        pos = next;
                     }
                     "forward" => {
-                        let duration = scale_duration(
-                            child_i64(node, "duration")
-                                .unwrap_or(0)
-                                .clamp(0, 100_000_000),
-                            tpb,
-                            local_div,
-                        )?;
+                        let duration =
+                            scale_duration(movement_duration(node, "forward")?, tpb, local_div)?;
                         pos = pos
                             .checked_add(duration)
                             .ok_or_else(|| "MusicXML cursor overflow".to_string())?;
@@ -879,9 +1383,10 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
             }
             mstart = maxpos;
         }
+        mark_unresolved_ties_source_only(&mut voice_events, &active_ties);
 
         let track_count = voice_events.len();
-        for ((staff, voice), mut events) in voice_events {
+        for ((staff, voice, chord_member), mut events) in voice_events {
             events.sort_by_key(|event| (event.tick, event.order));
             if !events
                 .iter()
@@ -908,13 +1413,27 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 TrackRoleHint::Instrumental
             };
             let suffix = if track_count > 1 {
-                format!(" — staff {staff}, voice {voice}")
+                if chord_member == 0 {
+                    format!(" — staff {staff}, voice {voice}")
+                } else {
+                    format!(
+                        " — staff {staff}, voice {voice}, chord member {}",
+                        chord_member + 1
+                    )
+                }
             } else {
                 String::new()
             };
             let instruments: Vec<_> = info.instruments.values().cloned().collect();
             tracks.push(Track {
-                id: format!("musicxml:{part_id}:staff:{staff}:voice:{voice}"),
+                id: if chord_member == 0 {
+                    format!("musicxml:{part_id}:staff:{staff}:voice:{voice}")
+                } else {
+                    format!(
+                        "musicxml:{part_id}:staff:{staff}:voice:{voice}:chord-member:{}",
+                        chord_member + 1
+                    )
+                },
                 name: format!(
                     "{}{suffix}",
                     if info.name.is_empty() {
@@ -1012,6 +1531,7 @@ fn sort_and_reindex(events: &mut [Event]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
 
     fn mxl(lyric_inner: &str) -> String {
         format!(
@@ -1035,6 +1555,45 @@ mod tests {
         )
     }
 
+    fn score_with_measure_body(body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list>
+    <score-part id="P1"><part-name>Voice</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      {body}
+    </measure>
+  </part>
+</score-partwise>"#
+        )
+    }
+
+    fn zipped_score(name: &str, bytes: &[u8]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn windows_1252(value: &str) -> Vec<u8> {
+        value
+            .chars()
+            .map(|character| match character {
+                'é' => 0xe9,
+                '’' => 0x92,
+                character if character.is_ascii() => character as u8,
+                character => panic!("test encoder does not cover {character:?}"),
+            })
+            .collect()
+    }
+
     fn lyrics_of(midi: &Midi) -> Vec<String> {
         midi.tracks
             .iter()
@@ -1055,6 +1614,414 @@ mod tests {
     fn plain_lyric_text() {
         let midi = parse(mxl("<syllabic>single</syllabic><text>la</text>").as_bytes()).unwrap();
         assert_eq!(lyrics_of(&midi), vec!["la"]);
+    }
+
+    #[test]
+    fn every_present_divisions_value_must_be_valid_and_positive() {
+        for value in ["", "0", "-1", "not-a-number", "480.5"] {
+            let xml = mxl("<text>la</text>").replace(
+                "<divisions>480</divisions>",
+                &format!("<divisions>{value}</divisions>"),
+            );
+            let error = parse(xml.as_bytes()).expect_err("invalid divisions must never be ignored");
+            assert!(
+                error.to_ascii_lowercase().contains("divisions"),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_grace_note_duration_is_required_positive_and_never_clamped() {
+        for replacement in [
+            String::new(),
+            "<duration>0</duration>".into(),
+            "<duration>-1</duration>".into(),
+            "<duration>invalid</duration>".into(),
+        ] {
+            let xml = mxl("<text>la</text>").replace("<duration>480</duration>", &replacement);
+            let error =
+                parse(xml.as_bytes()).expect_err("normal-note duration must fail explicitly");
+            assert!(
+                error.to_ascii_lowercase().contains("duration"),
+                "unexpected error for {replacement:?}: {error}"
+            );
+        }
+
+        let xml = mxl("<text>long</text>")
+            .replace("<duration>480</duration>", "<duration>100000001</duration>");
+        let midi = parse(xml.as_bytes()).expect("large exact duration must not be clamped");
+        let off = midi.tracks[0]
+            .events
+            .iter()
+            .find_map(|event| matches!(event.kind, Kind::NoteOff(_)).then_some(event.tick))
+            .unwrap();
+        assert_eq!(off, 100_000_001);
+    }
+
+    #[test]
+    fn only_real_grace_notes_may_omit_or_zero_the_duration() {
+        for duration in ["", "<duration>0</duration>"] {
+            let xml = mxl("<text>grace</text>")
+                .replace(
+                    "<pitch><step>C</step><octave>4</octave></pitch>",
+                    "<grace/><pitch><step>C</step><octave>4</octave></pitch>",
+                )
+                .replace("<duration>480</duration>", duration);
+            let midi = parse(xml.as_bytes()).expect("true grace duration exception");
+            let note = midi.tracks[0]
+                .events
+                .iter()
+                .find_map(|event| match &event.kind {
+                    Kind::NoteOn(note) => Some((event.tick, note)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(note.0, 0);
+            assert!(note.1.source.grace);
+            assert!(midi.tracks[0]
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, Kind::NoteOff(_)) && event.tick == 0));
+        }
+
+        let xml = mxl("<text>grace</text>")
+            .replace(
+                "<pitch><step>C</step><octave>4</octave></pitch>",
+                "<grace/><pitch><step>C</step><octave>4</octave></pitch>",
+            )
+            .replace("<duration>480</duration>", "<duration>1</duration>");
+        let error = parse(xml.as_bytes()).expect_err("grace duration must not advance the cursor");
+        assert!(error.to_ascii_lowercase().contains("grace"));
+    }
+
+    #[test]
+    fn backup_and_forward_require_positive_durations_without_cursor_clamping() {
+        for kind in ["backup", "forward"] {
+            for duration in ["", "<duration>0</duration>", "<duration>-1</duration>"] {
+                let body = format!(
+                    "<note><pitch><step>C</step><octave>4</octave></pitch>\
+                     <duration>480</duration></note><{kind}>{duration}</{kind}>"
+                );
+                let xml = score_with_measure_body(&body);
+                let error =
+                    parse(xml.as_bytes()).expect_err("movement duration must fail explicitly");
+                assert!(
+                    error.to_ascii_lowercase().contains("duration"),
+                    "unexpected error for {kind}/{duration:?}: {error}"
+                );
+            }
+        }
+
+        let xml = score_with_measure_body(
+            "<note><pitch><step>C</step><octave>4</octave></pitch>\
+             <duration>480</duration></note><backup><duration>960</duration></backup>",
+        );
+        let error = parse(xml.as_bytes()).expect_err("backup before measure start must fail");
+        assert!(
+            error.to_ascii_lowercase().contains("measure start"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn malformed_or_out_of_range_pitched_notes_are_rejected() {
+        let original = "<pitch><step>C</step><octave>4</octave></pitch>";
+        for invalid in [
+            "<pitch><octave>4</octave></pitch>",
+            "<pitch><step>H</step><octave>4</octave></pitch>",
+            "<pitch><step>C</step></pitch>",
+            "<pitch><step>C</step><octave>invalid</octave></pitch>",
+            "<pitch><step>C</step><alter>invalid</alter><octave>4</octave></pitch>",
+            "<pitch><step>C</step><alter>0.5</alter><octave>4</octave></pitch>",
+            "<pitch><step>C</step><octave>20</octave></pitch>",
+            "<pitch><step>C</step><alter>200</alter><octave>4</octave></pitch>",
+        ] {
+            let xml = mxl("<text>la</text>").replace(original, invalid);
+            let error = parse(xml.as_bytes()).expect_err("invalid pitch must not become key=None");
+            assert!(
+                error.to_ascii_lowercase().contains("pitch")
+                    || error.to_ascii_lowercase().contains("step")
+                    || error.to_ascii_lowercase().contains("octave")
+                    || error.to_ascii_lowercase().contains("alter"),
+                "unexpected error for {invalid}: {error}"
+            );
+        }
+
+        let xml = mxl("<text>la</text>").replace(original, "");
+        let error = parse(xml.as_bytes()).expect_err("pitched note needs pitch or unpitched");
+        assert!(
+            error.contains("neither pitch nor unpitched"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn absent_alter_defaults_to_zero_but_unmapped_unpitched_stays_source_only() {
+        let pitched = parse(mxl("<text>la</text>").as_bytes()).unwrap();
+        assert!(pitched.tracks[0]
+            .events
+            .iter()
+            .any(|event| matches!(&event.kind, Kind::NoteOn(note) if note.key == Some(60))));
+
+        let xml = score_with_measure_body(
+            "<note>\
+               <unpitched><display-step>C</display-step><display-octave>4</display-octave></unpitched>\
+               <duration>480</duration>\
+             </note>",
+        );
+        let unpitched = parse(xml.as_bytes()).expect("unmapped percussion is source-only");
+        let note = unpitched.tracks[0]
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                Kind::NoteOn(note) => Some(note),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(note.key, None);
+        assert!(note.source.unpitched.is_some());
+    }
+
+    #[test]
+    fn raw_and_zipped_windows_1252_follow_the_xml_declaration() {
+        let xml = mxl("<text>l’été</text>").replace("UTF-8", "windows-1252");
+        let bytes = windows_1252(&xml);
+        let raw = parse(&bytes).expect("raw MusicXML uses its declared encoding");
+        assert_eq!(lyrics_of(&raw), vec!["l’été"]);
+
+        let archive = zipped_score("score.musicxml", &bytes);
+        let zipped = parse(&archive).expect("zipped MusicXML uses the entry declaration");
+        assert_eq!(lyrics_of(&zipped), vec!["l’été"]);
+    }
+
+    #[test]
+    fn utf16_musicxml_is_detected_and_decoded() {
+        let xml = mxl("<text>été</text>").replace("UTF-8", "UTF-16");
+        let mut bytes = vec![0xff, 0xfe];
+        for word in xml.encode_utf16() {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        assert!(looks_like_xml(&bytes));
+        let midi = parse(&bytes).expect("UTF-16 MusicXML should decode from its BOM");
+        assert_eq!(lyrics_of(&midi), vec!["été"]);
+    }
+
+    #[test]
+    fn root_detection_is_not_limited_to_an_initial_byte_window() {
+        let xml = format!(
+            "{}<score-partwise version=\"3.1\"><part-list/></score-partwise>",
+            " ".repeat(2_000)
+        );
+        assert!(looks_like_xml(xml.as_bytes()));
+    }
+
+    #[test]
+    fn direction_offset_and_metronome_tempo_are_applied_exactly() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <direction>
+        <direction-type>
+          <metronome>
+            <beat-unit>eighth</beat-unit>
+            <per-minute>120</per-minute>
+          </metronome>
+        </direction-type>
+        <offset>240</offset>
+      </direction>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        let tempos: Vec<_> = midi
+            .tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .filter_map(|event| match &event.kind {
+                Kind::Tempo(micros) => Some((event.tick, *micros)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tempos, vec![(240, 1_000_000)]);
+    }
+
+    #[test]
+    fn sound_tempo_takes_priority_over_display_metronome() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <direction>
+        <direction-type>
+          <metronome><beat-unit>quarter</beat-unit><per-minute>90</per-minute></metronome>
+        </direction-type>
+        <sound tempo="120"/>
+      </direction>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        assert!(midi
+            .tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .any(|event| matches!(event.kind, Kind::Tempo(500_000))));
+    }
+
+    #[test]
+    fn additive_meter_is_summed_and_malformed_grouping_is_rejected() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>480</divisions>
+        <time><beats>3+2</beats><beat-type>8</beat-type></time>
+      </attributes>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        assert!(midi
+            .tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .any(|event| matches!(event.kind, Kind::TimeSig { num: 5, den: 8, .. })));
+
+        let malformed = xml.replace("<beats>3+2</beats>", "<beats>3+x</beats>");
+        let error = parse(malformed.as_bytes()).expect_err("malformed grouping must not vanish");
+        assert!(
+            error.contains("additive") || error.contains("beats"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn ties_merge_playback_but_keep_continuation_source_only() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <tie type="start"/>
+        <notations><tied type="start"/></notations>
+        <lyric><text>hold</text></lyric>
+      </note>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <tie type="stop"/>
+        <notations><tied type="stop"/></notations>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        let note_events: Vec<_> = midi.tracks[0]
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                Kind::NoteOn(note) => Some(("on", event.tick, note.key)),
+                Kind::NoteOff(note) => Some(("off", event.tick, note.key)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            note_events,
+            vec![
+                ("on", 0, Some(60)),
+                ("on", 480, None),
+                ("off", 960, Some(60)),
+                ("off", 960, None),
+            ]
+        );
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let project = outcome.svp.unwrap();
+        assert_eq!(project.tracks.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "hold");
+        assert_eq!(
+            project.tracks[0].main_group.notes[0].duration,
+            crate::engine::svp::BLICKS_PER_QUARTER as i64 * 2
+        );
+    }
+
+    #[test]
+    fn dangling_tie_is_source_only_instead_of_claimed_exact() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <tie type="start"/>
+        <lyric><text>hold</text></lyric>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        assert!(midi.tracks[0]
+            .events
+            .iter()
+            .any(|event| matches!(&event.kind, Kind::NoteOn(note) if note.key.is_none())));
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        assert_eq!(outcome.placed, 0);
+        assert!(outcome.svp.unwrap().tracks.is_empty());
+    }
+
+    #[test]
+    fn explicit_musicxml_chord_members_become_separate_monophonic_tracks() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <lyric><text>lead</text></lyric>
+      </note>
+      <note>
+        <chord/>
+        <pitch><step>E</step><octave>4</octave></pitch>
+        <duration>480</duration>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        assert_eq!(midi.tracks.len(), 2);
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let project = outcome.svp.unwrap();
+        assert_eq!(project.tracks.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes[0].pitch, 60);
+        assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "lead");
     }
 
     #[test]
@@ -1183,6 +2150,7 @@ mod tests {
         <duration>480</duration>
         <lyric><text>let</text></lyric>
       </note>
+      <forward><duration>960</duration></forward>
       <barline location="right"><repeat direction="backward" times="2"/></barline>
     </measure>
   </part>
@@ -1198,8 +2166,8 @@ mod tests {
             .iter()
             .filter_map(|event| matches!(event.kind, Kind::TimeSig { .. }).then_some(event.tick))
             .collect();
-        assert_eq!(tempo_ticks, vec![0, 480]);
-        assert_eq!(meter_ticks, vec![0, 480]);
+        assert_eq!(tempo_ticks, vec![0, 1_440]);
+        assert_eq!(meter_ticks, vec![0, 1_440]);
         let orders: std::collections::BTreeSet<_> = midi.tracks[0]
             .events
             .iter()

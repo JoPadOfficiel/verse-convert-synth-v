@@ -34,6 +34,19 @@ test("all documented source extensions are accepted", () => {
   assert.equal(utils.isSupported("/scores/not-midi.txt"), false);
 });
 
+test("one file-selection payload cannot create duplicate rows", () => {
+  assert.deepEqual(
+    utils.uniqueSupportedPaths([
+      "/scores/Song.mscz",
+      "/scores/Song.mscz",
+      "/scores/Other.mid",
+      "/scores/readme.txt",
+      "/scores/Other.mid",
+    ]),
+    ["/scores/Song.mscz", "/scores/Other.mid"],
+  );
+});
+
 test("bundle and vocal targets remain beside the source unless configured", () => {
   assert.equal(
     utils.defaultBundlePath("/scores/Song.mscz"),

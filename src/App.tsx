@@ -22,8 +22,8 @@ import {
   exportVocalsWithDialog,
   getRendererStatus,
   isAudioUnavailableErrorCode,
-  isSupported,
   pickFiles,
+  uniqueSupportedPaths,
   type FileResult,
   type Language,
   type Overrides,
@@ -113,7 +113,7 @@ export default function App() {
 
   const addPaths = useCallback(
     async (paths: string[]) => {
-      const supported = paths.filter(isSupported);
+      const supported = uniqueSupportedPaths(paths);
       if (!supported.length) return;
       if (!beginBusy()) return;
       setGlobalError(null);
@@ -190,7 +190,6 @@ export default function App() {
       return;
     }
     if (!beginBusy()) return;
-    setLanguage(nextLanguage);
     setGlobalError(null);
     try {
       const results = await convertFiles(
@@ -200,6 +199,7 @@ export default function App() {
         undefined,
         overrides,
       );
+      setLanguage(nextLanguage);
       setItems(results);
       setSelected(
         (previous) =>
