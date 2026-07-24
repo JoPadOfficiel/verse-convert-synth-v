@@ -1,11 +1,14 @@
 {
   "name": "verse",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "npm run test:frontend",
+    "test:frontend": "node --test tests/frontend-utils.test.mjs",
+    "version:check": "node scripts/check-version.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

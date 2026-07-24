@@ -1,127 +1,175 @@
 # Verse
 
-A desktop application (macOS / Windows) that converts karaoke, MIDI and score
-files into **Synthesizer V** projects (`.svp`) with the real lyrics placed on
-the notes, track by track.
+Verse is a desktop application for macOS and Windows that converts karaoke,
+MIDI and score files into Synthesizer V projects without inventing lyrics or
+notes. Its complete export also keeps the original file and adds a real,
+audible full-score reference mix.
 
 ![Verse screenshot](docs/screenshot.png)
 
 ## Why this exists
 
-**Synthesizer V Studio 1.x cannot import lyrics from MIDI files.** When you
-open a karaoke MIDI (`.kar`) that contains the full lyrics, every note arrives
-as "la la la" and you have to retype the whole song syllable by syllable —
-hours of tedious work per song.
+Synthesizer V Studio 1.x does not reliably import lyrics from MIDI. Depending
+on the import/conversion path, users can end up with `la la la`, altered
+Western text, missing lyrics or instrumental notes represented as silent vocal
+tracks.
 
-Dreamtonics fixed MIDI lyric import in **Synthesizer V Studio 2** (2025), but
-many users hold perpetual 1.x licenses (this project was born on **1.11.2**)
-and cannot upgrade. General-purpose converters either drop the lyrics or, in
-some configurations, mangle Western lyrics through a Japanese phonetic cleanup.
+Verse uses only evidence present in the source:
 
-Verse fills that gap: it reads the lyrics that are already inside your files
-and produces a ready-to-open `.svp` project. Lyrics are copied verbatim — there
-is no phonetic conversion of any kind.
+- a genuine source lyric such as `la` remains `la`;
+- an untexted note remains untexted;
+- generic MIDI Text is metadata, not a lyric;
+- a normal MIDI file without lyrics succeeds with zero generated words;
+- no fallback pitch, lyric, track, instrument or audio is fabricated.
 
 ## Supported input formats
 
 | Format | Extensions | Notes |
 |---|---|---|
-| Karaoke MIDI | `.kar` | both lyric storages (lyric meta events and `@`-tag text events) |
-| Standard MIDI | `.mid`, `.midi` | |
-| MusicXML | `.mxl`, `.xml`, `.musicxml` | multiple voices, repeats and verses unrolled |
-| MuseScore | `.mscz`, `.mscx` | MuseScore 3 and 4, no intermediate export needed |
+| Karaoke MIDI | `.kar` | Qualified Soft Karaoke text and MIDI lyric events |
+| Standard MIDI | `.mid`, `.midi` | Lyric-free MIDI is valid |
+| MusicXML | `.mxl`, `.xml`, `.musicxml` | Parts, voices, lyric lanes and unpitched percussion are inventoried |
+| MuseScore | `.mscz`, `.mscx` | Native MuseScore score parsing |
 
-## What the conversion does
+## Complete preservation bundle
 
-- **Multi-track**: the `.svp` reproduces every track of the source file.
-  Singing tracks receive their lyrics and are placed first; backing tracks are
-  kept, muted by default.
-- **Voice detection**: a track sings if it carries most of the song text (lead
-  voice) or if most of its own notes land on syllables (harmonies and choirs).
-  A track that carries its own aligned lyrics always sings, whatever its name.
-  A per-track **Sings / Muted** toggle gives you the final say.
-- **Score structure unrolled**: repeat barlines, voltas (1st/2nd endings),
-  D.S. / D.C. (al Fine, al Coda), Segno, To Coda and Fine are played out in
-  real order — pass k sings verse k.
-- **No sung melody?** If a file contains lyrics but no vocal note track (some
-  karaoke files only ship the backing band), Verse creates a "Lyrics" track
-  with every syllable at the right time on a flat pitch, ready to be melodized
-  in Synthesizer V. The tedious part — typing the words — is already done.
-- **Languages**: English and French lyric handling. The singing language is
-  pre-set in the project file.
+The primary export is a new `.versebundle` directory:
+
+```text
+Song.versebundle/
+├── manifest.json
+├── preservation.json
+├── source/
+│   └── Song.mscz
+├── project/
+│   └── Song.svp
+└── audio/
+    └── full-score.wav
+```
+
+- `source/` contains a byte-identical copy of the input.
+- `preservation.json` records the disposition of inventoried source items.
+- `manifest.json` contains hashes, sizes, renderer identity and audio metadata.
+- `project/*.svp` contains only evidence-backed vocal-note projections plus a
+  Synthesizer V instrumental-audio track.
+- `audio/full-score.wav` is rendered from the original file by MuseScore
+  Studio 4 and referenced by the SVP as real instrumental audio.
+
+The bundle is staged and committed transactionally. Verse never silently
+falls back to an audio-less bundle and never overwrites an existing bundle.
+
+“Source-faithful” means that the original bytes and a disposition ledger are
+preserved. It does not mean every notation or MIDI concept has a lossless SVP
+equivalent.
+
+## Audio renderer and important limits
+
+Complete bundle export requires a user-installed **MuseScore Studio 4**.
+Configure its executable in Settings or let Verse try to detect it. MuseScore
+is not bundled with Verse.
+
+MuseScore renders the **original full score**. This keeps piano, instruments
+and percussion audible, but the WAV is a reference mix, not a clean
+vocal-removed accompaniment stem. Renderer absence, timeout, invalid output or
+write failure blocks the bundle and leaves no fake or partial result.
+
+The secondary “Vocals `.svp`” action writes only editable vocal notes. It does
+not contain piano or instrumental audio; use the complete bundle when those
+parts must be audible.
+
+## Lyrics, tracks and voices
+
+- MusicXML and MuseScore lyric ownership stays attached to the source
+  note/voice/lane.
+- Soft Karaoke text is accepted only after its karaoke profile is qualified.
+- Generic MIDI Text is preserved as metadata.
+- Continuation markers are emitted only from source lyric-extension evidence.
+- Unpitched percussion and data not representable in SVP remain in the source,
+  ledger and full-score audio.
+- A manual “Vocal SVP” override changes only the requested export
+  representation. It does not change the reported source role and does not
+  invent words.
+
+Verse does not embed or select a commercial Synthesizer V voice database.
+After opening the project, assign a compatible voice to every vocal track.
+Without that assignment Synthesizer V cannot sing the notes. The instrumental
+WAV does not need a voice database.
 
 ## Usage
 
-1. Download the latest release for your platform from the
+1. Install Verse from the
    [Releases page](https://github.com/JoPadOfficiel/verse-convert-synth-v/releases)
-   (`.dmg` for macOS, `.exe` / `.msi` for Windows).
-2. Launch Verse and drop your files (several at once), or click to browse.
-3. Click a row to inspect the detected tracks; use the Sings / Muted toggle to
-   override the detection if needed.
-4. Convert all, or select specific files and download the selection. A
-   `<name>_LYRICS.svp` file is written next to each source file (or to the
-   folder chosen in Settings).
-5. In Synthesizer V, use **File > Open** (not Import) on the `.svp`, then
-   assign a voice database to each singing track.
+   (`.dmg` on macOS, `.exe` or `.msi` on Windows).
+2. Install MuseScore Studio 4 if you want complete bundles.
+3. Drop one or more supported files into Verse.
+4. Expand a file to inspect source roles, lyric status, export representation
+   and warnings.
+5. Optionally change a pitched track’s “Vocal SVP” export choice.
+6. Click **Bundle** (or **Export all bundles**) for the complete result.
+7. Open `project/*.svp` from inside the bundle in Synthesizer V and assign a
+   voice database to the vocal tracks.
+
+The selected lyric language configures the Synthesizer V vocal database
+language. It never translates, normalizes or phoneticizes source text.
 
 ### Opening an unsigned build
 
-The released binaries are not code-signed with a paid Apple/Microsoft developer
-certificate, so the operating system asks for a one-time confirmation. Building
-from source yourself produces a local, non-quarantined app that opens without
-any prompt.
+Released binaries are not code-signed with paid Apple/Microsoft developer
+certificates, so the operating system may ask for one-time confirmation.
 
-**Windows** — on the SmartScreen dialog, click **More info > Run anyway**.
+**Windows:** on the SmartScreen dialog, select **More info > Run anyway**.
 
-**macOS** — see Troubleshooting below.
+**macOS:** if Gatekeeper reports that Verse is damaged, remove the download
+quarantine flag:
 
-## Troubleshooting
-
-### macOS says "Verse is damaged and can't be opened"?
-
-This is macOS Gatekeeper. Because the app is downloaded from outside the App
-Store and is not notarized, macOS adds a "quarantine" flag and shows this
-message. **The app is not actually damaged.** In this case the right-click >
-Open trick and the "Open Anyway" button in Settings usually do not appear —
-remove the flag from Terminal instead:
-
-```
+```sh
 sudo xattr -rd com.apple.quarantine "/Applications/Verse.app"
 ```
 
-Adjust the path if you keep Verse elsewhere (for example
-`~/Downloads/Verse.app`). Then open the app normally. This only needs to be
-done once, after installing or updating.
+Adjust the path if Verse is installed elsewhere.
 
 ## Development
 
-Prerequisites: Rust (stable) and Node.js 18+.
+Prerequisites:
 
+- Rust stable;
+- Node.js 18 or later;
+- MuseScore Studio 4 for real audio-rendering gates.
+
+```sh
+npm ci
+npm run build
+npm run tauri dev
+
+cd src-tauri
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
-npm install
-npm run tauri dev      # run in development
-npm run tauri build    # native package (.app/.dmg on macOS, .msi/.exe on Windows)
-cargo test             # engine tests (run from src-tauri/)
+
+Optional local gates for the two reported real-world regressions use:
+
+```sh
+VERSE_MSCZ_GATE="/path/to/score.mscz" \
+VERSE_MXL_GATE="/path/to/score.mxl" \
+cargo test --locked --test source_fidelity
 ```
 
 ### Architecture
 
-- `src-tauri/src/engine/` — the conversion engine, pure Rust with no runtime
-  network dependency: built-in parsers for MIDI (`midi.rs`), MusicXML
-  (`musicxml.rs`) and native MuseScore (`musescore.rs`), score unrolling
-  (`unroll`), track classification and `.svp` serialization (`convert.rs`,
-  `svp.rs`).
-- `src-tauri/src/lib.rs` — the Tauri command layer (file validation, size
-  caps, per-track overrides).
-- `src/` — React + shadcn/ui front end (light/dark theme, batch conversion,
-  track detail with toggles, settings).
+- `src-tauri/src/engine/` parses MIDI, MusicXML and MuseScore into a
+  provenance-rich source model and projects evidence-backed vocal material.
+- `src-tauri/src/renderer.rs` discovers and bounds MuseScore Studio 4
+  rendering.
+- `src-tauri/src/bundle.rs` creates the transactional preservation bundle,
+  validates WAV output and writes manifests/hashes.
+- `src-tauri/src/lib.rs` exposes validated Tauri commands and structured
+  errors.
+- `src/` is the React interface for analysis, renderer settings, overrides and
+  bundle/vocal-only export.
 
-The `.svp` format is JSON (version 113). Time is expressed in blicks:
-one quarter note = 705,600,000 blicks.
-
-Note: song-based test fixtures are not committed (copyrighted material); the
-corresponding tests skip automatically when fixtures are absent, while the
-score-structure tests always run.
+The SVP serializer currently targets project format version 113. Time is
+expressed in blicks; one quarter note is 705,600,000 blicks.
 
 ## License
 

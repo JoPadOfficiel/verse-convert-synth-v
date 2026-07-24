@@ -1,117 +1,366 @@
-name: build-verse
+name: Build release
 
-# Builds Verse for every desktop platform and architecture and attaches the
-# installers to the GitHub Release. Triggered by pushing a v* tag (e.g. v1.0.0).
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: Strict release tag name (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      commit_sha:
+        description: Full 40-character commit SHA the release must target
+        required: true
+        type: string
+      publish_release:
+        description: Publish the draft after every artifact is uploaded
+        required: false
+        default: true
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Strict release tag name (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      commit_sha:
+        description: Full 40-character commit SHA the release must target
+        required: true
+        type: string
+      publish_release:
+        description: Publish the draft after every artifact is uploaded
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: build-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
-  # 1. Run the engine tests once (pure Rust logic, platform-independent).
-  test:
+  validate:
+    name: Validate immutable release identity
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out the requested commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          node-version: 20
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux dependencies
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy
+
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - run: npm install
-      - run: npm run build
-      - name: Engine tests
-        working-directory: src-tauri
-        run: cargo test
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
 
-  # 2. Create a draft release the build jobs will upload to.
-  create-release:
-    needs: test
-    runs-on: ubuntu-22.04
-    outputs:
-      release_id: ${{ steps.create.outputs.result }}
-    steps:
-      - uses: actions/github-script@v7
-        id: create
-        with:
-          script: |
-            const tag = context.ref.replace('refs/tags/', '');
-            const { data } = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: tag,
-              name: tag,
-              draft: true,
-              prerelease: false,
-              generate_release_notes: true,
-            });
-            return data.id;
+      - name: Verify commit, versions, and any existing tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag must be strict SemVer prefixed with v"
+            exit 1
+          fi
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Release SHA must be a full lowercase 40-character commit SHA"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
+            echo "::error::Checked-out revision does not equal the requested SHA"
+            exit 1
+          fi
+          remote_tag="$(git ls-remote --refs origin "refs/tags/${RELEASE_TAG}")"
+          if [[ -n "$remote_tag" ]]; then
+            git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            if [[ "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" != "$RELEASE_SHA" ]]; then
+              echo "::error::Existing release tag does not resolve to the requested SHA"
+              exit 1
+            fi
+          else
+            echo "Release tag is not published yet; the draft release will create it from ${RELEASE_SHA}."
+          fi
+          node scripts/check-version.mjs --tag "$RELEASE_TAG"
 
-  # 3. Build every platform/architecture and upload to the draft release.
+      - name: Install frontend dependencies reproducibly
+        run: npm ci
+
+      - name: Run frontend tests
+        run: npm run test:frontend
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Lint all Rust targets
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Run all Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
   build:
-    needs: create-release
+    name: Build ${{ matrix.target }}
+    needs:
+      - validate
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest      # macOS Apple Silicon
+          - runner: macos-latest
             target: aarch64-apple-darwin
-          - platform: macos-latest      # macOS Intel
+          - runner: macos-latest
             target: x86_64-apple-darwin
-          - platform: ubuntu-22.04      # Linux x64
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - platform: ubuntu-22.04-arm  # Linux ARM64
+          - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - platform: windows-latest    # Windows x64
+          - runner: windows-2022
             target: x86_64-pc-windows-msvc
-          - platform: windows-latest    # Windows ARM64
+          - runner: windows-2022
             target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: Check out the validated commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          node-version: 20
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable action
+        with:
+          toolchain: 1.93.0
           targets: ${{ matrix.target }}
 
-      - name: Install Linux dependencies
-        if: startsWith(matrix.platform, 'ubuntu')
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.runner, 'ubuntu')
+        shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
-            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
 
-      - run: npm install
+      - name: Install frontend dependencies reproducibly
+        run: npm ci
 
-      - name: Build and upload (Tauri)
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Recheck release version
+        run: node scripts/check-version.mjs --tag "${{ inputs.tag }}"
+
+      - name: Build Tauri bundles
+        run: npm run tauri -- build --target "${{ matrix.target }}"
+
+      - name: Upload platform bundles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          args: --target ${{ matrix.target }}
+          name: verse-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/**
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
-  # 4. Publish (undraft) the release once every build succeeded.
-  publish-release:
-    needs: [create-release, build]
+  publish:
+    name: Assemble checksums and update draft
+    needs:
+      - build
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
     steps:
-      - uses: actions/github-script@v7
+      - name: Check out the validated commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          script: |
-            await github.rest.repos.updateRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: ${{ needs.create-release.outputs.release_id }},
-              draft: false,
-            });
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Download all platform bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: verse-*
+          path: downloaded
+
+      - name: Assemble release assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          while IFS= read -r -d '' file; do
+            relative="${file#downloaded/}"
+            target="${relative%%/*}"
+            base="${file##*/}"
+            case "$base" in
+              *.AppImage|*.deb|*.dmg|*.exe|*.msi|*.rpm|*.sig|*.tar.gz|*.zip)
+                destination="release-assets/${target}-${base}"
+                if [[ -e "$destination" ]]; then
+                  echo "::error::Release asset collision: $destination"
+                  exit 1
+                fi
+                cp "$file" "$destination"
+                ;;
+            esac
+          done < <(find downloaded -type f -print0)
+          if ! find release-assets -maxdepth 1 -type f | grep -q .; then
+            echo "::error::No releasable installer was found"
+            exit 1
+          fi
+          (
+            cd release-assets
+            find . -maxdepth 1 -type f -printf '%f\0' \
+              | sort -z \
+              | xargs -0 sha256sum
+          ) > release-assets/SHA256SUMS
+          (
+            cd release-assets
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Retain assembled release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verse-${{ inputs.tag }}-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Create or update the draft release idempotently
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ inputs.commit_sha }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+        run: |
+          set -euo pipefail
+
+          tag_exists=false
+          remote_tag="$(git ls-remote --refs origin "refs/tags/${RELEASE_TAG}")"
+          if [[ -n "$remote_tag" ]]; then
+            tag_exists=true
+            git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            if [[ "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" != "$RELEASE_SHA" ]]; then
+              echo "::error::Existing release tag does not resolve to the requested SHA"
+              exit 1
+            fi
+          fi
+
+          release_exists=false
+          release_is_draft="$(
+            gh release list \
+              --limit 1000 \
+              --json isDraft,tagName \
+              --jq ".[] | select(.tagName == \"${RELEASE_TAG}\") | .isDraft"
+          )"
+          if [[ -n "$release_is_draft" ]]; then
+            release_exists=true
+          fi
+
+          if [[ "$release_exists" == "true" && "$release_is_draft" != "true" ]]; then
+            if [[ "$tag_exists" != "true" ]]; then
+              echo "::error::Published release exists without its expected remote tag"
+              exit 1
+            fi
+            echo "Release ${RELEASE_TAG} is already published at ${RELEASE_SHA}; nothing to update."
+            exit 0
+          fi
+
+          if [[ "$release_exists" == "true" ]]; then
+            if [[ "$tag_exists" == "true" ]]; then
+              gh release edit "$RELEASE_TAG" \
+                --draft \
+                --target "$RELEASE_SHA" \
+                --verify-tag
+            else
+              gh release edit "$RELEASE_TAG" \
+                --draft \
+                --target "$RELEASE_SHA"
+            fi
+          elif [[ "$tag_exists" == "true" ]]; then
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --generate-notes \
+              --target "$RELEASE_SHA" \
+              --title "$RELEASE_TAG" \
+              --verify-tag
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --generate-notes \
+              --target "$RELEASE_SHA" \
+              --title "$RELEASE_TAG"
+          fi
+
+          mapfile -d '' assets < <(find release-assets -maxdepth 1 -type f -print0)
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+
+          if [[ "$PUBLISH_RELEASE" == "true" ]]; then
+            if [[ "$tag_exists" == "true" ]]; then
+              gh release edit "$RELEASE_TAG" \
+                --draft=false \
+                --target "$RELEASE_SHA" \
+                --verify-tag
+            else
+              gh release edit "$RELEASE_TAG" \
+                --draft=false \
+                --target "$RELEASE_SHA"
+            fi
+
+            git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            if [[ "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" != "$RELEASE_SHA" ]]; then
+              echo "::error::Published release tag does not resolve to the requested SHA"
+              exit 1
+            fi
+          fi
