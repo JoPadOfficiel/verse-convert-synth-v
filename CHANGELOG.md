@@ -5,6 +5,54 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.4.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.3.0...v0.4.0) (2026-07-25)
+
+### Added
+
+- Preserve the original Part → staff → source voice → projection-lane
+  topology for MusicXML and MuseScore inputs instead of presenting technical
+  chord lanes as independent source tracks.
+- Bind detached KAR lyric streams to a melody only when the complete mapping
+  is unique, injective, monotonic, timing-compatible, and non-percussive.
+- Publish `.versebundle` schema v2 with one validated MuseScore WAV stem per
+  note-bearing source Part plus a muted full-score reference mix.
+- Support one user-installed MuseScore Studio 3.6.2+ or 4.x renderer, including
+  strict master-score/Part extraction, executable identity checks, and bounded
+  macOS MuseScore 4 shutdown retries.
+- Add private multi-format regression gates and a pinned CC0 OpenScore Lieder
+  auditor covering 1,352 scores and deterministic real-audio render samples.
+- Add complete tracked documentation for architecture, supported formats,
+  bundle schema, renderer setup, IPC contracts, development, testing,
+  security, troubleshooting, deployment, and contribution.
+
+### Fixed
+
+- Keep genuinely lyricless notes empty instead of generating `la`, Japanese
+  text, continuation markers, fallback pitches, or a synthetic C4 melody.
+- Apply the `.kar` container profile consistently during analysis, direct SVP
+  export, and complete bundle export.
+- Report `nTracks` as the actual number of detailed projection lanes rather
+  than copying the source Part count.
+- Reject source timing that cannot map to integral Synthesizer V blick
+  positions instead of silently rounding note or tempo positions.
+- Preserve every source lyric lane, formatted MuseScore text, source voice,
+  rest-only topology item, percussion identity, and ambiguous chord lyric as
+  source evidence without inventing a target representation.
+- Prevent incomplete, silent, misaligned, duplicate, oversized, or
+  identity-mismatched Part renders from publishing a partial bundle.
+
+### Reliability and compatibility
+
+- Validate complete Part coverage, WAV headers/frame alignment, SHA-256
+  identities, relative SVP audio references, preservation-ledger dispositions,
+  and the final no-replace bundle after publication.
+- Bound source parsing, MuseScore extraction, renderer logs/process trees,
+  per-WAV size, aggregate audio size, Part count, and total render time.
+- Keep analysis and vocal-only export available without MuseScore; fail
+  complete bundle export explicitly when no compatible renderer is available.
+- Build release artifacts for macOS, Windows, and build-qualified Linux on
+  ARM64 and x86_64 with stable names and `SHA256SUMS`.
+
 ## [0.3.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.2.0...v0.3.0) (2026-07-24)
 
 

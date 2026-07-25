@@ -11,8 +11,8 @@ import type {
   ExportRepresentation,
   FileResult,
   LyricStatus,
+  PartInfo,
   SourceRole,
-  TrackInfo,
 } from "@/lib/tauri";
 
 const ROLE_LABEL: Record<SourceRole, string> = {
@@ -27,8 +27,9 @@ const ROLE_LABEL: Record<SourceRole, string> = {
 
 const REPRESENTATION_LABEL: Record<ExportRepresentation, string> = {
   vocalNotes: "Vocal notes in SVP",
-  referenceMixMember: "Included in full-score audio",
-  vocalNotesAndReferenceMix: "Vocal notes + full-score audio",
+  referenceMixMember: "Separate MuseScore Part stem in the bundle",
+  vocalNotesAndReferenceMix:
+    "Vocal notes + separate muted Part reference stem",
   sourceOnly: "Preserved in source/manifest",
 };
 
@@ -56,23 +57,21 @@ function exportsVocalNotes(representation: ExportRepresentation): boolean {
   );
 }
 
-function TrackRow({
-  track,
+function PartRow({
+  part,
   disabled,
   onToggle,
 }: {
-  track: TrackInfo;
+  part: PartInfo;
   disabled: boolean;
-  onToggle: (trackId: number, enabled: boolean) => void;
+  onToggle: (trackIds: number[], enabled: boolean) => void;
 }) {
-  const vocalExport = exportsVocalNotes(track.exportRepresentation);
-  const canToggle =
-    track.notes > 0 &&
-    !["percussion", "metadata", "lyricsOnly"].includes(track.sourceRole);
+  const vocalExport = exportsVocalNotes(part.exportRepresentation);
+  const canToggle = part.vocalCandidateTrackIds.length > 0;
   const color =
-    track.sourceRole === "vocal"
+    part.sourceRole === "vocal"
       ? "text-success"
-      : track.sourceRole === "percussion"
+      : part.sourceRole === "percussion"
         ? "text-warning"
         : "text-muted-foreground";
 
@@ -80,21 +79,23 @@ function TrackRow({
     <div className="border-b py-2 last:border-b-0">
       <div className="flex items-center gap-2 text-sm">
         <DotFilledIcon className={`${color} size-4 shrink-0`} />
-        <span className="w-44 truncate font-medium" title={track.track}>
-          {track.track}
+        <span className="w-44 truncate font-medium" title={part.part}>
+          {part.part}
         </span>
         <span className="w-20 text-right tabular-nums text-muted-foreground">
-          {track.notes} notes
+          {part.notes} notes
         </span>
         <span className="min-w-0 flex-1 truncate text-muted-foreground">
-          · {ROLE_LABEL[track.sourceRole]} · {lyricLabel(track.lyricStatus)}
+          · {ROLE_LABEL[part.sourceRole]} · {part.staves} staff
+          {part.staves === 1 ? "" : "s"} · {part.voices} voice
+          {part.voices === 1 ? "" : "s"} · {lyricLabel(part.lyricStatus)}
         </span>
         {canToggle && (
           <button
             disabled={disabled}
             onClick={(event) => {
               event.stopPropagation();
-              onToggle(track.id, !vocalExport);
+              onToggle(part.vocalCandidateTrackIds, !vocalExport);
             }}
             title={
               vocalExport
@@ -114,11 +115,11 @@ function TrackRow({
         )}
       </div>
       <div className="ml-6 mt-1 text-xs text-muted-foreground">
-        {REPRESENTATION_LABEL[track.exportRepresentation]}
-        {track.requiresVoiceAssignment &&
+        {REPRESENTATION_LABEL[part.exportRepresentation]}
+        {part.requiresVoiceAssignment &&
           " · Assign a Synthesizer V voice before playback"}
       </div>
-      {track.warnings.map((warning) => (
+      {part.warnings.map((warning) => (
         <div
           key={`${warning.code}-${warning.sourceId ?? ""}`}
           className={
@@ -152,11 +153,15 @@ function Row({
   onVocals: (item: FileResult) => void;
   selected: boolean;
   onToggleSelect: (path: string) => void;
-  onToggleVocal: (path: string, trackId: number, enabled: boolean) => void;
+  onToggleVocal: (
+    path: string,
+    trackIds: readonly number[],
+    enabled: boolean,
+  ) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const vocalTracks = item.tracks.filter((track) =>
-    exportsVocalNotes(track.exportRepresentation),
+  const vocalTracks = item.parts.filter((part) =>
+    exportsVocalNotes(part.exportRepresentation),
   ).length;
   const hasVocalExport = vocalTracks > 0;
   const analysisError = item.error?.message ?? item.msg;
@@ -190,7 +195,7 @@ function Row({
             <div className="truncate text-sm font-medium">{item.name}</div>
             <div className="truncate text-xs text-muted-foreground">
               {item.ok
-                ? `${item.nTracks} source tracks · ${vocalTracks} vocal exports · ${item.placed} projected lyrics`
+                ? `${item.nParts} source Parts · ${item.nVoices} voices · ${vocalTracks} vocal exports · ${item.placed} projected lyrics`
                 : analysisError}
             </div>
             {item.ok && (
@@ -235,10 +240,10 @@ function Row({
             <Button
               size="sm"
               disabled={busy}
-              title="Create an auditable bundle with source, SVP, manifest and a real full-score WAV"
+              title="Create an auditable bundle with source, SVP, one audio stem per MuseScore Part, and a muted full-score reference"
               onClick={() => onBundle(item)}
             >
-              <DownloadIcon /> Bundle
+              <DownloadIcon /> Complete project
             </Button>
             <Button
               size="sm"
@@ -251,7 +256,7 @@ function Row({
               }
               onClick={() => onVocals(item)}
             >
-              Vocals .svp
+              Vocals only
             </Button>
           </div>
         )}
@@ -259,17 +264,17 @@ function Row({
       {open && item.ok && (
         <div className="border-t px-4 py-2 pl-11">
           <p className="mb-2 text-xs text-muted-foreground">
-            Bundle audio is the original full-score reference mix. It keeps
-            piano, instruments and percussion audible, but it is not a
-            vocal-removed accompaniment stem.
+            Each note-bearing source Part becomes its own MuseScore-rendered
+            audio track. Vocal reference Parts and the full-score reference are
+            muted by default; accompaniment Parts remain audible.
           </p>
-          {item.tracks.map((track) => (
-            <TrackRow
-              key={track.sourceId}
-              track={track}
+          {item.parts.map((part) => (
+            <PartRow
+              key={part.sourceId}
+              part={part}
               disabled={busy}
-              onToggle={(trackId, enabled) =>
-                onToggleVocal(item.path, trackId, enabled)
+              onToggle={(trackIds, enabled) =>
+                onToggleVocal(item.path, trackIds, enabled)
               }
             />
           ))}
@@ -296,7 +301,11 @@ export function FileList({
   onVocals: (item: FileResult) => void;
   selected: Set<string>;
   onToggleSelect: (path: string) => void;
-  onToggleVocal: (path: string, trackId: number, enabled: boolean) => void;
+  onToggleVocal: (
+    path: string,
+    trackIds: readonly number[],
+    enabled: boolean,
+  ) => void;
 }) {
   if (!items.length) {
     return (

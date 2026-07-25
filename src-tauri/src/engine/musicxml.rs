@@ -3,10 +3,11 @@
 //! whole multi-track conversion logic can be reused.
 use crate::engine::midi::{
     unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricExtension, LyricFragment, LyricState,
-    MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat, Syllabic,
-    TimeBase, Track, TrackRoleHint, TrackSource, UnpitchedInfo,
+    MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat, SourcePart,
+    SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track, TrackRoleHint,
+    TrackSource, UnpitchedInfo,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 
 type MusicXmlVoiceKey = (String, String, usize);
@@ -1071,6 +1072,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
 
     let mut tracks = Vec::new();
     let mut global_events = Vec::new();
+    let mut declared_parts = Vec::new();
     for (part_index, part) in root
         .children()
         .filter(|n| n.has_tag_name("part"))
@@ -1085,6 +1087,60 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
             .children()
             .filter(|n| n.has_tag_name("measure"))
             .collect();
+        let mut declared_staff_ids: BTreeSet<String> = BTreeSet::new();
+        let mut declared_voices: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut declared_staff_count = 1usize;
+        for measure in &measures {
+            for attributes in measure
+                .children()
+                .filter(|node| node.has_tag_name("attributes"))
+            {
+                if let Some(staves) = strict_child_i64(attributes, "staves", "MusicXML attributes")?
+                {
+                    let staves = usize::try_from(staves)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| "MusicXML staves must be positive".to_string())?;
+                    declared_staff_count = declared_staff_count.max(staves);
+                }
+            }
+            for note in measure.children().filter(|node| node.has_tag_name("note")) {
+                let optional_child_text = |tag| {
+                    note.children()
+                        .find(|child| child.has_tag_name(tag))
+                        .and_then(|child| child.text())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                };
+                let staff = optional_child_text("staff").unwrap_or("1").to_string();
+                let voice = optional_child_text("voice").unwrap_or("1").to_string();
+                declared_staff_ids.insert(staff.clone());
+                declared_voices.insert((staff, voice));
+            }
+        }
+        for staff in 1..=declared_staff_count {
+            declared_staff_ids.insert(staff.to_string());
+        }
+        declared_parts.push(SourcePart {
+            id: part_id.clone(),
+            name: info.name.clone(),
+            source_track_ids: Vec::new(),
+            staves: declared_staff_ids
+                .into_iter()
+                .map(|staff_id| SourceStaff {
+                    voices: declared_voices
+                        .iter()
+                        .filter(|(voice_staff, _)| voice_staff == &staff_id)
+                        .map(|(_, number)| SourceVoice {
+                            id: format!("{part_id}:staff:{staff_id}:voice:{number}"),
+                            number: number.clone(),
+                            projection_track_ids: Vec::new(),
+                        })
+                        .collect(),
+                    id: staff_id,
+                })
+                .collect(),
+        });
         let mut divisions_at_measure = Vec::with_capacity(measures.len());
         let mut carried_divisions = 1u32;
         for measure in &measures {
@@ -1476,11 +1532,26 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
     if tracks.is_empty() {
         return Err("no usable part in the MusicXML".into());
     }
+    let mut undeclared_content_parts = part_info
+        .iter()
+        .filter(|(part_id, _)| !declared_parts.iter().any(|part| &part.id == *part_id))
+        .collect::<Vec<_>>();
+    undeclared_content_parts.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (part_id, info) in undeclared_content_parts {
+        declared_parts.push(SourcePart {
+            id: part_id.clone(),
+            name: info.name.clone(),
+            source_track_ids: Vec::new(),
+            staves: Vec::new(),
+        });
+    }
+    let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
     Ok(Midi {
         ticks_per_beat: tpb,
         time_base: TimeBase::PulsesPerQuarter(tpb),
         format: 1,
         source_format: SourceFormat::MusicXml,
+        topology,
         tracks,
     })
 }
@@ -2015,8 +2086,14 @@ mod tests {
 </score-partwise>"#;
         let midi = parse(xml.as_bytes()).unwrap();
         assert_eq!(midi.tracks.len(), 2);
+        assert_eq!(midi.topology.part_count(), 1);
+        assert_eq!(midi.topology.staff_count(), 1);
+        assert_eq!(midi.topology.voice_count(), 1);
+        assert_eq!(midi.topology.projection_lane_count(), 2);
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
+        assert_eq!(outcome.n_tracks, 1);
+        assert_eq!(outcome.topology, midi.topology);
         let project = outcome.svp.unwrap();
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes.len(), 1);
@@ -2231,6 +2308,13 @@ mod tests {
             .iter()
             .flat_map(|track| &track.events)
             .any(|event| matches!(event.kind, Kind::Tempo(_))));
+        assert_eq!(midi.topology.part_count(), 2);
+        assert_eq!(midi.topology.parts[0].name, "Rest staff");
+        assert_eq!(midi.topology.parts[0].staves.len(), 1);
+        assert_eq!(midi.topology.parts[0].staves[0].voices.len(), 1);
+        assert!(midi.topology.parts[0].staves[0].voices[0]
+            .projection_track_ids
+            .is_empty());
     }
 
     #[test]

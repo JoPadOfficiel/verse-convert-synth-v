@@ -1,6 +1,7 @@
 //! MIDI -> Synthesizer V conversion logic. 1:1 port of kar2svp_core.py.
 use crate::engine::midi::{
-    self, Kind, LineBreak, Lyric, Midi, MidiTextProfile, NoteOn, TimeBase, Track, TrackRoleHint,
+    self, Kind, LineBreak, Lyric, Midi, MidiTextProfile, NoteOn, SourceTopology, TimeBase, Track,
+    TrackRoleHint,
 };
 use crate::engine::svp::*;
 use serde::Serialize;
@@ -87,6 +88,7 @@ pub struct ConvertOutcome {
     pub ok: bool,
     pub msg: Option<String>,
     pub svp: Option<SvpProject>,
+    pub topology: SourceTopology,
     pub tracks: Vec<TrackReport>,
     pub n_tracks: usize,
     pub placed: usize,
@@ -243,16 +245,23 @@ struct TimedLyric {
     tick: u32,
     order: u32,
     lyric: Lyric,
+    origin: TimedLyricOrigin,
 }
 
-fn karaoke_text_lyric(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimedLyricOrigin {
+    MidiLyric,
+    KaraokeText,
+}
+
+pub(crate) fn karaoke_text_lyric(
     track_id: &str,
     tick: u32,
     order: u32,
     text: &midi::TextEvent,
 ) -> Option<Lyric> {
     let raw = text.text.as_str();
-    if raw.starts_with('@') {
+    if midi::is_soft_karaoke_text_control(raw) {
         return None;
     }
     let (line_break, value) = if let Some(rest) = raw.strip_prefix('\\') {
@@ -262,9 +271,6 @@ fn karaoke_text_lyric(
     } else {
         (None, raw)
     };
-    if value.is_empty() {
-        return None;
-    }
     let mut lyric = Lyric::text(format!("{track_id}-text-{tick}-{order}"), value.to_string());
     lyric.raw = raw.to_string();
     lyric.raw_bytes = text.raw.clone();
@@ -277,12 +283,15 @@ fn karaoke_text_lyric(
 fn track_tokens(track: &Track) -> Vec<TimedLyric> {
     let mut tokens = Vec::new();
     for event in &track.events {
-        let lyric = match &event.kind {
-            Kind::Lyrics(lyric) => Some(lyric.clone()),
-            Kind::Text(text) if track.text_profile == MidiTextProfile::KaraokeLyrics => {
-                karaoke_text_lyric(&track.id, event.tick, event.order, text)
+        let (lyric, origin) = match &event.kind {
+            Kind::Lyrics(lyric) if !midi::is_midi_lyric_line_break(&lyric.raw) => {
+                (Some(lyric.clone()), TimedLyricOrigin::MidiLyric)
             }
-            _ => None,
+            Kind::Text(text) if track.text_profile == MidiTextProfile::KaraokeLyrics => (
+                karaoke_text_lyric(&track.id, event.tick, event.order, text),
+                TimedLyricOrigin::KaraokeText,
+            ),
+            _ => (None, TimedLyricOrigin::MidiLyric),
         };
         if let Some(lyric) = lyric {
             tokens.push(TimedLyric {
@@ -290,6 +299,7 @@ fn track_tokens(track: &Track) -> Vec<TimedLyric> {
                 tick: event.tick,
                 order: event.order,
                 lyric,
+                origin,
             });
         }
     }
@@ -297,13 +307,35 @@ fn track_tokens(track: &Track) -> Vec<TimedLyric> {
     tokens
 }
 
-fn read_tempo(midi: &Midi, bpt: f64) -> (Vec<Tempo>, BTreeSet<String>) {
+const BLICKS_PER_QUARTER_INTEGER: u64 = 705_600_000;
+
+fn exact_blick_position(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i64, String> {
+    if ticks_per_beat == 0 {
+        return Err("MIDI PPQ division must be non-zero".into());
+    }
+    let numerator = u128::from(ticks) * u128::from(BLICKS_PER_QUARTER_INTEGER);
+    let denominator = u128::from(ticks_per_beat);
+    if numerator % denominator != 0 {
+        return Err(format!(
+            "{context} at MIDI tick {ticks} cannot be represented exactly in Synthesizer V blicks \
+             with PPQ {ticks_per_beat}"
+        ));
+    }
+    i64::try_from(numerator / denominator)
+        .map_err(|_| format!("{context} exceeds the Synthesizer V blick range"))
+}
+
+fn read_tempo(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Tempo>, BTreeSet<String>), String> {
     let mut seen: BTreeMap<i64, (f64, String)> = BTreeMap::new();
     for track in &midi.tracks {
         for event in &track.events {
             if let Kind::Tempo(us) = event.kind {
                 if us > 0 {
-                    let pos = (event.tick as f64 * bpt).round() as i64;
+                    let pos = exact_blick_position(
+                        event.tick,
+                        ticks_per_beat,
+                        &format!("tempo event {}:{}", track.id, event.order),
+                    )?;
                     let bpm = (60_000_000.0 / us as f64 * 1e6).round() / 1e6;
                     seen.insert(pos, (bpm, format!("event:{}:{}", track.id, event.order)));
                 }
@@ -311,20 +343,20 @@ fn read_tempo(midi: &Midi, bpt: f64) -> (Vec<Tempo>, BTreeSet<String>) {
         }
     }
     if seen.is_empty() {
-        return (
+        return Ok((
             vec![Tempo {
                 bpm: 120.0,
                 position: 0,
             }],
             BTreeSet::new(),
-        );
+        ));
     }
     let evidence = seen.values().map(|(_, id)| id.clone()).collect();
     let tempo = seen
         .into_iter()
         .map(|(position, (bpm, _))| Tempo { bpm, position })
         .collect();
-    (tempo, evidence)
+    Ok((tempo, evidence))
 }
 
 fn read_meter(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Meter>, BTreeSet<String>), String> {
@@ -466,9 +498,9 @@ fn make_track(
     idx: usize,
     name: &str,
     notes: &[SourceNote],
-    bpt: f64,
+    ticks_per_beat: u16,
     projection: TrackProjection<'_>,
-) -> SvpTrack {
+) -> Result<SvpTrack, String> {
     let mut svp_notes = Vec::with_capacity(notes.len());
     let mut explicit_extension_end = None;
     let mut musicxml_extension_open = false;
@@ -551,16 +583,29 @@ fn make_track(
             "event:{}:{}",
             projection.source_track_id, source_note.end_order
         ));
+        let onset = exact_blick_position(
+            source_note.onset,
+            ticks_per_beat,
+            &format!("note onset on source track {}", projection.source_track_id),
+        )?;
+        let duration = exact_blick_position(
+            source_note.duration,
+            ticks_per_beat,
+            &format!(
+                "note duration on source track {}",
+                projection.source_track_id
+            ),
+        )?;
         svp_notes.push(Note {
             attributes: serde_json::json!({}),
-            duration: (source_note.duration as f64 * bpt).round() as i64,
+            duration,
             lyrics: lyric,
-            onset: (source_note.onset as f64 * bpt).round() as i64,
+            onset,
             phonemes: String::new(),
             pitch,
         });
     }
-    build_track(idx, name.to_string(), svp_notes)
+    Ok(build_track(idx, name.to_string(), svp_notes))
 }
 
 /// Detects the format (MIDI / MusicXML / MuseScore) and converts.
@@ -580,6 +625,7 @@ pub fn convert_auto_with(
         ok: false,
         msg: Some(m),
         svp: None,
+        topology: SourceTopology::default(),
         tracks: vec![],
         n_tracks: 0,
         placed: 0,
@@ -629,6 +675,7 @@ pub fn convert_bytes(data: &[u8], language: &str) -> ConvertOutcome {
                 ok: false,
                 msg: Some(format!("unreadable file ({})", e)),
                 svp: None,
+                topology: SourceTopology::default(),
                 tracks: vec![],
                 n_tracks: 0,
                 placed: 0,
@@ -657,6 +704,9 @@ pub fn convert_midi_with(
         ok: false,
         msg: Some(msg),
         svp: None,
+        // Parsing succeeded, so a projection refusal must not erase the
+        // source Part/staff/voice evidence from diagnostics or manifests.
+        topology: midi.topology.clone(),
         tracks: vec![],
         n_tracks: 0,
         placed: 0,
@@ -690,7 +740,6 @@ pub fn convert_midi_with(
             "MIDI format 2 contains independent sequences and cannot be flattened safely".into(),
         );
     }
-    let bpt = BLICKS_PER_QUARTER / f64::from(tpb);
     let (meter, meter_evidence) = match read_meter(midi, tpb) {
         Ok(meter) => meter,
         Err(error) => {
@@ -702,25 +751,35 @@ pub fn convert_midi_with(
     let mut report: Vec<TrackReport> = Vec::new();
     let mut total_placed = 0usize;
     let mut projection = ProjectionEvidence::default();
+    let notes_by_track: Vec<_> = midi.tracks.iter().map(extract_notes).collect();
+    let tokens_by_track: Vec<_> = midi.tracks.iter().map(track_tokens).collect();
+    let external = resolve_external_lyrics(midi, &notes_by_track, &tokens_by_track, tpb);
 
     for (index, track) in midi.tracks.iter().enumerate() {
-        let notes = extract_notes(track);
+        let notes = &notes_by_track[index];
         let source_note_count = source_note_count(track);
-        let own_tokens = track_tokens(track);
+        let own_tokens = &tokens_by_track[index];
+        let source_binding = external.binding_for_source(index);
+        let source_binding_active = source_binding.filter(|binding| {
+            overrides.and_then(|map| map.get(&binding.target_track).copied()) != Some(false)
+        });
+        let source_projected = source_binding_active
+            .map(|binding| binding.assignment.len())
+            .unwrap_or_default();
         let name = if track.name.is_empty() {
             format!("Track {}", track.source.source_track)
         } else {
             track.name.clone()
         };
         if notes.is_empty() {
-            let lyric_status = lyric_status(track, 0);
+            let lyric_status = lyric_status(track, source_projected);
             let source_role = source_role(
                 track,
                 !own_tokens.is_empty(),
                 source_note_count,
                 &lyric_status,
             );
-            let warnings = track_warnings(
+            let mut warnings = track_warnings(
                 track,
                 &lyric_status,
                 source_role,
@@ -728,6 +787,13 @@ pub fn convert_midi_with(
                 0,
                 !own_tokens.is_empty(),
                 overrides.and_then(|map| map.get(&index).copied()),
+            );
+            append_external_warnings(
+                &mut warnings,
+                midi,
+                &external,
+                index,
+                source_binding_active.is_some(),
             );
             report.push(TrackReport {
                 id: index,
@@ -748,12 +814,21 @@ pub fn convert_midi_with(
             });
             continue;
         }
-        let lanes = attached_lanes(&notes);
+        let lanes = attached_lanes(notes);
         let attached = !lanes.is_empty();
-        let assignment = if track.text_profile == MidiTextProfile::KaraokeLyrics {
-            karaoke_assignment(&own_tokens, &notes, tpb)
+        let target_binding = external.binding_for_target(index).filter(|binding| {
+            overrides.and_then(|map| map.get(&binding.target_track).copied()) != Some(false)
+        });
+        let assignment = if let Some(binding) = target_binding {
+            binding.assignment.clone()
+        } else if source_binding_active.is_some() {
+            // The source tokens have proven ownership on another track. Do
+            // not also duplicate them onto this track's unrelated notes.
+            HashMap::new()
+        } else if track.text_profile == MidiTextProfile::KaraokeLyrics {
+            karaoke_assignment(own_tokens, notes, tpb)
         } else {
-            exact_assignment(&own_tokens, &notes)
+            exact_assignment(own_tokens, notes)
         };
 
         let source_vocal = attached || !assignment.is_empty();
@@ -762,19 +837,24 @@ pub fn convert_midi_with(
         let mut placed = 0usize;
         if sing {
             if lanes.is_empty() {
-                placed = projected_lyric_count(&notes, None, &assignment);
-                let mut svp_track = make_track(
+                placed = projected_lyric_count(notes, None, &assignment);
+                let mut svp_track = match make_track(
                     svp_tracks.len(),
                     &name,
-                    &notes,
-                    bpt,
+                    notes,
+                    tpb,
                     TrackProjection {
                         source_track_id: &track.id,
                         lane: None,
                         standalone: &assignment,
                         evidence: &mut projection,
                     },
-                );
+                ) {
+                    Ok(track) => track,
+                    Err(error) => {
+                        return fail(format!("source timing cannot be projected safely: {error}"));
+                    }
+                };
                 if !svp_track.main_group.notes.is_empty() {
                     svp_track.main_ref.database.language = language.to_string();
                     svp_tracks.push(svp_track);
@@ -782,24 +862,31 @@ pub fn convert_midi_with(
             } else {
                 let no_assignment = HashMap::new();
                 for lane in &lanes {
-                    placed += projected_lyric_count(&notes, Some(lane), &no_assignment);
+                    placed += projected_lyric_count(notes, Some(lane), &no_assignment);
                     let lane_name = if lanes.len() == 1 {
                         name.clone()
                     } else {
                         format!("{name} — lyric lane {lane}")
                     };
-                    let mut svp_track = make_track(
+                    let mut svp_track = match make_track(
                         svp_tracks.len(),
                         &lane_name,
-                        &notes,
-                        bpt,
+                        notes,
+                        tpb,
                         TrackProjection {
                             source_track_id: &track.id,
                             lane: Some(lane),
                             standalone: &no_assignment,
                             evidence: &mut projection,
                         },
-                    );
+                    ) {
+                        Ok(track) => track,
+                        Err(error) => {
+                            return fail(format!(
+                                "source timing cannot be projected safely: {error}"
+                            ));
+                        }
+                    };
                     if !svp_track.main_group.notes.is_empty() {
                         svp_track.main_ref.database.language = language.to_string();
                         svp_tracks.push(svp_track);
@@ -808,12 +895,16 @@ pub fn convert_midi_with(
             }
         }
         total_placed += placed;
-        let projectable_notes = notes
-            .iter()
-            .filter(|note| note.pitch.is_some() && note.duration > 0)
-            .count();
+        let projectable_notes = projectable_note_count(notes);
         let standalone_with_attached_lanes = attached && !own_tokens.is_empty();
-        let mut lyric_status = lyric_status(track, placed);
+        let status_projected = if source_binding_active.is_some() {
+            source_projected
+        } else if target_binding.is_some() {
+            0
+        } else {
+            placed
+        };
+        let mut lyric_status = lyric_status(track, status_projected);
         if standalone_with_attached_lanes {
             lyric_status.state = LyricStatusState::Ambiguous;
         }
@@ -832,6 +923,13 @@ pub fn convert_midi_with(
             projectable_notes,
             source_vocal,
             explicit_override,
+        );
+        append_external_warnings(
+            &mut warnings,
+            midi,
+            &external,
+            index,
+            source_binding_active.is_some() || target_binding.is_some(),
         );
         if standalone_with_attached_lanes {
             warnings.push(report_warning(
@@ -881,7 +979,12 @@ pub fn convert_midi_with(
         track.disp_color = COLORS[display_order % COLORS.len()].to_string();
     }
 
-    let (tempo, tempo_evidence) = read_tempo(midi, bpt);
+    let (tempo, tempo_evidence) = match read_tempo(midi, tpb) {
+        Ok(tempo) => tempo,
+        Err(error) => {
+            return fail(format!("source timing cannot be projected safely: {error}"));
+        }
+    };
     projection.source_ids.extend(meter_evidence);
     projection.source_ids.extend(tempo_evidence);
     let svp = SvpProject {
@@ -890,11 +993,12 @@ pub fn convert_midi_with(
         render_config: RenderConfig::default(),
         tracks: svp_tracks,
     };
-    let n_tracks = report.len();
+    let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
         ok: true,
         msg: None,
         svp: Some(svp),
+        topology: midi.topology.clone(),
         tracks: report,
         n_tracks,
         placed: total_placed,
@@ -969,6 +1073,221 @@ fn karaoke_assignment(
     assignment
 }
 
+#[derive(Clone, Debug)]
+struct ExternalLyricBinding {
+    source_track: usize,
+    target_track: usize,
+    assignment: HashMap<usize, TimedLyric>,
+    chord_ambiguities: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalLyricStatus {
+    Bound {
+        target_track: usize,
+        chord_ambiguities: usize,
+    },
+    NoCompleteCandidate,
+    AmbiguousCandidates {
+        count: usize,
+    },
+    TargetClaimConflict,
+}
+
+#[derive(Default)]
+struct ExternalLyricResolution {
+    bindings: Vec<ExternalLyricBinding>,
+    status_by_source: HashMap<usize, ExternalLyricStatus>,
+}
+
+impl ExternalLyricResolution {
+    fn binding_for_source(&self, source_track: usize) -> Option<&ExternalLyricBinding> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.source_track == source_track)
+    }
+
+    fn binding_for_target(&self, target_track: usize) -> Option<&ExternalLyricBinding> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.target_track == target_track)
+    }
+}
+
+/// Resolve a lyrics-only KAR stream against source melody notes. A binding is
+/// accepted only when every real token maps monotonically and injectively,
+/// exactly one non-percussion candidate satisfies that contract, and no other
+/// lyric stream claims the same target. Track names and GM programs never
+/// participate in the decision.
+fn resolve_external_lyrics(
+    midi: &Midi,
+    notes_by_track: &[Vec<SourceNote>],
+    tokens_by_track: &[Vec<TimedLyric>],
+    ticks_per_beat: u16,
+) -> ExternalLyricResolution {
+    // Cross-track lyric ownership is a narrowly qualified KAR repair. Plain
+    // MIDI, MusicXML, and MuseScore lyrics remain owned by their source lane;
+    // rebinding them would invent score semantics that those formats did not
+    // declare.
+    if midi.source_format != midi::SourceFormat::KaraokeMidi {
+        return ExternalLyricResolution::default();
+    }
+
+    let mut resolution = ExternalLyricResolution::default();
+    let mut proposals = Vec::new();
+
+    for (source_index, tokens) in tokens_by_track.iter().enumerate() {
+        if tokens.is_empty() {
+            continue;
+        }
+        let has_text = tokens
+            .iter()
+            .any(|token| token.origin == TimedLyricOrigin::KaraokeText);
+        let has_midi_lyric = tokens
+            .iter()
+            .any(|token| token.origin == TimedLyricOrigin::MidiLyric);
+        if has_text && has_midi_lyric {
+            resolution.status_by_source.insert(
+                source_index,
+                ExternalLyricStatus::AmbiguousCandidates { count: 0 },
+            );
+            continue;
+        }
+
+        // Qualified KAR Text can be transferred only from a lyrics-only
+        // source track. A genuine MIDI Lyric stream may coexist with notes,
+        // but it stays on its own track when that track already gives a full
+        // source-owned assignment.
+        if has_text && projectable_note_count(&notes_by_track[source_index]) > 0 {
+            continue;
+        }
+        if has_midi_lyric {
+            let owned = karaoke_assignment(tokens, &notes_by_track[source_index], ticks_per_beat);
+            if !tokens.is_empty() && owned.len() == tokens.len() {
+                continue;
+            }
+        }
+
+        let mut candidates = Vec::new();
+        for (target_index, notes) in notes_by_track.iter().enumerate() {
+            if target_index == source_index
+                || projectable_note_count(notes) < tokens.len()
+                || is_percussion_candidate(&midi.tracks[target_index])
+                || !tokens_by_track[target_index].is_empty()
+                || !attached_lanes(notes).is_empty()
+            {
+                continue;
+            }
+            let assignment = karaoke_assignment(tokens, notes, ticks_per_beat);
+            if assignment.len() == tokens.len() {
+                candidates.push((target_index, assignment));
+            }
+        }
+
+        match candidates.len() {
+            0 => {
+                resolution
+                    .status_by_source
+                    .insert(source_index, ExternalLyricStatus::NoCompleteCandidate);
+            }
+            1 => {
+                let (target_track, mut assignment) =
+                    candidates.pop().expect("one candidate was measured");
+                let chord_ambiguities =
+                    remove_chord_ambiguities(&mut assignment, &notes_by_track[target_track]);
+                proposals.push(ExternalLyricBinding {
+                    source_track: source_index,
+                    target_track,
+                    assignment,
+                    chord_ambiguities,
+                });
+            }
+            count => {
+                resolution.status_by_source.insert(
+                    source_index,
+                    ExternalLyricStatus::AmbiguousCandidates { count },
+                );
+            }
+        }
+    }
+
+    let mut claims: HashMap<usize, usize> = HashMap::new();
+    for proposal in &proposals {
+        *claims.entry(proposal.target_track).or_default() += 1;
+    }
+    for proposal in proposals {
+        if claims.get(&proposal.target_track).copied() != Some(1) {
+            resolution.status_by_source.insert(
+                proposal.source_track,
+                ExternalLyricStatus::TargetClaimConflict,
+            );
+            continue;
+        }
+        resolution.status_by_source.insert(
+            proposal.source_track,
+            ExternalLyricStatus::Bound {
+                target_track: proposal.target_track,
+                chord_ambiguities: proposal.chord_ambiguities,
+            },
+        );
+        resolution.bindings.push(proposal);
+    }
+    resolution
+}
+
+fn projectable_note_count(notes: &[SourceNote]) -> usize {
+    notes
+        .iter()
+        .filter(|note| note.pitch.is_some() && note.duration > 0)
+        .count()
+}
+
+fn is_percussion_candidate(track: &Track) -> bool {
+    matches!(
+        track.role_hint,
+        TrackRoleHint::Percussion | TrackRoleHint::Mixed
+    ) || track
+        .instruments
+        .iter()
+        .any(|instrument| instrument.percussion || instrument.channel == Some(9))
+        || track.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                Kind::NoteOn(note)
+                    if note.velocity != Some(0)
+                        && (note.channel == Some(9) || note.source.unpitched.is_some())
+            )
+        })
+}
+
+fn remove_chord_ambiguities(
+    assignment: &mut HashMap<usize, TimedLyric>,
+    notes: &[SourceNote],
+) -> usize {
+    let mut notes_per_onset: HashMap<u32, usize> = HashMap::new();
+    for note in notes
+        .iter()
+        .filter(|note| note.pitch.is_some() && note.duration > 0)
+    {
+        *notes_per_onset.entry(note.onset).or_default() += 1;
+    }
+    let ambiguous: Vec<usize> = assignment
+        .keys()
+        .copied()
+        .filter(|index| {
+            notes_per_onset
+                .get(&notes[*index].onset)
+                .copied()
+                .unwrap_or_default()
+                > 1
+        })
+        .collect();
+    for index in &ambiguous {
+        assignment.remove(index);
+    }
+    ambiguous.len()
+}
+
 fn projected_lyric_count(
     notes: &[SourceNote],
     lane: Option<&str>,
@@ -1025,7 +1344,7 @@ fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
                     count(lyric);
                 }
             }
-            Kind::Lyrics(lyric) => count(lyric),
+            Kind::Lyrics(lyric) if !midi::is_midi_lyric_line_break(&lyric.raw) => count(lyric),
             Kind::Text(_) if track.text_profile == MidiTextProfile::Generic => {
                 generic_text_count += 1
             }
@@ -1166,6 +1485,104 @@ fn track_warnings(
     warnings
 }
 
+fn append_external_warnings(
+    warnings: &mut Vec<Diagnostic>,
+    midi: &Midi,
+    resolution: &ExternalLyricResolution,
+    track_index: usize,
+    binding_active: bool,
+) {
+    let track = &midi.tracks[track_index];
+    let control_count = track
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                Kind::Lyrics(lyric) if midi::is_midi_lyric_line_break(&lyric.raw)
+            ) || matches!(
+                &event.kind,
+                Kind::Text(text)
+                    if track.text_profile != MidiTextProfile::Generic
+                        && midi::is_soft_karaoke_text_control(&text.text)
+            )
+        })
+        .count();
+    if control_count > 0 {
+        warnings.push(report_warning(
+            "KARAOKE_CONTROLS_PRESERVED_AS_METADATA",
+            DiagnosticSeverity::Info,
+            format!(
+                "{control_count} karaoke control record(s) were preserved as metadata and not sung."
+            ),
+            &track.id,
+        ));
+    }
+
+    if let Some(status) = resolution.status_by_source.get(&track_index) {
+        match status {
+            ExternalLyricStatus::Bound {
+                target_track,
+                chord_ambiguities,
+            } if binding_active => {
+                warnings.push(report_warning(
+                    "EXTERNAL_KARAOKE_LYRICS_BOUND",
+                    DiagnosticSeverity::Info,
+                    format!(
+                        "The complete source lyric stream was bound to source track {} by timing evidence.",
+                        midi.tracks[*target_track].id
+                    ),
+                    &track.id,
+                ));
+                if *chord_ambiguities > 0 {
+                    warnings.push(report_warning(
+                        "KARAOKE_CHORD_PITCH_AMBIGUOUS",
+                        DiagnosticSeverity::Warning,
+                        format!(
+                            "{chord_ambiguities} lyric item(s) coincide with multi-pitch chord onsets and remain source-only."
+                        ),
+                        &track.id,
+                    ));
+                }
+            }
+            ExternalLyricStatus::Bound { .. } => {}
+            ExternalLyricStatus::NoCompleteCandidate => warnings.push(report_warning(
+                "EXTERNAL_KARAOKE_LYRICS_UNRESOLVED",
+                DiagnosticSeverity::Warning,
+                "No source melody track matched every lyric token; the stream remains source-only.",
+                &track.id,
+            )),
+            ExternalLyricStatus::AmbiguousCandidates { count } => warnings.push(report_warning(
+                "EXTERNAL_KARAOKE_LYRICS_AMBIGUOUS",
+                DiagnosticSeverity::Warning,
+                format!(
+                    "{count} complete melody candidate(s) were found without unique ownership; the stream remains source-only."
+                ),
+                &track.id,
+            )),
+            ExternalLyricStatus::TargetClaimConflict => warnings.push(report_warning(
+                "EXTERNAL_KARAOKE_TARGET_CONFLICT",
+                DiagnosticSeverity::Warning,
+                "Multiple lyric streams claim the same melody track; all remain source-only.",
+                &track.id,
+            )),
+        }
+    }
+    if binding_active {
+        if let Some(binding) = resolution.binding_for_target(track_index) {
+            warnings.push(report_warning(
+                "EXTERNAL_KARAOKE_MELODY_TARGET",
+                DiagnosticSeverity::Info,
+                format!(
+                    "Vocal lyrics are source-owned by track {} and were bound here by complete monotonic timing.",
+                    midi.tracks[binding.source_track].id
+                ),
+                &track.id,
+            ));
+        }
+    }
+}
+
 fn attached_lanes(notes: &[SourceNote]) -> BTreeSet<String> {
     notes
         .iter()
@@ -1183,8 +1600,15 @@ mod tests {
             time_base: TimeBase::PulsesPerQuarter(480),
             format: 1,
             source_format: midi::SourceFormat::StandardMidi,
+            topology: midi::SourceTopology::from_tracks(&tracks),
             tracks,
         }
+    }
+
+    fn kar_with(tracks: Vec<Track>) -> Midi {
+        let mut midi = midi_with(tracks);
+        midi.source_format = midi::SourceFormat::KaraokeMidi;
+        midi
     }
 
     fn note_events(
@@ -1220,6 +1644,57 @@ mod tests {
                 }),
             ),
         ]
+    }
+
+    fn pitched_track(id: &str, notes: &[(u32, u32, u8, u8)]) -> Track {
+        let mut track = Track::new(id, 0);
+        track.name = id.into();
+        for (index, (onset, duration, pitch, channel)) in notes.iter().copied().enumerate() {
+            let source_id = format!("{id}-note-{index}");
+            let order = u32::try_from(index * 2).expect("test order fits");
+            track.events.push(midi::Event::new(
+                onset,
+                order,
+                Kind::NoteOn(NoteOn {
+                    channel: Some(channel),
+                    key: Some(pitch),
+                    velocity: Some(90),
+                    source: midi::NoteSource {
+                        id: source_id.clone(),
+                        ..midi::NoteSource::default()
+                    },
+                    lyrics: Vec::new(),
+                }),
+            ));
+            track.events.push(midi::Event::new(
+                onset + duration,
+                order + 1,
+                Kind::NoteOff(midi::NoteOff {
+                    channel: Some(channel),
+                    key: Some(pitch),
+                    velocity: Some(0),
+                    source_id: Some(source_id),
+                }),
+            ));
+        }
+        track
+    }
+
+    fn karaoke_text_track(id: &str, values: &[(u32, &str)]) -> Track {
+        let mut track = Track::new(id, 0);
+        track.name = id.into();
+        track.text_profile = MidiTextProfile::KaraokeLyrics;
+        for (order, (tick, value)) in values.iter().enumerate() {
+            track.events.push(midi::Event::new(
+                *tick,
+                u32::try_from(order).expect("test order fits"),
+                Kind::Text(midi::TextEvent {
+                    text: (*value).into(),
+                    raw: value.as_bytes().to_vec(),
+                }),
+            ));
+        }
+        track
     }
 
     #[test]
@@ -1342,6 +1817,7 @@ mod tests {
             .msg
             .as_deref()
             .is_some_and(|message| message.contains("cannot be projected safely")));
+        assert_eq!(outcome.topology, midi.topology);
     }
 
     #[test]
@@ -1375,7 +1851,8 @@ mod tests {
             ),
         ];
         let midi = midi_with(vec![first, second]);
-        let (tempo, tempo_evidence) = read_tempo(&midi, BLICKS_PER_QUARTER / 480.0);
+        let (tempo, tempo_evidence) =
+            read_tempo(&midi, 480).expect("tick zero is exactly representable");
         let (meter, meter_evidence) =
             read_meter(&midi, 480).expect("same-tick meter changes are bar-aligned");
         assert_eq!(tempo.len(), 1);
@@ -1389,6 +1866,23 @@ mod tests {
             meter_evidence,
             BTreeSet::from(["event:second:1".to_string()])
         );
+    }
+
+    #[test]
+    fn inexact_svp_blick_positions_fail_instead_of_rounding() {
+        let mut track = Track::new("voice", 0);
+        track.events = note_events("voice", 1, 1, vec![Lyric::text("word", "word".into())]);
+        let mut midi = midi_with(vec![track]);
+        midi.ticks_per_beat = 1024;
+        midi.time_base = TimeBase::PulsesPerQuarter(1024);
+
+        let outcome = convert_midi(&midi, "english");
+        assert!(!outcome.ok);
+        assert!(outcome.svp.is_none());
+        assert!(outcome.msg.as_deref().is_some_and(|message| {
+            message.contains("cannot be represented exactly in Synthesizer V blicks")
+        }));
+        assert_eq!(outcome.topology, midi.topology);
     }
 
     #[test]
@@ -1459,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn vocal_override_never_copies_lyrics_from_another_track() {
+    fn unique_complete_external_lyric_stream_binds_without_name_evidence() {
         let mut lyrics = Track::new("lyrics", 0);
         lyrics.events.push(midi::Event::new(
             0,
@@ -1470,38 +1964,78 @@ mod tests {
         melody.name = "Soprano Vocal Melody".into();
         melody.events = note_events("melody", 0, 480, Vec::new());
 
-        let midi = midi_with(vec![lyrics, melody]);
+        let midi = kar_with(vec![lyrics, melody]);
         let automatic = convert_midi(&midi, "english");
+        let project = automatic.svp.expect("conversion succeeds");
+        assert_eq!(project.tracks.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "let");
+        assert_eq!(automatic.placed, 1);
+        assert_eq!(automatic.tracks[1].role, "vocal");
+        assert_eq!(automatic.tracks[1].source_role, SourceRole::Vocal);
         assert!(automatic
-            .svp
-            .expect("conversion succeeds")
-            .tracks
-            .is_empty());
-        assert_eq!(automatic.tracks[1].role, "backing");
-        assert_eq!(automatic.tracks[1].source_role, SourceRole::Ambiguous);
-
-        let forced = convert_midi_with(&midi, "english", Some(&HashMap::from([(1usize, true)])));
-        let forced_project = forced.svp.expect("explicit override succeeds");
-        assert_eq!(forced_project.tracks.len(), 1);
-        assert_eq!(forced_project.tracks[0].main_group.notes[0].lyrics, "");
-        assert_eq!(forced.placed, 0);
-        assert!(!forced
             .projection
             .source_ids
             .contains("lyric:word:event:lyrics:0"));
         assert_eq!(
-            forced.tracks[1].source_role,
-            SourceRole::Ambiguous,
-            "an export override must never rewrite the source role"
-        );
-        assert_eq!(
-            forced.tracks[1].export_representation,
+            automatic.tracks[1].export_representation,
             ExportRepresentation::VocalNotesAndReferenceMix
         );
-        assert!(forced.tracks[1]
+        assert!(automatic.tracks[1]
             .warnings
             .iter()
-            .any(|warning| warning.code == "USER_VOCAL_OVERRIDE"));
+            .any(|warning| warning.code == "EXTERNAL_KARAOKE_MELODY_TARGET"));
+    }
+
+    #[test]
+    fn ordinary_midi_never_rebinds_a_detached_lyric_stream() {
+        let mut lyrics = Track::new("lyrics", 0);
+        lyrics.events.push(midi::Event::new(
+            0,
+            0,
+            Kind::Lyrics(Lyric::text("word", "let".into())),
+        ));
+        let melody = pitched_track("melody", &[(0, 480, 60, 0)]);
+
+        let outcome = convert_midi(&midi_with(vec![lyrics, melody]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(outcome.placed, 0);
+        assert!(project.tracks.is_empty());
+        assert!(!outcome
+            .projection
+            .source_ids
+            .contains("lyric:word:event:lyrics:0"));
+    }
+
+    #[test]
+    fn kar_binding_never_replaces_a_target_owned_lyric_stream() {
+        let mut detached = Track::new("detached", 0);
+        detached.events.push(midi::Event::new(
+            0,
+            0,
+            Kind::Lyrics(Lyric::text("detached-word", "external".into())),
+        ));
+        let mut melody = pitched_track("melody", &[(0, 480, 60, 0)]);
+        melody.events.insert(
+            0,
+            midi::Event::new(
+                0,
+                0,
+                Kind::Lyrics(Lyric::text("owned-word", "owned".into())),
+            ),
+        );
+        for (order, event) in melody.events.iter_mut().enumerate() {
+            event.order = order as u32;
+        }
+
+        let outcome = convert_midi(&kar_with(vec![detached, melody]), "english");
+        assert_eq!(outcome.placed, 1);
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(project.tracks.len(), 1);
+        assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "owned");
+        assert!(!outcome
+            .projection
+            .source_ids
+            .contains("lyric:detached-word:event:detached:0"));
     }
 
     #[test]
@@ -1522,7 +2056,7 @@ mod tests {
         melody.events = note_events("melody", 0, 480, Vec::new());
 
         let outcome = convert_midi_with(
-            &midi_with(vec![lyrics_a, lyrics_b, melody]),
+            &kar_with(vec![lyrics_a, lyrics_b, melody]),
             "english",
             Some(&HashMap::from([(2usize, true)])),
         );
@@ -1530,6 +2064,120 @@ mod tests {
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "");
         assert_eq!(outcome.placed, 0);
+    }
+
+    #[test]
+    fn soft_karaoke_controls_are_metadata_and_never_sung() {
+        let lyrics = karaoke_text_track(
+            "words",
+            &[(0, "\\let"), (120, "."), (240, "/...."), (480, "/it")],
+        );
+        let melody = pitched_track("melody", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
+
+        let outcome = convert_midi(&kar_with(vec![lyrics, melody]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(outcome.placed, 2);
+        assert_eq!(
+            project.tracks[0]
+                .main_group
+                .notes
+                .iter()
+                .map(|note| note.lyrics.as_str())
+                .collect::<Vec<_>>(),
+            vec!["let", "it"]
+        );
+        assert_eq!(outcome.tracks[0].lyric_status.source_text_count, 2);
+        assert!(outcome.tracks[0].warnings.iter().any(|warning| {
+            warning.code == "KARAOKE_CONTROLS_PRESERVED_AS_METADATA"
+                && warning.message.starts_with('2')
+        }));
+    }
+
+    #[test]
+    fn incomplete_or_non_unique_external_matches_remain_source_only() {
+        let partial_words =
+            karaoke_text_track("partial", &[(0, "\\one"), (480, "two"), (960, "three")]);
+        let partial_melody = pitched_track("short", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
+        let partial = convert_midi(&kar_with(vec![partial_words, partial_melody]), "english");
+        assert_eq!(partial.placed, 0);
+        assert!(partial.svp.expect("conversion succeeds").tracks.is_empty());
+
+        let ambiguous_words = karaoke_text_track("ambiguous", &[(0, "\\one"), (480, "two")]);
+        let first = pitched_track("first", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
+        let second = pitched_track("second", &[(0, 240, 65, 1), (480, 240, 67, 1)]);
+        let ambiguous = convert_midi(&kar_with(vec![ambiguous_words, first, second]), "english");
+        assert_eq!(ambiguous.placed, 0);
+        assert!(ambiguous
+            .svp
+            .expect("conversion succeeds")
+            .tracks
+            .is_empty());
+        assert!(ambiguous.tracks[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "EXTERNAL_KARAOKE_LYRICS_AMBIGUOUS"));
+    }
+
+    #[test]
+    fn percussion_candidates_are_excluded_and_chord_pitches_stay_unassigned() {
+        let percussion_words = karaoke_text_track("drum-words", &[(0, "\\hit")]);
+        let percussion = pitched_track("drums", &[(0, 240, 36, 9)]);
+        let rejected = convert_midi(&kar_with(vec![percussion_words, percussion]), "english");
+        assert_eq!(rejected.placed, 0);
+        assert!(rejected.svp.expect("conversion succeeds").tracks.is_empty());
+
+        let words = karaoke_text_track("words", &[(0, "\\one"), (480, "two")]);
+        let chord = pitched_track(
+            "melody",
+            &[(0, 240, 60, 0), (0, 240, 64, 0), (480, 240, 67, 0)],
+        );
+        let outcome = convert_midi(&kar_with(vec![words, chord]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(outcome.placed, 1);
+        assert_eq!(
+            project.tracks[0]
+                .main_group
+                .notes
+                .iter()
+                .filter(|note| note.lyrics == "two")
+                .count(),
+            1
+        );
+        assert!(project.tracks[0]
+            .main_group
+            .notes
+            .iter()
+            .filter(|note| note.onset == 0)
+            .all(|note| note.lyrics.is_empty()));
+        assert!(outcome.tracks[0].warnings.iter().any(|warning| {
+            warning.code == "KARAOKE_CHORD_PITCH_AMBIGUOUS" && warning.message.starts_with('1')
+        }));
+    }
+
+    #[test]
+    fn midi_lyric_line_breaks_are_controls_not_tokens() {
+        let mut lyrics = Track::new("lyrics", 0);
+        for (order, (tick, value)) in [(0, (0, "\r")), (1, (0, "let")), (2, (480, "it"))] {
+            lyrics.events.push(midi::Event::new(
+                tick,
+                order,
+                Kind::Lyrics(Lyric::text(format!("lyric-{order}"), value.into())),
+            ));
+        }
+        let melody = pitched_track("melody", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
+        let outcome = convert_midi(&kar_with(vec![lyrics, melody]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(outcome.placed, 2);
+        assert_eq!(
+            project.tracks[0]
+                .main_group
+                .notes
+                .iter()
+                .map(|note| note.lyrics.as_str())
+                .collect::<Vec<_>>(),
+            vec!["let", "it"]
+        );
+        assert_eq!(outcome.tracks[0].lyric_status.source_text_count, 2);
     }
 
     #[test]
@@ -1551,6 +2199,7 @@ mod tests {
             tick: 0,
             order: 0,
             lyric: Lyric::text("token", "word".into()),
+            origin: TimedLyricOrigin::KaraokeText,
         };
         let notes = vec![
             source_note("zero-duration", 0, 0, Some(60)),

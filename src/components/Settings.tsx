@@ -43,7 +43,7 @@ export function Settings({
       : rendererStatus.state === "available"
         ? `${rendererStatus.provider ?? "MuseScore"} ready${rendererStatus.version ? ` · ${rendererStatus.version}` : ""}`
         : rendererStatus.message ??
-          "MuseScore Studio 4 is required for complete bundles.";
+          "MuseScore Studio 3.6.2 or 4 with score-parts support is required for complete bundles.";
 
   return (
     <div className="flex flex-col gap-6">
@@ -101,13 +101,15 @@ export function Settings({
       </div>
 
       <div className="flex flex-col gap-2">
-        <Label htmlFor="renderer-path">MuseScore Studio 4 renderer</Label>
+        <Label htmlFor="renderer-path">
+          MuseScore Studio 3.6.2 / 4 renderer
+        </Label>
         <div className="flex items-center gap-2">
           <input
             id="renderer-path"
             value={rendererPath ?? ""}
             onChange={(event) => setRendererPath(event.target.value)}
-            placeholder="Auto-detect MuseScore Studio 4"
+            placeholder="Auto-detect MuseScore Studio 3.6.2 or 4"
             className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2 text-sm"
           />
           <Button
@@ -145,17 +147,18 @@ export function Settings({
         </p>
         <p className="text-xs text-muted-foreground">
           MuseScore is not bundled with Verse. Complete bundle export is
-          blocked when MuseScore Studio 4 cannot be detected or validated;
-          Verse never creates fake audio.
+          blocked when a compatible MuseScore 3.6.2 or 4 renderer cannot be
+          detected and its score-parts capability validated; Verse never
+          creates fake audio.
         </p>
       </div>
 
       <div className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
         A complete <code>.versebundle</code> contains the byte-identical source,
-        an auditable manifest, editable vocal notes and a real WAV of the
-        original full score. Assign a voice database in Synthesizer V to every
-        vocal track. The WAV is a reference mix, not a clean vocal-removed
-        accompaniment.
+        an auditable manifest, editable vocal notes, one real WAV stem per
+        source Part and a muted WAV of the original full score. Assign a voice
+        database in Synthesizer V to every vocal track. Vocal-reference stems
+        start muted; accompaniment stems start active.
       </div>
     </div>
   );

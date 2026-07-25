@@ -102,15 +102,21 @@ fn hound_dog_multitrack() {
         "every source track is inventoried"
     );
     assert_eq!(
-        automatic.placed, 0,
-        "a separate lyrics track must not be transferred by the `Lead Vox` name"
+        automatic.placed, 244,
+        "the complete lyrics stream must bind to its unique timing-compatible melody"
     );
-    assert!(automatic.tracks.iter().all(|track| track.role != "vocal"));
+    let automatic_vocal: Vec<_> = automatic
+        .tracks
+        .iter()
+        .filter(|track| track.role == "vocal")
+        .collect();
+    assert_eq!(automatic_vocal.len(), 1);
+    assert_eq!(automatic_vocal[0].placed, 244);
 
     let r = convert_midi_with(&parsed, "english", Some(&HashMap::from([(10usize, true)])));
     assert_eq!(
-        r.placed, 0,
-        "a vocal override exports only that track's source-owned lyrics; report: {:?}",
+        r.placed, 244,
+        "the proven external binding remains source-backed under an explicit override; report: {:?}",
         r.tracks
     );
     let vox = r
@@ -118,21 +124,21 @@ fn hound_dog_multitrack() {
         .iter()
         .find(|t| t.role == "vocal")
         .expect("one singing track");
-    assert_eq!(vox.placed, 0);
+    assert_eq!(vox.placed, 244);
     let svp = r.svp.unwrap();
-    for tr in &svp.tracks {
-        for n in &tr.main_group.notes {
-            assert!(
-                n.lyrics.is_empty(),
-                "the Words track must not be copied to Lead Vox"
-            );
-        }
-    }
+    assert_eq!(
+        svp.tracks
+            .iter()
+            .flat_map(|track| &track.main_group.notes)
+            .filter(|note| !note.lyrics.is_empty())
+            .count(),
+        244
+    );
 }
 
 #[test]
 #[ignore = "requires the private help.kar fixture"]
-fn help_kar_overrides_export_notes_without_copying_the_words_track() {
+fn help_kar_binds_words_only_to_the_unique_lead_track() {
     let data = read_fixture("help.kar");
     let parsed = midi::parse(&data).expect("valid KAR/SMF");
     let automatic = convert_midi_with(&parsed, "english", None);
@@ -142,9 +148,10 @@ fn help_kar_overrides_export_notes_without_copying_the_words_track() {
             .iter()
             .filter(|track| track.role == "vocal")
             .count(),
-        0,
-        "track names must never authorize a cross-track lyric transfer"
+        1,
+        "only the complete timing-compatible melody may receive the Words stream"
     );
+    assert_eq!(automatic.placed, 314);
     // The user may explicitly export Lead + Harm 1 + Harm 2 as vocal notes,
     // but that never transfers the separate Words track into them.
     let r = convert_midi_with(
@@ -173,7 +180,7 @@ fn help_kar_overrides_export_notes_without_copying_the_words_track() {
         .iter()
         .find(|t| t.track.contains("Lead"))
         .expect("Lead track");
-    assert_eq!(lead.placed, 0);
+    assert_eq!(lead.placed, 314);
     assert!(vocal
         .iter()
         .any(|t| t.track.contains("Harm 1") && t.placed == 0));
@@ -184,9 +191,18 @@ fn help_kar_overrides_export_notes_without_copying_the_words_track() {
     let svp = r.svp.unwrap();
     assert_eq!(svp.tracks.len(), 3);
     assert!(svp.tracks[0].name.contains("Lead") || svp.tracks[0].name.contains("Harm"));
+    assert_eq!(
+        svp.tracks
+            .iter()
+            .flat_map(|track| &track.main_group.notes)
+            .filter(|note| !note.lyrics.is_empty())
+            .count(),
+        314
+    );
     assert!(svp
         .tracks
         .iter()
+        .filter(|track| track.name.contains("Harm"))
         .flat_map(|track| &track.main_group.notes)
         .all(|note| note.lyrics.is_empty()));
 }
