@@ -7,6 +7,19 @@ entries are maintained by Release Please from Conventional Commits.
 
 ## [0.4.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.3.0...v0.4.0) (2026-07-25)
 
+
+### Features
+
+* preserve source parts and KAR lyrics ([bca0da7](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/bca0da7b32f60ad360a59642df9fca99a7623786))
+* source-faithful conversion, track decomposition and release 0.4.0 ([25b488a](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/25b488a4bc2018b35e22c70e6299b667e02f7227))
+
+
+### Bug Fixes
+
+* finalize conversion paths, documentation and release 0.4.0 ([9d20747](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/9d207471e992e17e2224d188b15dfeb9c24cf2e3))
+
+## [0.4.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.3.0...v0.4.0) (2026-07-25)
+
 ### Added
 
 - Preserve the original Part → staff → source voice → projection-lane
