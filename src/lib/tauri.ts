@@ -84,6 +84,24 @@ export type TrackInfo = {
   warnings: Diagnostic[];
 };
 
+export type PartInfo = {
+  sourceId: string;
+  part: string;
+  staves: number;
+  voices: number;
+  trackIds: number[];
+  vocalCandidateTrackIds: number[];
+  sourceTrackIds: string[];
+  notes: number;
+  placed: number;
+  sourceRole: SourceRole;
+  lyricStatus: LyricStatus;
+  exportRepresentation: ExportRepresentation;
+  requiresVoiceAssignment: boolean;
+  hasAudioStem: boolean;
+  warnings: Diagnostic[];
+};
+
 export type FileResult = {
   path: string;
   name: string;
@@ -91,8 +109,11 @@ export type FileResult = {
   error: CommandError | null;
   /** Compatibility value supplied by the backend. */
   msg: string | null;
+  nParts: number;
+  nVoices: number;
   nTracks: number;
   placed: number;
+  parts: PartInfo[];
   tracks: TrackInfo[];
   audioStatus: AudioStatus;
   requiresVoiceAssignment: boolean;
@@ -116,13 +137,17 @@ export type BundleResult = {
   bundlePath: string;
   projectPath: string;
   audioPath: string;
+  audioPaths: string[];
+  stemCount: number;
   sourcePath: string;
   manifestPath: string;
   renderer: {
     provider: string;
     version: string;
+    major: number;
     executableSha256: string;
     fullScoreMix: true;
+    capabilities: string[];
   };
   audioDurationSeconds: number;
   audioSampleRate: number;
@@ -153,7 +178,7 @@ export async function pickRenderer(): Promise<string | undefined> {
   const result = await open({
     directory: false,
     multiple: false,
-    title: "Choose the MuseScore Studio 4 executable",
+    title: "Choose a MuseScore Studio 3.6.2 or 4 executable",
   });
   return typeof result === "string" ? result : undefined;
 }

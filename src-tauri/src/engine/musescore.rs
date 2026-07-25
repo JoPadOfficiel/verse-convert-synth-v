@@ -2,13 +2,14 @@
 //! Produces the same intermediate `Midi` structure as the other parsers.
 //! Covers MuseScore 3.x / 4.x: Division, Part/Instrument/longName,
 //! Staff/Measure/voice, TimeSig, Tempo, Chord (dots, tuplets, graces),
-//! Rest (including full measures), location, lyrics (1st verse).
+//! Rest (including full measures), location, and all source lyric lanes.
 use crate::engine::midi::{
     unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricFragment, LyricState, MeasureMarks,
-    Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat, Syllabic, TimeBase, Track,
-    TrackRoleHint, TrackSource,
+    Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff,
+    SourceTopology, SourceVoice, Syllabic, TimeBase, Track, TrackRoleHint, TrackSource,
 };
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
 pub fn is_musescore_xml(data: &[u8]) -> bool {
     crate::engine::musicxml::xml_bytes_contain_ascii(data, b"<museScore")
@@ -29,18 +30,201 @@ pub fn zip_has_mscx(data: &[u8]) -> bool {
 
 pub fn parse(data: &[u8]) -> Result<Midi, String> {
     let xml = if data.len() >= 2 && &data[0..2] == b"PK" {
-        let mut zip =
-            zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
-        let name = (0..zip.len())
-            .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
-            .find(|n| n.ends_with(".mscx"))
-            .ok_or_else(|| "no .mscx in archive".to_string())?;
-        let mut f = zip.by_name(&name).map_err(|e| e.to_string())?;
-        crate::engine::musicxml::read_zip_entry_capped(&mut f)?
+        extract_mscz(data)?
     } else {
         crate::engine::musicxml::decode_xml_bytes(data)?
     };
     parse_mscx(&xml)
+}
+
+fn is_mscx_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mscx"))
+}
+
+fn validate_rootfile_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("MuseScore rootfile has an empty full-path".to_string());
+    }
+    // ZIP member names always use `/`. Rejecting `\` also prevents a
+    // Windows-style absolute or traversal path from appearing relative when
+    // this code runs on Unix.
+    if path.contains('\\') {
+        return Err(format!(
+            "MuseScore rootfile has an unsafe full-path: {path:?}"
+        ));
+    }
+    let bytes = path.as_bytes();
+    let has_windows_drive_prefix =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    let has_unsafe_segment = path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    let path_object = Path::new(path);
+    if has_windows_drive_prefix
+        || has_unsafe_segment
+        || path_object.is_absolute()
+        || path_object
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "MuseScore rootfile has an unsafe full-path: {path:?}"
+        ));
+    }
+    if !is_mscx_path(path) {
+        return Err(format!(
+            "MuseScore rootfile is not an .mscx score: {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn is_top_level_path(path: &str) -> bool {
+    Path::new(path).components().count() == 1
+}
+
+fn is_excerpt_path(path: &str) -> bool {
+    Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(segment)
+                if segment
+                    .to_str()
+                    .is_some_and(|segment| segment.eq_ignore_ascii_case("Excerpts"))
+        )
+    })
+}
+
+fn select_declared_master(container: &str) -> Result<String, String> {
+    let document = roxmltree::Document::parse_with_options(
+        container,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 100_000,
+        },
+    )
+    .map_err(|error| format!("invalid MuseScore container: {error}"))?;
+
+    let mut roots = Vec::new();
+    for rootfile in document
+        .descendants()
+        .filter(|node| node.has_tag_name("rootfile"))
+    {
+        let path = rootfile
+            .attribute("full-path")
+            .ok_or_else(|| "MuseScore rootfile has no full-path".to_string())?;
+        if is_mscx_path(path) {
+            validate_rootfile_path(path)?;
+            roots.push(path.to_string());
+        }
+    }
+    if roots.is_empty() {
+        return Err("MuseScore container has no .mscx rootfile".to_string());
+    }
+
+    let top_level: Vec<_> = roots
+        .iter()
+        .filter(|path| is_top_level_path(path) && !is_excerpt_path(path))
+        .collect();
+    if top_level.len() == 1 {
+        return Ok(top_level[0].clone());
+    }
+    if top_level.len() > 1 {
+        return Err("MuseScore container has ambiguous master .mscx rootfiles".to_string());
+    }
+
+    let non_excerpt: Vec<_> = roots.iter().filter(|path| !is_excerpt_path(path)).collect();
+    if non_excerpt.len() == 1 {
+        return Ok(non_excerpt[0].clone());
+    }
+    if non_excerpt.is_empty() {
+        return Err(
+            "MuseScore container declares only Excerpts and no master .mscx rootfile".to_string(),
+        );
+    }
+    Err("MuseScore container has ambiguous master .mscx rootfiles".to_string())
+}
+
+fn extract_mscz(data: &[u8]) -> Result<String, String> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
+
+    let mut container_indices = Vec::new();
+    let mut mscx_entries = Vec::new();
+    for index in 0..zip.len() {
+        let file = zip.by_index(index).map_err(|error| error.to_string())?;
+        let name = file.name().to_string();
+        if name == "META-INF/container.xml" {
+            container_indices.push(index);
+        }
+        if !file.is_dir() && is_mscx_path(&name) {
+            if file.enclosed_name().is_none() {
+                return Err(format!(
+                    "MuseScore archive has an unsafe .mscx member path: {name:?}"
+                ));
+            }
+            validate_rootfile_path(&name)?;
+            mscx_entries.push((index, name));
+        }
+    }
+
+    let selected = match container_indices.as_slice() {
+        [container_index] => {
+            let mut container_file = zip
+                .by_index(*container_index)
+                .map_err(|error| error.to_string())?;
+            let container = crate::engine::musicxml::read_zip_entry_capped(&mut container_file)?;
+            drop(container_file);
+            select_declared_master(&container)?
+        }
+        [] => {
+            let top_level: Vec<_> = mscx_entries
+                .iter()
+                .filter(|(_, path)| is_top_level_path(path))
+                .collect();
+            if top_level.len() == 1 {
+                top_level[0].1.clone()
+            } else if top_level.is_empty() && mscx_entries.len() == 1 {
+                mscx_entries[0].1.clone()
+            } else if mscx_entries.is_empty() {
+                return Err("no .mscx in MuseScore archive".to_string());
+            } else {
+                return Err(
+                    "MuseScore archive has ambiguous .mscx roots and no container".to_string(),
+                );
+            }
+        }
+        _ => {
+            return Err(
+                "MuseScore archive has ambiguous META-INF/container.xml entries".to_string(),
+            )
+        }
+    };
+
+    let matching_entries: Vec<_> = mscx_entries
+        .iter()
+        .filter(|(_, path)| path == &selected)
+        .collect();
+    let entry_index = match matching_entries.as_slice() {
+        [(index, _)] => *index,
+        [] => {
+            return Err(format!(
+                "MuseScore container-declared rootfile is missing: {selected:?}"
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "MuseScore container-declared rootfile is ambiguous: {selected:?}"
+            ))
+        }
+    };
+
+    let mut score_file = zip
+        .by_index(entry_index)
+        .map_err(|error| error.to_string())?;
+    crate::engine::musicxml::read_zip_entry_capped(&mut score_file)
 }
 
 fn frac(s: &str) -> Option<(i64, i64)> {
@@ -210,6 +394,93 @@ fn exact_ticks(division: i64, ratio: (i64, i64), context: &str) -> Result<i64, S
     i64::try_from(numerator / denominator).map_err(|_| format!("{context} timing overflow"))
 }
 
+fn measure_voice_containers<'a, 'input>(
+    measure: roxmltree::Node<'a, 'input>,
+) -> Result<Vec<roxmltree::Node<'a, 'input>>, String> {
+    let explicit_voices = measure
+        .children()
+        .filter(|node| node.has_tag_name("voice"))
+        .collect::<Vec<_>>();
+    let has_direct_sequence = measure
+        .children()
+        .filter(|node| node.is_element())
+        .any(|node| {
+            matches!(
+                node.tag_name().name(),
+                "TimeSig" | "Tempo" | "Tuplet" | "endTuplet" | "location" | "Chord" | "Rest"
+            )
+        });
+    if !explicit_voices.is_empty() && has_direct_sequence {
+        return Err(
+            "MuseScore measure mixes direct legacy events with explicit voice containers".into(),
+        );
+    }
+    // MuseScore 2.x stored the musical sequence directly under <Measure>;
+    // MuseScore 3/4 wrap the same sequence in one or more <voice> elements.
+    if explicit_voices.is_empty() {
+        Ok(vec![measure])
+    } else {
+        Ok(explicit_voices)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MuseScoreTimeSignature {
+    numerator: i64,
+    denominator: i64,
+    /// Actual-time multiplier for locally stretched notation.
+    /// MuseScore stores this as `stretchD / stretchN`.
+    stretch: (i64, i64),
+    /// Meter duration after applying the local stretch, reduced.
+    effective: (i64, i64),
+}
+
+fn positive_time_signature_value(
+    node: roxmltree::Node,
+    tag: &str,
+    default: Option<i64>,
+) -> Result<i64, String> {
+    match child_text(node, tag) {
+        Some(value) => value
+            .parse::<i64>()
+            .ok()
+            .filter(|value| (1..=1_000_000).contains(value))
+            .ok_or_else(|| format!("MuseScore TimeSig has an invalid {tag}: {value:?}")),
+        None => default.ok_or_else(|| format!("MuseScore TimeSig is missing {tag}")),
+    }
+}
+
+fn musescore_time_signature(node: roxmltree::Node) -> Result<MuseScoreTimeSignature, String> {
+    let numerator = positive_time_signature_value(node, "sigN", None)?;
+    let denominator = positive_time_signature_value(node, "sigD", None)?;
+    let stretch_n = positive_time_signature_value(node, "stretchN", Some(1))?;
+    let stretch_d = positive_time_signature_value(node, "stretchD", Some(1))?;
+    let stretch = (stretch_d, stretch_n);
+    let effective = checked_ratio_mul(
+        (numerator, denominator),
+        stretch.0,
+        stretch.1,
+        "MuseScore local time-signature stretch",
+    )?;
+    Ok(MuseScoreTimeSignature {
+        numerator,
+        denominator,
+        stretch,
+        effective,
+    })
+}
+
+fn checked_meter_values(ratio: (i64, i64), context: &str) -> Result<(u8, u16), String> {
+    if ratio.0 <= 0 || ratio.1 <= 0 {
+        return Err(format!("{context} is non-positive"));
+    }
+    let numerator =
+        u8::try_from(ratio.0).map_err(|_| format!("{context} numerator exceeds 255"))?;
+    let denominator =
+        u16::try_from(ratio.1).map_err(|_| format!("{context} denominator exceeds 65535"))?;
+    Ok((numerator, denominator))
+}
+
 fn musescore_tick_scale(score: roxmltree::Node, source_division: i64) -> Result<i64, String> {
     let mut scale = 1i64;
 
@@ -233,126 +504,159 @@ fn musescore_tick_scale(score: roxmltree::Node, source_division: i64) -> Result<
         }
     }
 
-    for voice in score
-        .descendants()
-        .filter(|node| node.has_tag_name("voice"))
-    {
-        let mut tuplet: Option<(i64, i64)> = None;
-        for element in voice.children().filter(|node| node.is_element()) {
-            match element.tag_name().name() {
-                "TimeSig" => {
-                    let numerator = child_text(element, "sigN")
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .filter(|value| *value > 0)
-                        .ok_or_else(|| "MuseScore TimeSig has an invalid sigN".to_string())?;
-                    let denominator = child_text(element, "sigD")
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .filter(|value| *value > 0)
-                        .ok_or_else(|| "MuseScore TimeSig has an invalid sigD".to_string())?;
-                    include_tick_ratio(
-                        &mut scale,
-                        source_division,
-                        (
-                            4i64.checked_mul(numerator).ok_or_else(|| {
-                                "MuseScore time-signature numerator overflow".to_string()
-                            })?,
-                            denominator,
-                        ),
-                        "MuseScore time signature",
-                    )?;
-                }
-                "Tuplet" => {
-                    let normal = child_text(element, "normalNotes")
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .filter(|value| (1..=64).contains(value))
-                        .ok_or_else(|| "MuseScore Tuplet has invalid normalNotes".to_string())?;
-                    let actual = child_text(element, "actualNotes")
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .filter(|value| (1..=64).contains(value))
-                        .ok_or_else(|| "MuseScore Tuplet has invalid actualNotes".to_string())?;
-                    tuplet = Some((normal, actual));
-                }
-                "endTuplet" => tuplet = None,
-                "location" => {
-                    let text = child_text(element, "fractions")
-                        .ok_or_else(|| "MuseScore location is missing fractions".to_string())?;
-                    let (numerator, denominator) = frac(text).ok_or_else(|| {
-                        format!("MuseScore location fraction is invalid: {text:?}")
-                    })?;
-                    include_tick_ratio(
-                        &mut scale,
-                        source_division,
-                        (
-                            4i64.checked_mul(numerator).ok_or_else(|| {
-                                "MuseScore location numerator overflow".to_string()
-                            })?,
-                            denominator,
-                        ),
-                        "MuseScore location",
-                    )?;
-                }
-                "Chord" | "Rest" if !is_grace(element) => {
-                    let duration_type = child_text(element, "durationType").ok_or_else(|| {
-                        format!(
-                            "MuseScore {} is missing durationType",
-                            element.tag_name().name()
-                        )
-                    })?;
-                    let ratio = if duration_type == "measure" {
-                        match child_text(element, "duration") {
-                            Some(value) => {
-                                let (numerator, denominator) = frac(value).ok_or_else(|| {
-                                    format!("MuseScore measure duration is invalid: {value:?}")
-                                })?;
-                                Some((
-                                    4i64.checked_mul(numerator).ok_or_else(|| {
-                                        "MuseScore measure duration numerator overflow".to_string()
-                                    })?,
-                                    denominator,
-                                ))
-                            }
-                            None => None,
-                        }
-                    } else {
-                        let dots = child_text(element, "dots")
-                            .map(|value| value.parse::<u32>())
-                            .transpose()
-                            .map_err(|_| "MuseScore dots value is invalid".to_string())?
-                            .unwrap_or(0);
-                        if dots > 4 {
-                            return Err("MuseScore dots value is invalid".into());
-                        }
-                        Some(dotted_ratio(
-                            duration_ratio(duration_type).ok_or_else(|| {
-                                format!("MuseScore durationType is unsupported: {duration_type:?}")
-                            })?,
-                            dots,
-                        )?)
-                    };
-                    if let Some(mut ratio) = ratio {
-                        include_tick_ratio(
-                            &mut scale,
-                            source_division,
-                            ratio,
-                            "MuseScore base duration",
-                        )?;
-                        if let Some((normal, actual)) = tuplet {
-                            ratio = checked_ratio_mul(
-                                ratio,
-                                normal,
-                                actual,
-                                "MuseScore tuplet duration",
+    for staff in score.children().filter(|node| node.has_tag_name("Staff")) {
+        let mut time_stretch = (1i64, 1i64);
+        for measure in staff.children().filter(|node| node.has_tag_name("Measure")) {
+            for voice in measure_voice_containers(measure)? {
+                let mut tuplet: Option<(i64, i64)> = None;
+                for element in voice.children().filter(|node| node.is_element()) {
+                    match element.tag_name().name() {
+                        "TimeSig" => {
+                            let signature = musescore_time_signature(element)?;
+                            time_stretch = signature.stretch;
+                            let quarter_ratio = checked_ratio_mul(
+                                signature.effective,
+                                4,
+                                1,
+                                "MuseScore time-signature duration",
+                            )?;
+                            include_tick_ratio(
+                                &mut scale,
+                                source_division,
+                                quarter_ratio,
+                                "MuseScore time signature",
                             )?;
                         }
-                        include_tick_ratio(
-                            &mut scale,
-                            source_division,
-                            ratio,
-                            "MuseScore note duration",
-                        )?;
+                        "Tuplet" => {
+                            let normal = child_text(element, "normalNotes")
+                                .and_then(|value| value.parse::<i64>().ok())
+                                .filter(|value| (1..=64).contains(value))
+                                .ok_or_else(|| {
+                                    "MuseScore Tuplet has invalid normalNotes".to_string()
+                                })?;
+                            let actual = child_text(element, "actualNotes")
+                                .and_then(|value| value.parse::<i64>().ok())
+                                .filter(|value| (1..=64).contains(value))
+                                .ok_or_else(|| {
+                                    "MuseScore Tuplet has invalid actualNotes".to_string()
+                                })?;
+                            tuplet = Some((normal, actual));
+                        }
+                        "endTuplet" => tuplet = None,
+                        "location" => {
+                            let text = child_text(element, "fractions").ok_or_else(|| {
+                                "MuseScore location is missing fractions".to_string()
+                            })?;
+                            let (numerator, denominator) = frac(text).ok_or_else(|| {
+                                format!("MuseScore location fraction is invalid: {text:?}")
+                            })?;
+                            let base = (
+                                4i64.checked_mul(numerator).ok_or_else(|| {
+                                    "MuseScore location numerator overflow".to_string()
+                                })?,
+                                denominator,
+                            );
+                            let ratio = checked_ratio_mul(
+                                base,
+                                time_stretch.0,
+                                time_stretch.1,
+                                "MuseScore stretched location",
+                            )?;
+                            include_tick_ratio(
+                                &mut scale,
+                                source_division,
+                                ratio,
+                                "MuseScore location",
+                            )?;
+                        }
+                        "Chord" | "Rest" if !is_grace(element) => {
+                            let duration_type =
+                                child_text(element, "durationType").ok_or_else(|| {
+                                    format!(
+                                        "MuseScore {} is missing durationType",
+                                        element.tag_name().name()
+                                    )
+                                })?;
+                            let ratio = if duration_type == "measure" {
+                                match child_text(element, "duration") {
+                                    Some(value) => {
+                                        let (numerator, denominator) =
+                                            frac(value).ok_or_else(|| {
+                                                format!(
+                                                    "MuseScore measure duration is invalid: {value:?}"
+                                                )
+                                            })?;
+                                        Some((
+                                            4i64.checked_mul(numerator).ok_or_else(|| {
+                                                "MuseScore measure duration numerator overflow"
+                                                    .to_string()
+                                            })?,
+                                            denominator,
+                                        ))
+                                    }
+                                    None => None,
+                                }
+                            } else {
+                                let dots = child_text(element, "dots")
+                                    .map(|value| value.parse::<u32>())
+                                    .transpose()
+                                    .map_err(|_| "MuseScore dots value is invalid".to_string())?
+                                    .unwrap_or(0);
+                                if dots > 4 {
+                                    return Err("MuseScore dots value is invalid".into());
+                                }
+                                Some(dotted_ratio(
+                                    duration_ratio(duration_type).ok_or_else(|| {
+                                        format!(
+                                            "MuseScore durationType is unsupported: \
+                                             {duration_type:?}"
+                                        )
+                                    })?,
+                                    dots,
+                                )?)
+                            };
+                            if let Some(mut ratio) = ratio {
+                                // Event emission resolves the source duration,
+                                // then the tuplet, then the local time stretch.
+                                // Every intermediate must therefore be exactly
+                                // representable at the selected tick division.
+                                include_tick_ratio(
+                                    &mut scale,
+                                    source_division,
+                                    ratio,
+                                    "MuseScore base duration",
+                                )?;
+                                if let Some((normal, actual)) = tuplet {
+                                    ratio = checked_ratio_mul(
+                                        ratio,
+                                        normal,
+                                        actual,
+                                        "MuseScore tuplet duration",
+                                    )?;
+                                    include_tick_ratio(
+                                        &mut scale,
+                                        source_division,
+                                        ratio,
+                                        "MuseScore tuplet duration",
+                                    )?;
+                                }
+                                ratio = checked_ratio_mul(
+                                    ratio,
+                                    time_stretch.0,
+                                    time_stretch.1,
+                                    "MuseScore stretched note duration",
+                                )?;
+                                include_tick_ratio(
+                                    &mut scale,
+                                    source_division,
+                                    ratio,
+                                    "MuseScore note duration",
+                                )?;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -588,6 +892,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         .collect();
     let mut staff_cursor = 0usize;
     let mut staff_info: BTreeMap<String, StaffInfo> = BTreeMap::new();
+    let mut declared_parts = Vec::new();
     for (part_index, part) in score
         .children()
         .filter(|n| n.has_tag_name("Part"))
@@ -597,14 +902,16 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .attribute("id")
             .map(|value| format!("musescore-part-{value}"))
             .unwrap_or_else(|| format!("musescore-part-{part_index}"));
-        let name = part
-            .children()
-            .find(|c| c.has_tag_name("Instrument"))
-            .and_then(|i| child(i, "longName").map(|n| collapse_ws(&deep_text(n))))
+        // MuseScore's `--score-parts` contract identifies Parts by
+        // `trackName`. Use the same source-owned identity for topology and
+        // stem alignment; `Instrument/longName` is only a display fallback.
+        let name = child(part, "trackName")
+            .map(|n| collapse_ws(&deep_text(n)))
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                child(part, "trackName")
-                    .map(|n| collapse_ws(&deep_text(n)))
+                part.children()
+                    .find(|c| c.has_tag_name("Instrument"))
+                    .and_then(|i| child(i, "longName").map(|n| collapse_ws(&deep_text(n))))
                     .filter(|s| !s.is_empty())
             })
             .unwrap_or_default();
@@ -684,6 +991,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .children()
             .filter(|child| child.has_tag_name("Staff"))
             .collect();
+        let mut declared_staves = Vec::new();
         for (staff_index, staff) in part_staves.iter().copied().enumerate() {
             let staff_id = staff
                 .attribute("id")
@@ -697,6 +1005,10 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 })
                 .unwrap_or_else(|| format!("{}-{}", part_index + 1, staff_index + 1));
             staff_cursor += 1;
+            declared_staves.push(SourceStaff {
+                id: staff_id.clone(),
+                voices: Vec::new(),
+            });
             let group = staff
                 .children()
                 .find(|node| node.has_tag_name("StaffType"))
@@ -717,10 +1029,48 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 },
             );
         }
+        declared_parts.push(SourcePart {
+            id: part_id,
+            name,
+            source_track_ids: Vec::new(),
+            staves: declared_staves,
+        });
+    }
+
+    // Voice containers exist independently of pitched notes. Seed them before
+    // projection so a rest-only source voice remains visible in topology.
+    for staff in score.children().filter(|node| node.has_tag_name("Staff")) {
+        let staff_id = staff
+            .attribute("id")
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("anonymous-declared-{}", declared_parts.len() + 1));
+        let Some(info) = staff_info.get(&staff_id) else {
+            continue;
+        };
+        let mut voice_count = 0usize;
+        for measure in staff.children().filter(|node| node.has_tag_name("Measure")) {
+            voice_count = voice_count.max(measure_voice_containers(measure)?.len());
+        }
+        let Some(source_staff) = declared_parts
+            .iter_mut()
+            .find(|part| part.id == info.part_id)
+            .and_then(|part| part.staves.iter_mut().find(|staff| staff.id == staff_id))
+        else {
+            continue;
+        };
+        for voice_index in 0..voice_count {
+            let number = (voice_index + 1).to_string();
+            source_staff.voices.push(SourceVoice {
+                id: format!("{}:staff:{}:voice:{}", info.part_id, staff_id, number),
+                number,
+                projection_track_ids: Vec::new(),
+            });
+        }
     }
 
     let mut tracks = Vec::new();
     let mut global_events = Vec::new();
+    let mut local_meter_fallbacks = Vec::new();
 
     for staff in score.children().filter(|n| n.has_tag_name("Staff")) {
         let staff_id = staff
@@ -733,6 +1083,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
 
         let mut measure_start: i64 = 0;
         let mut measure_len: i64 = 4 * div; // 4/4 by default
+        let mut time_stretch = (1i64, 1i64);
 
         let measures: Vec<_> = staff
             .children()
@@ -741,48 +1092,23 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         for &(mi, pass) in playback_order(&measures)?.iter() {
             let measure = measures[mi];
             let mut this_len = measure_len;
-            for (voice_index, voice) in measure
-                .children()
-                .filter(|n| n.has_tag_name("voice"))
-                .enumerate()
-            {
+            for (voice_index, voice) in measure_voice_containers(measure)?.into_iter().enumerate() {
                 let mut pos = measure_start;
                 let mut tuplet: Option<(i64, i64)> = None; // (normal, actual)
                 for (element_index, el) in voice.children().filter(|n| n.is_element()).enumerate() {
                     match el.tag_name().name() {
                         "TimeSig" => {
-                            let numerator_text = child_text(el, "sigN")
-                                .ok_or_else(|| "MuseScore TimeSig is missing sigN".to_string())?;
-                            let denominator_text = child_text(el, "sigD")
-                                .ok_or_else(|| "MuseScore TimeSig is missing sigD".to_string())?;
-                            let numerator = numerator_text
-                                .parse::<i64>()
-                                .ok()
-                                .and_then(|value| u8::try_from(value).ok())
-                                .filter(|value| *value > 0)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "MuseScore time-signature numerator is invalid: {numerator_text:?}"
-                                    )
-                                })?;
-                            let denominator = denominator_text
-                                .parse::<i64>()
-                                .ok()
-                                .and_then(|value| u16::try_from(value).ok())
-                                .filter(|value| *value > 0)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "MuseScore time-signature denominator is invalid: {denominator_text:?}"
-                                    )
-                                })?;
+                            let signature = musescore_time_signature(el)?;
+                            time_stretch = signature.stretch;
+                            let effective_quarters = checked_ratio_mul(
+                                signature.effective,
+                                4,
+                                1,
+                                "MuseScore time-signature duration",
+                            )?;
                             measure_len = exact_ticks(
                                 div,
-                                (
-                                    4i64.checked_mul(i64::from(numerator)).ok_or_else(|| {
-                                        "MuseScore time-signature numerator overflow".to_string()
-                                    })?,
-                                    i64::from(denominator),
-                                ),
+                                effective_quarters,
                                 "MuseScore time-signature duration",
                             )?;
                             if measure_len <= 0 {
@@ -791,16 +1117,26 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                 );
                             }
                             this_len = measure_len;
-                            push_global_event(
-                                &mut global_events,
+                            let meter_ratio = if signature.stretch == (1, 1) {
+                                (signature.numerator, signature.denominator)
+                            } else {
+                                signature.effective
+                            };
+                            let (numerator, denominator) = checked_meter_values(
+                                meter_ratio,
+                                "MuseScore effective time signature",
+                            )?;
+                            let destination = if signature.stretch == (1, 1) {
+                                &mut global_events
+                            } else {
+                                &mut local_meter_fallbacks
+                            };
+                            push_meter_event(
+                                destination,
                                 checked_score_tick(pos)?,
-                                Kind::TimeSig {
-                                    num: numerator,
-                                    den: denominator,
-                                    clocks_per_click: None,
-                                    notated_32nds: None,
-                                },
-                            );
+                                numerator,
+                                denominator,
+                            )?;
                         }
                         "Tempo" => {
                             // <tempo> = quarter notes per second
@@ -861,16 +1197,19 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         "MuseScore location fraction is invalid: {fraction_text:?}"
                                     )
                                 })?;
-                            let delta = exact_ticks(
-                                div,
-                                (
-                                    4i64.checked_mul(numerator).ok_or_else(|| {
-                                        "MuseScore location numerator overflow".to_string()
-                                    })?,
-                                    denominator,
-                                ),
-                                "MuseScore location",
+                            let base = (
+                                4i64.checked_mul(numerator).ok_or_else(|| {
+                                    "MuseScore location numerator overflow".to_string()
+                                })?,
+                                denominator,
+                            );
+                            let ratio = checked_ratio_mul(
+                                base,
+                                time_stretch.0,
+                                time_stretch.1,
+                                "MuseScore stretched location",
                             )?;
+                            let delta = exact_ticks(div, ratio, "MuseScore location")?;
                             pos = pos
                                 .checked_add(delta)
                                 .ok_or_else(|| "MuseScore cursor overflow".to_string())?;
@@ -878,8 +1217,8 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                         "Chord" | "Rest" => {
                             let is_rest = el.has_tag_name("Rest");
                             let grace = !is_rest && is_grace(el);
-                            let mut dur = if grace {
-                                0
+                            let (mut dur, stretch_duration) = if grace {
+                                (0, false)
                             } else {
                                 let duration_type =
                                     child_text(el, "durationType").ok_or_else(|| {
@@ -907,21 +1246,24 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                         "MuseScore measure duration is invalid: {value:?}"
                                                     )
                                                 })?;
-                                            exact_ticks(
-                                                div,
-                                                (
-                                                    4i64.checked_mul(numerator).ok_or_else(
-                                                        || {
-                                                            "MuseScore measure duration numerator overflow"
-                                                                .to_string()
-                                                        },
-                                                    )?,
-                                                    denominator,
-                                                ),
-                                                "MuseScore measure duration",
-                                            )?
+                                            (
+                                                exact_ticks(
+                                                    div,
+                                                    (
+                                                        4i64.checked_mul(numerator).ok_or_else(
+                                                            || {
+                                                                "MuseScore measure duration numerator overflow"
+                                                                    .to_string()
+                                                            },
+                                                        )?,
+                                                        denominator,
+                                                    ),
+                                                    "MuseScore measure duration",
+                                                )?,
+                                                true,
+                                            )
                                         }
-                                        None => this_len,
+                                        None => (this_len, false),
                                     }
                                 } else {
                                     let ratio = dotted_ratio(
@@ -932,11 +1274,18 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         })?,
                                         dots,
                                     )?;
-                                    exact_ticks(div, ratio, "MuseScore note duration")?
+                                    (exact_ticks(div, ratio, "MuseScore note duration")?, true)
                                 }
                             };
                             if let Some((n, a)) = tuplet {
                                 dur = exact_ticks(dur, (n, a), "MuseScore tuplet duration")?;
+                            }
+                            if stretch_duration {
+                                dur = exact_ticks(
+                                    dur,
+                                    time_stretch,
+                                    "MuseScore stretched note duration",
+                                )?;
                             }
                             if !grace && dur <= 0 {
                                 return Err(format!(
@@ -1151,6 +1500,13 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         }
     }
 
+    for event in local_meter_fallbacks {
+        let Kind::TimeSig { num, den, .. } = event.kind else {
+            unreachable!("local meter fallback must be a time signature");
+        };
+        push_meter_event(&mut global_events, event.tick, num, den)?;
+    }
+
     if !global_events.is_empty() {
         if tracks.is_empty() {
             tracks.push(Track {
@@ -1170,11 +1526,13 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     if tracks.is_empty() {
         return Err("no usable staff in the MuseScore file".into());
     }
+    let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
     Ok(Midi {
         ticks_per_beat: tpb,
         time_base: TimeBase::PulsesPerQuarter(tpb),
         format: 1,
         source_format: SourceFormat::MuseScore,
+        topology,
         tracks,
     })
 }
@@ -1186,6 +1544,47 @@ fn push_event(events: &mut Vec<Event>, tick: u32, kind: Kind) {
 
 fn checked_score_tick(value: i64) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| "MuseScore tick exceeds the supported range".into())
+}
+
+fn push_meter_event(
+    events: &mut Vec<Event>,
+    tick: u32,
+    numerator: u8,
+    denominator: u16,
+) -> Result<(), String> {
+    if let Some((existing_num, existing_den)) = events.iter().find_map(|event| {
+        if event.tick != tick {
+            return None;
+        }
+        match event.kind {
+            Kind::TimeSig { num, den, .. } => Some((num, den)),
+            _ => None,
+        }
+    }) {
+        let existing_duration = u32::from(existing_num) * u32::from(denominator);
+        let candidate_duration = u32::from(numerator) * u32::from(existing_den);
+        if existing_duration != candidate_duration {
+            return Err(format!(
+                "MuseScore time signatures at tick {tick} disagree about the global measure \
+                 duration ({existing_num}/{existing_den} versus {numerator}/{denominator})"
+            ));
+        }
+        // Equivalent local signatures (for example stretched 9/8 and global
+        // 3/4) share one temporal meter in SVP. The original notation remains
+        // preserved in the source score inside the bundle.
+        return Ok(());
+    }
+    push_event(
+        events,
+        tick,
+        Kind::TimeSig {
+            num: numerator,
+            den: denominator,
+            clocks_per_click: None,
+            notated_32nds: None,
+        },
+    );
+    Ok(())
 }
 
 fn push_global_event(events: &mut Vec<Event>, tick: u32, kind: Kind) {
@@ -1266,6 +1665,32 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn zipped_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        for (name, bytes) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn container(paths: &[&str]) -> String {
+        let roots = paths
+            .iter()
+            .map(|path| format!(r#"<rootfile full-path="{path}"/>"#))
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>{roots}</rootfiles>
+</container>"#
+        )
+    }
+
     fn latin1(value: &str) -> Vec<u8> {
         value
             .chars()
@@ -1299,6 +1724,131 @@ mod tests {
     }
 
     #[test]
+    fn musescore_two_direct_measure_elements_are_one_implicit_voice() {
+        let legacy = mscx("<text>let</text>")
+            .replace(r#"version="3.02""#, r#"version="2.06""#)
+            .replace("        <voice>\n", "")
+            .replace("        </voice>\n", "");
+        let midi = parse_mscx(&legacy).expect("MuseScore 2 direct measure elements must parse");
+        assert_eq!(midi.topology.part_count(), 1);
+        assert_eq!(midi.topology.voice_count(), 1);
+        assert_eq!(lyrics_of(&midi), vec!["let"]);
+    }
+
+    #[test]
+    fn musescore_two_direct_measure_tuplet_expands_the_exact_tick_scale() {
+        let legacy = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="2.06">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Soprano</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure>
+        <Tuplet id="1"><normalNotes>1</normalNotes><actualNotes>7</actualNotes></Tuplet>
+        <Chord>
+          <Tuplet>1</Tuplet>
+          <durationType>quarter</durationType>
+          <Note><pitch>60</pitch></Note>
+        </Chord>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(legacy).expect("legacy implicit-voice tuplet must be exact");
+        assert_eq!(midi.ticks_per_beat, 3_360);
+        let ticks = midi.tracks[0]
+            .events
+            .iter()
+            .map(|event| event.tick)
+            .collect::<Vec<_>>();
+        assert_eq!(ticks, vec![0, 480]);
+    }
+
+    #[test]
+    fn mixed_direct_and_explicit_voice_encodings_are_rejected() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure>
+        <Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>
+        <voice>
+          <Chord><durationType>quarter</durationType><Note><pitch>62</pitch></Note></Chord>
+        </voice>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let error = parse_mscx(xml).expect_err("mixed encodings have ambiguous ownership");
+        assert!(error.contains("mixes direct legacy events"));
+    }
+
+    #[test]
+    fn local_time_signature_stretch_scales_meter_locations_and_notes_exactly() {
+        let legacy = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="2.06">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Soprano</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure>
+        <TimeSig>
+          <sigN>9</sigN><sigD>8</sigD><stretchN>3</stretchN><stretchD>2</stretchD>
+        </TimeSig>
+        <location><fractions>1/8</fractions></location>
+        <Chord><durationType>eighth</durationType><Note><pitch>60</pitch></Note></Chord>
+      </Measure>
+      <Measure>
+        <Chord><durationType>eighth</durationType><Note><pitch>62</pitch></Note></Chord>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(legacy).expect("local time stretch must remain exact");
+        assert_eq!(midi.ticks_per_beat, 480);
+        let note_ticks = midi.tracks[0]
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, Kind::NoteOn(_) | Kind::NoteOff(_)))
+            .map(|event| event.tick)
+            .collect::<Vec<_>>();
+        assert_eq!(note_ticks, vec![160, 320, 1_440, 1_600]);
+
+        let meters = midi.tracks[0]
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                Kind::TimeSig { num, den, .. } => Some((event.tick, num, den)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(meters, vec![(0, 3, 4)]);
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let meter = &outcome.svp.expect("SVP project").time.meter;
+        assert_eq!(
+            meter
+                .iter()
+                .map(|meter| (meter.index, meter.numerator, meter.denominator))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, 4)]
+        );
+    }
+
+    #[test]
+    fn equivalent_local_and_global_meters_merge_but_conflicts_fail() {
+        let mut events = Vec::new();
+        push_meter_event(&mut events, 0, 3, 4).unwrap();
+        push_meter_event(&mut events, 0, 6, 8).unwrap();
+        assert_eq!(events.len(), 1);
+        let error = push_meter_event(&mut events, 0, 5, 8)
+            .expect_err("different temporal measure lengths must conflict");
+        assert!(error.contains("disagree"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn raw_and_zipped_latin1_follow_the_xml_declaration() {
         let xml = mscx("<text>café</text>").replace("UTF-8", "ISO-8859-1");
         let bytes = latin1(&xml);
@@ -1308,6 +1858,117 @@ mod tests {
         let archive = zipped_score(&bytes);
         let zipped = parse(&archive).expect("zipped MSCX uses the entry declaration");
         assert_eq!(lyrics_of(&zipped), vec!["café"]);
+    }
+
+    #[test]
+    fn mscz_uses_container_master_even_when_an_excerpt_is_first() {
+        let excerpt = mscx("<text>excerpt</text>");
+        let master = mscx("<text>master</text>");
+        let manifest = container(&["Excerpts/Soprano.mscx", "Master Score.mscx"]);
+        let archive = zipped_entries(&[
+            ("Excerpts/Soprano.mscx", excerpt.as_bytes()),
+            ("META-INF/container.xml", manifest.as_bytes()),
+            ("Master Score.mscx", master.as_bytes()),
+        ]);
+
+        let midi = parse(&archive).expect("the declared top-level master must be selected");
+        assert_eq!(lyrics_of(&midi), vec!["master"]);
+    }
+
+    #[test]
+    fn mscz_rejects_ambiguous_declared_masters() {
+        let first = mscx("<text>first</text>");
+        let second = mscx("<text>second</text>");
+        let manifest = container(&["First.mscx", "Second.mscx"]);
+        let archive = zipped_entries(&[
+            ("First.mscx", first.as_bytes()),
+            ("Second.mscx", second.as_bytes()),
+            ("META-INF/container.xml", manifest.as_bytes()),
+        ]);
+
+        let error = parse(&archive).expect_err("two declared top-level masters are ambiguous");
+        assert!(error.contains("ambiguous"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn mscz_never_promotes_an_excerpt_when_no_master_is_declared() {
+        let excerpt = mscx("<text>excerpt</text>");
+        let manifest = container(&["Excerpts/Soprano.mscx"]);
+        let archive = zipped_entries(&[
+            ("Excerpts/Soprano.mscx", excerpt.as_bytes()),
+            ("META-INF/container.xml", manifest.as_bytes()),
+        ]);
+
+        let error = parse(&archive).expect_err("an excerpt must not silently become the master");
+        assert!(error.contains("only Excerpts"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn mscz_rejects_a_missing_declared_root() {
+        let excerpt = mscx("<text>excerpt</text>");
+        let manifest = container(&["Missing.mscx"]);
+        let archive = zipped_entries(&[
+            ("Excerpts/Soprano.mscx", excerpt.as_bytes()),
+            ("META-INF/container.xml", manifest.as_bytes()),
+        ]);
+
+        let error = parse(&archive).expect_err("a declared root must exist in the archive");
+        assert!(error.contains("missing"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn mscz_rejects_traversal_and_absolute_declared_roots() {
+        let master = mscx("<text>master</text>");
+        for unsafe_path in [
+            "../Master.mscx",
+            "/Master.mscx",
+            "C:/Master.mscx",
+            r"C:\Master.mscx",
+        ] {
+            let manifest = container(&[unsafe_path]);
+            let archive = zipped_entries(&[
+                ("Master.mscx", master.as_bytes()),
+                ("META-INF/container.xml", manifest.as_bytes()),
+            ]);
+
+            let error = parse(&archive).expect_err("unsafe roots must not be resolved");
+            assert!(error.contains("unsafe"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn mscz_without_container_accepts_one_unique_nested_score() {
+        let only = mscx("<text>only</text>");
+        let archive = zipped_entries(&[("Scores/Only.mscx", only.as_bytes())]);
+
+        let midi = parse(&archive).expect("one unique MSCX is an unambiguous fallback");
+        assert_eq!(lyrics_of(&midi), vec!["only"]);
+    }
+
+    #[test]
+    fn mscz_without_container_prefers_one_top_level_score_over_excerpts() {
+        let excerpt = mscx("<text>excerpt</text>");
+        let master = mscx("<text>master</text>");
+        let archive = zipped_entries(&[
+            ("Excerpts/Soprano.mscx", excerpt.as_bytes()),
+            ("Master.mscx", master.as_bytes()),
+        ]);
+
+        let midi = parse(&archive).expect("the sole top-level MSCX is the safe fallback");
+        assert_eq!(lyrics_of(&midi), vec!["master"]);
+    }
+
+    #[test]
+    fn mscz_without_container_rejects_multiple_nested_scores() {
+        let first = mscx("<text>first</text>");
+        let second = mscx("<text>second</text>");
+        let archive = zipped_entries(&[
+            ("Scores/First.mscx", first.as_bytes()),
+            ("Scores/Second.mscx", second.as_bytes()),
+        ]);
+
+        let error = parse(&archive).expect_err("multiple fallback roots are ambiguous");
+        assert!(error.contains("ambiguous"), "unexpected error: {error}");
     }
 
     #[test]
@@ -1430,9 +2091,15 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(midi.topology.part_count(), 1);
+        assert_eq!(midi.topology.staff_count(), 1);
+        assert_eq!(midi.topology.voice_count(), 1);
+        assert_eq!(midi.topology.projection_lane_count(), 2);
 
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
+        assert_eq!(outcome.n_tracks, 1);
+        assert_eq!(outcome.topology, midi.topology);
         assert_eq!(outcome.placed, 0);
         assert!(outcome.svp.unwrap().tracks.is_empty());
     }
@@ -1784,6 +2451,13 @@ Melodie</trackName>
             .iter()
             .flat_map(|track| &track.events)
             .any(|event| matches!(event.kind, Kind::Tempo(_))));
+        assert_eq!(midi.topology.part_count(), 2);
+        assert_eq!(midi.topology.parts[0].name, "Rest");
+        assert_eq!(midi.topology.parts[0].staves.len(), 1);
+        assert_eq!(midi.topology.parts[0].staves[0].voices.len(), 1);
+        assert!(midi.topology.parts[0].staves[0].voices[0]
+            .projection_track_ids
+            .is_empty());
     }
 
     #[test]

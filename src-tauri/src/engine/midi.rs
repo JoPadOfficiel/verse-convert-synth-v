@@ -29,7 +29,169 @@ pub struct Midi {
     pub time_base: TimeBase,
     pub format: u16,
     pub source_format: SourceFormat,
+    /// Stable source score hierarchy. `tracks` remains the set of
+    /// monophonic projection lanes; several of those lanes may belong to one
+    /// notational voice when a source chord has to be split for Synthesizer V.
+    pub topology: SourceTopology,
     pub tracks: Vec<Track>,
+}
+
+/// Source-owned score hierarchy, independent from target projection lanes.
+///
+/// MIDI/KAR sources that do not expose a score hierarchy receive one
+/// synthetic part/staff/voice per physical MIDI track. Score importers group
+/// all technical chord-member lanes under their original voice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceTopology {
+    pub parts: Vec<SourcePart>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourcePart {
+    pub id: String,
+    pub name: String,
+    /// Every rich-source lane owned by this Part, including lyrics-only and
+    /// metadata-only lanes that intentionally have no SVP projection voice.
+    pub source_track_ids: Vec<String>,
+    pub staves: Vec<SourceStaff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceStaff {
+    pub id: String,
+    pub voices: Vec<SourceVoice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceVoice {
+    pub id: String,
+    pub number: String,
+    /// Internal monophonic lanes that project this source voice. Chord
+    /// members live here and are never counted as independent source voices.
+    pub projection_track_ids: Vec<String>,
+}
+
+impl SourceTopology {
+    pub fn from_tracks(tracks: &[Track]) -> Self {
+        Self::from_declared_parts(Vec::new(), tracks)
+    }
+
+    /// Starts with the score-declared hierarchy, then attaches every emitted
+    /// rich-source lane. This preserves rest-only and metadata-only Parts
+    /// without pretending that they contain an editable SVP projection lane.
+    pub fn from_declared_parts(parts: Vec<SourcePart>, tracks: &[Track]) -> Self {
+        let mut topology = Self { parts };
+        for track in tracks {
+            let scored = track.source.part_id.is_some()
+                || track.source.staff_id.is_some()
+                || track.source.voice.is_some();
+            let part_id = track
+                .source
+                .part_id
+                .clone()
+                .unwrap_or_else(|| format!("midi:track:{}", track.source.source_track));
+            let staff_id = track
+                .source
+                .staff_id
+                .clone()
+                .unwrap_or_else(|| format!("track:{}", track.source.source_track));
+            let part_name = track
+                .name
+                .split_once(" — ")
+                .map_or(track.name.as_str(), |(name, _)| name)
+                .trim();
+            let part_name = if part_name.is_empty() {
+                format!("Track {}", track.source.source_track)
+            } else {
+                part_name.to_string()
+            };
+
+            let part_index = topology
+                .parts
+                .iter()
+                .position(|part| part.id == part_id)
+                .unwrap_or_else(|| {
+                    topology.parts.push(SourcePart {
+                        id: part_id.clone(),
+                        name: part_name.clone(),
+                        source_track_ids: Vec::new(),
+                        staves: Vec::new(),
+                    });
+                    topology.parts.len() - 1
+                });
+            let part = &mut topology.parts[part_index];
+            if part.name.trim().is_empty() {
+                part.name = part_name;
+            }
+            if !part.source_track_ids.contains(&track.id) {
+                part.source_track_ids.push(track.id.clone());
+            }
+            let staff_index = part
+                .staves
+                .iter()
+                .position(|staff| staff.id == staff_id)
+                .unwrap_or_else(|| {
+                    part.staves.push(SourceStaff {
+                        id: staff_id.clone(),
+                        voices: Vec::new(),
+                    });
+                    part.staves.len() - 1
+                });
+
+            // A source-only score lane (for example lyrics whose chord note
+            // ownership is ambiguous) belongs to its staff, not to a made-up
+            // musical voice. Native MIDI tracks have no hierarchy, so their
+            // physical track is represented as voice 1.
+            let voice = match &track.source.voice {
+                Some(voice) => voice.clone(),
+                None if scored => continue,
+                None => "1".to_string(),
+            };
+            let staff = &mut part.staves[staff_index];
+            let voice_id = format!("{part_id}:staff:{staff_id}:voice:{voice}");
+            let voice_index = staff
+                .voices
+                .iter()
+                .position(|source_voice| source_voice.id == voice_id)
+                .unwrap_or_else(|| {
+                    staff.voices.push(SourceVoice {
+                        id: voice_id,
+                        number: voice.clone(),
+                        projection_track_ids: Vec::new(),
+                    });
+                    staff.voices.len() - 1
+                });
+            staff.voices[voice_index]
+                .projection_track_ids
+                .push(track.id.clone());
+        }
+        topology
+    }
+
+    pub fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    pub fn staff_count(&self) -> usize {
+        self.parts.iter().map(|part| part.staves.len()).sum()
+    }
+
+    pub fn voice_count(&self) -> usize {
+        self.parts
+            .iter()
+            .flat_map(|part| &part.staves)
+            .map(|staff| staff.voices.len())
+            .sum()
+    }
+
+    pub fn projection_lane_count(&self) -> usize {
+        self.parts
+            .iter()
+            .flat_map(|part| &part.staves)
+            .flat_map(|staff| &staff.voices)
+            .map(|voice| voice.projection_track_ids.len())
+            .sum()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -491,6 +653,28 @@ pub struct TextEvent {
     pub raw: Vec<u8>,
 }
 
+/// True only for the line separators used as control records by MIDI lyric
+/// meta events. They carry layout, not a syllable to sing.
+pub fn is_midi_lyric_line_break(value: &str) -> bool {
+    matches!(value, "\r" | "\n" | "\r\n")
+}
+
+/// Soft Karaoke Text controls proven by the source profile. `@` records are
+/// headers/directives, while empty and dot-only line records drive the
+/// karaoke display. The caller must still require a qualified local KAR Text
+/// profile before applying this classification.
+pub fn is_soft_karaoke_text_control(value: &str) -> bool {
+    if value.trim_start().starts_with('@') {
+        return true;
+    }
+    let body = value
+        .strip_prefix('\\')
+        .or_else(|| value.strip_prefix('/'))
+        .unwrap_or(value)
+        .trim();
+    body.is_empty() || body.chars().all(|character| character == '.')
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     NoteOn(NoteOn),
@@ -616,7 +800,13 @@ pub fn parse(data: &[u8]) -> Result<Midi, String> {
 /// not evidence by itself: Text events are qualified only by markers carried
 /// by their own source track.
 pub fn parse_with_karaoke_profile(data: &[u8]) -> Result<Midi, String> {
-    parse_smf(data)
+    let mut midi = parse_smf(data)?;
+    // The container identity authorizes only the conservative cross-track KAR
+    // ownership resolver. It does not qualify generic Text events: each track
+    // still has to carry its own karaoke controls before Text becomes lyric
+    // material.
+    midi.source_format = SourceFormat::KaraokeMidi;
+    Ok(midi)
 }
 
 fn parse_smf(data: &[u8]) -> Result<Midi, String> {
@@ -943,11 +1133,13 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
     } else {
         SourceFormat::StandardMidi
     };
+    let topology = SourceTopology::from_tracks(&tracks);
     Ok(Midi {
         ticks_per_beat,
         time_base,
         format,
         source_format,
+        topology,
         tracks,
     })
 }
@@ -1160,7 +1352,7 @@ mod tests {
         text.extend(text_meta(0x01, b"second"));
         let midi = parse_with_karaoke_profile(&smf(480, vec![text])).unwrap();
         assert_eq!(midi.tracks[0].text_profile, MidiTextProfile::Generic);
-        assert_eq!(midi.source_format, SourceFormat::StandardMidi);
+        assert_eq!(midi.source_format, SourceFormat::KaraokeMidi);
     }
 
     #[test]
@@ -1170,5 +1362,71 @@ mod tests {
         let midi = parse(&smf(480, vec![lyrics, Vec::new()])).unwrap();
         assert_eq!(midi.tracks[0].text_profile, MidiTextProfile::KaraokeLyrics);
         assert_eq!(midi.tracks[1].text_profile, MidiTextProfile::Generic);
+    }
+
+    #[test]
+    fn source_topology_groups_projection_lanes_by_part_staff_and_voice() {
+        let score_track = |id: &str, part: &str, staff: &str, voice: Option<&str>| Track {
+            id: id.to_string(),
+            name: format!("{part} — technical lane"),
+            source: TrackSource {
+                source_track: 0,
+                part_id: Some(part.to_string()),
+                staff_id: Some(staff.to_string()),
+                voice: voice.map(str::to_string),
+            },
+            role_hint: TrackRoleHint::Ambiguous,
+            text_profile: MidiTextProfile::Generic,
+            instruments: Vec::new(),
+            instrument: None,
+            events: Vec::new(),
+        };
+        let tracks = vec![
+            score_track("p1-s1-v1-member-1", "P1", "1", Some("1")),
+            score_track("p1-s1-v1-member-2", "P1", "1", Some("1")),
+            score_track("p1-s1-v2", "P1", "1", Some("2")),
+            score_track("p1-s1-source-only", "P1", "1", None),
+            score_track("p2-s2-v1", "P2", "2", Some("1")),
+        ];
+
+        let topology = SourceTopology::from_tracks(&tracks);
+        assert_eq!(topology.part_count(), 2);
+        assert_eq!(topology.staff_count(), 2);
+        assert_eq!(topology.voice_count(), 3);
+        assert_eq!(topology.projection_lane_count(), 4);
+        assert_eq!(
+            topology.parts[0].source_track_ids,
+            [
+                "p1-s1-v1-member-1",
+                "p1-s1-v1-member-2",
+                "p1-s1-v2",
+                "p1-s1-source-only"
+            ]
+        );
+        assert_eq!(
+            topology.parts[0].staves[0].voices[0].projection_track_ids,
+            ["p1-s1-v1-member-1", "p1-s1-v1-member-2"]
+        );
+        assert!(topology
+            .parts
+            .iter()
+            .flat_map(|part| &part.staves)
+            .flat_map(|staff| &staff.voices)
+            .all(|voice| !voice
+                .projection_track_ids
+                .contains(&"p1-s1-source-only".to_string())));
+    }
+
+    #[test]
+    fn native_midi_tracks_receive_deterministic_synthetic_topology() {
+        let tracks = vec![Track::new("midi:track:0", 0), Track::new("midi:track:1", 1)];
+        let topology = SourceTopology::from_tracks(&tracks);
+        assert_eq!(topology.part_count(), 2);
+        assert_eq!(topology.staff_count(), 2);
+        assert_eq!(topology.voice_count(), 2);
+        assert_eq!(
+            topology.parts[1].staves[0].voices[0].projection_track_ids,
+            ["midi:track:1"]
+        );
     }
 }
