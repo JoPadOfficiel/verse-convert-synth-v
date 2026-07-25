@@ -684,16 +684,18 @@ fn export_bundle_with_hook_and_progress(
         .ok_or(BundleError::InvalidDestination)?;
     let mut staging = StagingGuard::create(parent, &request.destination)?;
     let root = staging.path().to_path_buf();
-    for directory in [
-        "source",
-        "project",
-        "audio",
-        STEM_AUDIO_DIRECTORY,
-        ".render-work",
-        ".render-work/parts",
-    ] {
+    for directory in ["source", "project", "audio", STEM_AUDIO_DIRECTORY] {
         create_directory(&root.join(directory), "create staging directories")?;
     }
+    // Renderer intermediates must stay on the platform-local temporary
+    // filesystem. A bundle destination may be a network or Parallels shared
+    // folder where recursively deleting a work directory can fail even after
+    // every renderer process has exited.
+    let mut render_work = RenderWorkGuard::create()?;
+    create_directory(
+        &render_work.path().join("parts"),
+        "create private renderer parts directory",
+    )?;
 
     let source_path = safe_join(&root, &layout.source_relative_path)?;
     write_new(
@@ -736,7 +738,7 @@ fn export_bundle_with_hook_and_progress(
         stem_id: None,
         stem_name: None,
     });
-    let render_output = root.join(".render-work/full-score.wav");
+    let render_output = render_work.path().join("full-score.wav");
     let rendered = render_owned(
         request.renderer.as_ref(),
         &source_path,
@@ -744,10 +746,11 @@ fn export_bundle_with_hook_and_progress(
         &remaining_render_limits(render_started, &request.render_limits)?,
     )?;
     let audio_path = safe_join(&root, &layout.audio_relative_path)?;
-    fs::rename(&render_output, &audio_path).map_err(|source| BundleError::Io {
-        phase: "publish rendered audio into staging",
-        source,
-    })?;
+    copy_new_file(
+        &render_output,
+        &audio_path,
+        "publish rendered audio into staging",
+    )?;
     let reference_wav = validate_wav(&audio_path, request.render_limits.max_output_bytes)?;
     if reference_wav.sha256 != rendered.wav.sha256 {
         return Err(BundleError::Integrity(
@@ -778,12 +781,14 @@ fn export_bundle_with_hook_and_progress(
             stem_id: Some(stem.stem_id.clone()),
             stem_name: Some(stem.display_name.clone()),
         });
-        let part_input = root
-            .join(".render-work/parts")
+        let part_input = render_work
+            .path()
+            .join("parts")
             .join(format!("{}.mscz", stem.stem_id));
         write_new(&part_input, &part.mscz, "write extracted MuseScore Part")?;
-        let part_output = root
-            .join(".render-work/parts")
+        let part_output = render_work
+            .path()
+            .join("parts")
             .join(format!("{}.wav", stem.stem_id));
         let rendered_part = render_part_owned(
             request.renderer.as_ref(),
@@ -805,10 +810,11 @@ fn export_bundle_with_hook_and_progress(
             )));
         }
         let published_path = safe_join(&root, relative_path)?;
-        fs::rename(&part_output, &published_path).map_err(|source| BundleError::Io {
-            phase: "publish rendered stem into staging",
-            source,
-        })?;
+        copy_new_file(
+            &part_output,
+            &published_path,
+            "publish rendered stem into staging",
+        )?;
         let wav =
             validate_wav_allowing_silence(&published_path, request.render_limits.max_output_bytes)?;
         if wav.sha256 != rendered_part.wav.sha256 {
@@ -825,10 +831,7 @@ fn export_bundle_with_hook_and_progress(
             wav,
         });
     }
-    fs::remove_dir_all(root.join(".render-work")).map_err(|source| BundleError::Io {
-        phase: "remove private renderer work directory",
-        source,
-    })?;
+    render_work.cleanup()?;
     hook.checkpoint(FaultPoint::AfterAudio)?;
 
     progress(BundleProgressEvent {
@@ -1267,6 +1270,40 @@ fn write_new(path: &Path, bytes: &[u8], phase: &'static str) -> Result<(), Bundl
         .map_err(|source| BundleError::Io { phase, source })
 }
 
+fn copy_new_file(
+    source_path: &Path,
+    destination_path: &Path,
+    phase: &'static str,
+) -> Result<(), BundleError> {
+    let metadata =
+        fs::symlink_metadata(source_path).map_err(|source| BundleError::Io { phase, source })?;
+    if !metadata.file_type().is_file() {
+        return Err(BundleError::Integrity(format!(
+            "renderer output is not a regular file: {}",
+            source_path.display()
+        )));
+    }
+    let mut source_file =
+        fs::File::open(source_path).map_err(|source| BundleError::Io { phase, source })?;
+    let mut destination_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination_path)
+        .map_err(|source| BundleError::Io { phase, source })?;
+    let copied = io::copy(&mut source_file, &mut destination_file)
+        .map_err(|source| BundleError::Io { phase, source })?;
+    destination_file
+        .sync_all()
+        .map_err(|source| BundleError::Io { phase, source })?;
+    if copied != metadata.len() {
+        return Err(BundleError::Integrity(format!(
+            "renderer output copy length changed: expected {}, copied {copied}",
+            metadata.len()
+        )));
+    }
+    Ok(())
+}
+
 fn sync_directory(path: &Path, phase: &'static str) -> Result<(), BundleError> {
     #[cfg(unix)]
     {
@@ -1675,6 +1712,96 @@ fn verify_artifact(root: &Path, record: &ArtifactRecord) -> Result<(), BundleErr
 }
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RENDER_WORK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct RenderWorkGuard {
+    path: PathBuf,
+    cleaned: bool,
+}
+
+impl RenderWorkGuard {
+    fn create() -> Result<Self, BundleError> {
+        for _ in 0..100 {
+            let counter = RENDER_WORK_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "verse-bundle-render-{}-{timestamp}-{counter}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    let guard = Self {
+                        path,
+                        cleaned: false,
+                    };
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(source) =
+                            fs::set_permissions(&guard.path, fs::Permissions::from_mode(0o700))
+                        {
+                            let _ = fs::remove_dir_all(&guard.path);
+                            return Err(BundleError::Io {
+                                phase: "secure private renderer work directory",
+                                source,
+                            });
+                        }
+                    }
+                    return Ok(guard);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(BundleError::Io {
+                        phase: "create private renderer work directory",
+                        source,
+                    })
+                }
+            }
+        }
+        Err(BundleError::Commit(
+            "cannot allocate a private renderer work directory".into(),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(&mut self) -> Result<(), BundleError> {
+        const ATTEMPTS: usize = 40;
+        for attempt in 0..ATTEMPTS {
+            match fs::remove_dir_all(&self.path) {
+                Ok(()) => {
+                    self.cleaned = true;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.cleaned = true;
+                    return Ok(());
+                }
+                Err(source) if attempt + 1 == ATTEMPTS => {
+                    return Err(BundleError::Io {
+                        phase: "remove private renderer work directory",
+                        source,
+                    });
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        unreachable!("bounded cleanup loop always returns")
+    }
+}
+
+impl Drop for RenderWorkGuard {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
 
 struct StagingGuard {
     path: PathBuf,
