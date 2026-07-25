@@ -150,7 +150,7 @@ cargo run \
   --quiet \
   --locked \
   --manifest-path "${PROJECT_ROOT}/src-tauri/Cargo.toml" \
-  --bin corpus_audit \
+  --example corpus_audit \
   -- \
   "${audit_arguments[@]}"
 

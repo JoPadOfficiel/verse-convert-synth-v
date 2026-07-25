@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   SUPPORTED_EXTENSIONS,
@@ -9,6 +9,7 @@ import {
 
 export {
   SUPPORTED_EXTENSIONS,
+  batchBundlePaths,
   commandError,
   commandErrorMessage,
   defaultBundlePath,
@@ -155,6 +156,23 @@ export type BundleResult = {
   warnings: string[];
 };
 
+export type BundleProgressPhase =
+  | "preparing"
+  | "extractingParts"
+  | "renderingReference"
+  | "renderingStem"
+  | "finalizing"
+  | "finished";
+
+export type BundleProgressEvent = {
+  phase: BundleProgressPhase;
+  completed: number;
+  total: number;
+  message: string;
+  stemId: string | null;
+  stemName: string | null;
+};
+
 export async function pickFiles(): Promise<string[]> {
   const result = await open({
     multiple: true,
@@ -219,13 +237,17 @@ export async function exportBundle(
   language: Language,
   overrides?: Record<number, boolean>,
   rendererPath?: string,
+  onProgress?: (event: BundleProgressEvent) => void,
 ): Promise<BundleResult> {
+  const progress = new Channel<BundleProgressEvent>();
+  progress.onmessage = (event) => onProgress?.(event);
   return await invoke<BundleResult>("export_bundle", {
     path: file.path,
     target,
     language,
     overrides: overrides ?? null,
     rendererPath: rendererPath?.trim() || null,
+    onProgress: progress,
   });
 }
 

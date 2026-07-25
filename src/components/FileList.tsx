@@ -14,6 +14,10 @@ import type {
   PartInfo,
   SourceRole,
 } from "@/lib/tauri";
+import {
+  exportProgressPercent,
+  type FileExportProgress,
+} from "@/lib/export-progress";
 
 const ROLE_LABEL: Record<SourceRole, string> = {
   vocal: "Source vocal",
@@ -140,6 +144,7 @@ function Row({
   item,
   busy,
   exportError,
+  exportProgress,
   onBundle,
   onVocals,
   selected,
@@ -149,6 +154,7 @@ function Row({
   item: FileResult;
   busy: boolean;
   exportError?: string;
+  exportProgress?: FileExportProgress;
   onBundle: (item: FileResult) => void;
   onVocals: (item: FileResult) => void;
   selected: boolean;
@@ -171,6 +177,9 @@ function Row({
       : item.audioStatus.state === "unavailable"
         ? "Audio unavailable"
         : "Audio not rendered yet";
+  const progressPercent = exportProgress
+    ? exportProgressPercent(exportProgress)
+    : 0;
 
   return (
     <div className="rounded-lg border bg-card">
@@ -218,6 +227,47 @@ function Row({
             {item.out && (
               <div className="truncate text-xs text-success" title={item.out}>
                 Saved: {item.out}
+              </div>
+            )}
+            {exportProgress && (
+              <div className="mt-1" aria-live="polite">
+                <div
+                  className={
+                    "flex items-center justify-between gap-2 text-xs " +
+                    (exportProgress.phase === "failed"
+                      ? "text-destructive"
+                      : exportProgress.phase === "finished"
+                        ? "text-success"
+                        : "text-muted-foreground")
+                  }
+                >
+                  <span className="truncate">{exportProgress.message}</span>
+                  <span className="shrink-0 tabular-nums">
+                    {exportProgress.phase === "finished"
+                      ? "Done"
+                      : `${exportProgress.completed} / ${exportProgress.total}`}
+                  </span>
+                </div>
+                <div
+                  role="progressbar"
+                  aria-label={`Complete project progress for ${item.name}`}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(progressPercent)}
+                  className="mt-1 h-1.5 overflow-hidden rounded-full bg-secondary"
+                >
+                  <div
+                    className={
+                      "h-full rounded-full transition-[width] duration-300 " +
+                      (exportProgress.phase === "failed"
+                        ? "bg-destructive"
+                        : exportProgress.phase === "finished"
+                          ? "bg-success"
+                          : "bg-primary")
+                    }
+                    style={{ width: `${progressPercent}%` }}
+                  />
+                </div>
               </div>
             )}
             {exportError && (
@@ -288,6 +338,7 @@ export function FileList({
   items,
   busy,
   exportErrors,
+  exportProgress,
   onBundle,
   onVocals,
   selected,
@@ -297,6 +348,7 @@ export function FileList({
   items: FileResult[];
   busy: boolean;
   exportErrors: Record<string, string>;
+  exportProgress: Record<string, FileExportProgress>;
   onBundle: (item: FileResult) => void;
   onVocals: (item: FileResult) => void;
   selected: Set<string>;
@@ -322,6 +374,7 @@ export function FileList({
           item={item}
           busy={busy}
           exportError={exportErrors[item.path]}
+          exportProgress={exportProgress[item.path]}
           onBundle={onBundle}
           onVocals={onVocals}
           selected={selected.has(item.path)}

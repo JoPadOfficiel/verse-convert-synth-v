@@ -62,6 +62,16 @@ test("bundle and vocal targets remain beside the source unless configured", () =
   );
 });
 
+test("batch bundle targets disambiguate equal stems by source extension", () => {
+  const paths = utils.batchBundlePaths(
+    ["/scores/Help.mscz", "/scores/Help.mxl", "/scores/Other.kar"],
+    "/exports",
+  );
+  assert.equal(paths.get("/scores/Help.mscz"), "/exports/Help.mscz.versebundle");
+  assert.equal(paths.get("/scores/Help.mxl"), "/exports/Help.mxl.versebundle");
+  assert.equal(paths.get("/scores/Other.kar"), "/exports/Other.versebundle");
+});
+
 test("structured Tauri errors retain remediation and never stringify as object", () => {
   const parsed = utils.commandError({
     code: "RENDERER_NOT_FOUND",
