@@ -52,6 +52,51 @@ export function defaultBundlePath(
   return `${trimmed}${sep}${stem}.versebundle`;
 }
 
+export function batchBundlePaths(
+  sourcePaths: string[],
+  outputDirectory?: string,
+): Map<string, string> {
+  const defaults = sourcePaths.map((path) =>
+    defaultBundlePath(path, outputDirectory),
+  );
+  const defaultCounts = new Map<string, number>();
+  for (const path of defaults) {
+    const key = path.toLocaleLowerCase();
+    defaultCounts.set(key, (defaultCounts.get(key) ?? 0) + 1);
+  }
+
+  const used = new Set<string>();
+  const result = new Map<string, string>();
+  for (let index = 0; index < sourcePaths.length; index += 1) {
+    const sourcePath = sourcePaths[index];
+    const defaultPath = defaults[index];
+    let candidate = defaultPath;
+    if ((defaultCounts.get(defaultPath.toLocaleLowerCase()) ?? 0) > 1) {
+      const file = sourcePath.slice(sourcePath.lastIndexOf(separator(sourcePath)) + 1);
+      const extension = file.includes(".")
+        ? file.slice(file.lastIndexOf(".") + 1).toLocaleLowerCase()
+        : "source";
+      candidate = defaultPath.replace(
+        /\.versebundle$/i,
+        `.${extension}.versebundle`,
+      );
+    }
+
+    const baseCandidate = candidate;
+    let suffix = 2;
+    while (used.has(candidate.toLocaleLowerCase())) {
+      candidate = baseCandidate.replace(
+        /\.versebundle$/i,
+        `.${suffix}.versebundle`,
+      );
+      suffix += 1;
+    }
+    used.add(candidate.toLocaleLowerCase());
+    result.set(sourcePath, candidate);
+  }
+  return result;
+}
+
 export function commandError(error: unknown): StructuredCommandError {
   if (typeof error === "string") {
     try {

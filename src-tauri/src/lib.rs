@@ -4,8 +4,8 @@ pub mod renderer;
 pub mod stems;
 
 use bundle::{
-    build_preservation_ledger, export_bundle as write_bundle, BundleInput, BundleLayout,
-    BundleRequest, BundleResult,
+    build_preservation_ledger, export_bundle_with_progress as write_bundle, BundleInput,
+    BundleLayout, BundleProgressEvent, BundleRequest, BundleResult,
 };
 use engine::convert::{
     convert_midi_with, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState, SourceRole,
@@ -20,6 +20,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tauri::ipc::Channel;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -555,6 +556,7 @@ fn export_bundle_blocking(
     language: Option<String>,
     overrides: Option<HashMap<String, bool>>,
     renderer_path: Option<String>,
+    progress: &(dyn Fn(BundleProgressEvent) + Sync),
 ) -> Result<BundleResult, CommandErrorDto> {
     let source_path = PathBuf::from(&path);
     let extension = source_path
@@ -646,23 +648,26 @@ fn export_bundle_blocking(
     };
     let renderer = MuseScoreRenderer::discover(&config)
         .map_err(|error| CommandErrorDto::from(bundle::BundleError::Render(error)))?;
-    write_bundle(BundleRequest {
-        destination,
-        input: BundleInput {
-            original_name,
-            source_format: source_format_name(midi.source_format).into(),
-            source_bytes,
-            project,
-            stem_plan,
-            ledger,
-            warnings: manifest_warnings,
+    write_bundle(
+        BundleRequest {
+            destination,
+            input: BundleInput {
+                original_name,
+                source_format: source_format_name(midi.source_format).into(),
+                source_bytes,
+                project,
+                stem_plan,
+                ledger,
+                warnings: manifest_warnings,
+            },
+            renderer: Arc::new(renderer),
+            render_limits: RenderLimits {
+                timeout: config.timeout,
+                max_output_bytes: config.max_wav_bytes,
+            },
         },
-        renderer: Arc::new(renderer),
-        render_limits: RenderLimits {
-            timeout: config.timeout,
-            max_output_bytes: config.max_wav_bytes,
-        },
-    })
+        progress,
+    )
     .map_err(CommandErrorDto::from)
 }
 
@@ -673,9 +678,12 @@ async fn export_bundle(
     language: Option<String>,
     overrides: Option<HashMap<String, bool>>,
     renderer_path: Option<String>,
+    on_progress: Channel<BundleProgressEvent>,
 ) -> Result<BundleResult, CommandErrorDto> {
     tauri::async_runtime::spawn_blocking(move || {
-        export_bundle_blocking(path, target, language, overrides, renderer_path)
+        export_bundle_blocking(path, target, language, overrides, renderer_path, &|event| {
+            let _ = on_progress.send(event);
+        })
     })
     .await
     .map_err(|error| {

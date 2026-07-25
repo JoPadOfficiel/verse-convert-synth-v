@@ -37,13 +37,15 @@ const MAX_NATIVE_SCORE_PROLOGUE_BYTES: usize = 1024 * 1024;
 // MuseScore PR #31084 documents the macOS shutdown race fixed on upstream
 // master: an async Channel destructor reaches an already-destroyed audio
 // EngineController mutex and aborts with "mutex lock failed: Invalid argument".
-// Released MuseScore 4 builds can still exhibit it after successful console
-// conversion, so score-loading processes are serialized and cooled down.
+// MuseScore 4 releases before 4.7 can still exhibit it after successful
+// console conversion, so those score-loading processes are serialized and
+// cooled down. The upstream fix is included in MuseScore 4.7 and later.
 // https://github.com/musescore/MuseScore/pull/31084
 const MACOS_MUSESCORE4_SCORE_LOAD_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_MACOS_MUSESCORE4_SCORE_LOAD_ATTEMPTS: usize = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const COMPLETE_STDOUT_EXIT_GRACE: Duration = Duration::from_secs(1);
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 const COMMON_ENVIRONMENT_KEYS: &[&str] = &["SystemRoot", "WINDIR", "LANG", "LC_ALL"];
 static PRIVATE_WORK_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -137,6 +139,18 @@ pub trait AudioRenderer: Send + Sync {
         output: &Path,
         limits: &RenderLimits,
     ) -> Result<RenderedAudio, RenderError>;
+
+    /// Render one isolated source Part. A structurally valid silent WAV is
+    /// allowed because a source Part can contain only inaudible/unsupported
+    /// events; complete reference mixes remain subject to signal validation.
+    fn render_part(
+        &self,
+        input: &Path,
+        output: &Path,
+        limits: &RenderLimits,
+    ) -> Result<RenderedAudio, RenderError> {
+        self.render(input, output, limits)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -355,7 +369,9 @@ struct ScoreLoadRetryPolicy {
 
 impl ScoreLoadRetryPolicy {
     fn for_renderer(identity: &RendererIdentity) -> Self {
-        let enabled = cfg!(target_os = "macos") && identity.major == 4;
+        let enabled = cfg!(target_os = "macos")
+            && identity.major == 4
+            && needs_macos_score_load_workaround(&identity.version);
         Self {
             enabled,
             cooldown: MACOS_MUSESCORE4_SCORE_LOAD_COOLDOWN,
@@ -366,6 +382,35 @@ impl ScoreLoadRetryPolicy {
             },
         }
     }
+}
+
+fn needs_macos_score_load_workaround(version_output: &str) -> bool {
+    musescore_version(version_output).is_none_or(|version| {
+        version
+            < (MuseScoreVersion {
+                major: 4,
+                minor: 7,
+                patch: 0,
+            })
+    })
+}
+
+fn needs_macos_complete_stdout_workaround(version_output: &str) -> bool {
+    musescore_version(version_output).is_some_and(|version| {
+        version
+            >= (MuseScoreVersion {
+                major: 4,
+                minor: 7,
+                patch: 0,
+            })
+    })
+}
+
+fn can_recover_macos_shutdown_abort(identity: &RendererIdentity, status: &ExitStatus) -> bool {
+    cfg!(target_os = "macos")
+        && identity.major == 4
+        && needs_macos_complete_stdout_workaround(&identity.version)
+        && status_is_sigabrt(status)
 }
 
 fn render_timeout(timeout: Duration) -> RenderError {
@@ -482,15 +527,30 @@ impl MuseScoreRenderer {
         for attempt in 0..policy.max_attempts {
             let remaining = remaining_render_budget(started, limits.timeout)?;
             let private_work = PrivateWorkDir::create("score-parts")?;
-            let process_result = run_bounded_process_with_capture(
-                &self.executable,
-                &Self::score_parts_args(input),
-                private_work.path(),
-                remaining,
-                None,
-                limits.max_output_bytes,
-                MAX_PARTS_JSON_BYTES,
-            );
+            let process_result = if cfg!(target_os = "macos")
+                && needs_macos_complete_stdout_workaround(&self.capabilities.identity.version)
+            {
+                run_bounded_process_with_capture_until_complete_stdout(
+                    &self.executable,
+                    &Self::score_parts_args(input),
+                    private_work.path(),
+                    remaining,
+                    None,
+                    limits.max_output_bytes,
+                    MAX_PARTS_JSON_BYTES,
+                    score_parts_json_is_complete,
+                )
+            } else {
+                run_bounded_process_with_capture(
+                    &self.executable,
+                    &Self::score_parts_args(input),
+                    private_work.path(),
+                    remaining,
+                    None,
+                    limits.max_output_bytes,
+                    MAX_PARTS_JSON_BYTES,
+                )
+            };
             record_score_load_finished(&mut gate);
             let result =
                 process_result.map_err(|error| process_render_error(error, limits.timeout))?;
@@ -498,11 +558,18 @@ impl MuseScoreRenderer {
                 &self.executable,
                 &self.capabilities.identity.executable_sha256,
             )?;
-            if result.status.success() {
+            let payload_is_fully_valid = parse_score_parts_json(&result.stdout).is_ok();
+            if result.status.success()
+                || result.completed_from_stdout
+                || (payload_is_fully_valid
+                    && can_recover_macos_shutdown_abort(
+                        &self.capabilities.identity,
+                        &result.status,
+                    ))
+            {
                 return parse_score_parts_json(&result.stdout);
             }
 
-            let payload_is_fully_valid = parse_score_parts_json(&result.stdout).is_ok();
             let retryable_sigabrt = policy.enabled
                 && status_is_sigabrt(&result.status)
                 && payload_is_fully_valid
@@ -524,6 +591,7 @@ impl MuseScoreRenderer {
         output: &Path,
         limits: &RenderLimits,
         policy: ScoreLoadRetryPolicy,
+        allow_silence: bool,
     ) -> Result<RenderedAudio, RenderError> {
         self.validate_input(input)?;
         if output.exists() {
@@ -565,7 +633,7 @@ impl MuseScoreRenderer {
                 if !output.exists() {
                     return Err(RenderError::MissingOutput);
                 }
-                let wav = validate_wav(output, limits.max_output_bytes)?;
+                let wav = validate_wav_with_policy(output, limits.max_output_bytes, allow_silence)?;
                 return Ok(RenderedAudio {
                     path: output.to_path_buf(),
                     wav,
@@ -574,6 +642,19 @@ impl MuseScoreRenderer {
             }
 
             let was_sigabrt = status_is_sigabrt(&result.status);
+            if can_recover_macos_shutdown_abort(&renderer_identity, &result.status)
+                && output.exists()
+            {
+                if let Ok(wav) =
+                    validate_wav_with_policy(output, limits.max_output_bytes, allow_silence)
+                {
+                    return Ok(RenderedAudio {
+                        path: output.to_path_buf(),
+                        wav,
+                        renderer: renderer_identity,
+                    });
+                }
+            }
             if was_sigabrt {
                 remove_failed_renderer_output(output)?;
             }
@@ -619,6 +700,22 @@ impl AudioRenderer for MuseScoreRenderer {
             output,
             limits,
             ScoreLoadRetryPolicy::for_renderer(&self.capabilities.identity),
+            false,
+        )
+    }
+
+    fn render_part(
+        &self,
+        input: &Path,
+        output: &Path,
+        limits: &RenderLimits,
+    ) -> Result<RenderedAudio, RenderError> {
+        self.render_with_policy(
+            input,
+            output,
+            limits,
+            ScoreLoadRetryPolicy::for_renderer(&self.capabilities.identity),
+            true,
         )
     }
 }
@@ -941,6 +1038,18 @@ fn xml_attribute<'a>(mut attributes: &'a str, requested: &str) -> Option<&'a str
 }
 
 pub fn validate_wav(path: &Path, max_bytes: u64) -> Result<WavInfo, RenderError> {
+    validate_wav_with_policy(path, max_bytes, false)
+}
+
+pub fn validate_wav_allowing_silence(path: &Path, max_bytes: u64) -> Result<WavInfo, RenderError> {
+    validate_wav_with_policy(path, max_bytes, true)
+}
+
+fn validate_wav_with_policy(
+    path: &Path,
+    max_bytes: u64,
+    allow_silence: bool,
+) -> Result<WavInfo, RenderError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             RenderError::MissingOutput
@@ -1032,7 +1141,7 @@ pub fn validate_wav(path: &Path, max_bytes: u64) -> Result<WavInfo, RenderError>
         });
     }
     let rms = (sum_squares / decoded_samples as f64).sqrt();
-    if peak == 0.0 || rms == 0.0 {
+    if !allow_silence && (peak == 0.0 || rms == 0.0) {
         return Err(RenderError::InvalidWav {
             reason: "audio samples contain no non-zero signal energy (WAV is silent)".into(),
         });
@@ -1109,6 +1218,7 @@ struct ProcessResult {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    completed_from_stdout: bool,
 }
 
 impl ProcessResult {
@@ -1305,6 +1415,52 @@ fn run_bounded_process_with_capture(
     max_output_bytes: u64,
     capture_limit: usize,
 ) -> Result<ProcessResult, ProcessError> {
+    run_bounded_process_with_capture_policy(
+        program,
+        args,
+        current_dir,
+        timeout,
+        monitored_output,
+        max_output_bytes,
+        capture_limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_process_with_capture_until_complete_stdout(
+    program: &Path,
+    args: &[OsString],
+    current_dir: &Path,
+    timeout: Duration,
+    monitored_output: Option<&Path>,
+    max_output_bytes: u64,
+    capture_limit: usize,
+    complete_stdout: fn(&[u8]) -> bool,
+) -> Result<ProcessResult, ProcessError> {
+    run_bounded_process_with_capture_policy(
+        program,
+        args,
+        current_dir,
+        timeout,
+        monitored_output,
+        max_output_bytes,
+        capture_limit,
+        Some(complete_stdout),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_process_with_capture_policy(
+    program: &Path,
+    args: &[OsString],
+    current_dir: &Path,
+    timeout: Duration,
+    monitored_output: Option<&Path>,
+    max_output_bytes: u64,
+    capture_limit: usize,
+    complete_stdout: Option<fn(&[u8]) -> bool>,
+) -> Result<ProcessResult, ProcessError> {
     if capture_limit == 0 {
         return Err(ProcessError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1373,6 +1529,8 @@ fn run_bounded_process_with_capture(
     let mut output_collector = ProcessOutputCollector::new(drain_receiver, capture_limit);
 
     let started = Instant::now();
+    let mut complete_stdout_seen_at = None;
+    let mut completed_from_stdout = false;
     let status = loop {
         output_collector.poll();
         if let Some(error) = output_collector.take_error() {
@@ -1389,6 +1547,26 @@ fn run_bounded_process_with_capture(
             Err(error) => {
                 terminate_and_reap(&mut child, &mut output_collector);
                 return Err(ProcessError::Io(error));
+            }
+        }
+        if let Some(is_complete) = complete_stdout {
+            if complete_stdout_seen_at.is_none() && is_complete(&output_collector.stdout) {
+                complete_stdout_seen_at = Some(Instant::now());
+            }
+            if complete_stdout_seen_at
+                .is_some_and(|seen_at| seen_at.elapsed() >= COMPLETE_STDOUT_EXIT_GRACE)
+            {
+                terminate_process_tree(&mut child);
+                let deadline = Instant::now() + TERMINATION_GRACE;
+                if !wait_for_child_until(&mut child, deadline).map_err(ProcessError::Io)? {
+                    return Err(ProcessError::Io(io::Error::other(
+                        "renderer remained alive after complete stdout termination",
+                    )));
+                }
+                completed_from_stdout = true;
+                break child.try_wait().map_err(ProcessError::Io)?.ok_or_else(|| {
+                    ProcessError::Io(io::Error::other("renderer termination status unavailable"))
+                })?;
             }
         }
         if let Some(output) = monitored_output {
@@ -1428,7 +1606,15 @@ fn run_bounded_process_with_capture(
         status,
         stdout: output_collector.stdout,
         stderr: output_collector.stderr,
+        completed_from_stdout,
     })
+}
+
+fn score_parts_json_is_complete(bytes: &[u8]) -> bool {
+    let Some(last_non_whitespace) = bytes.iter().rfind(|byte| !byte.is_ascii_whitespace()) else {
+        return false;
+    };
+    *last_non_whitespace == b'}' && serde_json::from_slice::<ScorePartsEnvelope>(bytes).is_ok()
 }
 
 fn terminate_descendants_after_parent_exit(parent_id: u32) {
@@ -1571,6 +1757,13 @@ fn copy_required_environment(command: &mut Command, private_dir: &Path) {
     copy_linux_session_environment(command, |key| std::env::var_os(key), private_dir);
 
     command.env("HOME", private_dir);
+    // CoreFoundation does not consistently derive NSSearchPathDirectory
+    // locations from HOME on macOS. Without this override, MuseScore can still
+    // scan the user's real Documents/MuseScore4/Plugins directory. A stalled
+    // File Provider mount there would freeze every console conversion before
+    // the input score is opened.
+    #[cfg(target_os = "macos")]
+    command.env("CFFIXED_USER_HOME", private_dir);
     command.env("XDG_CONFIG_HOME", private_dir.join("config"));
     command.env("XDG_CACHE_HOME", private_dir.join("cache"));
     command.env("XDG_DATA_HOME", private_dir.join("data"));
@@ -1693,9 +1886,15 @@ struct MuseScoreVersion {
 fn musescore_version(output: &str) -> Option<MuseScoreVersion> {
     let lowercase = output.to_ascii_lowercase();
     let marker = lowercase.find("musescore")?;
-    let version = output[marker + "musescore".len()..]
+    let candidates = output[marker + "musescore".len()..]
         .split(|character: char| !character.is_ascii_digit() && character != '.')
-        .find(|piece| piece.chars().any(|character| character.is_ascii_digit()))?;
+        .filter(|piece| piece.chars().any(|character| character.is_ascii_digit()))
+        .collect::<Vec<_>>();
+    let version = candidates
+        .iter()
+        .copied()
+        .find(|piece| piece.contains('.'))
+        .or_else(|| candidates.first().copied())?;
     let mut components = version.split('.');
     Some(MuseScoreVersion {
         major: components.next()?.parse().ok()?,
@@ -1996,6 +2195,9 @@ mod tests {
                 ),
                 "{error}"
             );
+            let allowed = validate_wav_allowing_silence(&path, 1024 * 1024)
+                .expect("isolated source Parts may render a structurally valid silent WAV");
+            assert!(allowed.frames > 0);
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2179,6 +2381,14 @@ mod tests {
                 patch: 2
             })
         );
+        assert_eq!(
+            musescore_version("MuseScore4 4.7.4.252060402"),
+            Some(MuseScoreVersion {
+                major: 4,
+                minor: 7,
+                patch: 4
+            })
+        );
         assert_eq!(musescore_version("not a version"), None);
         for version in [
             MuseScoreVersion {
@@ -2225,6 +2435,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn macos_score_load_cooldown_is_limited_to_musescore_four_before_four_seven() {
+        assert!(needs_macos_score_load_workaround("MuseScore 4.6.4"));
+        assert!(!needs_macos_score_load_workaround("MuseScore 4.7.0"));
+        assert!(!needs_macos_score_load_workaround(
+            "MuseScore4 4.7.4.252060402"
+        ));
+        assert!(needs_macos_score_load_workaround("unparseable MuseScore"));
+    }
+
+    #[test]
+    fn complete_stdout_workaround_targets_musescore_four_seven_and_later() {
+        assert!(!needs_macos_complete_stdout_workaround("MuseScore 4.6.4"));
+        assert!(needs_macos_complete_stdout_workaround("MuseScore 4.7.0"));
+        assert!(needs_macos_complete_stdout_workaround(
+            "MuseScore4 4.7.4.252060402"
+        ));
+        assert!(!needs_macos_complete_stdout_workaround(
+            "unparseable MuseScore"
+        ));
+    }
+
     #[cfg(unix)]
     fn fake_probe_executable(label: &str, version: &str, help: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -2265,6 +2497,7 @@ mod tests {
     #[cfg(unix)]
     fn fake_score_parts_signals_then_succeeds(
         label: &str,
+        version: &str,
         signal_attempts: usize,
         signal: &str,
         valid_payload: bool,
@@ -2286,7 +2519,7 @@ mod tests {
             "incomplete-json".to_string()
         };
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' 'MuseScore 4.5.2' ;;\n  \
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' 'MuseScore {version}' ;;\n  \
              --help) printf '%s\\n' '--score-parts' ;;\n  -F)\n    count=0\n    if [ -f \
              '{attempts}' ]; then read -r count < '{attempts}'; fi\n    count=$((count + 1))\n    \
              printf '%s\\n' \"$count\" > '{attempts}'\n    printf '%s\\n' '{payload}'\n    if [ \
@@ -2302,6 +2535,7 @@ mod tests {
     #[cfg(unix)]
     fn fake_render_signals_then_succeeds(
         label: &str,
+        version: &str,
         signal_attempts: usize,
     ) -> (PathBuf, PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -2312,7 +2546,7 @@ mod tests {
         let wav_template = directory.join("template.wav");
         write_wav(&wav_template);
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' 'MuseScore 4.5.2' ;;\n  \
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' 'MuseScore {version}' ;;\n  \
              --help) printf '%s\\n' '--score-parts' ;;\n  -F)\n    count=0\n    if [ -f \
              '{attempts}' ]; then read -r count < '{attempts}'; fi\n    count=$((count + 1))\n    \
              printf '%s\\n' \"$count\" > '{attempts}'\n    if [ -e \"$3\" ]; then exit 9; fi\n    \
@@ -2411,9 +2645,53 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn complete_score_parts_stdout_bounds_a_renderer_that_stays_alive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temp_dir("score-parts-complete-stdout");
+        let executable = directory.join("mscore");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(part_mscz("4.50"));
+        let payload = serde_json::json!({
+            "parts": ["Piano"],
+            "partsBin": [encoded]
+        })
+        .to_string();
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' '{payload}'\nsleep 10\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = Instant::now();
+        let result = run_bounded_process_with_capture_until_complete_stdout(
+            &executable,
+            &[],
+            &directory,
+            Duration::from_secs(5),
+            None,
+            1024 * 1024,
+            MAX_PARTS_JSON_BYTES,
+            score_parts_json_is_complete,
+        )
+        .expect("complete score-parts JSON should end the lingering process");
+
+        assert!(result.completed_from_stdout);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(parse_score_parts_json(&result.stdout).unwrap().len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn score_parts_rejects_signaled_process_even_when_stdout_is_valid_json() {
-        let (directory, executable, attempts) =
-            fake_score_parts_signals_then_succeeds("score-parts-signal-rejected", 1, "TERM", true);
+        let (directory, executable, attempts) = fake_score_parts_signals_then_succeeds(
+            "score-parts-signal-rejected",
+            "4.5.2",
+            1,
+            "TERM",
+            true,
+        );
         let input = fake_score_input(&directory);
         let renderer = MuseScoreRenderer::probe(&executable).unwrap();
         let error = renderer
@@ -2440,6 +2718,7 @@ mod tests {
     fn score_parts_sigabrt_with_incomplete_payload_is_not_retried() {
         let (directory, executable, attempts) = fake_score_parts_signals_then_succeeds(
             "score-parts-sigabrt-incomplete",
+            "4.5.2",
             1,
             "ABRT",
             false,
@@ -2468,8 +2747,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn score_parts_retries_only_sigabrt_with_valid_payload_and_requires_exit_zero() {
-        let (directory, executable, attempts) =
-            fake_score_parts_signals_then_succeeds("score-parts-sigabrt-retry", 1, "ABRT", true);
+        let (directory, executable, attempts) = fake_score_parts_signals_then_succeeds(
+            "score-parts-sigabrt-retry",
+            "4.5.2",
+            1,
+            "ABRT",
+            true,
+        );
         let input = fake_score_input(&directory);
         let renderer = MuseScoreRenderer::probe(&executable).unwrap();
         let parts = renderer
@@ -2488,11 +2772,44 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn score_parts_recovers_valid_macos_four_seven_output_after_shutdown_abort() {
+        let (directory, executable, attempts) = fake_score_parts_signals_then_succeeds(
+            "score-parts-four-seven-shutdown-abort",
+            "4.7.4",
+            1,
+            "ABRT",
+            true,
+        );
+        let input = fake_score_input(&directory);
+        let renderer = MuseScoreRenderer::probe(&executable).unwrap();
+        let parts = renderer
+            .extract_score_parts_with_policy(
+                &input,
+                &RenderLimits {
+                    timeout: Duration::from_secs(2),
+                    max_output_bytes: 1024 * 1024,
+                },
+                no_score_load_retry_policy(),
+            )
+            .expect("fully validated output survives MuseScore shutdown abort");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(fs::read_to_string(attempts).unwrap().trim(), "1");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn score_parts_sigabrt_retries_stop_at_the_hard_limit() {
-        let (directory, executable, attempts) =
-            fake_score_parts_signals_then_succeeds("score-parts-sigabrt-limit", 3, "ABRT", true);
+        let (directory, executable, attempts) = fake_score_parts_signals_then_succeeds(
+            "score-parts-sigabrt-limit",
+            "4.5.2",
+            3,
+            "ABRT",
+            true,
+        );
         let input = fake_score_input(&directory);
         let renderer = MuseScoreRenderer::probe(&executable).unwrap();
         let error = renderer
@@ -2518,7 +2835,7 @@ mod tests {
     #[test]
     fn wav_render_sigabrt_removes_failed_output_and_requires_exit_zero() {
         let (directory, executable, attempts) =
-            fake_render_signals_then_succeeds("render-sigabrt-retry", 1);
+            fake_render_signals_then_succeeds("render-sigabrt-retry", "4.5.2", 1);
         let input = fake_score_input(&directory);
         let output = directory.join("mix.wav");
         let renderer = MuseScoreRenderer::probe(&executable).unwrap();
@@ -2531,10 +2848,38 @@ mod tests {
                     max_output_bytes: 1024 * 1024,
                 },
                 fast_score_load_retry_policy(),
+                false,
             )
             .expect("second render exits zero");
         assert_eq!(rendered.path, output);
         assert_eq!(fs::read_to_string(attempts).unwrap().trim(), "2");
+        assert!(rendered.wav.duration_seconds > 0.0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wav_render_recovers_valid_macos_four_seven_output_after_shutdown_abort() {
+        let (directory, executable, attempts) =
+            fake_render_signals_then_succeeds("render-four-seven-shutdown-abort", "4.7.4", 1);
+        let input = fake_score_input(&directory);
+        let output = directory.join("mix.wav");
+        let renderer = MuseScoreRenderer::probe(&executable).unwrap();
+        let rendered = renderer
+            .render_with_policy(
+                &input,
+                &output,
+                &RenderLimits {
+                    timeout: Duration::from_secs(2),
+                    max_output_bytes: 1024 * 1024,
+                },
+                no_score_load_retry_policy(),
+                false,
+            )
+            .expect("fully validated WAV survives MuseScore shutdown abort");
+
+        assert_eq!(rendered.path, output);
+        assert_eq!(fs::read_to_string(attempts).unwrap().trim(), "1");
         assert!(rendered.wav.duration_seconds > 0.0);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2550,6 +2895,7 @@ mod tests {
             status,
             stdout: vec![b'j'; MAX_LOG_BYTES * 2],
             stderr: b"mutex lock failed: Invalid argument".to_vec(),
+            completed_from_stdout: false,
         };
 
         assert!(

@@ -12,8 +12,8 @@ use crate::engine::convert::{
 use crate::engine::midi::{self, Kind, Midi, MidiTextProfile};
 use crate::engine::svp::{append_instrumental_track, SvpProject};
 use crate::renderer::{
-    sha256_bytes, sha256_file, validate_wav, AudioRenderer, ExtractedScorePart, RenderError,
-    RenderLimits, RendererIdentity, WavInfo,
+    sha256_bytes, sha256_file, validate_wav, validate_wav_allowing_silence, AudioRenderer,
+    ExtractedScorePart, RenderError, RenderLimits, RendererIdentity, WavInfo,
 };
 use crate::stems::{StemDescriptor, StemPlan, StemRole};
 use serde::{Deserialize, Serialize};
@@ -529,6 +529,28 @@ pub struct BundleResult {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleProgressEvent {
+    pub phase: BundleProgressPhase,
+    pub completed: usize,
+    pub total: usize,
+    pub message: String,
+    pub stem_id: Option<String>,
+    pub stem_name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BundleProgressPhase {
+    Preparing,
+    ExtractingParts,
+    RenderingReference,
+    RenderingStem,
+    Finalizing,
+    Finished,
+}
+
 #[derive(Debug, Error)]
 pub enum BundleError {
     #[error("bundle destination must be a new .versebundle directory")]
@@ -593,9 +615,24 @@ pub fn export_bundle(request: BundleRequest) -> Result<BundleResult, BundleError
     export_bundle_with_hook(request, &NoopHook)
 }
 
+pub fn export_bundle_with_progress(
+    request: BundleRequest,
+    progress: &(dyn Fn(BundleProgressEvent) + Sync),
+) -> Result<BundleResult, BundleError> {
+    export_bundle_with_hook_and_progress(request, &NoopHook, progress)
+}
+
 fn export_bundle_with_hook(
+    request: BundleRequest,
+    hook: &dyn BundleHook,
+) -> Result<BundleResult, BundleError> {
+    export_bundle_with_hook_and_progress(request, hook, &|_| {})
+}
+
+fn export_bundle_with_hook_and_progress(
     mut request: BundleRequest,
     hook: &dyn BundleHook,
+    progress: &(dyn Fn(BundleProgressEvent) + Sync),
 ) -> Result<BundleResult, BundleError> {
     validate_destination(&request.destination)?;
     let layout = BundleLayout::new(&request.destination, &request.input.original_name)?;
@@ -610,6 +647,21 @@ fn export_bundle_with_hook(
         }
         .into());
     }
+    let progress_total = request
+        .input
+        .stem_plan
+        .stems
+        .len()
+        .checked_add(4)
+        .ok_or_else(|| BundleError::Integrity("bundle progress size overflow".into()))?;
+    progress(BundleProgressEvent {
+        phase: BundleProgressPhase::Preparing,
+        completed: 0,
+        total: progress_total,
+        message: "Preparing source and conversion plan".into(),
+        stem_id: None,
+        stem_name: None,
+    });
 
     let stem_relative_paths = request
         .input
@@ -658,12 +710,32 @@ fn export_bundle_with_hook(
     hook.checkpoint(FaultPoint::AfterSource)?;
 
     let render_started = Instant::now();
+    progress(BundleProgressEvent {
+        phase: BundleProgressPhase::ExtractingParts,
+        completed: 1,
+        total: progress_total,
+        message: "Extracting source Parts with MuseScore".into(),
+        stem_id: None,
+        stem_name: None,
+    });
     let extracted_parts = request.renderer.extract_score_parts(
         &source_path,
         &remaining_render_limits(render_started, &request.render_limits)?,
     )?;
-    let extracted_parts = align_extracted_parts(&request.input.stem_plan.stems, extracted_parts)?;
+    let extracted_parts = align_extracted_parts(
+        &request.input.source_format,
+        &request.input.stem_plan.stems,
+        extracted_parts,
+    )?;
 
+    progress(BundleProgressEvent {
+        phase: BundleProgressPhase::RenderingReference,
+        completed: 2,
+        total: progress_total,
+        message: "Rendering the full-score reference mix".into(),
+        stem_id: None,
+        stem_name: None,
+    });
     let render_output = root.join(".render-work/full-score.wav");
     let rendered = render_owned(
         request.renderer.as_ref(),
@@ -684,14 +756,28 @@ fn export_bundle_with_hook(
     }
     let mut total_audio_bytes = reference_wav.bytes;
     let mut rendered_stems = Vec::with_capacity(extracted_parts.len());
-    for ((stem, relative_path), part) in request
+    for (stem_index, ((stem, relative_path), part)) in request
         .input
         .stem_plan
         .stems
         .iter()
         .zip(&stem_relative_paths)
         .zip(extracted_parts)
+        .enumerate()
     {
+        progress(BundleProgressEvent {
+            phase: BundleProgressPhase::RenderingStem,
+            completed: stem_index + 3,
+            total: progress_total,
+            message: format!(
+                "Rendering Part {} of {}: {}",
+                stem_index + 1,
+                request.input.stem_plan.stems.len(),
+                stem.display_name
+            ),
+            stem_id: Some(stem.stem_id.clone()),
+            stem_name: Some(stem.display_name.clone()),
+        });
         let part_input = root
             .join(".render-work/parts")
             .join(format!("{}.mscz", stem.stem_id));
@@ -699,7 +785,7 @@ fn export_bundle_with_hook(
         let part_output = root
             .join(".render-work/parts")
             .join(format!("{}.wav", stem.stem_id));
-        let rendered_part = render_owned(
+        let rendered_part = render_part_owned(
             request.renderer.as_ref(),
             &part_input,
             &part_output,
@@ -723,7 +809,8 @@ fn export_bundle_with_hook(
             phase: "publish rendered stem into staging",
             source,
         })?;
-        let wav = validate_wav(&published_path, request.render_limits.max_output_bytes)?;
+        let wav =
+            validate_wav_allowing_silence(&published_path, request.render_limits.max_output_bytes)?;
         if wav.sha256 != rendered_part.wav.sha256 {
             return Err(BundleError::Integrity(format!(
                 "stem {} changed after validation",
@@ -744,6 +831,14 @@ fn export_bundle_with_hook(
     })?;
     hook.checkpoint(FaultPoint::AfterAudio)?;
 
+    progress(BundleProgressEvent {
+        phase: BundleProgressPhase::Finalizing,
+        completed: progress_total - 1,
+        total: progress_total,
+        message: "Writing and verifying the preservation bundle".into(),
+        stem_id: None,
+        stem_name: None,
+    });
     let mut stem_audio_records = Vec::with_capacity(rendered_stems.len());
     for stem in &rendered_stems {
         let group_id = append_instrumental_track(
@@ -820,7 +915,7 @@ fn export_bundle_with_hook(
             != normalize_part_name(&stem.descriptor.display_name)
         {
             warnings.push(format!(
-                "[PART_NAME_DIFFERENCE] Source Part '{}' was returned by MuseScore as '{}'; native Part identity was preserved.",
+                "[PART_NAME_DIFFERENCE] Source Part '{}' was returned by MuseScore as '{}'; verified source ordinal was preserved.",
                 stem.descriptor.display_name, stem.extracted_name
             ));
         }
@@ -894,7 +989,7 @@ fn export_bundle_with_hook(
     }
     staging.commit();
 
-    Ok(BundleResult {
+    let result = BundleResult {
         bundle_path: request.destination.clone(),
         project_path: request
             .destination
@@ -918,7 +1013,16 @@ fn export_bundle_with_hook(
         audio_sample_rate: reference_wav.sample_rate,
         audio_channels: reference_wav.channels,
         warnings: manifest.warnings,
-    })
+    };
+    progress(BundleProgressEvent {
+        phase: BundleProgressPhase::Finished,
+        completed: progress_total,
+        total: progress_total,
+        message: "Complete project ready".into(),
+        stem_id: None,
+        stem_name: None,
+    });
+    Ok(result)
 }
 
 fn ensure_same_timeline(
@@ -945,6 +1049,7 @@ struct RenderedStem {
 }
 
 fn align_extracted_parts(
+    _source_format: &str,
     stems: &[StemDescriptor],
     parts: Vec<ExtractedScorePart>,
 ) -> Result<Vec<ExtractedScorePart>, BundleError> {
@@ -965,62 +1070,17 @@ fn align_extracted_parts(
         }
     }
 
-    let mut aligned = Vec::with_capacity(stems.len());
-    for stem in stems {
-        let native_id = stem
-            .source_part_id
-            .strip_prefix("musescore-part-")
-            .unwrap_or(&stem.source_part_id);
-        let id_matches = available
-            .iter()
-            .enumerate()
-            .filter_map(|(index, part)| {
-                part.as_ref()
-                    .and_then(|part| part.metadata.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| *id == native_id)
-                    .map(|_| index)
-            })
-            .collect::<Vec<_>>();
-        if id_matches.len() > 1 {
-            return Err(BundleError::Integrity(format!(
-                "MuseScore Part alignment is ambiguous for source Part {}: \
-                 native ID {native_id:?} matched more than once",
-                stem.source_part_id
-            )));
-        }
-        let normalized_stem_name = normalize_part_name(&stem.display_name);
-        let name_matches = available
-            .iter()
-            .enumerate()
-            .filter_map(|(index, part)| {
-                part.as_ref()
-                    .filter(|part| normalize_part_name(&part.name) == normalized_stem_name)
-                    .map(|_| index)
-            })
-            .collect::<Vec<_>>();
-        if id_matches.is_empty() && name_matches.len() > 1 {
-            return Err(BundleError::Integrity(format!(
-                "MuseScore Part alignment is ambiguous for source Part {}: \
-                 display name {:?} matched more than once",
-                stem.source_part_id, stem.display_name
-            )));
-        }
-        let selected = id_matches
-            .first()
-            .copied()
-            .or_else(|| name_matches.first().copied())
-            .ok_or_else(|| {
+    available
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, part)| {
+            part.ok_or_else(|| {
                 BundleError::Integrity(format!(
-                    "MuseScore returned no uniquely identifiable Part for source Part {} ({:?})",
-                    stem.source_part_id, stem.display_name
+                    "MuseScore returned no Part at source ordinal {ordinal}"
                 ))
-            })?;
-        aligned.push(available[selected].take().ok_or_else(|| {
-            BundleError::Integrity("MuseScore Part was assigned more than once".into())
-        })?);
-    }
-    Ok(aligned)
+            })
+        })
+        .collect()
 }
 
 fn remaining_render_limits(
@@ -1047,6 +1107,23 @@ fn render_owned(
     limits: &RenderLimits,
 ) -> Result<crate::renderer::RenderedAudio, BundleError> {
     let rendered = renderer.render(input, expected_output, limits)?;
+    validate_owned_render(rendered, expected_output)
+}
+
+fn render_part_owned(
+    renderer: &dyn AudioRenderer,
+    input: &Path,
+    expected_output: &Path,
+    limits: &RenderLimits,
+) -> Result<crate::renderer::RenderedAudio, BundleError> {
+    let rendered = renderer.render_part(input, expected_output, limits)?;
+    validate_owned_render(rendered, expected_output)
+}
+
+fn validate_owned_render(
+    rendered: crate::renderer::RenderedAudio,
+    expected_output: &Path,
+) -> Result<crate::renderer::RenderedAudio, BundleError> {
     if rendered.path != expected_output {
         return Err(BundleError::Integrity(
             "renderer returned a path other than the owned render output".into(),
@@ -1390,7 +1467,7 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
     for record in [&manifest.source, &manifest.project, &manifest.preservation] {
         verify_artifact(root, record)?;
     }
-    verify_audio_artifact(root, &manifest.audio.reference_mix.asset)?;
+    verify_audio_artifact(root, &manifest.audio.reference_mix.asset, false)?;
     if !manifest.audio.reference_mix.muted_by_default {
         return Err(BundleError::Integrity(
             "the full-score reference mix must be muted by default".into(),
@@ -1446,7 +1523,7 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
                 stem.stem_id
             )));
         }
-        verify_audio_artifact(root, &stem.asset)?;
+        verify_audio_artifact(root, &stem.asset, true)?;
     }
 
     let project_path = safe_join(root, &manifest.project.path)?;
@@ -1496,10 +1573,18 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
     ledger.validate(&allowed)
 }
 
-fn verify_audio_artifact(root: &Path, record: &AudioArtifactRecord) -> Result<(), BundleError> {
+fn verify_audio_artifact(
+    root: &Path,
+    record: &AudioArtifactRecord,
+    allow_silence: bool,
+) -> Result<(), BundleError> {
     verify_artifact(root, &record.artifact)?;
     let audio_path = safe_join(root, &record.artifact.path)?;
-    let wav = validate_wav(&audio_path, record.artifact.bytes)?;
+    let wav = if allow_silence {
+        validate_wav_allowing_silence(&audio_path, record.artifact.bytes)?
+    } else {
+        validate_wav(&audio_path, record.artifact.bytes)?
+    };
     if wav.sha256 != record.artifact.sha256
         || wav.sample_rate != record.sample_rate
         || wav.channels != record.channels
@@ -1702,12 +1787,14 @@ mod tests {
     use crate::renderer::{MuseScoreRenderer, RendererCapabilities, WavInfo};
     use crate::stems::{StemDescriptor, StemPlan, StemRole};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
 
     static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Clone, Copy)]
     enum FakeMode {
         Success,
+        SilentStem,
         MisalignedStem,
         Missing,
         Corrupt,
@@ -1830,7 +1917,7 @@ mod tests {
                         reason: "injected corrupt response".into(),
                     })
                 }
-                FakeMode::Success | FakeMode::MisalignedStem => {}
+                FakeMode::Success | FakeMode::SilentStem | FakeMode::MisalignedStem => {}
             }
             Ok(self.parts.clone())
         }
@@ -1851,7 +1938,7 @@ mod tests {
                 FakeMode::Corrupt => {
                     fs::write(output, b"not a wave").unwrap();
                 }
-                FakeMode::Success => write_test_wav(output),
+                FakeMode::Success | FakeMode::SilentStem => write_test_wav(output),
                 FakeMode::MisalignedStem => {
                     if input.extension().and_then(|value| value.to_str()) == Some("mscz") {
                         write_test_wav_with_frames(output, 880);
@@ -1866,6 +1953,24 @@ mod tests {
                 wav,
                 renderer: self.capabilities.identity.clone(),
             })
+        }
+
+        fn render_part(
+            &self,
+            input: &Path,
+            output: &Path,
+            limits: &RenderLimits,
+        ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+            if matches!(self.mode, FakeMode::SilentStem) {
+                write_silent_test_wav(output);
+                let wav = validate_wav_allowing_silence(output, limits.max_output_bytes)?;
+                return Ok(crate::renderer::RenderedAudio {
+                    path: output.into(),
+                    wav,
+                    renderer: self.capabilities.identity.clone(),
+                });
+            }
+            self.render(input, output, limits)
         }
     }
 
@@ -1888,6 +1993,20 @@ mod tests {
 
     fn write_test_wav(path: &Path) {
         write_test_wav_with_frames(path, 882);
+    }
+
+    fn write_silent_test_wav(path: &Path) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..882 {
+            writer.write_sample::<i16>(0).unwrap();
+        }
+        writer.finalize().unwrap();
     }
 
     fn write_test_wav_with_frames(path: &Path, interleaved_samples: usize) {
@@ -2023,6 +2142,39 @@ mod tests {
     }
 
     #[test]
+    fn successful_bundle_reports_bounded_monotonic_progress() {
+        let root = temp_dir("progress");
+        let events = Mutex::new(Vec::new());
+        export_bundle_with_progress(request(&root, FakeMode::Success), &|event| {
+            events.lock().unwrap().push(event);
+        })
+        .unwrap();
+        let events = events.into_inner().unwrap();
+
+        assert_eq!(
+            events.iter().map(|event| event.phase).collect::<Vec<_>>(),
+            [
+                BundleProgressPhase::Preparing,
+                BundleProgressPhase::ExtractingParts,
+                BundleProgressPhase::RenderingReference,
+                BundleProgressPhase::RenderingStem,
+                BundleProgressPhase::Finalizing,
+                BundleProgressPhase::Finished,
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.completed)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert!(events.iter().all(|event| event.total == 5));
+        assert_eq!(events[3].stem_name.as_deref(), Some("Music"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn multiple_source_parts_become_distinct_audio_tracks_with_safe_mute_defaults() {
         let root = temp_dir("multiple-stems");
         let mut request = request(&root, FakeMode::Success);
@@ -2088,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn extracted_parts_align_by_native_id_before_ordinal_or_display_name() {
+    fn native_scores_align_parts_by_verified_source_order() {
         let descriptors = vec![
             StemDescriptor {
                 stem_id: "first".into(),
@@ -2123,13 +2275,55 @@ mod tests {
                 mscz: vec![2],
             },
         ];
-        let aligned = align_extracted_parts(&descriptors, parts).unwrap();
-        assert_eq!(aligned[0].mscz, [2]);
-        assert_eq!(aligned[1].mscz, [1]);
+        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
+        assert_eq!(aligned[0].mscz, [1]);
+        assert_eq!(aligned[1].mscz, [2]);
     }
 
     #[test]
-    fn extracted_parts_without_unique_identity_are_rejected() {
+    fn imported_scores_align_parts_by_source_order_when_musescore_rewrites_names_and_ids() {
+        let descriptors = vec![
+            StemDescriptor {
+                stem_id: "banjo".into(),
+                source_part_id: "midi:track:3".into(),
+                display_name: "BANJO MELODY".into(),
+                source_track_ids: vec!["midi:track:3".into()],
+                source_note_count: 1,
+                role: StemRole::Accompaniment,
+                active_by_default: true,
+            },
+            StemDescriptor {
+                stem_id: "strings".into(),
+                source_part_id: "midi:track:5".into(),
+                display_name: "STRINGS".into(),
+                source_track_ids: vec!["midi:track:5".into()],
+                source_note_count: 1,
+                role: StemRole::Accompaniment,
+                active_by_default: true,
+            },
+        ];
+        let parts = vec![
+            ExtractedScorePart {
+                ordinal: 0,
+                name: "Banjo, BANJO MELODY".into(),
+                metadata: serde_json::json!({"id": "generated-banjo-id"}),
+                mscz: vec![1],
+            },
+            ExtractedScorePart {
+                ordinal: 1,
+                name: "Violins, STRINGS".into(),
+                metadata: serde_json::json!({"id": "generated-strings-id"}),
+                mscz: vec![2],
+            },
+        ];
+
+        let aligned = align_extracted_parts("karaokeMidi", &descriptors, parts).unwrap();
+        assert_eq!(aligned[0].mscz, [1]);
+        assert_eq!(aligned[1].mscz, [2]);
+    }
+
+    #[test]
+    fn native_scores_tolerate_musescore_rewritten_part_identity() {
         let descriptors = vec![StemDescriptor {
             stem_id: "voice".into(),
             source_part_id: "musescore-part-voice".into(),
@@ -2146,11 +2340,9 @@ mod tests {
             mscz: vec![1],
         }];
 
-        assert!(matches!(
-            align_extracted_parts(&descriptors, parts),
-            Err(BundleError::Integrity(message))
-                if message.contains("no uniquely identifiable Part")
-        ));
+        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
+        assert_eq!(aligned[0].name, "Piano");
+        assert_eq!(aligned[0].mscz, [1]);
     }
 
     #[test]
@@ -2165,6 +2357,19 @@ mod tests {
         ));
         assert!(!destination.exists());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn silent_isolated_source_part_is_preserved_when_reference_mix_is_audible() {
+        let root = temp_dir("silent-stem");
+        let request = request(&root, FakeMode::SilentStem);
+
+        let result = export_bundle(request).expect("a legitimate silent Part must be preserved");
+        assert_eq!(result.stem_count, 1);
+        assert!(validate_wav(&result.audio_path, 1024 * 1024).is_ok());
+        assert!(validate_wav_allowing_silence(&result.audio_paths[0], 1024 * 1024).is_ok());
+        assert!(validate_wav(&result.audio_paths[0], 1024 * 1024).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

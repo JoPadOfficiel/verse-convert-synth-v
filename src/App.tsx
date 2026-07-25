@@ -14,6 +14,7 @@ import { FileList } from "@/components/FileList";
 import { Settings } from "@/components/Settings";
 import {
   chooseBundleTarget,
+  batchBundlePaths,
   commandError,
   commandErrorMessage,
   convertFiles,
@@ -31,6 +32,11 @@ import {
 } from "@/lib/tauri";
 import { applyTrackOverrides } from "@/lib/vocal-overrides";
 import { useTheme } from "@/components/theme-provider";
+import {
+  failedExportProgress,
+  queuedExportProgress,
+  type FileExportProgress,
+} from "@/lib/export-progress";
 
 const RENDERER_PATH_KEY = "verse.rendererPath";
 
@@ -59,6 +65,9 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [overrides, setOverrides] = useState<Overrides>({});
   const [exportErrors, setExportErrors] = useState<Record<string, string>>({});
+  const [exportProgress, setExportProgress] = useState<
+    Record<string, FileExportProgress>
+  >({});
   const [globalError, setGlobalError] = useState<string | null>(null);
   const { theme, setTheme } = useTheme();
 
@@ -223,6 +232,17 @@ export default function App() {
       delete next[item.path];
       return next;
     });
+    setExportProgress((previous) => ({
+      ...previous,
+      [item.path]: {
+        phase: "preparing",
+        completed: 0,
+        total: 1,
+        message: "Starting complete project export",
+        stemId: null,
+        stemName: null,
+      },
+    }));
     try {
       const result = await exportBundle(
         item,
@@ -230,6 +250,12 @@ export default function App() {
         language,
         overrides[item.path],
         rendererPath,
+        (progress) => {
+          setExportProgress((previous) => ({
+            ...previous,
+            [item.path]: progress,
+          }));
+        },
       );
       setItems((previous) =>
         previous.map((candidate) =>
@@ -251,6 +277,10 @@ export default function App() {
       );
     } catch (error) {
       const parsed = commandError(error);
+      setExportProgress((previous) => ({
+        ...previous,
+        [item.path]: failedExportProgress(previous[item.path]),
+      }));
       setExportErrors((previous) => ({
         ...previous,
         [item.path]: commandErrorMessage(parsed),
@@ -292,11 +322,24 @@ export default function App() {
   async function exportManyBundles(paths: string[]) {
     if (!beginBusy()) return;
     setGlobalError(null);
+    setExportProgress((previous) => {
+      const next = { ...previous };
+      for (const path of paths) {
+        if (items.some((item) => item.path === path && item.ok)) {
+          next[path] = queuedExportProgress();
+        }
+      }
+      return next;
+    });
     try {
+      const bundlePaths = batchBundlePaths(paths, outDir);
       for (const path of paths) {
         const item = items.find((candidate) => candidate.path === path);
         if (!item?.ok) continue;
-        await runBundleExport(item, defaultBundlePath(path, outDir));
+        await runBundleExport(
+          item,
+          bundlePaths.get(path) ?? defaultBundlePath(path, outDir),
+        );
       }
     } catch (error) {
       setGlobalError(commandErrorMessage(error));
@@ -467,6 +510,7 @@ export default function App() {
                   setSelected(new Set());
                   setOverrides({});
                   setExportErrors({});
+                  setExportProgress({});
                   setGlobalError(null);
                 }}
               >
@@ -504,6 +548,7 @@ export default function App() {
             items={items}
             busy={busy}
             exportErrors={exportErrors}
+            exportProgress={exportProgress}
             onBundle={(item) => void exportOneBundle(item)}
             onVocals={(item) => void exportVocals(item)}
             selected={selected}

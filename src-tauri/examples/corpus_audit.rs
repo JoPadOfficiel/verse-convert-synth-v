@@ -1,4 +1,4 @@
-//! Deterministic, machine-readable corpus audit for openly licensed score
+//! Developer-only deterministic, machine-readable corpus audit for openly licensed score
 //! collections. This binary never downloads data; the wrapper script pins and
 //! verifies the corpus before invoking it.
 
