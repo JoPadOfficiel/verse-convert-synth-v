@@ -29,6 +29,7 @@ import {
   type Overrides,
   type RendererStatus,
 } from "@/lib/tauri";
+import { applyTrackOverrides } from "@/lib/vocal-overrides";
 import { useTheme } from "@/components/theme-provider";
 
 const RENDERER_PATH_KEY = "verse.rendererPath";
@@ -332,16 +333,16 @@ export default function App() {
     }
   }
 
-  async function toggleVocalExport(
+  async function toggleVocalExports(
     path: string,
-    trackId: number,
+    trackIds: readonly number[],
     enabled: boolean,
   ) {
     if (!beginBusy()) return;
     const previousOverrides = overrides;
     const next: Overrides = {
       ...overrides,
-      [path]: { ...(overrides[path] ?? {}), [trackId]: enabled },
+      [path]: applyTrackOverrides(overrides[path], trackIds, enabled),
     };
     setOverrides(next);
     setGlobalError(null);
@@ -479,7 +480,7 @@ export default function App() {
                 disabled={busy}
                 onClick={() => void exportManyBundles([...selected])}
               >
-                Export selected bundles ({selected.size})
+                Export selected complete projects ({selected.size})
               </Button>
             )}
             <Button
@@ -488,7 +489,7 @@ export default function App() {
                 void exportManyBundles(validItems.map((item) => item.path))
               }
             >
-              {busy ? "Working…" : "Export all bundles"}
+              {busy ? "Working…" : "Export all complete projects"}
             </Button>
           </div>
           {globalError && (
@@ -507,7 +508,7 @@ export default function App() {
             onVocals={(item) => void exportVocals(item)}
             selected={selected}
             onToggleSelect={toggleSelect}
-            onToggleVocal={toggleVocalExport}
+            onToggleVocal={toggleVocalExports}
           />
         </>
       )}

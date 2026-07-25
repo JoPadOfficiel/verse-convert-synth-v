@@ -84,14 +84,14 @@ fn note_on_velocity_zero_remains_distinguishable_and_closes_the_note() {
 }
 
 #[test]
-fn a_karaoke_extension_hint_cannot_qualify_unproven_text() {
+fn a_karaoke_container_cannot_qualify_unproven_text() {
     let data = smf(&[
         0x00, 0xff, 0x01, 0x03, b'l', b'e', b't', 0x00, 0xff, 0x2f, 0x00,
     ]);
     let standard = midi::parse(&data).unwrap();
     let karaoke = midi::parse_with_karaoke_profile(&data).unwrap();
     assert_eq!(standard.source_format, SourceFormat::StandardMidi);
-    assert_eq!(karaoke.source_format, SourceFormat::StandardMidi);
+    assert_eq!(karaoke.source_format, SourceFormat::KaraokeMidi);
     assert_eq!(
         karaoke.tracks[0].text_profile,
         midi::MidiTextProfile::Generic

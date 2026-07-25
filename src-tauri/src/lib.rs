@@ -1,15 +1,17 @@
 pub mod bundle;
 pub mod engine;
 pub mod renderer;
+pub mod stems;
 
 use bundle::{
     build_preservation_ledger, export_bundle as write_bundle, BundleInput, BundleLayout,
     BundleRequest, BundleResult,
 };
 use engine::convert::{
-    convert_auto_with, Diagnostic, ExportRepresentation, LyricStatus, SourceRole,
+    convert_auto_with, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState, SourceRole,
+    TrackReport,
 };
-use engine::midi::{Midi, SourceFormat};
+use engine::midi::{Midi, SourceFormat, SourceTopology};
 use renderer::{
     AudioRenderer, MuseScoreConfig, MuseScoreRenderer, RenderLimits, DEFAULT_MAX_WAV_BYTES,
     DEFAULT_RENDER_TIMEOUT,
@@ -38,6 +40,26 @@ pub struct TrackInfo {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartInfo {
+    pub source_id: String,
+    pub part: String,
+    pub staves: usize,
+    pub voices: usize,
+    pub track_ids: Vec<usize>,
+    pub vocal_candidate_track_ids: Vec<usize>,
+    pub source_track_ids: Vec<String>,
+    pub notes: usize,
+    pub placed: usize,
+    pub source_role: SourceRole,
+    pub lyric_status: LyricStatus,
+    pub export_representation: ExportRepresentation,
+    pub requires_voice_assignment: bool,
+    pub has_audio_stem: bool,
+    pub warnings: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum AudioStatusDto {
     NotRendered,
@@ -52,8 +74,11 @@ pub struct FileResult {
     pub error: Option<CommandErrorDto>,
     /// Compatibility message retained for the current desktop webview.
     pub msg: Option<String>,
+    pub n_parts: usize,
+    pub n_voices: usize,
     pub n_tracks: usize,
     pub placed: usize,
+    pub parts: Vec<PartInfo>,
     pub tracks: Vec<TrackInfo>,
     pub audio_status: AudioStatusDto,
     pub requires_voice_assignment: bool,
@@ -119,10 +144,12 @@ impl From<bundle::BundleError> for CommandErrorDto {
     fn from(error: bundle::BundleError) -> Self {
         let code = error.code();
         let remediation = match code {
-            "RENDERER_NOT_FOUND" => {
-                Some("Configure MuseScore Studio 4, then retry the bundle export.")
-            }
-            "RENDERER_UNSUPPORTED" => Some("Install or select MuseScore Studio 4 or later."),
+            "RENDERER_NOT_FOUND" => Some(
+                "Configure MuseScore Studio 3.6.2 or 4 with score-parts support, then retry the bundle export.",
+            ),
+            "RENDERER_UNSUPPORTED" => Some(
+                "Install or select MuseScore Studio 3.6.2 or 4 with verified score-parts support.",
+            ),
             "DESTINATION_EXISTS" => Some("Choose a new bundle name; Verse never overwrites."),
             _ => None,
         };
@@ -143,6 +170,152 @@ pub struct RendererStatusDto {
     pub message: Option<String>,
 }
 
+fn part_infos(topology: &SourceTopology, reports: &[TrackReport]) -> Vec<PartInfo> {
+    topology
+        .parts
+        .iter()
+        .map(|part| {
+            let mut projection_track_ids = Vec::new();
+            for track_id in part
+                .staves
+                .iter()
+                .flat_map(|staff| &staff.voices)
+                .flat_map(|voice| &voice.projection_track_ids)
+            {
+                if !projection_track_ids.contains(track_id) {
+                    projection_track_ids.push(track_id.clone());
+                }
+            }
+            let source_track_ids = if part.source_track_ids.is_empty() {
+                projection_track_ids.clone()
+            } else {
+                part.source_track_ids.clone()
+            };
+            let part_reports = reports
+                .iter()
+                .filter(|report| source_track_ids.contains(&report.source_id))
+                .collect::<Vec<_>>();
+            let notes = part_reports.iter().map(|report| report.notes).sum();
+            let placed = part_reports.iter().map(|report| report.placed).sum();
+            let mut roles = Vec::new();
+            let mut warnings = Vec::new();
+            for report in &part_reports {
+                if !roles.contains(&report.source_role) {
+                    roles.push(report.source_role);
+                }
+                for warning in &report.warnings {
+                    if !warnings.contains(warning) {
+                        warnings.push(warning.clone());
+                    }
+                }
+            }
+            let source_role = match roles.as_slice() {
+                [] => SourceRole::Metadata,
+                [role] => *role,
+                roles
+                    if roles.iter().all(|role| {
+                        matches!(role, SourceRole::Metadata | SourceRole::LyricsOnly)
+                    }) =>
+                {
+                    if roles.contains(&SourceRole::LyricsOnly) {
+                        SourceRole::LyricsOnly
+                    } else {
+                        SourceRole::Metadata
+                    }
+                }
+                _ => SourceRole::Mixed,
+            };
+            let mut lyric_status = LyricStatus {
+                state: LyricStatusState::None,
+                source_text_count: 0,
+                projected_text_count: 0,
+                explicit_empty_count: 0,
+                continuation_count: 0,
+                unsupported_count: 0,
+            };
+            for report in &part_reports {
+                lyric_status.source_text_count += report.lyric_status.source_text_count;
+                lyric_status.projected_text_count += report.lyric_status.projected_text_count;
+                lyric_status.explicit_empty_count += report.lyric_status.explicit_empty_count;
+                lyric_status.continuation_count += report.lyric_status.continuation_count;
+                lyric_status.unsupported_count += report.lyric_status.unsupported_count;
+            }
+            lyric_status.state = if part_reports
+                .iter()
+                .any(|report| report.lyric_status.state == LyricStatusState::Unsupported)
+            {
+                LyricStatusState::Unsupported
+            } else if part_reports
+                .iter()
+                .any(|report| report.lyric_status.state == LyricStatusState::Ambiguous)
+            {
+                LyricStatusState::Ambiguous
+            } else if lyric_status.source_text_count > 0 {
+                LyricStatusState::SourceOwned
+            } else if lyric_status.explicit_empty_count > 0 {
+                LyricStatusState::ExplicitEmpty
+            } else if part_reports
+                .iter()
+                .any(|report| report.lyric_status.state == LyricStatusState::MetadataOnly)
+            {
+                LyricStatusState::MetadataOnly
+            } else {
+                LyricStatusState::None
+            };
+            let vocal_projection = part_reports.iter().any(|report| {
+                matches!(
+                    report.export_representation,
+                    ExportRepresentation::VocalNotes
+                        | ExportRepresentation::VocalNotesAndReferenceMix
+                )
+            });
+            let has_audio_stem = notes > 0;
+            let export_representation = match (vocal_projection, has_audio_stem) {
+                (true, true) => ExportRepresentation::VocalNotesAndReferenceMix,
+                (true, false) => ExportRepresentation::VocalNotes,
+                (false, true) => ExportRepresentation::ReferenceMixMember,
+                (false, false) => ExportRepresentation::SourceOnly,
+            };
+            PartInfo {
+                source_id: part.id.clone(),
+                part: if part.name.trim().is_empty() {
+                    part.id.clone()
+                } else {
+                    part.name.clone()
+                },
+                staves: part.staves.len(),
+                voices: part.staves.iter().map(|staff| staff.voices.len()).sum(),
+                track_ids: part_reports.iter().map(|report| report.id).collect(),
+                vocal_candidate_track_ids: part_reports
+                    .iter()
+                    .filter(|report| {
+                        projection_track_ids.contains(&report.source_id)
+                            && report.notes > 0
+                            && !matches!(
+                                report.source_role,
+                                SourceRole::Percussion
+                                    | SourceRole::Metadata
+                                    | SourceRole::LyricsOnly
+                            )
+                    })
+                    .map(|report| report.id)
+                    .collect(),
+                source_track_ids,
+                notes,
+                placed,
+                source_role,
+                lyric_status,
+                export_representation,
+                requires_voice_assignment: part_reports
+                    .iter()
+                    .any(|report| report.requires_voice_assignment),
+                has_audio_stem,
+                warnings,
+            }
+        })
+        .collect()
+}
+
 fn process_one(
     path: &str,
     write: bool,
@@ -161,8 +334,11 @@ fn process_one(
         ok: false,
         error: Some(CommandErrorDto::new(code, msg.clone())),
         msg: Some(msg),
+        n_parts: 0,
+        n_voices: 0,
         n_tracks: 0,
         placed: 0,
+        parts: vec![],
         tracks: vec![],
         audio_status: AudioStatusDto::NotRendered,
         requires_voice_assignment: false,
@@ -215,6 +391,15 @@ fn process_one(
             warnings: t.warnings.clone(),
         })
         .collect();
+    let parts = part_infos(&r.topology, &r.tracks);
+    let n_parts = parts.len();
+    let n_voices = r
+        .topology
+        .parts
+        .iter()
+        .flat_map(|part| &part.staves)
+        .map(|staff| staff.voices.len())
+        .sum();
     let requires_voice_assignment = tracks.iter().any(|track| track.requires_voice_assignment);
     let warnings = tracks
         .iter()
@@ -255,8 +440,11 @@ fn process_one(
         ok,
         error,
         msg,
-        n_tracks: r.n_tracks,
+        n_parts,
+        n_voices,
+        n_tracks: n_parts,
         placed: r.placed,
+        parts,
         tracks,
         audio_status: AudioStatusDto::NotRendered,
         requires_voice_assignment,
@@ -422,7 +610,9 @@ fn export_bundle_blocking(
         })?
         .to_string();
     let layout = BundleLayout::new(&destination, &original_name).map_err(CommandErrorDto::from)?;
-    let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout);
+    let stem_plan = stems::StemPlan::from_source(&midi, &outcome.tracks)
+        .map_err(|error| CommandErrorDto::new("STEM_PLAN_INVALID", error.to_string()))?;
+    let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
     let manifest_warnings: Vec<String> = outcome
         .tracks
         .iter()
@@ -461,6 +651,7 @@ fn export_bundle_blocking(
             source_format: source_format_name(midi.source_format).into(),
             source_bytes,
             project,
+            stem_plan,
             ledger,
             warnings: manifest_warnings,
         },
@@ -521,6 +712,8 @@ async fn renderer_status(renderer_path: Option<String>) -> RendererStatusDto {
             }
         }
         Ok(Err(error @ renderer::RenderError::UnsupportedVersion { .. }))
+        | Ok(Err(error @ renderer::RenderError::UnsupportedCapabilities { .. }))
+        | Ok(Err(error @ renderer::RenderError::IncompatibleScore { .. }))
         | Ok(Err(error @ renderer::RenderError::ProbeRejected { .. })) => RendererStatusDto {
             state: "unsupported".into(),
             configured,
@@ -680,5 +873,155 @@ mod output_tests {
     fn audio_status_is_a_discriminated_camel_case_object() {
         let value = serde_json::to_value(AudioStatusDto::NotRendered).unwrap();
         assert_eq!(value["state"], "notRendered");
+    }
+
+    #[test]
+    fn part_dto_groups_technical_chord_lanes_under_source_part() {
+        use engine::midi::{SourcePart, SourceStaff, SourceVoice};
+
+        let topology = SourceTopology {
+            parts: vec![
+                SourcePart {
+                    id: "part:P1".into(),
+                    name: "Voice".into(),
+                    source_track_ids: vec![
+                        "part:P1:voice:1:lane:1".into(),
+                        "part:P1:voice:1:lane:2".into(),
+                        "part:P1:unassigned-lyrics".into(),
+                    ],
+                    staves: vec![SourceStaff {
+                        id: "staff:1".into(),
+                        voices: vec![SourceVoice {
+                            id: "part:P1:staff:1:voice:1".into(),
+                            number: "1".into(),
+                            projection_track_ids: vec![
+                                "part:P1:voice:1:lane:1".into(),
+                                "part:P1:voice:1:lane:2".into(),
+                            ],
+                        }],
+                    }],
+                },
+                SourcePart {
+                    id: "part:P2".into(),
+                    name: "Piano".into(),
+                    source_track_ids: vec!["part:P2:voice:1".into()],
+                    staves: vec![SourceStaff {
+                        id: "staff:2".into(),
+                        voices: vec![SourceVoice {
+                            id: "part:P2:staff:2:voice:1".into(),
+                            number: "1".into(),
+                            projection_track_ids: vec!["part:P2:voice:1".into()],
+                        }],
+                    }],
+                },
+            ],
+        };
+        let lyric_status = LyricStatus {
+            state: engine::convert::LyricStatusState::SourceOwned,
+            source_text_count: 1,
+            projected_text_count: 1,
+            explicit_empty_count: 0,
+            continuation_count: 0,
+            unsupported_count: 0,
+        };
+        let reports = vec![
+            TrackReport {
+                id: 0,
+                source_id: "part:P1:voice:1:lane:1".into(),
+                track: "Voice".into(),
+                notes: 5,
+                role: "vocal".into(),
+                placed: 5,
+                source_role: SourceRole::Vocal,
+                lyric_status: lyric_status.clone(),
+                export_representation: ExportRepresentation::VocalNotesAndReferenceMix,
+                requires_voice_assignment: true,
+                warnings: Vec::new(),
+            },
+            TrackReport {
+                id: 1,
+                source_id: "part:P1:voice:1:lane:2".into(),
+                track: "Voice — polyphonic member 2".into(),
+                notes: 3,
+                role: "backing".into(),
+                placed: 0,
+                source_role: SourceRole::Vocal,
+                lyric_status: LyricStatus {
+                    state: engine::convert::LyricStatusState::None,
+                    source_text_count: 0,
+                    projected_text_count: 0,
+                    explicit_empty_count: 0,
+                    continuation_count: 0,
+                    unsupported_count: 0,
+                },
+                export_representation: ExportRepresentation::ReferenceMixMember,
+                requires_voice_assignment: false,
+                warnings: Vec::new(),
+            },
+            TrackReport {
+                id: 2,
+                source_id: "part:P2:voice:1".into(),
+                track: "Piano".into(),
+                notes: 12,
+                role: "backing".into(),
+                placed: 0,
+                source_role: SourceRole::Instrumental,
+                lyric_status: LyricStatus {
+                    state: engine::convert::LyricStatusState::None,
+                    source_text_count: 0,
+                    projected_text_count: 0,
+                    explicit_empty_count: 0,
+                    continuation_count: 0,
+                    unsupported_count: 0,
+                },
+                export_representation: ExportRepresentation::ReferenceMixMember,
+                requires_voice_assignment: false,
+                warnings: Vec::new(),
+            },
+            TrackReport {
+                id: 3,
+                source_id: "part:P1:unassigned-lyrics".into(),
+                track: "Voice — unassigned chord lyrics".into(),
+                notes: 0,
+                role: "metadata".into(),
+                placed: 0,
+                source_role: SourceRole::LyricsOnly,
+                lyric_status: LyricStatus {
+                    state: engine::convert::LyricStatusState::Ambiguous,
+                    source_text_count: 1,
+                    projected_text_count: 0,
+                    explicit_empty_count: 0,
+                    continuation_count: 0,
+                    unsupported_count: 1,
+                },
+                export_representation: ExportRepresentation::SourceOnly,
+                requires_voice_assignment: false,
+                warnings: vec![Diagnostic {
+                    code: "UNASSIGNED_CHORD_LYRIC".into(),
+                    severity: engine::convert::DiagnosticSeverity::Warning,
+                    message: "Source lyric remains source-only.".into(),
+                    source_id: Some("part:P1:unassigned-lyrics".into()),
+                }],
+            },
+        ];
+
+        let parts = part_infos(&topology, &reports);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].voices, 1);
+        assert_eq!(parts[0].track_ids, vec![0, 1, 3]);
+        assert_eq!(parts[0].vocal_candidate_track_ids, vec![0, 1]);
+        assert_eq!(parts[0].notes, 8);
+        assert_eq!(parts[0].placed, 5);
+        assert!(parts[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "UNASSIGNED_CHORD_LYRIC"));
+        assert_eq!(
+            parts[0].export_representation,
+            ExportRepresentation::VocalNotesAndReferenceMix
+        );
+        assert_eq!(parts[1].part, "Piano");
+        assert_eq!(parts[1].track_ids, vec![2]);
+        assert_eq!(parts[1].source_role, SourceRole::Instrumental);
     }
 }

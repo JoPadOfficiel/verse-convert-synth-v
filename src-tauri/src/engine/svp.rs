@@ -190,7 +190,8 @@ pub fn append_instrumental_track(
     relative_audio_filename: String,
     duration_seconds: f64,
     blick_offset: i64,
-) {
+    muted: bool,
+) -> String {
     let index = project.tracks.len();
     let uid = uuid(index);
     project.tracks.push(SvpTrack {
@@ -201,7 +202,7 @@ pub fn append_instrumental_track(
         mixer: Mixer {
             gain_decibel: 0.0,
             pan: 0.0,
-            mute: false,
+            mute: muted,
             solo: false,
             display: true,
         },
@@ -223,12 +224,13 @@ pub fn append_instrumental_track(
         },
         main_group: MainGroup {
             name: "main".into(),
-            uuid: uid,
+            uuid: uid.clone(),
             parameters: Parameters::default(),
             notes: Vec::new(),
         },
         groups: Vec::new(),
     });
+    uid
 }
 
 #[cfg(test)]
@@ -252,6 +254,7 @@ mod tests {
             "../audio/full-score.wav".into(),
             2.5,
             0,
+            true,
         );
         let value = serde_json::to_value(project).unwrap();
         let track = &value["tracks"][0];
@@ -261,8 +264,8 @@ mod tests {
             track["mainRef"]["audio"]["filename"],
             "../audio/full-score.wav"
         );
+        assert_eq!(track["mixer"]["mute"], true);
         assert_eq!(track["mainRef"]["audio"]["duration"], 2.5);
         assert_eq!(track["mainGroup"]["notes"], serde_json::json!([]));
-        assert_eq!(track["mixer"]["mute"], false);
     }
 }
