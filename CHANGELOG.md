@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.4.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.1...v0.4.2) (2026-07-25)
+
+
+### Bug Fixes
+
+* keep renderer work off shared destinations ([#6](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/6)) ([a6201c1](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/a6201c150154d27e317dd36588b82a50fdc3d5ca))
+
 ## [0.4.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.0...v0.4.1) (2026-07-25)
 
 
