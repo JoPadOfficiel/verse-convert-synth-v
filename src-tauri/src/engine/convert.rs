@@ -307,13 +307,35 @@ fn track_tokens(track: &Track) -> Vec<TimedLyric> {
     tokens
 }
 
-fn read_tempo(midi: &Midi, bpt: f64) -> (Vec<Tempo>, BTreeSet<String>) {
+const BLICKS_PER_QUARTER_INTEGER: u64 = 705_600_000;
+
+fn exact_blick_position(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i64, String> {
+    if ticks_per_beat == 0 {
+        return Err("MIDI PPQ division must be non-zero".into());
+    }
+    let numerator = u128::from(ticks) * u128::from(BLICKS_PER_QUARTER_INTEGER);
+    let denominator = u128::from(ticks_per_beat);
+    if numerator % denominator != 0 {
+        return Err(format!(
+            "{context} at MIDI tick {ticks} cannot be represented exactly in Synthesizer V blicks \
+             with PPQ {ticks_per_beat}"
+        ));
+    }
+    i64::try_from(numerator / denominator)
+        .map_err(|_| format!("{context} exceeds the Synthesizer V blick range"))
+}
+
+fn read_tempo(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Tempo>, BTreeSet<String>), String> {
     let mut seen: BTreeMap<i64, (f64, String)> = BTreeMap::new();
     for track in &midi.tracks {
         for event in &track.events {
             if let Kind::Tempo(us) = event.kind {
                 if us > 0 {
-                    let pos = (event.tick as f64 * bpt).round() as i64;
+                    let pos = exact_blick_position(
+                        event.tick,
+                        ticks_per_beat,
+                        &format!("tempo event {}:{}", track.id, event.order),
+                    )?;
                     let bpm = (60_000_000.0 / us as f64 * 1e6).round() / 1e6;
                     seen.insert(pos, (bpm, format!("event:{}:{}", track.id, event.order)));
                 }
@@ -321,20 +343,20 @@ fn read_tempo(midi: &Midi, bpt: f64) -> (Vec<Tempo>, BTreeSet<String>) {
         }
     }
     if seen.is_empty() {
-        return (
+        return Ok((
             vec![Tempo {
                 bpm: 120.0,
                 position: 0,
             }],
             BTreeSet::new(),
-        );
+        ));
     }
     let evidence = seen.values().map(|(_, id)| id.clone()).collect();
     let tempo = seen
         .into_iter()
         .map(|(position, (bpm, _))| Tempo { bpm, position })
         .collect();
-    (tempo, evidence)
+    Ok((tempo, evidence))
 }
 
 fn read_meter(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Meter>, BTreeSet<String>), String> {
@@ -476,9 +498,9 @@ fn make_track(
     idx: usize,
     name: &str,
     notes: &[SourceNote],
-    bpt: f64,
+    ticks_per_beat: u16,
     projection: TrackProjection<'_>,
-) -> SvpTrack {
+) -> Result<SvpTrack, String> {
     let mut svp_notes = Vec::with_capacity(notes.len());
     let mut explicit_extension_end = None;
     let mut musicxml_extension_open = false;
@@ -561,16 +583,29 @@ fn make_track(
             "event:{}:{}",
             projection.source_track_id, source_note.end_order
         ));
+        let onset = exact_blick_position(
+            source_note.onset,
+            ticks_per_beat,
+            &format!("note onset on source track {}", projection.source_track_id),
+        )?;
+        let duration = exact_blick_position(
+            source_note.duration,
+            ticks_per_beat,
+            &format!(
+                "note duration on source track {}",
+                projection.source_track_id
+            ),
+        )?;
         svp_notes.push(Note {
             attributes: serde_json::json!({}),
-            duration: (source_note.duration as f64 * bpt).round() as i64,
+            duration,
             lyrics: lyric,
-            onset: (source_note.onset as f64 * bpt).round() as i64,
+            onset,
             phonemes: String::new(),
             pitch,
         });
     }
-    build_track(idx, name.to_string(), svp_notes)
+    Ok(build_track(idx, name.to_string(), svp_notes))
 }
 
 /// Detects the format (MIDI / MusicXML / MuseScore) and converts.
@@ -705,7 +740,6 @@ pub fn convert_midi_with(
             "MIDI format 2 contains independent sequences and cannot be flattened safely".into(),
         );
     }
-    let bpt = BLICKS_PER_QUARTER / f64::from(tpb);
     let (meter, meter_evidence) = match read_meter(midi, tpb) {
         Ok(meter) => meter,
         Err(error) => {
@@ -804,18 +838,23 @@ pub fn convert_midi_with(
         if sing {
             if lanes.is_empty() {
                 placed = projected_lyric_count(notes, None, &assignment);
-                let mut svp_track = make_track(
+                let mut svp_track = match make_track(
                     svp_tracks.len(),
                     &name,
                     notes,
-                    bpt,
+                    tpb,
                     TrackProjection {
                         source_track_id: &track.id,
                         lane: None,
                         standalone: &assignment,
                         evidence: &mut projection,
                     },
-                );
+                ) {
+                    Ok(track) => track,
+                    Err(error) => {
+                        return fail(format!("source timing cannot be projected safely: {error}"));
+                    }
+                };
                 if !svp_track.main_group.notes.is_empty() {
                     svp_track.main_ref.database.language = language.to_string();
                     svp_tracks.push(svp_track);
@@ -829,18 +868,25 @@ pub fn convert_midi_with(
                     } else {
                         format!("{name} — lyric lane {lane}")
                     };
-                    let mut svp_track = make_track(
+                    let mut svp_track = match make_track(
                         svp_tracks.len(),
                         &lane_name,
                         notes,
-                        bpt,
+                        tpb,
                         TrackProjection {
                             source_track_id: &track.id,
                             lane: Some(lane),
                             standalone: &no_assignment,
                             evidence: &mut projection,
                         },
-                    );
+                    ) {
+                        Ok(track) => track,
+                        Err(error) => {
+                            return fail(format!(
+                                "source timing cannot be projected safely: {error}"
+                            ));
+                        }
+                    };
                     if !svp_track.main_group.notes.is_empty() {
                         svp_track.main_ref.database.language = language.to_string();
                         svp_tracks.push(svp_track);
@@ -933,7 +979,12 @@ pub fn convert_midi_with(
         track.disp_color = COLORS[display_order % COLORS.len()].to_string();
     }
 
-    let (tempo, tempo_evidence) = read_tempo(midi, bpt);
+    let (tempo, tempo_evidence) = match read_tempo(midi, tpb) {
+        Ok(tempo) => tempo,
+        Err(error) => {
+            return fail(format!("source timing cannot be projected safely: {error}"));
+        }
+    };
     projection.source_ids.extend(meter_evidence);
     projection.source_ids.extend(tempo_evidence);
     let svp = SvpProject {
@@ -1800,7 +1851,8 @@ mod tests {
             ),
         ];
         let midi = midi_with(vec![first, second]);
-        let (tempo, tempo_evidence) = read_tempo(&midi, BLICKS_PER_QUARTER / 480.0);
+        let (tempo, tempo_evidence) =
+            read_tempo(&midi, 480).expect("tick zero is exactly representable");
         let (meter, meter_evidence) =
             read_meter(&midi, 480).expect("same-tick meter changes are bar-aligned");
         assert_eq!(tempo.len(), 1);
@@ -1814,6 +1866,23 @@ mod tests {
             meter_evidence,
             BTreeSet::from(["event:second:1".to_string()])
         );
+    }
+
+    #[test]
+    fn inexact_svp_blick_positions_fail_instead_of_rounding() {
+        let mut track = Track::new("voice", 0);
+        track.events = note_events("voice", 1, 1, vec![Lyric::text("word", "word".into())]);
+        let mut midi = midi_with(vec![track]);
+        midi.ticks_per_beat = 1024;
+        midi.time_base = TimeBase::PulsesPerQuarter(1024);
+
+        let outcome = convert_midi(&midi, "english");
+        assert!(!outcome.ok);
+        assert!(outcome.svp.is_none());
+        assert!(outcome.msg.as_deref().is_some_and(|message| {
+            message.contains("cannot be represented exactly in Synthesizer V blicks")
+        }));
+        assert_eq!(outcome.topology, midi.topology);
     }
 
     #[test]

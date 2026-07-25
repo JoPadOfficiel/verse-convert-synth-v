@@ -2,7 +2,7 @@
 //! Produces the same intermediate `Midi` structure as the other parsers.
 //! Covers MuseScore 3.x / 4.x: Division, Part/Instrument/longName,
 //! Staff/Measure/voice, TimeSig, Tempo, Chord (dots, tuplets, graces),
-//! Rest (including full measures), location, lyrics (1st verse).
+//! Rest (including full measures), location, and all source lyric lanes.
 use crate::engine::midi::{
     unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricFragment, LyricState, MeasureMarks,
     Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff,

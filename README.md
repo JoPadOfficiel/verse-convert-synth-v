@@ -2,8 +2,10 @@
 
 Verse is a desktop application for macOS and Windows that converts karaoke,
 MIDI and score files into Synthesizer V projects without inventing lyrics or
-notes. Its complete export keeps the original file, renders one real audio
-stem per source score Part, and retains a muted full-score reference mix.
+notes. Linux packages are built for release qualification but are not yet an
+officially supported user platform. A complete export keeps the original file,
+renders one real audio stem per note-bearing source score Part, and retains a
+muted full-score reference mix.
 
 ![Verse screenshot](docs/screenshot.png)
 
@@ -72,15 +74,17 @@ equivalent.
 
 ## Audio renderer and important limits
 
-Complete bundle export requires a user-installed **MuseScore Studio 3.6.2 or
-4.x** whose `--score-parts` capability passes Verse's probe. Install the
+Complete bundle export requires **one** user-installed **MuseScore Studio
+3.6.2+ or 4.x** executable whose `--score-parts` capability passes Verse's
+probe. You do not need to install both major versions. Install the
 [current MuseScore Studio 4 release](https://musescore.org/en/download) or the
 [official MuseScore 3.6.2 release](https://github.com/musescore/MuseScore/releases/tag/v3.6.2),
 then configure its executable in Settings or let Verse try to detect it.
 MuseScore is not bundled with Verse. Analysis and the secondary vocal-only
 `.svp` export do not need MuseScore; complete bundles do. A native MuseScore 4
-score requires a MuseScore 4 renderer, and unknown major versions are rejected
-until their CLI contract is qualified.
+score requires a MuseScore 4 renderer. MuseScore 4 can render older MuseScore
+sources; MuseScore 3 cannot render a native MuseScore 4 source. Unknown major
+versions are rejected until their CLI contract is qualified.
 
 Common executable locations are:
 
@@ -139,7 +143,9 @@ WAV does not need a voice database.
 1. Install Verse from the
    [Releases page](https://github.com/JoPadOfficiel/verse-convert-synth-v/releases)
    (`.dmg` on macOS, `.exe` or `.msi` on Windows).
-2. Install MuseScore Studio 3.6.2 or 4 if you want complete bundles.
+   Linux ARM64/x86_64 packages are build-qualified but currently experimental.
+2. Install either MuseScore Studio 3.6.2+ or MuseScore Studio 4 if you want
+   complete bundles.
 3. Drop one or more supported files into Verse.
 4. Expand a file to inspect source Parts, staff/voice counts, source roles,
    lyric status, stem state and warnings.
@@ -168,13 +174,33 @@ sudo xattr -rd com.apple.quarantine "/Applications/Verse.app"
 
 Adjust the path if Verse is installed elsewhere.
 
+## Documentation
+
+Start with the [documentation index](docs/index.md). The maintained project
+documentation includes:
+
+- [project overview](docs/project-overview.md) and
+  [source tree](docs/source-tree-analysis.md);
+- [current architecture](docs/architecture.md) and
+  [component inventory](docs/component-inventory.md);
+- [format and fidelity rules](docs/formats-and-fidelity.md),
+  [bundle schema](docs/bundle-format.md), and
+  [Tauri command contracts](docs/tauri-command-contracts.md);
+- [MuseScore renderer setup](docs/musescore-renderer.md),
+  [development](docs/development-guide.md), and [testing](docs/testing.md);
+- [security and limits](docs/security-and-limits.md),
+  [troubleshooting](docs/troubleshooting.md), and
+  [deployment](docs/deployment-guide.md);
+- [contribution rules](docs/contribution-guide.md) and
+  [corpus testing/licensing](docs/test-corpora.md).
+
 ## Development
 
 Prerequisites:
 
-- Rust stable;
-- Node.js 22 or later;
-- MuseScore Studio 3.6.2 or 4 for real audio-rendering gates.
+- Rust stable (CI uses Rust 1.93.0);
+- Node.js 20.19+ or 22.12+ (CI uses Node.js 22);
+- either MuseScore Studio 3.6.2+ or 4.x for real audio-rendering gates.
 
 ```sh
 npm ci
@@ -223,7 +249,8 @@ It writes a machine-readable report under `src-tauri/target/corpus-reports/`.
 At the pinned commit the corpus contains 1,352 canonical `.mscx` files. The
 current gate projects 1,277 exactly, records 75 narrowly classified
 source-evidence limitations, and has zero unexpected or render errors.
-See [Corpus testing and licensing](docs/test-corpora.md) for the source audit,
+See [Testing](docs/testing.md) and
+[Corpus testing and licensing](docs/test-corpora.md) for the source audit,
 rights policy and additional datasets that were evaluated.
 
 ### Releases
@@ -238,6 +265,9 @@ Repository administrators must enforce immutable/protected `v*` tags in
 GitHub. The workflow revalidates the tag immediately before and after
 publication, but a repository rule is the atomic protection against an
 external force-push during that final API operation.
+
+See the [deployment guide](docs/deployment-guide.md) for the complete CI,
+artifact, checksum, platform-support, and unsigned-package contract.
 
 ### Architecture
 
@@ -256,6 +286,11 @@ external force-push during that final API operation.
 
 The SVP serializer currently targets project format version 113. Time is
 expressed in blicks; one quarter note is 705,600,000 blicks.
+
+The tracked [architecture document](docs/architecture.md) describes the
+implementation that exists today. The BMAD architecture artifacts under
+`_bmad-output/` also contain explicitly labelled convergence targets; do not
+mistake those future application/domain seams for already shipped modules.
 
 ## License
 

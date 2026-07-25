@@ -8,7 +8,7 @@ use bundle::{
     BundleRequest, BundleResult,
 };
 use engine::convert::{
-    convert_auto_with, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState, SourceRole,
+    convert_midi_with, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState, SourceRole,
     TrackReport,
 };
 use engine::midi::{Midi, SourceFormat, SourceTopology};
@@ -345,14 +345,14 @@ fn process_one(
         warnings: vec![],
         out: None,
     };
-    let ext_ok = Path::new(path)
+    let extension = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED_EXT.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false);
-    if !ext_ok {
+        .map(str::to_ascii_lowercase)
+        .filter(|extension| SUPPORTED_EXT.contains(&extension.as_str()));
+    let Some(extension) = extension else {
         return err(name, "UNSUPPORTED_FILE", "unsupported file type".into());
-    }
+    };
     match std::fs::metadata(path) {
         Ok(md) if md.len() > MAX_INPUT_BYTES => {
             return err(
@@ -373,7 +373,11 @@ fn process_one(
             );
         }
     };
-    let r = convert_auto_with(&data, language, overrides);
+    let midi = match parse_source_snapshot(&data, &extension) {
+        Ok(midi) => midi,
+        Err(message) => return err(name, "SOURCE_PARSE_FAILED", message),
+    };
+    let r = convert_midi_with(&midi, language, overrides);
     let tracks: Vec<_> = r
         .tracks
         .iter()
@@ -393,6 +397,7 @@ fn process_one(
         .collect();
     let parts = part_infos(&r.topology, &r.tracks);
     let n_parts = parts.len();
+    let n_tracks = tracks.len();
     let n_voices = r
         .topology
         .parts
@@ -442,7 +447,7 @@ fn process_one(
         msg,
         n_parts,
         n_voices,
-        n_tracks: n_parts,
+        n_tracks,
         placed: r.placed,
         parts,
         tracks,
@@ -460,17 +465,12 @@ fn export_svp(
     language: Option<String>,
     overrides: Option<HashMap<String, bool>>,
 ) -> Result<String, CommandErrorDto> {
-    let ext_ok = Path::new(&path)
+    let extension = Path::new(&path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED_EXT.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false);
-    if !ext_ok {
-        return Err(CommandErrorDto::new(
-            "UNSUPPORTED_FILE",
-            "unsupported file type",
-        ));
-    }
+        .map(str::to_ascii_lowercase)
+        .filter(|extension| SUPPORTED_EXT.contains(&extension.as_str()))
+        .ok_or_else(|| CommandErrorDto::new("UNSUPPORTED_FILE", "unsupported file type"))?;
     if let Ok(md) = std::fs::metadata(&path) {
         if md.len() > MAX_INPUT_BYTES {
             return Err(CommandErrorDto::new(
@@ -488,7 +488,9 @@ fn export_svp(
         .filter_map(|(k, v)| k.parse::<usize>().ok().map(|k| (k, v)))
         .collect();
     let lang = language.as_deref().unwrap_or("english");
-    let r = convert_auto_with(&data, lang, Some(&ov));
+    let midi = parse_source_snapshot(&data, &extension)
+        .map_err(|message| CommandErrorDto::new("SOURCE_PARSE_FAILED", message))?;
+    let r = convert_midi_with(&midi, lang, Some(&ov));
     if !r.ok {
         return Err(CommandErrorDto::new(
             "CONVERSION_FAILED",
@@ -1023,5 +1025,85 @@ mod output_tests {
         assert_eq!(parts[1].part, "Piano");
         assert_eq!(parts[1].track_ids, vec![2]);
         assert_eq!(parts[1].source_role, SourceRole::Instrumental);
+    }
+
+    fn detached_lyric_kar() -> Vec<u8> {
+        let mut bytes = b"MThd\x00\x00\x00\x06\x00\x01\x00\x02\x01\xe0".to_vec();
+        let lyric_track = b"\x00\xff\x05\x05Hello\x00\xff\x2f\x00";
+        bytes.extend_from_slice(b"MTrk\x00\x00\x00\x0d");
+        bytes.extend_from_slice(lyric_track);
+        let melody_track = b"\x00\x90\x3c\x64\x83\x60\x80\x3c\x00\x00\xff\x2f\x00";
+        bytes.extend_from_slice(b"MTrk\x00\x00\x00\x0d");
+        bytes.extend_from_slice(melody_track);
+        bytes
+    }
+
+    #[test]
+    fn every_application_path_uses_the_kar_container_profile() {
+        let root = temp_dir();
+        let source = root.join("detached-lyrics.kar");
+        std::fs::write(&source, detached_lyric_kar()).unwrap();
+
+        let analysis = process_one(source.to_str().unwrap(), false, None, "english", None);
+        assert!(analysis.ok, "{:?}", analysis.msg);
+        assert_eq!(analysis.placed, 1);
+        assert_eq!(
+            analysis
+                .tracks
+                .iter()
+                .map(|track| track.placed)
+                .sum::<usize>(),
+            1
+        );
+
+        let direct_target = root.join("direct.svp");
+        export_svp(
+            source.to_string_lossy().into_owned(),
+            direct_target.to_string_lossy().into_owned(),
+            Some("english".into()),
+            None,
+        )
+        .unwrap();
+        let direct: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(direct_target).unwrap()).unwrap();
+        let direct_lyrics = direct["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|track| track["mainGroup"]["notes"].as_array().unwrap())
+            .map(|note| note["lyrics"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(direct_lyrics, vec!["Hello"]);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_result_track_count_reports_projection_lanes_not_parts() {
+        let root = temp_dir();
+        let source = root.join("two-voices.musicxml");
+        std::fs::write(
+            &source,
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Choir</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice></note>
+    <backup><duration>1</duration></backup>
+    <note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><voice>2</voice></note>
+  </measure></part>
+</score-partwise>"#,
+        )
+        .unwrap();
+
+        let result = process_one(source.to_str().unwrap(), false, None, "english", None);
+        assert!(result.ok, "{:?}", result.msg);
+        assert_eq!(result.n_parts, 1);
+        assert_eq!(result.n_voices, 2);
+        assert_eq!(result.n_tracks, result.tracks.len());
+        assert_eq!(result.n_tracks, 2);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
