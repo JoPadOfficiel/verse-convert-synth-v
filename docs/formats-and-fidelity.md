@@ -144,6 +144,13 @@ contradicted pairing is refused and both notes stay separate. Cross-staff ties,
 ties ending on a grace note, and chains broken by a repeat jump are likewise
 left unmerged rather than guessed.
 
+A tie tail that carries its own syllable is not a plain sustain either: the
+score asks for that word to be sung, so the note keeps its own attack. An
+explicitly empty lyric is the opposite signal — both formats write one on a tied
+note to state that nothing is sung there — and does not block the merge. Both
+the MuseScore and the MusicXML path follow this rule, so the same score exported
+either way projects identically.
+
 ### Repeat structure
 
 Repeat barlines, voltas and jumps describe the score, not one staff, and

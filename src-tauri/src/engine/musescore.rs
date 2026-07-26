@@ -304,6 +304,15 @@ fn tie_location(side: roxmltree::Node) -> Result<TieSide, String> {
     })
 }
 
+/// True when at least one lyric actually carries a word. An `ExplicitEmpty`
+/// lyric does not: MuseScore writes one on a tied note to state that nothing is
+/// sung there, which is evidence for merging rather than against it.
+fn sings_a_word(lyrics: &[Lyric]) -> bool {
+    lyrics
+        .iter()
+        .any(|lyric| matches!(&lyric.state, LyricState::Text(text) if !text.trim().is_empty()))
+}
+
 fn tie_stop_key(ties: &NoteTies, voice_index: usize, pitch: u8) -> Option<TieKey> {
     if let Some(id) = &ties.legacy_stop {
         return Some(TieKey::Legacy(id.clone()));
@@ -1550,7 +1559,17 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                     // Resolve a tie stop before borrowing this
                                     // note's bucket: the head's note-off can
                                     // live in another bucket of the same staff.
-                                    let stop_key = tie_stop_key(&ties, voice_index, pitch);
+                                    // A tie tail carrying its own syllable is not
+                                    // a plain sustain: the source asks for that
+                                    // word to be sung, so the note must keep its
+                                    // own attack. Merging it would delete a real
+                                    // lyric from the projection. An explicitly
+                                    // empty lyric is the opposite: MuseScore
+                                    // writes one on a tied note precisely to say
+                                    // that nothing is sung there.
+                                    let stop_key = (!sings_a_word(&lyrics))
+                                        .then(|| tie_stop_key(&ties, voice_index, pitch))
+                                        .flatten();
                                     let continued = stop_key.and_then(|key| {
                                         let pending = active_ties.get(&key)?;
                                         // MuseScore's own back reference decides:
@@ -2829,6 +2848,34 @@ Melodie</trackName>
         ));
         let midi = parse_mscx(&xml).unwrap();
         assert_eq!(played_notes(&midi), vec![(0, 1_440, 65)]);
+    }
+
+    #[test]
+    fn a_tie_tail_that_carries_a_syllable_keeps_its_own_attack() {
+        // The score puts a word on the tied note, so it is not a plain sustain:
+        // merging it would delete that word from the projection entirely.
+        let xml = tie_score(&format!(
+            "<Measure><voice>\
+               <Chord><durationType>quarter</durationType><Lyrics><text>appreci</text></Lyrics><Note><pitch>65</pitch>{TIE_START}</Note></Chord>\
+               <Chord><durationType>quarter</durationType><Lyrics><text>ate</text></Lyrics><Note><pitch>65</pitch>{TIE_STOP}</Note></Chord>\
+             </voice></Measure>"
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 65), (480, 480, 65)]);
+    }
+
+    #[test]
+    fn a_tie_tail_with_an_explicitly_empty_lyric_still_merges() {
+        // MuseScore writes an empty `<Lyrics>` on a tied note precisely to say
+        // that nothing is sung there, so it argues for merging, not against it.
+        let xml = tie_score(&format!(
+            "<Measure><voice>\
+               <Chord><durationType>quarter</durationType><Lyrics><text>shine</text></Lyrics><Note><pitch>65</pitch>{TIE_START}</Note></Chord>\
+               <Chord><durationType>quarter</durationType><Lyrics><text></text></Lyrics><Note><pitch>65</pitch>{TIE_STOP}</Note></Chord>\
+             </voice></Measure>"
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 960, 65)]);
     }
 
     #[test]

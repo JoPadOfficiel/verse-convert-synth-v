@@ -480,19 +480,32 @@ fn lyric_text(lyric: &Lyric) -> String {
 /// melody actually notates. A pass beyond the last verse reuses the last one.
 fn selected_attached_lyric<'a>(note: &'a SourceNote, lanes: &[String]) -> Option<&'a Lyric> {
     let playback = note.source.occurrence + 1;
-    let lane = usize::try_from(note.source.occurrence)
+    let pick = |lane: &String| {
+        note.lyrics
+            .iter()
+            .filter(|lyric| &lyric.lane == lane)
+            .find(|lyric| !lyric.time_only.is_empty() && lyric.time_only.contains(&playback))
+            .or_else(|| {
+                note.lyrics
+                    .iter()
+                    .find(|lyric| &lyric.lane == lane && lyric.time_only.is_empty())
+            })
+    };
+    let this_pass = usize::try_from(note.source.occurrence)
         .ok()
         .and_then(|pass| lanes.get(pass))
         .or_else(|| lanes.last())?;
-    note.lyrics
-        .iter()
-        .filter(|lyric| &lyric.lane == lane)
-        .find(|lyric| !lyric.time_only.is_empty() && lyric.time_only.contains(&playback))
-        .or_else(|| {
-            note.lyrics
-                .iter()
-                .find(|lyric| &lyric.lane == lane && lyric.time_only.is_empty())
-        })
+    if let Some(lyric) = pick(this_pass) {
+        return Some(lyric);
+    }
+    // This pass's verse says nothing here. When one track carries every verse,
+    // fall back to the other verses rather than leave a word of the source
+    // unsung: verse markers and pickup syllables are commonly written on a
+    // later verse alone, at a spot the music only ever plays once.
+    if lanes.len() > 1 {
+        return lanes.iter().find_map(pick);
+    }
+    None
 }
 
 struct TrackProjection<'a> {
@@ -2006,6 +2019,27 @@ mod tests {
             .map(|note| note.lyrics.as_str())
             .collect();
         assert_eq!(sung, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn a_word_only_the_later_verse_carries_is_still_sung() {
+        // Verse markers and pickup syllables are commonly written on one verse
+        // alone. When a single track carries every verse, a note whose current
+        // verse says nothing must fall back rather than drop a source word.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        track.events = repeated_note_events("voice", vec![verse("lane-2", "3.", "2")]);
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(project.tracks.len(), 1);
+        let sung: Vec<_> = project.tracks[0]
+            .main_group
+            .notes
+            .iter()
+            .map(|note| note.lyrics.as_str())
+            .collect();
+        assert_eq!(sung, vec!["3.", "3."]);
     }
 
     #[test]

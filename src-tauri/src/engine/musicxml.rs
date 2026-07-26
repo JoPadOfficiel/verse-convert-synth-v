@@ -1313,6 +1313,15 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                             )?;
                             let channel = instrument.and_then(|instrument| instrument.channel);
                             let (tie_starts, tie_stops) = note_ties(node);
+                            // A tie tail carrying its own syllable is not a plain
+                            // sustain: the source asks for that word to be sung,
+                            // so the note keeps its own attack. Merging it would
+                            // delete a real lyric from the projection. The chain
+                            // still ends here, so it is closed either way.
+                            let tie_merges = tie_stops
+                                && !note_lyrics(node, "probe").iter().any(|lyric| {
+                                    matches!(&lyric.state, LyricState::Text(text) if !text.trim().is_empty())
+                                });
                             let tie_pitch = pitch
                                 .map(|value| format!("midi:{value}"))
                                 .or_else(|| {
@@ -1341,7 +1350,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                 tie_pitch,
                                 instrument_id.clone(),
                             );
-                            let continued_source = if tie_stops {
+                            let continued_source = if tie_merges {
                                 active_ties.get(&tie_key).cloned()
                             } else {
                                 None
@@ -1366,7 +1375,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                             // extended across the chain. This preserves every
                             // source occurrence without projecting a repeated
                             // Synthesizer V attack.
-                            let playback_pitch = if tie_stops { None } else { pitch };
+                            let playback_pitch = if tie_merges { None } else { pitch };
                             push_event(
                                 events,
                                 on,
