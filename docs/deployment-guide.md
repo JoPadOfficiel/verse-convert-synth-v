@@ -81,6 +81,23 @@ node scripts/check-version.mjs --tag vMAJOR.MINOR.PATCH
 The checker requires strict SemVer, an exact `v`-prefixed tag, and a valid ISO
 date in the latest changelog heading.
 
+### Why `Cargo.lock` is synchronized by a script
+
+Release Please updates every file in that list except `src-tauri/Cargo.lock`.
+That file is an array of `[[package]]` tables, and selecting one of them needs a
+jsonpath filter its TOML updater does not support, so an `extra-files` rule for
+it silently does nothing — it left two releases with a lock still on the
+previous version. Because `build.yml` runs `check-version.mjs` before it
+compiles anything, such a release fails the gate and publishes with no binaries
+at all.
+
+[`scripts/sync-cargo-lock.mjs`](../scripts/sync-cargo-lock.mjs) performs that
+one edit instead: it copies the version from `src-tauri/Cargo.toml` onto the
+locked `verse` package, changes nothing else, and is a no-op once they agree.
+`release-please.yml` runs it on the release branch while that branch is still a
+pull request, verifies the result with `check-version.mjs`, and commits only
+when the lock actually moved. Running it locally is safe at any time.
+
 ## Normal Release Please flow
 
 The normal release path is:
