@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.4.7](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.6...v0.4.7) (2026-07-26)
+
+
+### Bug Fixes
+
+* divide a MIDI into stems instead of asking MuseScore to ([#16](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/16)) ([c7c28fe](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/c7c28fea2e8e5f637d021b814371eaa7cea23e86))
+
 ## [0.4.6](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.5...v0.4.6) (2026-07-26)
 
 
