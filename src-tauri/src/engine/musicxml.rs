@@ -1391,6 +1391,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                         chord_id: Some(last_chord_id.clone()),
                                         instrument_id,
                                         occurrence: pass,
+                                        measure: u32::try_from(mi).ok(),
                                         grace: is_grace,
                                         unpitched,
                                     },

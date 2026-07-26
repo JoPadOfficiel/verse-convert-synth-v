@@ -90,6 +90,21 @@ If an unexpected `la` is visible:
 An output lyric with no source evidence is a bug and should not be manually
 explained away as a Synthesizer V phoneme.
 
+## Notes are there but silent from the middle of the piece
+
+Check whether the silent stretch is the second pass of a repeat, and whether the
+score stacks two verses earlier on. Until verse silence was read per measure,
+Verse assigned verse 2 to the whole second pass and dropped everything the
+refrain wrote on a single lyric line: the notes kept their pitch and duration
+while every lyric came out empty, and Synthesizer V displayed grey `la`
+placeholders for the rest of the piece.
+
+Current builds sing the line that is written wherever the pass's own verse says
+nothing anywhere in that measure. If a current build still shows the pattern,
+check the source at the same measure and lyric lane before reporting it, and
+note whether the missing words sit on a lane that does sing elsewhere in the
+same measure — that silence is deliberate.
+
 ## A KAR file shows `Words`, but no vocal track is exported
 
 KAR files often store text separately from melody notes. Verse does not infer

@@ -1624,6 +1624,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                     .first()
                                                     .and_then(|instrument| instrument.id.clone()),
                                                 occurrence: pass,
+                                                measure: u32::try_from(mi).ok(),
                                                 grace,
                                                 unpitched: None,
                                             },

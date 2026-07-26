@@ -620,6 +620,11 @@ pub struct NoteSource {
     pub chord_id: Option<String>,
     pub instrument_id: Option<String>,
     pub occurrence: u32,
+    /// Source measure index, identical across repeat passes. Notation scopes a
+    /// lyric lane to the passage it is written under, so this is what tells a
+    /// pass whether its verse is silent here on purpose or simply absent from
+    /// the whole passage. MIDI has no measures and leaves it `None`.
+    pub measure: Option<u32>,
     pub grace: bool,
     pub unpitched: Option<UnpitchedInfo>,
 }

@@ -168,6 +168,18 @@ When there are more verses than passes there is nowhere to put the extra ones,
 so each keeps a track of its own at the same instants and a
 `LYRIC_VERSES_EXCEED_REPEAT_PASSES` diagnostic says so.
 
+A score stacks verses only under the passage whose words differ. The refrain
+that follows is normally written on a single lyric line meant for every pass.
+Verse therefore reads a verse's silence per measure: where the pass's own verse
+carries no word anywhere in the measure, the line that is written is common text
+and every pass sings it. Where that verse does sing elsewhere in the same
+measure, its silence on one note is the verses dividing a word into different
+syllables, and the note stays wordless rather than borrowing a neighbouring
+verse's syllable.
+
+MIDI has no measures and cannot supply that evidence, so a replayed MIDI note
+whose verse says nothing keeps its empty lyric.
+
 ## Source topology and projection lanes
 
 Score formats preserve:

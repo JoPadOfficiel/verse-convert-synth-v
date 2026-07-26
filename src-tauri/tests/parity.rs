@@ -320,6 +320,34 @@ fn the_same_score_projects_identically_from_mscz_and_mxl() {
         "a syllable on a tied note is sung"
     );
     assert_eq!(words(&mscz), words(&mxl));
+
+    // The verses are stacked two deep only where their words differ; the
+    // refrain that follows them is written on a single lyric line for both
+    // passes. Reading that single line as "verse 2 is silent here" deleted the
+    // whole refrain from the second pass — ninety words across the three
+    // voices, twenty seconds of the piece with notes but nothing to sing.
+    let sung = |projection: &Vec<Vec<(i64, i64, u8, String)>>| {
+        projection
+            .iter()
+            .map(|track| {
+                track
+                    .iter()
+                    .filter(|note| !note.3.trim().is_empty())
+                    .count()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sung(&mscz),
+        vec![197, 194, 212],
+        "each pass sings its own verse and the refrain both passes share"
+    );
+    assert_eq!(sung(&mscz), sung(&mxl));
+    assert_eq!(
+        mscz[0].iter().filter(|note| note.3 == "bam").count(),
+        18,
+        "the refrain is sung on the repeat, not only on the first pass"
+    );
 }
 
 #[test]
