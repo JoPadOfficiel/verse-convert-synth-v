@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.4.4](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.3...v0.4.4) (2026-07-26)
+
+
+### Bug Fixes
+
+* sing the refrain a repeated passage writes once ([#10](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/10)) ([8dc9919](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/8dc9919507bbdae9757c95d9693914c3940d8df5))
+
 ## [0.4.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.2...v0.4.3) (2026-07-26)
 
 
