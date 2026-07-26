@@ -105,6 +105,30 @@ check the source at the same measure and lyric lane before reporting it, and
 note whether the missing words sit on a lane that does sing elsewhere in the
 same measure — that silence is deliberate.
 
+## `MuseScore extracted N Parts but the source topology requires M`
+
+This affected MIDI and KAR sources and blocked every complete bundle they
+produced. MuseScore decides on its own how an imported MIDI becomes Parts: it
+merges tracks that share an instrument, drops empty ones, and splits others. A
+two-track file came back as one Part, a three-track file as four, a twelve-track
+file as eleven. Verse compared that count against its own source tracks and
+refused the export.
+
+Current builds do not ask MuseScore to divide a MIDI. A MIDI, unlike a score,
+divides exactly along its own `MTrk` chunks, so Verse cuts it itself: each stem
+is the source track copied byte for byte, preceded by a rebuilt meta track
+carrying the file's tempo, meter, key and SMPTE marks so it renders on the same
+timeline as the reference mix. The stem is named `<track> (MIDI track)` rather
+than `(MuseScore Part)`, because Verse chose the division and knows exactly
+which source track each stem holds.
+
+Score sources are unchanged: their Parts still come from MuseScore, and a
+mismatch there is still a blocking error.
+
+A MIDI stem may be shorter than the full-score reference when its track falls
+silent before the end. Both start at zero, so it stays in step; padding it would
+add audio the source never carried.
+
 ## A KAR file shows `Words`, but no vocal track is exported
 
 KAR files often store text separately from melody notes. Verse does not infer

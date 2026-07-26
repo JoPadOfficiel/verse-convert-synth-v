@@ -73,6 +73,24 @@ A standard MIDI file commonly has no lyrics. This is valid. Verse preserves
 its events and topology, produces zero generated words, and does not create a
 synthetic C4 lyric track.
 
+### Audio stems
+
+A score's Parts are extracted by MuseScore, which reads the same file Verse
+did. An imported MIDI is different: MuseScore decides on its own how its tracks
+become Parts, merging those that share an instrument and dropping empty ones, so
+its Part list answers a different question than "which source track is this".
+
+Verse therefore divides a MIDI itself, along the `MTrk` chunks the format
+already separates. Each stem is the source track copied byte for byte, preceded
+by a rebuilt meta track carrying only the marks that govern the whole file —
+tempo, meter, key, SMPTE offset — so it renders on the reference mix's timeline.
+Nothing is transposed, quantised, or invented, a stem is a subset of the source,
+and the source track it holds is known because Verse chose it.
+
+A stem may therefore be shorter than the reference mix when its track falls
+silent before the end. Both start at zero, so it stays in step for every frame
+it has; a stem running past the end of the whole score is still refused.
+
 ### Explicit refusals
 
 - SMF format 2 independent sequences are not flattened.

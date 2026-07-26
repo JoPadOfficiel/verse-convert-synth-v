@@ -9,7 +9,7 @@ use crate::engine::convert::{
     attached_lyric_instance_id, karaoke_text_lyric, note_instance_id, standalone_lyric_instance_id,
     ProjectionEvidence,
 };
-use crate::engine::midi::{self, Kind, Midi, MidiTextProfile};
+use crate::engine::midi::{self, Kind, Midi, MidiTextProfile, SourceTopology};
 use crate::engine::svp::{append_instrumental_track, SvpProject};
 use crate::renderer::{
     sha256_bytes, sha256_file, validate_wav, validate_wav_allowing_silence, AudioRenderer,
@@ -720,15 +720,19 @@ fn export_bundle_with_hook_and_progress(
         stem_id: None,
         stem_name: None,
     });
-    let extracted_parts = request.renderer.extract_score_parts(
-        &source_path,
-        &remaining_render_limits(render_started, &request.render_limits)?,
-    )?;
-    let extracted_parts = align_extracted_parts(
-        &request.input.source_format,
-        &request.input.stem_plan.stems,
-        extracted_parts,
-    )?;
+    let extracted_parts = if is_midi_source(&request.input.source_format) {
+        midi_source_parts(&request.input.source_bytes, &request.input.stem_plan.stems)?
+    } else {
+        let extracted = request.renderer.extract_score_parts(
+            &source_path,
+            &remaining_render_limits(render_started, &request.render_limits)?,
+        )?;
+        align_extracted_parts(
+            &request.input.source_format,
+            &request.input.stem_plan.stems,
+            extracted,
+        )?
+    };
 
     progress(BundleProgressEvent {
         phase: BundleProgressPhase::RenderingReference,
@@ -781,11 +785,12 @@ fn export_bundle_with_hook_and_progress(
             stem_id: Some(stem.stem_id.clone()),
             stem_name: Some(stem.display_name.clone()),
         });
-        let part_input = render_work
-            .path()
-            .join("parts")
-            .join(format!("{}.mscz", stem.stem_id));
-        write_new(&part_input, &part.mscz, "write extracted MuseScore Part")?;
+        let part_input = render_work.path().join("parts").join(format!(
+            "{}.{}",
+            stem.stem_id,
+            part_container_extension(&request.input.source_format)
+        ));
+        write_new(&part_input, &part.mscz, "write extracted source Part")?;
         let part_output = render_work
             .path()
             .join("parts")
@@ -843,10 +848,18 @@ fn export_bundle_with_hook_and_progress(
         stem_name: None,
     });
     let mut stem_audio_records = Vec::with_capacity(rendered_stems.len());
+    // A score stem is the Part MuseScore extracted; a MIDI stem is the source
+    // track Verse divided out itself. Naming the second one after MuseScore
+    // would credit a decomposition it never made.
+    let stem_origin = if is_midi_source(&request.input.source_format) {
+        "MIDI track"
+    } else {
+        "MuseScore Part"
+    };
     for stem in &rendered_stems {
         let group_id = append_instrumental_track(
             &mut request.input.project,
-            format!("{} (MuseScore Part)", stem.descriptor.display_name),
+            format!("{} ({stem_origin})", stem.descriptor.display_name),
             format!("../{}", stem.relative_path),
             stem.wav.duration_seconds,
             0,
@@ -1028,12 +1041,18 @@ fn export_bundle_with_hook_and_progress(
     Ok(result)
 }
 
+/// Both files start at zero and share a sample rate, so a stem stays in step
+/// with the reference for every frame it has. A stem that stops earlier is a
+/// Part that falls silent before the end — a MIDI track that finishes its last
+/// phrase early renders exactly that way — and padding it would add audio the
+/// source never carried. A stem that runs *longer* than the whole score is not
+/// explainable and is still refused.
 fn ensure_same_timeline(
     reference: &WavInfo,
     stem: &WavInfo,
     stem_id: &str,
 ) -> Result<(), BundleError> {
-    if stem.sample_rate != reference.sample_rate || stem.frames != reference.frames {
+    if stem.sample_rate != reference.sample_rate || stem.frames > reference.frames {
         return Err(BundleError::Integrity(format!(
             "stem {stem_id} is not aligned with the full-score reference \
              (reference: {} Hz / {} frames; stem: {} Hz / {} frames)",
@@ -1049,6 +1068,66 @@ struct RenderedStem {
     relative_path: String,
     extracted_name: String,
     wav: WavInfo,
+}
+
+/// True when the source is a MIDI file, whose stems Verse divides itself.
+fn is_midi_source(source_format: &str) -> bool {
+    matches!(source_format, "standardMidi" | "karaokeMidi")
+}
+
+/// Filename extension a Part container needs so the renderer imports it as the
+/// format it actually is.
+fn part_container_extension(source_format: &str) -> &'static str {
+    if is_midi_source(source_format) {
+        "mid"
+    } else {
+        "mscz"
+    }
+}
+
+/// One renderable Part per stem, taken from the source itself.
+///
+/// MuseScore decides on its own how an imported MIDI becomes Parts — merging
+/// tracks that share an instrument, dropping empty ones — so its Part list
+/// answers a different question than "which source track is this". The counts
+/// disagreed and every MIDI bundle failed. A MIDI, unlike a score, divides
+/// exactly along its own `MTrk` chunks, so Verse cuts it here and knows which
+/// track each stem carries because it chose it.
+fn midi_source_parts(
+    source_bytes: &[u8],
+    stems: &[StemDescriptor],
+) -> Result<Vec<ExtractedScorePart>, BundleError> {
+    let slices = crate::engine::midi_split::split_tracks(source_bytes).map_err(|error| {
+        BundleError::Integrity(format!("source MIDI cannot be divided: {error}"))
+    })?;
+    stems
+        .iter()
+        .enumerate()
+        .map(|(ordinal, stem)| {
+            let source_track =
+                SourceTopology::midi_part_track(&stem.source_part_id).ok_or_else(|| {
+                    BundleError::Integrity(format!(
+                        "stem {} does not name a source MIDI track",
+                        stem.stem_id
+                    ))
+                })?;
+            let slice = slices
+                .iter()
+                .find(|slice| slice.source_track == source_track)
+                .ok_or_else(|| {
+                    BundleError::Integrity(format!(
+                        "source MIDI has no track {source_track} for stem {}",
+                        stem.stem_id
+                    ))
+                })?;
+            Ok(ExtractedScorePart {
+                ordinal,
+                name: stem.display_name.clone(),
+                metadata: serde_json::Value::Null,
+                mscz: slice.bytes.clone(),
+            })
+        })
+        .collect()
 }
 
 fn align_extracted_parts(
@@ -2067,8 +2146,11 @@ mod tests {
                 }
                 FakeMode::Success | FakeMode::SilentStem => write_test_wav(output),
                 FakeMode::MisalignedStem => {
-                    if input.extension().and_then(|value| value.to_str()) == Some("mscz") {
-                        write_test_wav_with_frames(output, 880);
+                    // Stems are staged under `parts/`; the reference mix is not.
+                    // A stem running past the end of the whole score cannot be
+                    // explained by a Part falling silent early.
+                    if input.parent().and_then(Path::file_name) == Some("parts".as_ref()) {
+                        write_test_wav_with_frames(output, 884);
                     } else {
                         write_test_wav(output);
                     }
@@ -2183,7 +2265,7 @@ mod tests {
         let stem_plan = StemPlan {
             stems: vec![StemDescriptor {
                 stem_id: "part-001-test".into(),
-                source_part_id: "part:midi-track-0".into(),
+                source_part_id: "midi:track:0".into(),
                 display_name: "Music".into(),
                 source_track_ids: vec!["midi-track-0".into()],
                 source_note_count: 1,
@@ -2207,7 +2289,7 @@ mod tests {
             input: BundleInput {
                 original_name: "source.mid".into(),
                 source_format: "standardMidi".into(),
-                source_bytes: b"MThd source snapshot".to_vec(),
+                source_bytes: one_track_midi(),
                 project: empty_project(),
                 stem_plan,
                 ledger: PreservationLedger {
@@ -2225,6 +2307,46 @@ mod tests {
         }
     }
 
+    /// A real one-track Standard MIDI File. The MIDI stem path divides the
+    /// source itself, so a bundle test must hand it something divisible.
+    fn test_wav_info() -> WavInfo {
+        WavInfo {
+            bytes: 0,
+            sha256: String::new(),
+            duration_seconds: 0.0,
+            sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            frames: 0,
+        }
+    }
+
+    fn one_track_midi() -> Vec<u8> {
+        smf(&[
+            0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // tempo
+            0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0x00, 0xff, 0x2f, 0x00,
+        ])
+    }
+
+    /// A real two-track Standard MIDI File, for the two-stem cases.
+    fn two_track_midi() -> Vec<u8> {
+        let mut data = b"MThd\0\0\0\x06\0\x01\0\x02\x01\xe0".to_vec();
+        for track in [
+            &[
+                0x00u8, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, 0x00, 0x90, 60, 100, 0x83, 0x60, 0x80,
+                60, 0, 0x00, 0xff, 0x2f, 0x00,
+            ][..],
+            &[
+                0x00, 0x91, 67, 90, 0x83, 0x60, 0x81, 67, 0, 0x00, 0xff, 0x2f, 0x00,
+            ][..],
+        ] {
+            data.extend_from_slice(b"MTrk");
+            data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+            data.extend_from_slice(track);
+        }
+        data
+    }
+
     fn smf(track: &[u8]) -> Vec<u8> {
         let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
         data.extend_from_slice(&(track.len() as u32).to_be_bytes());
@@ -2236,10 +2358,7 @@ mod tests {
     fn successful_bundle_is_source_exact_and_audio_backed() {
         let root = temp_dir("success");
         let result = export_bundle(request(&root, FakeMode::Success)).unwrap();
-        assert_eq!(
-            fs::read(&result.source_path).unwrap(),
-            b"MThd source snapshot"
-        );
+        assert_eq!(fs::read(&result.source_path).unwrap(), one_track_midi());
         let project: serde_json::Value =
             serde_json::from_slice(&fs::read(&result.project_path).unwrap()).unwrap();
         assert_eq!(project["tracks"].as_array().unwrap().len(), 2);
@@ -2252,10 +2371,7 @@ mod tests {
         assert_eq!(project["tracks"][1]["mixer"]["mute"], true);
         let manifest: BundleManifest =
             serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
-        assert_eq!(
-            manifest.source.sha256,
-            sha256_bytes(b"MThd source snapshot")
-        );
+        assert_eq!(manifest.source.sha256, sha256_bytes(&one_track_midi()));
         assert!(manifest.audio.reference_mix.asset.duration_seconds > 0.0);
         assert_eq!(manifest.audio.stems.len(), 1);
         assert!(manifest.audio.coverage.complete);
@@ -2305,11 +2421,12 @@ mod tests {
     fn multiple_source_parts_become_distinct_audio_tracks_with_safe_mute_defaults() {
         let root = temp_dir("multiple-stems");
         let mut request = request(&root, FakeMode::Success);
+        request.input.source_bytes = two_track_midi();
         request.input.stem_plan.stems[0].role = StemRole::VocalReference;
         request.input.stem_plan.stems[0].active_by_default = false;
         let second = StemDescriptor {
             stem_id: "part-002-test".into(),
-            source_part_id: "part:piano".into(),
+            source_part_id: "midi:track:1".into(),
             display_name: "Piano".into(),
             source_track_ids: vec!["piano".into()],
             source_note_count: 4,
@@ -2355,6 +2472,9 @@ mod tests {
     fn incomplete_part_extraction_is_blocking_and_transactional() {
         let root = temp_dir("missing-part");
         let mut request = request(&root, FakeMode::Success);
+        // Only a score has Parts extracted by MuseScore; a MIDI is divided by
+        // Verse itself and cannot come back short.
+        request.input.source_format = "museScore".into();
         request.renderer = Arc::new(FakeRenderer::with_parts(FakeMode::Success, 2));
         let destination = request.destination.clone();
         assert!(matches!(
@@ -2470,6 +2590,38 @@ mod tests {
         let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
         assert_eq!(aligned[0].name, "Piano");
         assert_eq!(aligned[0].mscz, [1]);
+    }
+
+    #[test]
+    fn a_stem_that_falls_silent_before_the_end_is_still_accepted() {
+        // A MIDI track that finishes its last phrase early renders shorter than
+        // the whole score. Both files start at zero, so it stays in step for
+        // every frame it has; padding it would add audio the source never
+        // carried, and refusing it blocked every such bundle.
+        let reference = WavInfo {
+            sample_rate: 44_100,
+            frames: 882,
+            ..test_wav_info()
+        };
+        let short = WavInfo {
+            sample_rate: 44_100,
+            frames: 441,
+            ..test_wav_info()
+        };
+        assert!(ensure_same_timeline(&reference, &short, "part-001").is_ok());
+
+        let long = WavInfo {
+            sample_rate: 44_100,
+            frames: 883,
+            ..test_wav_info()
+        };
+        assert!(ensure_same_timeline(&reference, &long, "part-001").is_err());
+        let resampled = WavInfo {
+            sample_rate: 48_000,
+            frames: 882,
+            ..test_wav_info()
+        };
+        assert!(ensure_same_timeline(&reference, &resampled, "part-001").is_err());
     }
 
     #[test]
