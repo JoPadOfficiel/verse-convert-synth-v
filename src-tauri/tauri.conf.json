@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Verse",
   "mainBinaryName": "verse",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "identifier": "com.jopad.verse",
   "build": {
     "beforeDevCommand": "npm run dev",
