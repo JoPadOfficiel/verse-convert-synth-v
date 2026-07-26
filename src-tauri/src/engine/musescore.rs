@@ -4,9 +4,10 @@
 //! Staff/Measure/voice, TimeSig, Tempo, Chord (dots, tuplets, graces),
 //! Rest (including full measures), location, and all source lyric lanes.
 use crate::engine::midi::{
-    unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricFragment, LyricState, MeasureMarks,
-    Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff,
-    SourceTopology, SourceVoice, Syllabic, TimeBase, Track, TrackRoleHint, TrackSource,
+    merge_measure_marks, unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricFragment,
+    LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat,
+    SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track, TrackRoleHint,
+    TrackSource,
 };
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -912,42 +913,10 @@ fn score_playback_order(
     let mut merged = vec![MeasureMarks::default(); first.len()];
     for measures in staff_measures {
         for (target, marks) in merged.iter_mut().zip(measure_marks(measures)?) {
-            merge_measure_marks(target, marks)?;
+            merge_measure_marks(target, marks, "MuseScore staves")?;
         }
     }
     unroll(&merged)
-}
-
-fn merge_measure_marks(target: &mut MeasureMarks, source: MeasureMarks) -> Result<(), String> {
-    let conflict = |name: &str| format!("MuseScore staves disagree on the {name} of a measure");
-    target.start_repeat |= source.start_repeat;
-    if source.end_repeat != 0 {
-        if target.end_repeat != 0 && target.end_repeat != source.end_repeat {
-            return Err(conflict("repeat count"));
-        }
-        target.end_repeat = source.end_repeat;
-    }
-    if let Some(volta) = source.volta {
-        if target
-            .volta
-            .as_ref()
-            .is_some_and(|current| *current != volta)
-        {
-            return Err(conflict("volta endings"));
-        }
-        target.volta = Some(volta);
-    }
-    if let Some(jump) = source.jump {
-        if target.jump.is_some_and(|current| current != jump) {
-            return Err(conflict("jump"));
-        }
-        target.jump = Some(jump);
-    }
-    target.segno |= source.segno;
-    target.coda |= source.coda;
-    target.to_coda |= source.to_coda;
-    target.fine |= source.fine;
-    Ok(())
 }
 
 fn measure_marks(measures: &[roxmltree::Node]) -> Result<Vec<MeasureMarks>, String> {

@@ -2,10 +2,10 @@
 //! Produces the same intermediate `Midi` structure as the MIDI parser, so the
 //! whole multi-track conversion logic can be reused.
 use crate::engine::midi::{
-    unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricExtension, LyricFragment, LyricState,
-    MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat, SourcePart,
-    SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track, TrackRoleHint,
-    TrackSource, UnpitchedInfo,
+    merge_measure_marks, unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricExtension,
+    LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource,
+    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track,
+    TrackRoleHint, TrackSource, UnpitchedInfo,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -864,10 +864,41 @@ fn mark_unresolved_ties_source_only(
     }
 }
 
-/// Playback order of MusicXML measures: repeats (<repeat>), voltas
-/// (<ending>), jumps (<sound> attributes: segno/dalsegno/dacapo/coda/
+/// Playback order every Part follows. A score is one piece of music: an
+/// exporter routinely writes its repeat structure under a single Part, yet all
+/// of them play it, so the score reads as the union of what its Parts write.
+/// Computing this per Part instead let one Part repeat while another played
+/// straight through, silently desynchronising the projection.
+fn score_playback_order_mxl(
+    part_measures: &[Vec<roxmltree::Node>],
+) -> Result<Vec<(usize, u32)>, String> {
+    let Some(first) = part_measures.first() else {
+        return Ok(Vec::new());
+    };
+    for (index, measures) in part_measures.iter().enumerate().skip(1) {
+        if measures.len() != first.len() {
+            return Err(format!(
+                "MusicXML parts disagree on measure count: part 1 has {}, part {} has {}",
+                first.len(),
+                index + 1,
+                measures.len()
+            ));
+        }
+    }
+    let mut merged = vec![MeasureMarks::default(); first.len()];
+    for measures in part_measures {
+        for (target, marks) in merged.iter_mut().zip(measure_marks_mxl(measures)?) {
+            merge_measure_marks(target, marks, "MusicXML parts")?;
+        }
+    }
+    resolve_jump_targets(&mut merged);
+    unroll(&merged)
+}
+
+/// Repeat and navigation marks a single Part writes: repeats (<repeat>),
+/// voltas (<ending>), jumps (<sound> attributes: segno/dalsegno/dacapo/coda/
 /// tocoda/fine).
-fn playback_order_mxl(measures: &[roxmltree::Node]) -> Result<Vec<(usize, u32)>, String> {
+fn measure_marks_mxl(measures: &[roxmltree::Node]) -> Result<Vec<MeasureMarks>, String> {
     let mut marks = vec![MeasureMarks::default(); measures.len()];
     let mut open_ending: Option<Vec<u32>> = None;
 
@@ -933,8 +964,15 @@ fn playback_order_mxl(measures: &[roxmltree::Node]) -> Result<Vec<(usize, u32)>,
             }
         }
     }
-    // MusicXML does not write "al Fine / al Coda" on the jump: we infer it
-    // from the presence of To Coda / Fine marks in the piece.
+    Ok(marks)
+}
+
+/// MusicXML does not write "al Fine / al Coda" on the jump: it is inferred from
+/// the To Coda / Fine marks present in the piece. The piece is the whole score,
+/// not one Part — an exporter can write the jump under one Part and its target
+/// under another, and reading them apart turns a `D.S. al Coda` into a plain
+/// `D.S.`. Apply this only once the Parts have been merged.
+fn resolve_jump_targets(marks: &mut [MeasureMarks]) {
     let has_tocoda = marks.iter().any(|m| m.to_coda);
     let has_fine = marks.iter().any(|m| m.fine);
     for mk in marks.iter_mut() {
@@ -959,7 +997,6 @@ fn playback_order_mxl(measures: &[roxmltree::Node]) -> Result<Vec<(usize, u32)>,
             }
         });
     }
-    unroll(&marks)
 }
 
 fn parse_musicxml(xml: &str) -> Result<Midi, String> {
@@ -1073,6 +1110,18 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
     let mut tracks = Vec::new();
     let mut global_events = Vec::new();
     let mut declared_parts = Vec::new();
+    // The repeat structure belongs to the score, so it is resolved once from
+    // every Part before any of them is projected.
+    let part_measures: Vec<Vec<_>> = root
+        .children()
+        .filter(|n| n.has_tag_name("part"))
+        .map(|part| {
+            part.children()
+                .filter(|n| n.has_tag_name("measure"))
+                .collect()
+        })
+        .collect();
+    let playback_order = score_playback_order_mxl(&part_measures)?;
     for (part_index, part) in root
         .children()
         .filter(|n| n.has_tag_name("part"))
@@ -1172,7 +1221,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         let mut previous_measure = None;
         let mut mstart: i64 = 0;
 
-        for &(mi, pass) in playback_order_mxl(&measures)?.iter() {
+        for &(mi, pass) in playback_order.iter() {
             if previous_measure.is_some_and(|previous| mi != previous + 1) {
                 mark_unresolved_ties_source_only(&mut voice_events, &active_ties);
                 active_ties.clear();
@@ -1987,6 +2036,172 @@ mod tests {
         assert!(
             error.contains("additive") || error.contains("beats"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Two Parts of two measures each. `repeat` holds extra barline markup for
+    /// the first Part; the second Part never carries any.
+    fn two_part_score(repeat: &str) -> String {
+        let voice = |part: &str, marks: &str| {
+            format!(
+                r#"  <part id="{part}">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>480</duration></note>
+      {marks}
+    </measure>
+  </part>"#
+            )
+        };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list>
+    <score-part id="P1"><part-name>One</part-name></score-part>
+    <score-part id="P2"><part-name>Two</part-name></score-part>
+  </part-list>
+{}
+{}
+</score-partwise>"#,
+            voice("P1", repeat),
+            voice("P2", "")
+        )
+    }
+
+    fn onsets(midi: &Midi) -> Vec<Vec<u32>> {
+        midi.tracks
+            .iter()
+            .map(|track| {
+                track
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event.kind, Kind::NoteOn(_)))
+                    .map(|event| event.tick)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_repeat_written_under_one_part_is_played_by_every_part() {
+        // An exporter routinely writes the repeat structure under a single
+        // Part. Reading it per Part let that Part repeat while the others
+        // played straight through, so the score silently desynchronised.
+        let midi = parse(
+            two_part_score(r#"<barline location="right"><repeat direction="backward"/></barline>"#)
+                .as_bytes(),
+        )
+        .expect("parse");
+        let played = onsets(&midi);
+        assert!(
+            played.iter().all(|part| *part == vec![0, 480, 960, 1440]),
+            "every part plays the repeat: {played:?}"
+        );
+    }
+
+    #[test]
+    fn a_score_without_any_repeat_is_played_once_through() {
+        let midi = parse(two_part_score("").as_bytes()).expect("parse");
+        let played = onsets(&midi);
+        assert!(
+            played.iter().all(|part| *part == vec![0, 480]),
+            "nothing is repeated: {played:?}"
+        );
+    }
+
+    #[test]
+    fn parts_that_disagree_on_measure_count_are_rejected() {
+        // A playback order computed score-wide indexes every Part's measures,
+        // so a Part that is short of measures is an ambiguity, not something to
+        // silently truncate.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list>
+    <score-part id="P1"><part-name>One</part-name></score-part>
+    <score-part id="P2"><part-name>Two</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+  </part>
+  <part id="P2">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let error = parse(xml.as_bytes()).expect_err("mismatched parts are refused");
+        assert!(
+            error.contains("MusicXML parts disagree on measure count"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_jump_and_its_target_written_under_different_parts_still_pair_up() {
+        // MusicXML leaves "al Coda" implicit, so the jump is only complete once
+        // the To Coda mark is known. Resolving that per Part turned a
+        // `D.S. al Coda` whose target lived under another Part into a plain
+        // `D.S.`, and the coda was never reached.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list>
+    <score-part id="P1"><part-name>One</part-name></score-part>
+    <score-part id="P2"><part-name>Two</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <direction><sound segno="s"/></direction>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+    <measure number="3">
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>480</duration></note>
+      <direction><sound dalsegno="s"/></direction>
+    </measure>
+    <measure number="4">
+      <note><pitch><step>F</step><octave>4</octave></pitch><duration>480</duration></note>
+    </measure>
+  </part>
+  <part id="P2">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note><pitch><step>C</step><octave>3</octave></pitch><duration>480</duration></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>480</duration></note>
+      <direction><sound tocoda="c"/></direction>
+    </measure>
+    <measure number="3">
+      <note><pitch><step>E</step><octave>3</octave></pitch><duration>480</duration></note>
+    </measure>
+    <measure number="4">
+      <direction><sound coda="c"/></direction>
+      <note><pitch><step>F</step><octave>3</octave></pitch><duration>480</duration></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).expect("parse");
+        let played = onsets(&midi);
+        // m1 m2 m3 | D.S.: m1 m2, then To Coda skips m3 straight to the coda.
+        // Read apart, the jump degrades to a plain D.S. and m3 is played again.
+        assert!(
+            played
+                .iter()
+                .all(|part| *part == vec![0, 480, 960, 1440, 1920, 2400]),
+            "the al Coda jump reaches its target: {played:?}"
         );
     }
 

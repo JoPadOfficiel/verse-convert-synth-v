@@ -33,6 +33,44 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # Release Please cannot address the `verse` entry inside Cargo.lock: that
+      # file is an array of [[package]] tables and its TOML updater does not
+      # support the jsonpath filter that would select one. Left alone, the lock
+      # keeps the previous version, check-version.mjs refuses the mismatch, and
+      # build.yml runs that check before compiling — so the release would ship
+      # without a single binary. Repair the branch here, while it is still a
+      # pull request.
+      - name: Check out the release branch
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Node
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "22"
+
+      - name: Keep Cargo.lock in step with the release
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          RELEASE_BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+        run: |
+          set -euo pipefail
+          node scripts/sync-cargo-lock.mjs
+          node scripts/check-version.mjs
+          if git diff --quiet -- src-tauri/Cargo.lock; then
+            echo "Cargo.lock already matched the release version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src-tauri/Cargo.lock
+          git commit -m "chore: sync Cargo.lock with the release version"
+          git push origin "HEAD:${RELEASE_BRANCH}"
+
   build-release:
     name: Build released revision
     needs:

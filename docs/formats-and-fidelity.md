@@ -153,11 +153,18 @@ either way projects identically.
 
 ### Repeat structure
 
-Repeat barlines, voltas and jumps describe the score, not one staff, and
-MuseScore usually writes them on the first staff only. Verse therefore unrolls
-one playback order built from the union of every staff's marks and applies it to
-all of them. Two staves stating different values for the same mark, or staves
-that disagree on measure count, are rejected instead of arbitrated.
+Repeat barlines, voltas and jumps describe the score, not one staff or one Part,
+and exporters usually write them under the first one only. Verse therefore
+unrolls a single playback order, built from the union of every staff's marks in
+MuseScore and every Part's marks in MusicXML, and applies it to all of them. Two
+containers stating different values for the same mark, or disagreeing on measure
+count, are rejected instead of arbitrated.
+
+MusicXML leaves "al Fine" and "al Coda" implicit: the jump is only complete once
+the To Coda and Fine marks are known. Those marks belong to the score too, so
+they are resolved after the Parts have been merged — an exporter can write the
+jump under one Part and its target under another, and reading them apart turns a
+`D.S. al Coda` into a plain `D.S.`.
 
 ### Stacked verses
 

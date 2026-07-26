@@ -299,6 +299,48 @@ pub enum Jump {
     Dc,
 }
 
+/// Folds into `target` the marks another container wrote for the same measure.
+/// Scores routinely write repeat and navigation marks on the first staff or the
+/// first part only, yet every container plays the same structure, so the score
+/// reads as the union of what its containers write. Contradictory marks are an
+/// ambiguity no reading can settle and are refused instead; `container` names
+/// what disagreed.
+pub fn merge_measure_marks(
+    target: &mut MeasureMarks,
+    source: MeasureMarks,
+    container: &str,
+) -> Result<(), String> {
+    let conflict = |name: &str| format!("{container} disagree on the {name} of a measure");
+    target.start_repeat |= source.start_repeat;
+    if source.end_repeat != 0 {
+        if target.end_repeat != 0 && target.end_repeat != source.end_repeat {
+            return Err(conflict("repeat count"));
+        }
+        target.end_repeat = source.end_repeat;
+    }
+    if let Some(volta) = source.volta {
+        if target
+            .volta
+            .as_ref()
+            .is_some_and(|current| *current != volta)
+        {
+            return Err(conflict("volta endings"));
+        }
+        target.volta = Some(volta);
+    }
+    if let Some(jump) = source.jump {
+        if target.jump.is_some_and(|current| current != jump) {
+            return Err(conflict("jump"));
+        }
+        target.jump = Some(jump);
+    }
+    target.segno |= source.segno;
+    target.coda |= source.coda;
+    target.to_coda |= source.to_coda;
+    target.fine |= source.fine;
+    Ok(())
+}
+
 /// Unrolls a score into its actual playback order: repeats, voltas
 /// (alternate endings), D.S./D.C. (al Fine / al Coda), To Coda, Fine.
 /// Returns (measure_index, pass_number 0-based) pairs -- the pass determines
