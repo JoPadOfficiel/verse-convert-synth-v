@@ -491,10 +491,32 @@ fn replayed_note_ids(notes: &[SourceNote]) -> BTreeSet<&str> {
         .collect()
 }
 
+/// Every `(measure, lane)` pair on which some note carries an actual word. A
+/// verse is written under the passage it belongs to, so a lane absent from a
+/// whole measure has nothing to say there and the text written under that
+/// measure is common to every pass — a refrain notated once. A lane that does
+/// sing elsewhere in the same measure is a real alternative, and its silence on
+/// one note is the verses dividing a word into different syllables.
+fn lane_words_by_measure(notes: &[SourceNote]) -> BTreeSet<(u32, &str)> {
+    notes
+        .iter()
+        .filter_map(|note| Some((note.source.measure?, note)))
+        .flat_map(|(measure, note)| {
+            note.lyrics
+                .iter()
+                .filter(|lyric| {
+                    matches!(&lyric.state, midi::LyricState::Text(text) if !text.trim().is_empty())
+                })
+                .map(move |lyric| (measure, lyric.lane.as_str()))
+        })
+        .collect()
+}
+
 fn selected_attached_lyric<'a>(
     note: &'a SourceNote,
     lanes: &[String],
     replayed: &BTreeSet<&str>,
+    lane_words: &BTreeSet<(u32, &str)>,
 ) -> Option<&'a Lyric> {
     let playback = note.source.occurrence + 1;
     let pick = |lane: &String| {
@@ -515,13 +537,24 @@ fn selected_attached_lyric<'a>(
     if let Some(lyric) = pick(this_pass) {
         return Some(lyric);
     }
-    // This pass's verse says nothing here. On a note the playback order reaches
-    // only once, every verse is stacked on that single instant and the other
-    // verses are the only text there is — verse markers and pickup syllables
-    // are commonly written on a later verse alone, exactly at such a spot.
-    // On a replayed note the silence is deliberate: the verse melismas there
-    // and the neighbouring verse belongs to its own pass, never to this one.
-    if lanes.len() > 1 && !replayed.contains(note.source.id.as_str()) {
+    // This pass's verse says nothing here. Sing what the score does write only
+    // when doing so cannot steal another pass's verse:
+    //   - the playback order reaches this note once, so every stacked verse
+    //     lands on that single instant and the other verses are the only text
+    //     there is — verse markers and pickup syllables are commonly written on
+    //     a later verse alone, exactly at such a spot;
+    //   - or this pass's verse is absent from the whole measure, so the text
+    //     written there is common to every pass. A refrain under a repeated
+    //     passage is notated once and sung on every pass; dropping it would
+    //     silence the passage instead of repeating it.
+    // Otherwise the verse does sing in this measure and its silence on this
+    // note is deliberate: the verses divide the word differently, and the
+    // neighbouring verse belongs to its own pass, never to this one.
+    let verse_is_silent_here = note
+        .source
+        .measure
+        .is_some_and(|measure| !lane_words.contains(&(measure, this_pass.as_str())));
+    if lanes.len() > 1 && (!replayed.contains(note.source.id.as_str()) || verse_is_silent_here) {
         return lanes.iter().find_map(pick);
     }
     None
@@ -543,12 +576,14 @@ fn make_track(
 ) -> Result<SvpTrack, String> {
     let mut svp_notes = Vec::with_capacity(notes.len());
     let replayed = replayed_note_ids(notes);
+    let lane_words = lane_words_by_measure(notes);
     let mut explicit_extension_end = None;
     let mut musicxml_extension_open = false;
     for (index, source_note) in notes.iter().enumerate() {
         let mut lyric_source_id = None;
         let mut lyric_event_id = None;
-        let attached = selected_attached_lyric(source_note, projection.lanes, &replayed);
+        let attached =
+            selected_attached_lyric(source_note, projection.lanes, &replayed, &lane_words);
         let lyric = if let Some(attached) = attached {
             if let Some(ticks) = attached.extend_ticks.filter(|ticks| *ticks > 0) {
                 explicit_extension_end = u32::try_from(ticks)
@@ -1336,6 +1371,7 @@ fn projected_lyric_count(
     assignment: &HashMap<usize, TimedLyric>,
 ) -> usize {
     let replayed = replayed_note_ids(notes);
+    let lane_words = lane_words_by_measure(notes);
     notes
         .iter()
         .enumerate()
@@ -1343,7 +1379,7 @@ fn projected_lyric_count(
             if note.pitch.is_none() || note.duration == 0 {
                 return false;
             }
-            selected_attached_lyric(note, lanes, &replayed)
+            selected_attached_lyric(note, lanes, &replayed, &lane_words)
                 .or_else(|| assignment.get(index).map(|timed| &timed.lyric))
                 .is_some_and(|lyric| {
                     matches!(
@@ -2097,8 +2133,10 @@ mod tests {
     #[test]
     fn a_replayed_note_never_borrows_another_verses_word() {
         // The first note is reached twice, so verse 2 owns its second pass.
-        // Verse 2 melismas there, and borrowing verse 1's syllable would sing a
-        // word from the wrong verse. The last note is played once, so it may.
+        // MIDI has no measures, so nothing here can prove verse 2 is absent
+        // from the whole passage rather than deliberately silent on this note;
+        // borrowing verse 1's syllable would risk singing a word from the wrong
+        // verse. The last note is played once, so every verse lands on it.
         let mut track = Track::new("voice", 0);
         track.name = "Voice".into();
         let mut events = repeated_note_events("voice", vec![verse("lane-1", "one", "1")]);
@@ -2167,6 +2205,83 @@ mod tests {
         // Sorting lane labels as text would sing verse 10 on the second pass.
         let lanes: BTreeSet<String> = ["1", "2", "10"].iter().map(|s| s.to_string()).collect();
         assert_eq!(ordered_lanes(&lanes), vec!["1", "2", "10"]);
+    }
+
+    fn sung_lyrics(xml: &str) -> Vec<String> {
+        let outcome = convert_auto(xml.as_bytes(), "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        outcome
+            .svp
+            .expect("valid SVP")
+            .tracks
+            .first()
+            .expect("one vocal track")
+            .main_group
+            .notes
+            .iter()
+            .map(|note| note.lyrics.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_refrain_written_once_under_a_repeat_is_sung_on_every_pass() {
+        // Verses stack only under the passage whose words differ. The refrain
+        // that follows carries one line of text for both passes, and the score
+        // repeats it verbatim. Reading the second pass as "verse 2 is silent
+        // here" would delete the refrain from half the piece.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure><startRepeat/><voice>
+        <Chord><durationType>whole</durationType>
+          <Lyrics><text>one</text></Lyrics>
+          <Lyrics><no>1</no><text>two</text></Lyrics>
+          <Note><pitch>60</pitch></Note>
+        </Chord>
+      </voice></Measure>
+      <Measure><voice>
+        <Chord><durationType>whole</durationType>
+          <Lyrics><text>bam</text></Lyrics>
+          <Note><pitch>62</pitch></Note>
+        </Chord>
+      </voice><endRepeat>2</endRepeat></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        assert_eq!(sung_lyrics(xml), vec!["one", "bam", "two", "bam"]);
+    }
+
+    #[test]
+    fn a_verse_that_sings_elsewhere_in_the_measure_stays_silent_where_it_says_nothing() {
+        // Both verses sing in this measure but divide the words differently:
+        // verse 1 spends two notes on "o-pened" where verse 2 spends one on
+        // "ne" and then holds. Verse 2's silence on the second note is what the
+        // score writes, and borrowing verse 1's syllable would sing a word from
+        // the wrong verse.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure><startRepeat/><voice>
+        <Chord><durationType>half</durationType>
+          <Lyrics><text>o</text></Lyrics>
+          <Lyrics><no>1</no><text>ne</text></Lyrics>
+          <Note><pitch>60</pitch></Note>
+        </Chord>
+        <Chord><durationType>half</durationType>
+          <Lyrics><text>pened</text></Lyrics>
+          <Note><pitch>62</pitch></Note>
+        </Chord>
+      </voice><endRepeat>2</endRepeat></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        assert_eq!(sung_lyrics(xml), vec!["o", "pened", "ne", ""]);
     }
 
     #[test]
