@@ -73,6 +73,21 @@ A standard MIDI file commonly has no lyrics. This is valid. Verse preserves
 its events and topology, produces zero generated words, and does not create a
 synthetic C4 lyric track.
 
+### Voices inside one track
+
+A Synthesizer V vocal track is monophonic, so a source track that sounds two
+notes at once is split into one lane per simultaneous voice — the same
+decomposition score importers apply to a chord. Splitting is driven by sounding
+overlap alone: a track that never overlaps is projected unchanged.
+
+This matters beyond tidiness. A karaoke syllable landing on a stack of notes has
+no single note to own, and used to be dropped as ambiguous. Split into voices,
+each voice owns the syllable it sounds.
+
+Lane 0 keeps the source track's identity and every non-note record — tempo,
+controls, program changes and lyrics belong to the track, not to one of its
+voices, and are never duplicated into another lane.
+
 ### Audio stems
 
 A score's Parts are extracted by MuseScore, which reads the same file Verse
@@ -143,10 +158,17 @@ only Excerpts, malformed XML, and unsafe timing/pitch values.
 
 ### Lyrics on chords
 
-When a lyric belongs to a chord with exactly one pitch, ownership is exact.
-When a lyric is attached to a polyphonic chord and the source does not identify
-which pitch owns it, the lyric remains in a source-only lane with a diagnostic.
-Verse does not choose the highest, lowest, or first note.
+The members of a chord are simultaneous voices of one line, not candidates to
+choose between. Each becomes its own monophonic lane and each sings the word
+written under it: a passage harmonised in thirds keeps both voices, both carry
+the text, and either can be given its own voice database.
+
+Verse never picks the highest, lowest or first note as "the melody" — that would
+silently delete the other voice. Reading a chord as ambiguous and leaving its
+lyric source-only did the same damage from the other side: it deleted whole
+sung phrases, such as an entire refrain line of a score whose banjo doubles the
+melody a sixth below. Only a chord with no note at all has nothing to carry its
+lyric, and that lyric stays source-only with a diagnostic.
 
 ### Native ties
 

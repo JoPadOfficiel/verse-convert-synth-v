@@ -1685,7 +1685,9 @@ fn append_external_warnings(
             ExternalLyricStatus::NoCompleteCandidate => warnings.push(report_warning(
                 "EXTERNAL_KARAOKE_LYRICS_UNRESOLVED",
                 DiagnosticSeverity::Warning,
-                "No source melody track matched every lyric token; the stream remains source-only.",
+                "This karaoke file has words but no sung melody to put them on: no source \
+                 track plays a note under every syllable. The words are kept in the source \
+                 and the preservation report, and no melody is invented for them.",
                 &track.id,
             )),
             ExternalLyricStatus::AmbiguousCandidates { count } => warnings.push(report_warning(

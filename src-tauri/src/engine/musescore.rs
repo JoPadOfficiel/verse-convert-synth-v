@@ -1491,7 +1491,15 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                     .filter(|child| child.has_tag_name("Note"))
                                     .collect();
                                 let polyphonic = notes.len() > 1;
-                                let ambiguous_lyric_ownership = notes.len() != 1;
+                                // A chord sings its word in every voice it
+                                // sounds. Its members are simultaneous voices
+                                // of one line, not candidates to choose
+                                // between, and each becomes its own monophonic
+                                // lane. Leaving the lyric standalone because no
+                                // single pitch "owns" it deleted whole phrases
+                                // from harmonised passages. Only a chord with
+                                // no note at all has nothing to carry it.
+                                let ambiguous_lyric_ownership = notes.is_empty();
                                 if ambiguous_lyric_ownership {
                                     for lyric in &lyrics {
                                         push_event(
@@ -2309,8 +2317,11 @@ mod tests {
     }
 
     #[test]
-    fn polyphonic_chord_lyrics_remain_standalone_and_source_only() {
-        let xml = mscx("<text>ambiguous</text>").replace(
+    fn a_chord_sings_its_word_in_every_voice() {
+        // The members of a chord are simultaneous voices of one line. Reading
+        // them as candidates to choose between meant no voice sang the word at
+        // all, which deleted whole harmonised phrases from the projection.
+        let xml = mscx("<text>together</text>").replace(
             "<Note><pitch>60</pitch></Note>",
             "<Note><pitch>60</pitch></Note><Note><pitch>64</pitch></Note>",
         );
@@ -2330,31 +2341,34 @@ mod tests {
             .flat_map(|track| &track.events)
             .filter(|event| matches!(event.kind, Kind::Lyrics(_)))
             .count();
-        assert_eq!(attached_count, 0);
-        assert_eq!(standalone_count, 1);
-        assert_eq!(
-            midi.tracks
-                .iter()
-                .filter(|track| {
-                    track
-                        .events
-                        .iter()
-                        .any(|event| matches!(event.kind, Kind::NoteOn(_)))
-                })
-                .count(),
-            2
-        );
+        assert_eq!(attached_count, 2, "both voices carry the word");
+        assert_eq!(standalone_count, 0, "nothing is left source-only");
         assert_eq!(midi.topology.part_count(), 1);
         assert_eq!(midi.topology.staff_count(), 1);
         assert_eq!(midi.topology.voice_count(), 1);
-        assert_eq!(midi.topology.projection_lane_count(), 2);
+        assert_eq!(
+            midi.topology.projection_lane_count(),
+            2,
+            "one monophonic lane per chord member"
+        );
 
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
-        assert_eq!(outcome.n_tracks, 1);
         assert_eq!(outcome.topology, midi.topology);
-        assert_eq!(outcome.placed, 0);
-        assert!(outcome.svp.unwrap().tracks.is_empty());
+        assert_eq!(outcome.placed, 2);
+        let sung: Vec<_> = outcome
+            .svp
+            .expect("valid SVP")
+            .tracks
+            .iter()
+            .flat_map(|track| track.main_group.notes.iter())
+            .map(|note| (note.pitch, note.lyrics.clone()))
+            .collect();
+        assert_eq!(
+            sung,
+            vec![(60, "together".into()), (64, "together".into())],
+            "each voice keeps its own pitch and the shared word"
+        );
     }
 
     #[test]

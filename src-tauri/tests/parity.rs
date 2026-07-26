@@ -96,11 +96,15 @@ fn hound_dog_multitrack() {
     let parsed = midi::parse(&data).expect("valid KAR/SMF");
     let automatic = convert_midi_with(&parsed, "english", None);
     assert!(automatic.ok, "Hound Dog must convert");
+    // One report entry per projection lane. A source track that sounds two
+    // notes at once becomes two monophonic lanes, so lanes outnumber the source
+    // voices `n_tracks` counts; every lane must still be inventoried.
     assert_eq!(
-        automatic.n_tracks,
         automatic.tracks.len(),
-        "every source track is inventoried"
+        parsed.tracks.len(),
+        "every projection lane is inventoried"
     );
+    assert_eq!(automatic.n_tracks, parsed.topology.voice_count());
     assert_eq!(
         automatic.placed, 244,
         "the complete lyrics stream must bind to its unique timing-compatible melody"
@@ -113,7 +117,16 @@ fn hound_dog_multitrack() {
     assert_eq!(automatic_vocal.len(), 1);
     assert_eq!(automatic_vocal[0].placed, 244);
 
-    let r = convert_midi_with(&parsed, "english", Some(&HashMap::from([(10usize, true)])));
+    // The override targets a track by report index. Splitting a source track
+    // into monophonic voices moves those indices, so the lead vocal is found by
+    // name instead of by a number that no longer means the same lane.
+    let lead = automatic
+        .tracks
+        .iter()
+        .find(|track| track.track.starts_with("Lead Vox"))
+        .expect("the lead vocal track is inventoried")
+        .id;
+    let r = convert_midi_with(&parsed, "english", Some(&HashMap::from([(lead, true)])));
     assert_eq!(
         r.placed, 244,
         "the proven external binding remains source-backed under an explicit override; report: {:?}",
@@ -154,26 +167,32 @@ fn help_kar_binds_words_only_to_the_unique_lead_track() {
     assert_eq!(automatic.placed, 314);
     // The user may explicitly export Lead + Harm 1 + Harm 2 as vocal notes,
     // but that never transfers the separate Words track into them.
-    let r = convert_midi_with(
-        &parsed,
-        "english",
-        Some(&HashMap::from([
-            (8usize, true),
-            (9usize, true),
-            (10usize, true),
-        ])),
-    );
+    // Overrides address report indices, which move once a source track is
+    // split into monophonic voices. Select the three sung parts by name so the
+    // test states its intent rather than a numbering.
+    let chosen: HashMap<usize, bool> = automatic
+        .tracks
+        .iter()
+        .filter(|track| {
+            ["Lead", "Harm 1", "Harm 2"]
+                .iter()
+                .any(|name| track.track.contains(name))
+        })
+        .map(|track| (track.id, true))
+        .collect();
+    let r = convert_midi_with(&parsed, "english", Some(&chosen));
     assert!(r.ok);
-    assert_eq!(
-        r.n_tracks,
-        r.tracks.len(),
-        "every source track is inventoried"
+    // Every source voice owns at least one projection lane; a voice that
+    // sounds two notes at once owns several.
+    assert!(
+        r.tracks.len() >= r.n_tracks,
+        "every source voice keeps at least one inventoried lane"
     );
     let vocal: Vec<_> = r.tracks.iter().filter(|t| t.role == "vocal").collect();
     assert_eq!(
         vocal.len(),
-        3,
-        "Lead + Harm 1 + Harm 2 must sing; report: {:?}",
+        chosen.len(),
+        "every selected part sings, one lane at a time; report: {:?}",
         r.tracks
     );
     let lead = vocal
@@ -355,10 +374,11 @@ fn the_same_score_projects_identically_from_mscz_and_mxl() {
 fn queen_lyrics_without_source_melody_do_not_create_c4() {
     let r = conv("queen.kar");
     assert!(r.ok, "a lyric-only karaoke file must still be accepted");
-    assert_eq!(
-        r.n_tracks,
-        r.tracks.len(),
-        "every source track is inventoried"
+    // Every source voice owns at least one projection lane; a voice that
+    // sounds two notes at once owns several.
+    assert!(
+        r.tracks.len() >= r.n_tracks,
+        "every source voice keeps at least one inventoried lane"
     );
     assert!(
         r.tracks.iter().all(|t| t.role != "vocal_synth"),
@@ -400,4 +420,92 @@ fn help_mxl_converts() {
     let r = conv_auto("help.mxl");
     assert!(r.ok, "help.mxl must convert: {:?}", r.msg);
     assert!(r.placed > 0, "lyrics must be placed");
+}
+
+/// Syllables a Soft Karaoke file actually asks to be sung, one list per text
+/// track. Control records (`@…`), line/paragraph markers and punctuation-only
+/// tokens are not words.
+fn kar_syllable_streams(data: &[u8]) -> Vec<Vec<String>> {
+    let parsed = midi::parse_with_karaoke_profile(data).expect("valid KAR");
+    parsed
+        .tracks
+        .iter()
+        .map(|track| {
+            track
+                .events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    midi::Kind::Text(text) => Some(text.text.clone()),
+                    midi::Kind::Lyrics(lyric) => match &lyric.state {
+                        midi::LyricState::Text(text) => Some(text.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .filter(|text| !text.starts_with('@'))
+                .map(|text| {
+                    text.replace(['\r', '\n'], "")
+                        .trim_start_matches(['\\', '/'])
+                        .trim()
+                        .to_string()
+                })
+                .filter(|text| !text.is_empty() && text.chars().any(|c| c != '.'))
+                .collect()
+        })
+        .collect()
+}
+
+/// Every syllable the source writes must reach the project. A KAR may transcribe
+/// the same passage in two competing text tracks, so the fullest stream is the
+/// reference: adding them together counts a duplicate as a loss.
+fn assert_no_syllable_is_lost(fixture: &str) {
+    let data = read_fixture(fixture);
+    let reference = kar_syllable_streams(&data)
+        .into_iter()
+        .max_by_key(Vec::len)
+        .unwrap_or_default();
+    assert!(
+        !reference.is_empty(),
+        "{fixture} must carry singable syllables"
+    );
+
+    let outcome = convert_bytes(&data, "english");
+    assert!(outcome.ok, "{fixture}: {:?}", outcome.msg);
+    let mut projected: HashMap<&str, usize> = HashMap::new();
+    let project = outcome.svp.as_ref().expect("valid SVP");
+    for note in project
+        .tracks
+        .iter()
+        .flat_map(|track| track.main_group.notes.iter())
+    {
+        let lyric = note.lyrics.trim();
+        if !lyric.is_empty() {
+            *projected.entry(lyric).or_default() += 1;
+        }
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    let mut needed: HashMap<&str, usize> = HashMap::new();
+    for syllable in &reference {
+        *needed.entry(syllable.as_str()).or_default() += 1;
+    }
+    for (syllable, count) in needed {
+        if projected.get(syllable).copied().unwrap_or(0) < count {
+            missing.push(syllable);
+        }
+    }
+    missing.sort_unstable();
+    assert!(
+        missing.is_empty(),
+        "{fixture} drops syllables the source writes: {missing:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires the private KAR fixtures"]
+fn no_karaoke_syllable_is_lost_on_the_way_to_the_project() {
+    // The counters said these files were complete while a whole refrain line
+    // was missing from one of them, so the oracle is the words themselves.
+    for fixture in ["help.kar", "hound_dog.kar"] {
+        assert_no_syllable_is_lost(fixture);
+    }
 }
