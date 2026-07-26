@@ -40,23 +40,38 @@ jobs:
       # build.yml runs that check before compiling — so the release would ship
       # without a single binary. Repair the branch here, while it is still a
       # pull request.
-      - name: Check out the release branch
+      # `pr` is unset on the run that creates the release rather than a pull
+      # request, and a skipped `if` does not stop GitHub from evaluating the
+      # rest of the step, so `fromJson` must never appear in one: it fails the
+      # whole job on an empty string. Decode the payload in the shell instead,
+      # from a plain string substitution that is safe when empty.
+      - name: Resolve the release branch
+        id: branch
         if: steps.release.outputs.prs_created == 'true'
+        env:
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          branch="$(jq -er '.headBranchName' <<<"$RELEASE_PR")"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release branch
+        if: steps.branch.outputs.name != ''
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ steps.branch.outputs.name }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Node
-        if: steps.release.outputs.prs_created == 'true'
+        if: steps.branch.outputs.name != ''
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: "22"
 
       - name: Keep Cargo.lock in step with the release
-        if: steps.release.outputs.prs_created == 'true'
+        if: steps.branch.outputs.name != ''
         env:
-          RELEASE_BRANCH: ${{ fromJson(steps.release.outputs.pr).headBranchName }}
+          RELEASE_BRANCH: ${{ steps.branch.outputs.name }}
         run: |
           set -euo pipefail
           node scripts/sync-cargo-lock.mjs
