@@ -1357,11 +1357,25 @@ fn resolve_external_lyrics(
             );
             continue;
         }
+        // One source now binds to every voice of the chosen track, so several
+        // proposals share a source. A conflict on any of them is the source's
+        // status and must not be overwritten by a later clean one, and the
+        // ambiguity count is the sum over the voices rather than the last one.
+        let previous = resolution.status_by_source.get(&proposal.source_track);
+        if matches!(previous, Some(ExternalLyricStatus::TargetClaimConflict)) {
+            continue;
+        }
+        let carried = match previous {
+            Some(ExternalLyricStatus::Bound {
+                chord_ambiguities, ..
+            }) => *chord_ambiguities,
+            _ => 0,
+        };
         resolution.status_by_source.insert(
             proposal.source_track,
             ExternalLyricStatus::Bound {
                 target_track: proposal.target_track,
-                chord_ambiguities: proposal.chord_ambiguities,
+                chord_ambiguities: carried + proposal.chord_ambiguities,
             },
         );
         resolution.bindings.push(proposal);

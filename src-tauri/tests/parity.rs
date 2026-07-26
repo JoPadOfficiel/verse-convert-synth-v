@@ -435,7 +435,15 @@ fn kar_syllable_streams(data: &[u8]) -> Vec<Vec<String>> {
                 .events
                 .iter()
                 .filter_map(|event| match &event.kind {
-                    midi::Kind::Text(text) => Some(text.text.clone()),
+                    // Generic Text is only karaoke lyrics when this very track
+                    // proves the Soft Karaoke profile, exactly as production
+                    // qualifies it. Counting unqualified metadata as required
+                    // syllables would fail the test for words nobody sings.
+                    midi::Kind::Text(text)
+                        if track.text_profile == midi::MidiTextProfile::KaraokeLyrics =>
+                    {
+                        Some(text.text.clone())
+                    }
                     midi::Kind::Lyrics(lyric) => match &lyric.state {
                         midi::LyricState::Text(text) => Some(text.clone()),
                         _ => None,
