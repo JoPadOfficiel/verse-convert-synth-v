@@ -129,6 +129,21 @@ A MIDI stem may be shorter than the full-score reference when its track falls
 silent before the end. Both start at zero, so it stays in step; padding it would
 add audio the source never carried.
 
+## A karaoke line is missing from the project
+
+Check whether the source harmonises that line. A track sounding two notes at
+once used to make its syllables ambiguous, and they were dropped rather than
+given to a voice — an entire refrain line disappeared from a score whose banjo
+doubles the melody underneath it.
+
+Current builds split such a track into one lane per simultaneous voice and let
+each voice sing the word. The project therefore contains more vocal tracks than
+before, one per voice, and each can be assigned its own voice database.
+
+A `.kar` sometimes transcribes the same passage twice, in two competing text
+tracks. Verse binds the fullest stream; the duplicate is not sung a second time
+and is not a loss.
+
 ## A KAR file shows `Words`, but no vocal track is exported
 
 KAR files often store text separately from melody notes. Verse does not infer

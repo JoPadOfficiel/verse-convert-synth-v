@@ -1245,20 +1245,73 @@ fn resolve_external_lyrics(
             }
         }
 
-        let mut candidates = Vec::new();
+        // A candidate is a source track, not one of its voices. Splitting a
+        // harmonised melody into monophonic voices means no single voice holds
+        // every syllable any more, and judging voices separately would reject
+        // the very track that sings the words. The voices of one source track
+        // are therefore weighed together, and a syllable is owned by each voice
+        // that sounds it — two voices harmonising a word both sing that word.
+        let mut by_source_track: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (target_index, notes) in notes_by_track.iter().enumerate() {
             if target_index == source_index
-                || projectable_note_count(notes) < tokens.len()
+                || projectable_note_count(notes) == 0
                 || is_percussion_candidate(&midi.tracks[target_index])
                 || !tokens_by_track[target_index].is_empty()
                 || !attached_lanes(notes).is_empty()
             {
                 continue;
             }
-            let assignment = karaoke_assignment(tokens, notes, ticks_per_beat);
-            if assignment.len() == tokens.len() {
-                candidates.push((target_index, assignment));
+            by_source_track
+                .entry(midi.tracks[target_index].source.source_track)
+                .or_default()
+                .push(target_index);
+        }
+
+        let mut candidates = Vec::new();
+        for voices in by_source_track.into_values() {
+            // The syllables are matched against everything the source track
+            // sounds, not against one voice at a time: the matcher consumes one
+            // note per syllable, so a voice holding a third of the melody could
+            // never account for all of them however well it lines up.
+            let mut sounded: Vec<(usize, usize, SourceNote)> = voices
+                .iter()
+                .flat_map(|target| {
+                    notes_by_track[*target]
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, note)| (*target, index, note.clone()))
+                })
+                .collect();
+            sounded.sort_by_key(|(_, _, note)| (note.onset, note.source_order, note.pitch));
+            let flattened: Vec<SourceNote> = sounded
+                .iter()
+                .map(|(_, _, note)| note.clone())
+                .collect::<Vec<_>>();
+            let matched = karaoke_assignment(tokens, &flattened, ticks_per_beat);
+            if matched.len() != tokens.len() {
+                continue;
             }
+
+            let mut per_voice: BTreeMap<usize, HashMap<usize, TimedLyric>> = BTreeMap::new();
+            for (position, token) in matched {
+                let (voice, index, note) = &sounded[position];
+                per_voice
+                    .entry(*voice)
+                    .or_default()
+                    .insert(*index, token.clone());
+                // Every other voice sounding at that same instant sings the
+                // same word. Nothing is chosen between them and nothing is
+                // dropped, which is what a harmonised line actually asks for.
+                for (other, other_index, other_note) in &sounded {
+                    if other != voice && other_note.onset == note.onset {
+                        per_voice
+                            .entry(*other)
+                            .or_default()
+                            .insert(*other_index, token.clone());
+                    }
+                }
+            }
+            candidates.push(per_voice.into_iter().collect::<Vec<_>>());
         }
 
         match candidates.len() {
@@ -1268,16 +1321,20 @@ fn resolve_external_lyrics(
                     .insert(source_index, ExternalLyricStatus::NoCompleteCandidate);
             }
             1 => {
-                let (target_track, mut assignment) =
-                    candidates.pop().expect("one candidate was measured");
-                let chord_ambiguities =
-                    remove_chord_ambiguities(&mut assignment, &notes_by_track[target_track]);
-                proposals.push(ExternalLyricBinding {
-                    source_track: source_index,
-                    target_track,
-                    assignment,
-                    chord_ambiguities,
-                });
+                let voices = candidates.pop().expect("one candidate was measured");
+                for (target_track, mut assignment) in voices {
+                    if assignment.is_empty() {
+                        continue;
+                    }
+                    let chord_ambiguities =
+                        remove_chord_ambiguities(&mut assignment, &notes_by_track[target_track]);
+                    proposals.push(ExternalLyricBinding {
+                        source_track: source_index,
+                        target_track,
+                        assignment,
+                        chord_ambiguities,
+                    });
+                }
             }
             count => {
                 resolution.status_by_source.insert(
@@ -1300,11 +1357,25 @@ fn resolve_external_lyrics(
             );
             continue;
         }
+        // One source now binds to every voice of the chosen track, so several
+        // proposals share a source. A conflict on any of them is the source's
+        // status and must not be overwritten by a later clean one, and the
+        // ambiguity count is the sum over the voices rather than the last one.
+        let previous = resolution.status_by_source.get(&proposal.source_track);
+        if matches!(previous, Some(ExternalLyricStatus::TargetClaimConflict)) {
+            continue;
+        }
+        let carried = match previous {
+            Some(ExternalLyricStatus::Bound {
+                chord_ambiguities, ..
+            }) => *chord_ambiguities,
+            _ => 0,
+        };
         resolution.status_by_source.insert(
             proposal.source_track,
             ExternalLyricStatus::Bound {
                 target_track: proposal.target_track,
-                chord_ambiguities: proposal.chord_ambiguities,
+                chord_ambiguities: carried + proposal.chord_ambiguities,
             },
         );
         resolution.bindings.push(proposal);
@@ -1628,7 +1699,9 @@ fn append_external_warnings(
             ExternalLyricStatus::NoCompleteCandidate => warnings.push(report_warning(
                 "EXTERNAL_KARAOKE_LYRICS_UNRESOLVED",
                 DiagnosticSeverity::Warning,
-                "No source melody track matched every lyric token; the stream remains source-only.",
+                "This karaoke file has words but no sung melody to put them on: no source \
+                 track plays a note under every syllable. The words are kept in the source \
+                 and the preservation report, and no melody is invented for them.",
                 &track.id,
             )),
             ExternalLyricStatus::AmbiguousCandidates { count } => warnings.push(report_warning(
@@ -1695,7 +1768,16 @@ fn repeat_passes(notes: &[SourceNote]) -> usize {
 mod tests {
     use super::*;
 
-    fn midi_with(tracks: Vec<Track>) -> Midi {
+    fn midi_with(mut tracks: Vec<Track>) -> Midi {
+        // A real file numbers its SMF tracks, and lyric binding now weighs the
+        // voices of one source track together. Leaving every fixture track on
+        // source track 0 would merge unrelated melodies into a single candidate
+        // and hide the ambiguity a test is asserting.
+        for (index, track) in tracks.iter_mut().enumerate() {
+            if track.source.source_track == 0 {
+                track.source.source_track = index;
+            }
+        }
         Midi {
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
