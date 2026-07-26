@@ -7,7 +7,7 @@ officially supported user platform. A complete export keeps the original file,
 renders one real audio stem per note-bearing source score Part, and retains a
 muted full-score reference mix.
 
-![Verse screenshot](docs/screenshot.png)
+![Verse screenshot](docs/convertion_flux.png)
 
 ## Why this exists
 
@@ -27,7 +27,7 @@ Verse uses only evidence present in the source:
 ## Supported input formats
 
 | Format | Extensions | Notes |
-|---|---|---|
+| --- | --- | --- |
 | Karaoke MIDI | `.kar` | Qualified Soft Karaoke text and MIDI lyric events |
 | Standard MIDI | `.mid`, `.midi` | Lyric-free MIDI is valid |
 | MusicXML | `.mxl`, `.xml`, `.musicxml` | Parts, voices, lyric lanes and unpitched percussion are inventoried |

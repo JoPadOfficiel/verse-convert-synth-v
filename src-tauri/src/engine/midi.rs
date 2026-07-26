@@ -76,6 +76,20 @@ impl SourceTopology {
         Self::from_declared_parts(Vec::new(), tracks)
     }
 
+    /// Part ID a MIDI track owns when the source declares no Part of its own.
+    /// Reading it back is how an audio stem finds the exact source track it
+    /// must carry, so both directions live here and cannot drift apart.
+    pub fn midi_part_id(source_track: usize) -> String {
+        format!("midi:track:{source_track}")
+    }
+
+    /// Source track number behind a [`Self::midi_part_id`], if that is what the
+    /// Part ID is. A score-declared Part ID has no track number and yields
+    /// `None`.
+    pub fn midi_part_track(part_id: &str) -> Option<usize> {
+        part_id.strip_prefix("midi:track:")?.parse().ok()
+    }
+
     /// Starts with the score-declared hierarchy, then attaches every emitted
     /// rich-source lane. This preserves rest-only and metadata-only Parts
     /// without pretending that they contain an editable SVP projection lane.
@@ -89,7 +103,7 @@ impl SourceTopology {
                 .source
                 .part_id
                 .clone()
-                .unwrap_or_else(|| format!("midi:track:{}", track.source.source_track));
+                .unwrap_or_else(|| Self::midi_part_id(track.source.source_track));
             let staff_id = track
                 .source
                 .staff_id
@@ -1102,7 +1116,14 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
         track.name = events
             .iter()
             .find_map(|event| match &event.kind {
-                Kind::TrackName(name) => Some(name.trim().to_string()),
+                // Sequencers commonly NUL-terminate a track name inside the
+                // meta event. `trim` leaves that byte in place, and it then
+                // travels into display names and stem filenames as `Piano\0`.
+                // The event itself keeps its exact source bytes.
+                Kind::TrackName(name) => Some(
+                    name.trim_matches(|c: char| c.is_whitespace() || c.is_control())
+                        .to_string(),
+                ),
                 _ => None,
             })
             .unwrap_or_default();
@@ -1261,6 +1282,20 @@ mod tests {
         let mut event = vec![0, 0xff, meta_type, payload.len() as u8];
         event.extend_from_slice(payload);
         event
+    }
+    #[test]
+    fn a_nul_terminated_track_name_does_not_reach_display_names() {
+        // Sequencers commonly NUL-terminate the name inside the meta event.
+        // Left in place it travels into stem filenames as `Piano\0`.
+        let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
+        let track: &[u8] = &[
+            0x00, 0xff, 0x03, 0x06, b'P', b'i', b'a', b'n', b'o', 0x00, // name + NUL
+            0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0x00, 0xff, 0x2f, 0x00,
+        ];
+        data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        data.extend_from_slice(track);
+        let parsed = parse(&data).expect("valid MIDI");
+        assert_eq!(parsed.tracks[0].name, "Piano");
     }
 
     #[test]
