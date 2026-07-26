@@ -2307,8 +2307,6 @@ mod tests {
         }
     }
 
-    /// A real one-track Standard MIDI File. The MIDI stem path divides the
-    /// source itself, so a bundle test must hand it something divisible.
     fn test_wav_info() -> WavInfo {
         WavInfo {
             bytes: 0,
@@ -2321,6 +2319,8 @@ mod tests {
         }
     }
 
+    /// A real one-track Standard MIDI File. The MIDI stem path divides the
+    /// source itself, so a bundle test must hand it something divisible.
     fn one_track_midi() -> Vec<u8> {
         smf(&[
             0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // tempo
