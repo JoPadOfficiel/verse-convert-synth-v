@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.4.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.2...v0.4.3) (2026-07-26)
+
+
+### Bug Fixes
+
+* restore MuseScore projection fidelity — tie merging, score-level repeats, verse-per-pass ([#8](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/8)) ([7587f59](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/7587f59e5424fd29d5ee6ec91c592a8aec4e1287))
+
 ## [0.4.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.1...v0.4.2) (2026-07-25)
 
 
