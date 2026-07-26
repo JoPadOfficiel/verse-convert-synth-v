@@ -931,8 +931,11 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
     };
 
     let mut tracks: Vec<Track> = Vec::new();
+    // Counted separately from `tracks`: one SMF track may yield several
+    // monophonic voice lanes, so the vector is no longer the track count.
+    let mut declared_tracks = 0usize;
     let mut total_events = 0usize;
-    while p + 8 <= n && tracks.len() < ntrk {
+    while p + 8 <= n && declared_tracks < ntrk {
         let is_mtrk = &data[p..p + 4] == b"MTrk";
         p += 4;
         let clen = be_u32(data, p) as usize;
@@ -945,7 +948,7 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
             p = end;
             continue;
         }
-        let track_index = tracks.len();
+        let track_index = declared_tracks;
         let mut events: Vec<Event> = Vec::new();
         let mut tick: u32 = 0;
         let mut running: u8 = 0;
@@ -1185,12 +1188,12 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
         }
         track.text_profile = classify_text_profile(&events);
         track.events = events;
-        tracks.push(track);
+        tracks.extend(split_polyphonic_voices(track));
+        declared_tracks += 1;
     }
-    if tracks.len() != ntrk {
+    if declared_tracks != ntrk {
         return Err(format!(
-            "MIDI declares {ntrk} tracks but only {} were found",
-            tracks.len()
+            "MIDI declares {ntrk} tracks but only {declared_tracks} were found"
         ));
     }
     let source_format = if tracks
@@ -1210,6 +1213,103 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
         topology,
         tracks,
     })
+}
+
+/// Splits one MIDI track into monophonic lanes, one per simultaneous voice.
+///
+/// A Synthesizer V vocal track is monophonic, and score importers have always
+/// decomposed a chord into one lane per member. MIDI never did: a track that
+/// harmonises its melody, or that carries an accompaniment beside it, stayed a
+/// single lane with its notes stacked on top of each other. A syllable landing
+/// on such a stack has no single note to own, so it was dropped as ambiguous —
+/// which is how `Right this way your tables waiting` vanished from a score
+/// whose banjo doubles the melody a sixth below.
+///
+/// Splitting keeps both voices: neither is chosen over the other, each can be
+/// given its own voice database, and a syllable written for that instant is
+/// sung by every voice that sounds it.
+///
+/// Lane 0 keeps the source track's identity and every non-note event, because
+/// tempo, controls and lyrics belong to the track rather than to one of its
+/// voices. A track that is already monophonic is returned untouched.
+fn split_polyphonic_voices(track: Track) -> Vec<Track> {
+    type VoiceKey = (Option<u8>, Option<u8>);
+    let mut lanes: Vec<Vec<Event>> = vec![Vec::new()];
+    // What each lane is currently sounding, and the lanes a key was started on
+    // so an off closes the lane its on opened.
+    let mut sounding: Vec<Option<VoiceKey>> = vec![None];
+    let mut open: std::collections::HashMap<VoiceKey, Vec<usize>> =
+        std::collections::HashMap::new();
+
+    for event in &track.events {
+        match &event.kind {
+            Kind::NoteOn(note) if note.velocity != Some(0) => {
+                let key: VoiceKey = (note.channel, note.key);
+                let lane = match sounding.iter().position(Option::is_none) {
+                    Some(free) => free,
+                    None => {
+                        lanes.push(Vec::new());
+                        sounding.push(None);
+                        lanes.len() - 1
+                    }
+                };
+                sounding[lane] = Some(key);
+                open.entry(key).or_default().push(lane);
+                lanes[lane].push(event.clone());
+            }
+            Kind::NoteOn(note) => {
+                let key: VoiceKey = (note.channel, note.key);
+                let lane = close_voice_lane(&mut open, &mut sounding, key);
+                lanes[lane].push(event.clone());
+            }
+            Kind::NoteOff(note) => {
+                let key: VoiceKey = (note.channel, note.key);
+                let lane = close_voice_lane(&mut open, &mut sounding, key);
+                lanes[lane].push(event.clone());
+            }
+            _ => lanes[0].push(event.clone()),
+        }
+    }
+
+    if lanes.len() == 1 {
+        return vec![track];
+    }
+    lanes
+        .into_iter()
+        .enumerate()
+        .map(|(lane, events)| {
+            let mut voice = track.clone();
+            if lane > 0 {
+                voice.id = format!("{}-voice-{}", track.id, lane + 1);
+                voice.name = if track.name.trim().is_empty() {
+                    format!("Voice {}", lane + 1)
+                } else {
+                    format!("{} — voice {}", track.name, lane + 1)
+                };
+            }
+            voice.events = events;
+            voice
+        })
+        .collect()
+}
+
+/// Frees the lane a note-off closes, following the same `(channel, key)` FIFO
+/// the note extractor uses. An off with no matching on stays on lane 0, where
+/// the extractor will ignore it exactly as it does today.
+fn close_voice_lane(
+    open: &mut std::collections::HashMap<(Option<u8>, Option<u8>), Vec<usize>>,
+    sounding: &mut [Option<(Option<u8>, Option<u8>)>],
+    key: (Option<u8>, Option<u8>),
+) -> usize {
+    let lane = open
+        .get_mut(&key)
+        .filter(|lanes| !lanes.is_empty())
+        .map(|lanes| lanes.remove(0));
+    let lane = lane.unwrap_or(0);
+    if let Some(slot) = sounding.get_mut(lane) {
+        *slot = None;
+    }
+    lane
 }
 
 fn classify_text_profile(events: &[Event]) -> MidiTextProfile {
