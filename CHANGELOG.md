@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.4.5](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.4...v0.4.5) (2026-07-26)
+
+
+### Bug Fixes
+
+* unroll MusicXML repeats score-wide and keep Cargo.lock released ([#12](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/12)) ([08f6977](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/08f6977acf7c66b4449698463f46cdff59665d76))
+
 ## [0.4.4](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.3...v0.4.4) (2026-07-26)
 
 
