@@ -132,8 +132,41 @@ Verse does not choose the highest, lowest, or first note.
 
 ### Native ties
 
-Native MuseScore tie/spanner graphs are retained in the source and audible
-audio. They are not currently merged into longer editable SVP notes.
+Native MuseScore tie spanners are merged into one sustained SVP note, as
+MusicXML tie chains already were. The tail of a chain keeps its source identity
+and loses only its played pitch, so the ledger still accounts for every source
+note while Synthesizer V sees a single attack held for the whole chain.
+
+A pairing is accepted only when MuseScore's own back reference confirms it: the
+notes must be adjacent in time and the head must sit exactly where the tail's
+`<location>` says it does. Pairing on pitch alone mis-merges measurably, so a
+contradicted pairing is refused and both notes stay separate. Cross-staff ties,
+ties ending on a grace note, and chains broken by a repeat jump are likewise
+left unmerged rather than guessed.
+
+A tie tail that carries its own syllable is not a plain sustain either: the
+score asks for that word to be sung, so the note keeps its own attack. An
+explicitly empty lyric is the opposite signal — both formats write one on a tied
+note to state that nothing is sung there — and does not block the merge. Both
+the MuseScore and the MusicXML path follow this rule, so the same score exported
+either way projects identically.
+
+### Repeat structure
+
+Repeat barlines, voltas and jumps describe the score, not one staff, and
+MuseScore usually writes them on the first staff only. Verse therefore unrolls
+one playback order built from the union of every staff's marks and applies it to
+all of them. Two staves stating different values for the same mark, or staves
+that disagree on measure count, are rejected instead of arbitrated.
+
+### Stacked verses
+
+Verses stacked under one melody are alternatives, not simultaneous voices: the
+score replays the music and sings the next verse. When the repeat structure
+provides a pass per verse, Verse projects one track and sings verse N on pass N.
+When there are more verses than passes there is nowhere to put the extra ones,
+so each keeps a track of its own at the same instants and a
+`LYRIC_VERSES_EXCEED_REPEAT_PASSES` diagnostic says so.
 
 ## Source topology and projection lanes
 

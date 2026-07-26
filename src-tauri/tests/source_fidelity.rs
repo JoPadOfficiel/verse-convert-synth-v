@@ -99,6 +99,56 @@ fn a_karaoke_container_cannot_qualify_unproven_text() {
 }
 
 #[test]
+fn merging_a_tie_sustains_the_note_without_losing_any_source_identity() {
+    // Merging is a projection decision, not a parsing loss. The tail of a tie
+    // must keep its source id and its lyric in the IR so the preservation
+    // ledger still accounts for it, while Synthesizer V receives one held note
+    // instead of a second attack that would cut the sound in half.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure><voice>
+        <Chord><durationType>quarter</durationType>
+          <Lyrics><text>shine</text></Lyrics>
+          <Note><pitch>65</pitch><Spanner type="Tie"><Tie/><next><location><fractions>1/4</fractions></location></next></Spanner></Note>
+        </Chord>
+        <Chord><durationType>quarter</durationType>
+          <Note><pitch>65</pitch><Spanner type="Tie"><prev><location><fractions>-1/4</fractions></location></prev></Spanner></Note>
+        </Chord>
+      </voice></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+    let parsed = musescore::parse(xml.as_bytes()).expect("parse");
+    let note_ids: BTreeSet<_> = parsed
+        .tracks
+        .iter()
+        .flat_map(|track| track.events.iter())
+        .filter_map(|event| match &event.kind {
+            Kind::NoteOn(note) => Some(note.source.id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        note_ids.len(),
+        2,
+        "both source notes must survive the merge"
+    );
+
+    let outcome = convert_auto(xml.as_bytes(), "english");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    let svp = outcome.svp.expect("valid SVP");
+    let notes = &svp.tracks[0].main_group.notes;
+    assert_eq!(notes.len(), 1, "the tie is sung as one sustained note");
+    assert_eq!(notes[0].lyrics, "shine");
+    // 2 quarters at 705_600_000 blicks each.
+    assert_eq!(notes[0].duration, 1_411_200_000);
+}
+
+#[test]
 fn supplied_musescore_gate_when_configured() {
     let Ok(path) = std::env::var("VERSE_MSCZ_GATE") else {
         return;

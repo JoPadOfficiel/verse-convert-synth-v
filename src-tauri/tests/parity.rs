@@ -268,6 +268,61 @@ fn musescore_mscz_native() {
 }
 
 #[test]
+#[ignore = "requires the private help.mscz and help.mxl fixtures"]
+fn the_same_score_projects_identically_from_mscz_and_mxl() {
+    // The two fixtures are the same piece exported twice, so the two paths must
+    // agree note for note. Before ties were merged and repeats were computed
+    // score-wide, the .mscz gave 250/162/173 notes against the .mxl's
+    // 214/210/231 — and both dropped the syllable sitting on a tied note.
+    let from_mscz = conv_auto("help.mscz");
+    let from_mxl = conv_auto("help.mxl");
+    let voices = |outcome: &ConvertOutcome| {
+        outcome
+            .svp
+            .as_ref()
+            .expect("conversion succeeds")
+            .tracks
+            .iter()
+            .map(|track| {
+                track
+                    .main_group
+                    .notes
+                    .iter()
+                    .map(|note| (note.onset, note.duration, note.pitch, note.lyrics.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mscz = voices(&from_mscz);
+    let mxl = voices(&from_mxl);
+    assert_eq!(
+        mscz.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![214, 210, 235],
+        "each staff must sustain its ties and unroll the repeat"
+    );
+    assert_eq!(
+        mscz, mxl,
+        "the MuseScore projection must match the MusicXML one note for note"
+    );
+
+    // No word may be lost on either path. "ate" sits on a tied note and used to
+    // vanish with the merge.
+    let words = |projection: &Vec<Vec<(i64, i64, u8, String)>>| {
+        projection
+            .iter()
+            .flatten()
+            .map(|note| note.3.trim().to_lowercase())
+            .filter(|text| !text.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert!(
+        words(&mscz).contains("ate"),
+        "a syllable on a tied note is sung"
+    );
+    assert_eq!(words(&mscz), words(&mxl));
+}
+
+#[test]
 #[ignore = "requires the private queen.kar fixture"]
 fn queen_lyrics_without_source_melody_do_not_create_c4() {
     let r = conv("queen.kar");

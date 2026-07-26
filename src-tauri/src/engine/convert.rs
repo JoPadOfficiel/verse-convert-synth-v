@@ -474,22 +474,62 @@ fn lyric_text(lyric: &Lyric) -> String {
     }
 }
 
-fn selected_attached_lyric<'a>(note: &'a SourceNote, lane: &str) -> Option<&'a Lyric> {
+/// Picks the lyric a note sings. `lanes` is indexed by repeat pass: a single
+/// entry pins one lane for the whole track, while several entries mean verse N
+/// is sung on pass N, which is what a score with stacked verses under one
+/// melody actually notates. A pass beyond the last verse reuses the last one.
+/// Source note ids that the playback order reaches more than once, so a note
+/// can tell whether another pass will sing it again.
+fn replayed_note_ids(notes: &[SourceNote]) -> BTreeSet<&str> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for note in notes {
+        *seen.entry(note.source.id.as_str()).or_default() += 1;
+    }
+    seen.into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+fn selected_attached_lyric<'a>(
+    note: &'a SourceNote,
+    lanes: &[String],
+    replayed: &BTreeSet<&str>,
+) -> Option<&'a Lyric> {
     let playback = note.source.occurrence + 1;
-    note.lyrics
-        .iter()
-        .filter(|lyric| lyric.lane == lane)
-        .find(|lyric| !lyric.time_only.is_empty() && lyric.time_only.contains(&playback))
-        .or_else(|| {
-            note.lyrics
-                .iter()
-                .find(|lyric| lyric.lane == lane && lyric.time_only.is_empty())
-        })
+    let pick = |lane: &String| {
+        note.lyrics
+            .iter()
+            .filter(|lyric| &lyric.lane == lane)
+            .find(|lyric| !lyric.time_only.is_empty() && lyric.time_only.contains(&playback))
+            .or_else(|| {
+                note.lyrics
+                    .iter()
+                    .find(|lyric| &lyric.lane == lane && lyric.time_only.is_empty())
+            })
+    };
+    let this_pass = usize::try_from(note.source.occurrence)
+        .ok()
+        .and_then(|pass| lanes.get(pass))
+        .or_else(|| lanes.last())?;
+    if let Some(lyric) = pick(this_pass) {
+        return Some(lyric);
+    }
+    // This pass's verse says nothing here. On a note the playback order reaches
+    // only once, every verse is stacked on that single instant and the other
+    // verses are the only text there is — verse markers and pickup syllables
+    // are commonly written on a later verse alone, exactly at such a spot.
+    // On a replayed note the silence is deliberate: the verse melismas there
+    // and the neighbouring verse belongs to its own pass, never to this one.
+    if lanes.len() > 1 && !replayed.contains(note.source.id.as_str()) {
+        return lanes.iter().find_map(pick);
+    }
+    None
 }
 
 struct TrackProjection<'a> {
     source_track_id: &'a str,
-    lane: Option<&'a str>,
+    lanes: &'a [String],
     standalone: &'a HashMap<usize, TimedLyric>,
     evidence: &'a mut ProjectionEvidence,
 }
@@ -502,14 +542,13 @@ fn make_track(
     projection: TrackProjection<'_>,
 ) -> Result<SvpTrack, String> {
     let mut svp_notes = Vec::with_capacity(notes.len());
+    let replayed = replayed_note_ids(notes);
     let mut explicit_extension_end = None;
     let mut musicxml_extension_open = false;
     for (index, source_note) in notes.iter().enumerate() {
         let mut lyric_source_id = None;
         let mut lyric_event_id = None;
-        let attached = projection
-            .lane
-            .and_then(|lane| selected_attached_lyric(source_note, lane));
+        let attached = selected_attached_lyric(source_note, projection.lanes, &replayed);
         let lyric = if let Some(attached) = attached {
             if let Some(ticks) = attached.extend_ticks.filter(|ticks| *ticks > 0) {
                 explicit_extension_end = u32::try_from(ticks)
@@ -814,8 +853,9 @@ pub fn convert_midi_with(
             });
             continue;
         }
-        let lanes = attached_lanes(notes);
+        let lanes = ordered_lanes(&attached_lanes(notes));
         let attached = !lanes.is_empty();
+        let mut unplaced_verses = 0usize;
         let target_binding = external.binding_for_target(index).filter(|binding| {
             overrides.and_then(|map| map.get(&binding.target_track).copied()) != Some(false)
         });
@@ -836,17 +876,42 @@ pub fn convert_midi_with(
         let sing = explicit_override.unwrap_or(source_vocal);
         let mut placed = 0usize;
         if sing {
-            if lanes.is_empty() {
-                placed = projected_lyric_count(notes, None, &assignment);
+            let no_assignment = HashMap::new();
+            // Stacked verses under one melody are alternatives, not simultaneous
+            // voices: the score plays the music again and sings the next verse.
+            // When the repeat provides a pass per verse, project one track that
+            // follows that reading. Otherwise there is no place to put the extra
+            // verses, so keep a track each and say so.
+            let groups: Vec<Vec<String>> = if lanes.is_empty() {
+                vec![Vec::new()]
+            } else if lanes.len() > 1 && repeat_passes(notes) >= lanes.len() {
+                vec![lanes.clone()]
+            } else {
+                lanes.iter().map(|lane| vec![lane.clone()]).collect()
+            };
+            if groups.len() > 1 {
+                unplaced_verses = groups.len() - 1;
+            }
+            for group in &groups {
+                let standalone = if group.is_empty() {
+                    &assignment
+                } else {
+                    &no_assignment
+                };
+                placed += projected_lyric_count(notes, group, standalone);
+                let lane_name = match group.as_slice() {
+                    [lane] if lanes.len() > 1 => format!("{name} — lyric lane {lane}"),
+                    _ => name.clone(),
+                };
                 let mut svp_track = match make_track(
                     svp_tracks.len(),
-                    &name,
+                    &lane_name,
                     notes,
                     tpb,
                     TrackProjection {
                         source_track_id: &track.id,
-                        lane: None,
-                        standalone: &assignment,
+                        lanes: group,
+                        standalone,
                         evidence: &mut projection,
                     },
                 ) {
@@ -858,39 +923,6 @@ pub fn convert_midi_with(
                 if !svp_track.main_group.notes.is_empty() {
                     svp_track.main_ref.database.language = language.to_string();
                     svp_tracks.push(svp_track);
-                }
-            } else {
-                let no_assignment = HashMap::new();
-                for lane in &lanes {
-                    placed += projected_lyric_count(notes, Some(lane), &no_assignment);
-                    let lane_name = if lanes.len() == 1 {
-                        name.clone()
-                    } else {
-                        format!("{name} — lyric lane {lane}")
-                    };
-                    let mut svp_track = match make_track(
-                        svp_tracks.len(),
-                        &lane_name,
-                        notes,
-                        tpb,
-                        TrackProjection {
-                            source_track_id: &track.id,
-                            lane: Some(lane),
-                            standalone: &no_assignment,
-                            evidence: &mut projection,
-                        },
-                    ) {
-                        Ok(track) => track,
-                        Err(error) => {
-                            return fail(format!(
-                                "source timing cannot be projected safely: {error}"
-                            ));
-                        }
-                    };
-                    if !svp_track.main_group.notes.is_empty() {
-                        svp_track.main_ref.database.language = language.to_string();
-                        svp_tracks.push(svp_track);
-                    }
                 }
             }
         }
@@ -931,6 +963,16 @@ pub fn convert_midi_with(
             index,
             source_binding_active.is_some() || target_binding.is_some(),
         );
+        if unplaced_verses > 0 {
+            warnings.push(report_warning(
+                "LYRIC_VERSES_EXCEED_REPEAT_PASSES",
+                DiagnosticSeverity::Info,
+                "The source stacks more verses under this melody than the repeat structure \
+                 plays it back, so the extra verses keep a track of their own at the same \
+                 instants instead of being sung one pass after the other.",
+                &track.id,
+            ));
+        }
         if standalone_with_attached_lanes {
             warnings.push(report_warning(
                 "STANDALONE_LYRICS_LEFT_SOURCE_ONLY",
@@ -1290,9 +1332,10 @@ fn remove_chord_ambiguities(
 
 fn projected_lyric_count(
     notes: &[SourceNote],
-    lane: Option<&str>,
+    lanes: &[String],
     assignment: &HashMap<usize, TimedLyric>,
 ) -> usize {
+    let replayed = replayed_note_ids(notes);
     notes
         .iter()
         .enumerate()
@@ -1300,7 +1343,7 @@ fn projected_lyric_count(
             if note.pitch.is_none() || note.duration == 0 {
                 return false;
             }
-            lane.and_then(|lane| selected_attached_lyric(note, lane))
+            selected_attached_lyric(note, lanes, &replayed)
                 .or_else(|| assignment.get(index).map(|timed| &timed.lyric))
                 .is_some_and(|lyric| {
                     matches!(
@@ -1588,6 +1631,28 @@ fn attached_lanes(notes: &[SourceNote]) -> BTreeSet<String> {
         .iter()
         .flat_map(|note| note.lyrics.iter().map(|lyric| lyric.lane.clone()))
         .collect()
+}
+
+/// Verse order, not label order: lanes are numbered in both source formats, and
+/// sorting them as text would place verse 10 between verse 1 and verse 2.
+/// Non-numeric labels keep a stable place after the numbered ones.
+fn ordered_lanes(lanes: &BTreeSet<String>) -> Vec<String> {
+    let mut ordered: Vec<String> = lanes.iter().cloned().collect();
+    ordered.sort_by(|a, b| {
+        let key = |lane: &String| (lane.parse::<u32>().ok().is_none(), lane.parse::<u32>().ok());
+        key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+    });
+    ordered
+}
+
+/// How many times the source is played back, counting repeat unrolling. A score
+/// with two verses needs two passes for both to be singable in place.
+fn repeat_passes(notes: &[SourceNote]) -> usize {
+    notes
+        .iter()
+        .map(|note| note.source.occurrence as usize + 1)
+        .max()
+        .unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -1910,6 +1975,198 @@ mod tests {
             .projection
             .source_ids
             .contains("lyric:lane-2:occurrence:0:note-event:0"));
+    }
+
+    /// Two occurrences of the same note, as repeat unrolling produces them:
+    /// one source id, two `occurrence` values. Both carry every verse, so the
+    /// projector has to pick one per pass.
+    fn repeated_note_events(track_id: &str, lyrics: Vec<Lyric>) -> Vec<midi::Event> {
+        let mut events = Vec::new();
+        let source_id = format!("{track_id}-note");
+        for (pass, onset) in [0u32, 480].into_iter().enumerate() {
+            let source = midi::NoteSource {
+                id: source_id.clone(),
+                occurrence: pass as u32,
+                ..midi::NoteSource::default()
+            };
+            events.push(midi::Event::new(
+                onset,
+                events.len() as u32,
+                Kind::NoteOn(NoteOn {
+                    channel: Some(0),
+                    key: Some(60),
+                    velocity: Some(90),
+                    source,
+                    lyrics: lyrics.clone(),
+                }),
+            ));
+            events.push(midi::Event::new(
+                onset + 480,
+                events.len() as u32,
+                Kind::NoteOff(midi::NoteOff {
+                    channel: Some(0),
+                    key: Some(60),
+                    velocity: Some(0),
+                    source_id: Some(source_id.clone()),
+                }),
+            ));
+        }
+        events
+    }
+
+    fn verse(id: &str, text: &str, lane: &str) -> Lyric {
+        let mut lyric = Lyric::text(id, text.into());
+        lyric.lane = lane.into();
+        lyric
+    }
+
+    #[test]
+    fn stacked_verses_are_sung_one_repeat_pass_after_the_other() {
+        // A score that stacks two verses under one melody means "play it again
+        // and sing the next verse", not "sing both at once".
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        track.events = repeated_note_events(
+            "voice",
+            vec![verse("lane-1", "one", "1"), verse("lane-2", "two", "2")],
+        );
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(project.tracks.len(), 1);
+        let sung: Vec<_> = project.tracks[0]
+            .main_group
+            .notes
+            .iter()
+            .map(|note| note.lyrics.as_str())
+            .collect();
+        assert_eq!(sung, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn a_word_only_a_later_verse_carries_is_still_sung_on_a_note_played_once() {
+        // Verse markers and pickup syllables are commonly written on one verse
+        // alone, at a spot outside the repeat. That note is played once, so
+        // every verse is stacked on it and the later verse is the only text
+        // there is: dropping it would lose a source word.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        let mut events = repeated_note_events(
+            "voice",
+            vec![verse("lane-1", "one", "1"), verse("lane-2", "two", "2")],
+        );
+        let played_once = midi::NoteSource {
+            id: "voice-tail".into(),
+            ..midi::NoteSource::default()
+        };
+        events.push(midi::Event::new(
+            960,
+            events.len() as u32,
+            Kind::NoteOn(NoteOn {
+                channel: Some(0),
+                key: Some(60),
+                velocity: Some(90),
+                source: played_once,
+                lyrics: vec![verse("lane-2-only", "3.", "2")],
+            }),
+        ));
+        events.push(midi::Event::new(
+            1440,
+            events.len() as u32,
+            Kind::NoteOff(midi::NoteOff {
+                channel: Some(0),
+                key: Some(60),
+                velocity: Some(0),
+                source_id: Some("voice-tail".into()),
+            }),
+        ));
+        track.events = events;
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(project.tracks.len(), 1);
+        let sung: Vec<_> = project.tracks[0]
+            .main_group
+            .notes
+            .iter()
+            .map(|note| note.lyrics.as_str())
+            .collect();
+        assert_eq!(sung, vec!["one", "two", "3."]);
+    }
+
+    #[test]
+    fn a_replayed_note_never_borrows_another_verses_word() {
+        // The first note is reached twice, so verse 2 owns its second pass.
+        // Verse 2 melismas there, and borrowing verse 1's syllable would sing a
+        // word from the wrong verse. The last note is played once, so it may.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        let mut events = repeated_note_events("voice", vec![verse("lane-1", "one", "1")]);
+        let played_once = midi::NoteSource {
+            id: "voice-tail".into(),
+            ..midi::NoteSource::default()
+        };
+        events.push(midi::Event::new(
+            960,
+            events.len() as u32,
+            Kind::NoteOn(NoteOn {
+                channel: Some(0),
+                key: Some(60),
+                velocity: Some(90),
+                source: played_once,
+                lyrics: vec![verse("lane-2", "two", "2")],
+            }),
+        ));
+        events.push(midi::Event::new(
+            1440,
+            events.len() as u32,
+            Kind::NoteOff(midi::NoteOff {
+                channel: Some(0),
+                key: Some(60),
+                velocity: Some(0),
+                source_id: Some("voice-tail".into()),
+            }),
+        ));
+        track.events = events;
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        let sung: Vec<_> = project.tracks[0]
+            .main_group
+            .notes
+            .iter()
+            .map(|note| note.lyrics.as_str())
+            .collect();
+        assert_eq!(sung, vec!["one", "", "two"]);
+    }
+
+    #[test]
+    fn verses_with_nowhere_to_go_keep_a_track_each_and_say_so() {
+        // Without a repeat there is no second pass to put verse 2 on, so the
+        // old shape is kept rather than silently dropping a verse.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        track.events = note_events(
+            "voice",
+            0,
+            480,
+            vec![verse("lane-1", "one", "1"), verse("lane-2", "two", "2")],
+        );
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = outcome.svp.expect("conversion succeeds");
+        assert_eq!(project.tracks.len(), 2);
+        assert!(outcome.tracks.iter().any(|report| report
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "LYRIC_VERSES_EXCEED_REPEAT_PASSES")));
+    }
+
+    #[test]
+    fn verse_order_follows_the_number_not_the_label() {
+        // Sorting lane labels as text would sing verse 10 on the second pass.
+        let lanes: BTreeSet<String> = ["1", "2", "10"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(ordered_lanes(&lanes), vec!["1", "2", "10"]);
     }
 
     #[test]

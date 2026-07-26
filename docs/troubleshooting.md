@@ -61,7 +61,16 @@ accompaniment and remains muted by default to avoid doubling the Part stems.
 
 ## `la` appears where the source note is blank
 
-Current Verse does not use `la` as a fallback lyric.
+Current Verse does not use `la` as a fallback lyric. Synthesizer V does: it
+displays its own default syllable, greyed out and unsung, on any note whose
+lyric is empty. A grey `la` in the piano roll is therefore a note Verse exported
+with no lyric, not a syllable Verse invented — inspect the source at that note
+before reporting it.
+
+Until MuseScore tie merging shipped, the commonest cause was a tied note: the
+tail of the tie was exported as a separate note with no lyric, so a sustained
+`shine` stopped dead at the tie and showed a grey `la` for the rest of its
+length. If you still see that pattern, re-export with a current build.
 
 For the audited “This Little” score, the first vocal note is pitch 65 with an
 empty lyric, and the first non-empty lyric is `let`. The regression test also
