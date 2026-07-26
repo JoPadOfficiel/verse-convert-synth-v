@@ -242,6 +242,122 @@ fn child<'a, 'b>(n: roxmltree::Node<'a, 'b>, tag: &str) -> Option<roxmltree::Nod
     n.children().find(|c| c.has_tag_name(tag))
 }
 
+/// One side (`<next>` or `<prev>`) of a MuseScore tie spanner. MuseScore stores
+/// the distance to the other end of the tie, and that distance is the evidence
+/// that proves a candidate pairing is the real one. Pairing on pitch and voice
+/// alone is a guess: measured over the pinned corpus it mis-pairs 49 ties, one
+/// of them fusing 58 measures that the score never sustains.
+#[derive(Clone, Copy, Default)]
+struct TieSide {
+    measure_delta: i64,
+    voice_delta: i64,
+    staff_delta: i64,
+    grace_target: bool,
+}
+
+/// Tie evidence carried by one `<Note>`. MuseScore 3.x nests a
+/// `<Spanner type="Tie">` per side; MuseScore 2.x pairs `<Tie id>` with
+/// `<endSpanner id>`. A note in the middle of a chain carries both sides.
+#[derive(Default)]
+struct NoteTies {
+    start: Option<TieSide>,
+    stop: Option<TieSide>,
+    legacy_start: Option<String>,
+    legacy_stop: Option<String>,
+}
+
+/// A tie chain whose head note-off is already queued and can still be extended.
+/// `measure_index` tracks the latest link, because the next link's back
+/// reference points at that link and not at the head of the chain.
+struct PendingTie {
+    bucket: (usize, Option<usize>),
+    off_index: usize,
+    end_tick: u32,
+    measure_index: usize,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TieKey {
+    Positional(usize, u8),
+    Legacy(String),
+}
+
+fn tie_location(side: roxmltree::Node) -> Result<TieSide, String> {
+    let Some(location) = child(side, "location") else {
+        return Ok(TieSide::default());
+    };
+    let signed = |tag: &str| -> Result<i64, String> {
+        match child_text(location, tag) {
+            None => Ok(0),
+            Some(text) => text
+                .parse::<i64>()
+                .ok()
+                .filter(|value| value.unsigned_abs() <= 1024)
+                .ok_or_else(|| format!("MuseScore tie location {tag} is invalid: {text:?}")),
+        }
+    };
+    Ok(TieSide {
+        measure_delta: signed("measures")?,
+        voice_delta: signed("voices")?,
+        staff_delta: signed("staves")?,
+        grace_target: child(location, "grace").is_some(),
+    })
+}
+
+fn tie_stop_key(ties: &NoteTies, voice_index: usize, pitch: u8) -> Option<TieKey> {
+    if let Some(id) = &ties.legacy_stop {
+        return Some(TieKey::Legacy(id.clone()));
+    }
+    let stop = ties.stop?;
+    // A cross-staff tie, or one ending on a grace note, cannot be resolved from
+    // this staff's event stream. Leaving it unmerged keeps both notes audible,
+    // which is the safe direction: nothing is invented and nothing goes silent.
+    if stop.staff_delta != 0 || stop.grace_target {
+        return None;
+    }
+    let head_voice = i64::try_from(voice_index).ok()? + stop.voice_delta;
+    usize::try_from(head_voice)
+        .ok()
+        .map(|voice| TieKey::Positional(voice, pitch))
+}
+
+fn tie_start_key(ties: &NoteTies, voice_index: usize, pitch: u8) -> Option<TieKey> {
+    if let Some(id) = &ties.legacy_start {
+        return Some(TieKey::Legacy(id.clone()));
+    }
+    ties.start.map(|_| TieKey::Positional(voice_index, pitch))
+}
+
+fn note_ties(note: roxmltree::Node) -> Result<NoteTies, String> {
+    let mut ties = NoteTies::default();
+    for element in note.children().filter(|c| c.is_element()) {
+        match element.tag_name().name() {
+            // `<Note>` also carries TextLine and Glissando spanners in real
+            // scores, so the type filter is required rather than cosmetic.
+            "Spanner" if element.attribute("type") == Some("Tie") => {
+                if let Some(next) = child(element, "next") {
+                    if ties.start.is_some() {
+                        return Err("MuseScore Note declares two tie starts".into());
+                    }
+                    ties.start = Some(tie_location(next)?);
+                }
+                if let Some(previous) = child(element, "prev") {
+                    if ties.stop.is_some() {
+                        return Err("MuseScore Note declares two tie stops".into());
+                    }
+                    ties.stop = Some(tie_location(previous)?);
+                }
+            }
+            // MuseScore 2.x encoding; `<Tie>` is never a direct child of
+            // `<Note>` in 3.x, where it sits inside the `<Spanner>`.
+            "Tie" => ties.legacy_start = element.attribute("id").map(str::to_string),
+            "endSpanner" => ties.legacy_stop = element.attribute("id").map(str::to_string),
+            _ => {}
+        }
+    }
+    Ok(ties)
+}
+
 fn child_text<'a>(n: roxmltree::Node<'a, '_>, tag: &str) -> Option<&'a str> {
     child(n, tag).and_then(|c| c.text()).map(|t| t.trim())
 }
@@ -762,7 +878,70 @@ fn chord_lyrics(
 }
 
 /// Playback order of the measures: repeats, voltas, D.S./D.C., Coda, Fine.
-fn playback_order(measures: &[roxmltree::Node]) -> Result<Vec<(usize, u32)>, String> {
+/// Playback structure is a property of the score, not of one staff: MuseScore
+/// normally writes repeat barlines on the first staff only, and a few scores
+/// split them (barlines on one staff, voltas on another). Unrolling each staff
+/// against its own marks therefore truncates every staff that carries none.
+/// Merging is a union, and two staves stating different values for the same
+/// mark is a contradiction we refuse rather than arbitrate.
+fn score_playback_order(
+    staff_measures: &[Vec<roxmltree::Node>],
+) -> Result<Vec<(usize, u32)>, String> {
+    let Some(first) = staff_measures.first() else {
+        return Ok(Vec::new());
+    };
+    for (index, measures) in staff_measures.iter().enumerate().skip(1) {
+        if measures.len() != first.len() {
+            return Err(format!(
+                "MuseScore staves disagree on measure count: staff 1 has {}, staff {} has {}",
+                first.len(),
+                index + 1,
+                measures.len()
+            ));
+        }
+    }
+    let mut merged = vec![MeasureMarks::default(); first.len()];
+    for measures in staff_measures {
+        for (target, marks) in merged.iter_mut().zip(measure_marks(measures)?) {
+            merge_measure_marks(target, marks)?;
+        }
+    }
+    unroll(&merged)
+}
+
+fn merge_measure_marks(target: &mut MeasureMarks, source: MeasureMarks) -> Result<(), String> {
+    let conflict = |name: &str| format!("MuseScore staves disagree on the {name} of a measure");
+    target.start_repeat |= source.start_repeat;
+    if source.end_repeat != 0 {
+        if target.end_repeat != 0 && target.end_repeat != source.end_repeat {
+            return Err(conflict("repeat count"));
+        }
+        target.end_repeat = source.end_repeat;
+    }
+    if let Some(volta) = source.volta {
+        if target
+            .volta
+            .as_ref()
+            .is_some_and(|current| *current != volta)
+        {
+            return Err(conflict("volta endings"));
+        }
+        target.volta = Some(volta);
+    }
+    if let Some(jump) = source.jump {
+        if target.jump.is_some_and(|current| current != jump) {
+            return Err(conflict("jump"));
+        }
+        target.jump = Some(jump);
+    }
+    target.segno |= source.segno;
+    target.coda |= source.coda;
+    target.to_coda |= source.to_coda;
+    target.fine |= source.fine;
+    Ok(())
+}
+
+fn measure_marks(measures: &[roxmltree::Node]) -> Result<Vec<MeasureMarks>, String> {
     let mut marks = vec![MeasureMarks::default(); measures.len()];
     let mut volta_spans: Vec<(usize, usize, Vec<u32>)> = Vec::new();
 
@@ -846,7 +1025,7 @@ fn playback_order(measures: &[roxmltree::Node]) -> Result<Vec<(usize, u32)>, Str
             marks[k].volta = Some(endings.clone());
         }
     }
-    unroll(&marks)
+    Ok(marks)
 }
 
 pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
@@ -1072,7 +1251,22 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     let mut global_events = Vec::new();
     let mut local_meter_fallbacks = Vec::new();
 
-    for staff in score.children().filter(|n| n.has_tag_name("Staff")) {
+    let score_staves: Vec<_> = score
+        .children()
+        .filter(|n| n.has_tag_name("Staff"))
+        .collect();
+    let staff_measures: Vec<Vec<_>> = score_staves
+        .iter()
+        .map(|staff| {
+            staff
+                .children()
+                .filter(|n| n.has_tag_name("Measure"))
+                .collect()
+        })
+        .collect();
+    let score_order = score_playback_order(&staff_measures)?;
+
+    for (staff_index, &staff) in score_staves.iter().enumerate() {
         let staff_id = staff
             .attribute("id")
             .map(str::to_string)
@@ -1080,16 +1274,24 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         let info = staff_info.get(&staff_id).cloned().unwrap_or_default();
         let mut voice_events: BTreeMap<(usize, Option<usize>), Vec<Event>> = BTreeMap::new();
         let mut unassigned_chord_lyrics = Vec::new();
+        // Scoped with `voice_events`, so tie state is per staff without needing
+        // a staff component in the key.
+        let mut active_ties: BTreeMap<TieKey, PendingTie> = BTreeMap::new();
+        let mut previous_measure: Option<usize> = None;
 
         let mut measure_start: i64 = 0;
         let mut measure_len: i64 = 4 * div; // 4/4 by default
         let mut time_stretch = (1i64, 1i64);
 
-        let measures: Vec<_> = staff
-            .children()
-            .filter(|n| n.has_tag_name("Measure"))
-            .collect();
-        for &(mi, pass) in playback_order(&measures)?.iter() {
+        let measures = &staff_measures[staff_index];
+        for &(mi, pass) in score_order.iter() {
+            // A repeat, volta or jump has just broken notated continuity. A tie
+            // location points at the next NOTATED measure, which is no longer
+            // the next PLAYED one, so open chains cannot be proven any more.
+            if previous_measure.is_some_and(|previous| mi != previous + 1) {
+                active_ties.clear();
+            }
+            previous_measure = Some(mi);
             let measure = measures[mi];
             let mut this_len = measure_len;
             for (voice_index, voice) in measure_voice_containers(measure)?.into_iter().enumerate() {
@@ -1343,15 +1545,54 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         .first()
                                         .and_then(|instrument| instrument.channel);
                                     let chord_member = polyphonic.then_some(note_index);
-                                    let events = voice_events
-                                        .entry((voice_index, chord_member))
-                                        .or_default();
+                                    let bucket = (voice_index, chord_member);
+                                    let ties = note_ties(note)?;
+                                    // Resolve a tie stop before borrowing this
+                                    // note's bucket: the head's note-off can
+                                    // live in another bucket of the same staff.
+                                    let stop_key = tie_stop_key(&ties, voice_index, pitch);
+                                    let continued = stop_key.and_then(|key| {
+                                        let pending = active_ties.get(&key)?;
+                                        // MuseScore's own back reference decides:
+                                        // the chain must stay time-contiguous and
+                                        // the previous link must sit exactly where
+                                        // the location says it does.
+                                        let notated_head = ties
+                                            .stop
+                                            .map(|stop| {
+                                                i64::try_from(mi).ok().and_then(|tail| {
+                                                    usize::try_from(tail + stop.measure_delta).ok()
+                                                }) == Some(pending.measure_index)
+                                            })
+                                            .unwrap_or(true);
+                                        if pending.end_tick != on || !notated_head {
+                                            return None;
+                                        }
+                                        Some(key)
+                                    });
+                                    // A merged tail keeps its source identity and
+                                    // loses only its played pitch, so the ledger
+                                    // still sees every source note while
+                                    // Synthesizer V sees one sustained note.
+                                    let playback_pitch = if continued.is_some() {
+                                        None
+                                    } else {
+                                        Some(pitch)
+                                    };
+                                    let head = continued.as_ref().and_then(|key| {
+                                        let pending = active_ties.remove(key)?;
+                                        let events = voice_events.get_mut(&pending.bucket)?;
+                                        let target = events.get_mut(pending.off_index)?;
+                                        target.tick = off;
+                                        Some(pending)
+                                    });
+                                    let events = voice_events.entry(bucket).or_default();
                                     push_event(
                                         events,
                                         on,
                                         Kind::NoteOn(NoteOn {
                                             channel,
-                                            key: Some(pitch),
+                                            key: playback_pitch,
                                             velocity: None,
                                             source: NoteSource {
                                                 id: source_id.clone(),
@@ -1383,11 +1624,34 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         off,
                                         Kind::NoteOff(NoteOff {
                                             channel,
-                                            key: Some(pitch),
+                                            key: playback_pitch,
                                             velocity: None,
-                                            source_id: Some(source_id),
+                                            source_id: Some(source_id.clone()),
                                         }),
                                     );
+                                    let off_index = events.len() - 1;
+                                    if let Some(key) = tie_start_key(&ties, voice_index, pitch) {
+                                        // A middle link keeps pointing at the
+                                        // head's note-off, which carries the
+                                        // whole chain's duration, but advances
+                                        // the position the next link matches on.
+                                        active_ties.insert(
+                                            key,
+                                            match head {
+                                                Some(head) => PendingTie {
+                                                    end_tick: off,
+                                                    measure_index: mi,
+                                                    ..head
+                                                },
+                                                None => PendingTie {
+                                                    bucket,
+                                                    off_index,
+                                                    end_tick: off,
+                                                    measure_index: mi,
+                                                },
+                                            },
+                                        );
+                                    }
                                 }
                             }
                             if !grace {
@@ -2489,5 +2753,262 @@ Melodie</trackName>
             .unwrap();
         assert_eq!(lyric.extend_ticks, Some(-1680));
         assert_eq!(lyric.extend_fraction, Some((-7, 8)));
+    }
+
+    /// Builds a one-staff score whose measures are supplied verbatim, so a tie
+    /// case can be written exactly as MuseScore stores it.
+    fn tie_score(measures: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/></Part>
+    <Staff id="1">{measures}</Staff>
+  </Score>
+</museScore>"#
+        )
+    }
+
+    /// Played notes with their duration, rebuilt by pairing note-on/note-off the
+    /// way the projector does. A merged tie appears here as one longer note; an
+    /// unmerged one as two notes.
+    fn played_notes(midi: &Midi) -> Vec<(u32, u32, u8)> {
+        let mut played = Vec::new();
+        for track in &midi.tracks {
+            for (index, event) in track.events.iter().enumerate() {
+                let Kind::NoteOn(note) = &event.kind else {
+                    continue;
+                };
+                let Some(key) = note.key else { continue };
+                let end = track.events[index + 1..]
+                    .iter()
+                    .find_map(|candidate| match &candidate.kind {
+                        Kind::NoteOff(off) if off.source_id == Some(note.source.id.clone()) => {
+                            Some(candidate.tick)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(event.tick);
+                played.push((event.tick, end - event.tick, key));
+            }
+        }
+        played.sort_unstable();
+        played
+    }
+
+    const TIE_START: &str = r#"<Spanner type="Tie"><Tie/><next><location><fractions>1/4</fractions></location></next></Spanner>"#;
+    const TIE_STOP: &str = r#"<Spanner type="Tie"><prev><location><fractions>-1/4</fractions></location></prev></Spanner>"#;
+
+    fn quarter(pitch: u8, spanners: &str) -> String {
+        format!(
+            "<Chord><durationType>quarter</durationType><Note><pitch>{pitch}</pitch>{spanners}</Note></Chord>"
+        )
+    }
+
+    #[test]
+    fn a_tie_becomes_one_sustained_note() {
+        let xml = tie_score(&format!(
+            "<Measure><voice>{}{}</voice></Measure>",
+            quarter(65, TIE_START),
+            quarter(65, TIE_STOP)
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        // 480 + 480 ticks sung as a single attack, not two.
+        assert_eq!(played_notes(&midi), vec![(0, 960, 65)]);
+    }
+
+    #[test]
+    fn a_tie_chain_accumulates_every_link() {
+        let middle = format!("{TIE_STOP}{TIE_START}");
+        let xml = tie_score(&format!(
+            "<Measure><voice>{}{}{}</voice></Measure>",
+            quarter(65, TIE_START),
+            quarter(65, &middle),
+            quarter(65, TIE_STOP)
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 1_440, 65)]);
+    }
+
+    #[test]
+    fn a_repeated_note_without_a_tie_stays_two_notes() {
+        let xml = tie_score(&format!(
+            "<Measure><voice>{}{}</voice></Measure>",
+            quarter(65, ""),
+            quarter(65, "")
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 65), (480, 480, 65)]);
+    }
+
+    #[test]
+    fn a_non_tie_spanner_on_a_note_never_merges() {
+        // Real scores carry TextLine and Glissando spanners on `<Note>` too, so
+        // the type filter is what keeps them from being read as ties.
+        let start = r#"<Spanner type="TextLine"><next><location><fractions>1/4</fractions></location></next></Spanner>"#;
+        let stop = r#"<Spanner type="Glissando"><prev><location><fractions>-1/4</fractions></location></prev></Spanner>"#;
+        let xml = tie_score(&format!(
+            "<Measure><voice>{}{}</voice></Measure>",
+            quarter(65, start),
+            quarter(65, stop)
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 65), (480, 480, 65)]);
+    }
+
+    #[test]
+    fn a_slur_between_equal_pitches_never_merges() {
+        // A slur is phrasing, not sustain, and MuseScore stores it on the
+        // `<Chord>` rather than on the `<Note>`.
+        let xml = tie_score(
+            r#"<Measure><voice>
+              <Chord><durationType>quarter</durationType><Spanner type="Slur"><next><location><fractions>1/4</fractions></location></next></Spanner><Note><pitch>65</pitch></Note></Chord>
+              <Chord><durationType>quarter</durationType><Note><pitch>65</pitch></Note></Chord>
+            </voice></Measure>"#,
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 65), (480, 480, 65)]);
+    }
+
+    #[test]
+    fn a_dangling_tie_start_keeps_its_note_audible() {
+        let xml = tie_score(&format!(
+            "<Measure><voice>{}{}</voice></Measure>",
+            quarter(65, TIE_START),
+            quarter(60, "")
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 65), (480, 480, 60)]);
+    }
+
+    #[test]
+    fn a_pairing_contradicted_by_the_location_is_refused() {
+        // The tail says its head is one measure back, but the only candidate is
+        // in the same measure. Pairing on pitch alone would sustain a note the
+        // score never sustains, so the merge must be refused.
+        let stop = r#"<Spanner type="Tie"><prev><location><measures>-1</measures></location></prev></Spanner>"#;
+        let xml = tie_score(&format!(
+            "<Measure><voice>{}{}</voice></Measure>",
+            quarter(65, TIE_START),
+            quarter(65, stop)
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 65), (480, 480, 65)]);
+    }
+
+    #[test]
+    fn a_musescore_2_x_tie_merges_through_its_spanner_id() {
+        let xml = tie_score(&format!(
+            "<Measure><voice>{}{}</voice></Measure>",
+            quarter(65, r#"<Tie id="8"/>"#),
+            quarter(65, r#"<endSpanner id="8"/>"#)
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 960, 65)]);
+    }
+
+    #[test]
+    fn a_tie_does_not_reach_across_a_repeat_jump() {
+        // The head sits inside the repeat and the tail after it. Their location
+        // evidence describes notated neighbours, but playback replays the
+        // repeated measure in between, so the notes are no longer adjacent and
+        // the chain cannot be proven. Every occurrence stays its own attack.
+        let xml = tie_score(&format!(
+            "<Measure><startRepeat/><voice>{}</voice><endRepeat>2</endRepeat></Measure>\
+             <Measure><voice>{}</voice></Measure>",
+            quarter(65, TIE_START),
+            quarter(65, TIE_STOP)
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(
+            played_notes(&midi),
+            vec![(0, 480, 65), (1_920, 480, 65), (3_840, 480, 65)]
+        );
+    }
+
+    #[test]
+    fn every_staff_unrolls_the_repeat_written_on_the_first_one() {
+        // MuseScore normally stores repeat barlines on the first staff only.
+        // Unrolling each staff against its own marks silently truncated the
+        // others by the whole repeated section.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Upper</trackName><Staff id="1"/></Part>
+    <Part><trackName>Lower</trackName><Staff id="2"/></Part>
+    <Staff id="1">
+      <Measure><startRepeat/><voice><Chord><durationType>whole</durationType><Note><pitch>72</pitch></Note></Chord></voice><endRepeat>2</endRepeat></Measure>
+    </Staff>
+    <Staff id="2">
+      <Measure><voice><Chord><durationType>whole</durationType><Note><pitch>48</pitch></Note></Chord></voice></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        assert_eq!(
+            played_notes(&midi),
+            vec![
+                (0, 1_920, 48),
+                (0, 1_920, 72),
+                (1_920, 1_920, 48),
+                (1_920, 1_920, 72)
+            ]
+        );
+    }
+
+    #[test]
+    fn repeat_marks_split_across_staves_are_unioned() {
+        // One corpus score writes the barlines on one staff and the volta on
+        // another; taking either staff alone loses half the structure.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Upper</trackName><Staff id="1"/></Part>
+    <Part><trackName>Lower</trackName><Staff id="2"/></Part>
+    <Staff id="1">
+      <Measure><startRepeat/><voice><Chord><durationType>whole</durationType><Note><pitch>72</pitch></Note></Chord></voice></Measure>
+      <Measure><voice><Chord><durationType>whole</durationType><Note><pitch>74</pitch></Note></Chord></voice><endRepeat>2</endRepeat></Measure>
+    </Staff>
+    <Staff id="2">
+      <Measure><voice><Chord><durationType>whole</durationType><Note><pitch>48</pitch></Note></Chord></voice></Measure>
+      <Measure><Spanner type="Volta"><Volta><endings>1</endings></Volta><next><location><measures>1</measures></location></next></Spanner><voice><Chord><durationType>whole</durationType><Note><pitch>50</pitch></Note></Chord></voice></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        // The volta is a first ending, so the second pass skips measure 2.
+        let ticks: Vec<u32> = played_notes(&midi)
+            .iter()
+            .filter(|(_, _, pitch)| *pitch == 72)
+            .map(|(onset, _, _)| *onset)
+            .collect();
+        assert_eq!(ticks, vec![0, 3_840]);
+    }
+
+    #[test]
+    fn staves_that_disagree_on_measure_count_are_rejected() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Upper</trackName><Staff id="1"/></Part>
+    <Part><trackName>Lower</trackName><Staff id="2"/></Part>
+    <Staff id="1">
+      <Measure><voice><Chord><durationType>whole</durationType><Note><pitch>72</pitch></Note></Chord></voice></Measure>
+      <Measure><voice><Chord><durationType>whole</durationType><Note><pitch>74</pitch></Note></Chord></voice></Measure>
+    </Staff>
+    <Staff id="2">
+      <Measure><voice><Chord><durationType>whole</durationType><Note><pitch>48</pitch></Note></Chord></voice></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let error = parse_mscx(xml).unwrap_err();
+        assert!(
+            error.contains("disagree on measure count"),
+            "unexpected error: {error}"
+        );
     }
 }
