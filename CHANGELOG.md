@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.4.9](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.8...v0.4.9) (2026-07-27)
+
+
+### Bug Fixes
+
+* let the window drive the layout instead of a fixed column ([#20](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/20)) ([afe1ba9](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/afe1ba978bfb63d1a046e86a8c394d5871b1772a))
+
 ## [0.4.8](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.7...v0.4.8) (2026-07-26)
 
 
