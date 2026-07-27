@@ -367,7 +367,7 @@ export function FileList({
     );
   }
   return (
-    <div className="flex flex-col gap-2 overflow-y-auto">
+    <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
       {items.map((item) => (
         <Row
           key={item.path}

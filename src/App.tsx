@@ -429,11 +429,17 @@ export default function App() {
     theme === "dark" ? MoonIcon : theme === "light" ? SunIcon : DesktopIcon;
 
   return (
-    <div className="mx-auto flex h-full max-w-3xl flex-col gap-4 p-6">
-      <header className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Verse</h1>
-          <p className="text-sm text-muted-foreground">
+    // The layout follows the window instead of sitting in a fixed 768px column:
+    // enlarging the window used to leave the content centred at the same width.
+    // The cap keeps long lines readable on a very wide screen, and the padding
+    // tightens on a small one so nothing is cut off.
+    <div className="mx-auto flex h-full w-full max-w-[min(100%,120rem)] flex-col gap-3 p-3 sm:gap-4 sm:p-5 lg:p-6">
+      <header className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
+            Verse
+          </h1>
+          <p className="truncate text-xs text-muted-foreground sm:text-sm">
             MIDI / score → Synthesizer V vocals + audible reference mix
           </p>
         </div>
