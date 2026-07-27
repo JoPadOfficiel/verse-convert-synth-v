@@ -15,7 +15,10 @@ export function Dropzone({
       disabled={disabled}
       onClick={onAdd}
       className={
-        "flex w-full flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed bg-card px-6 py-12 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-50 " +
+        // The drop target breathes on a large window and gives the file list its
+      // room back on a small one, instead of a fixed height that pushed the list
+      // off screen.
+      "flex w-full shrink-0 flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed bg-card px-4 py-6 text-center transition-colors sm:px-6 sm:py-10 lg:py-12 disabled:cursor-not-allowed disabled:opacity-50 " +
         (dragging
           ? "border-ring bg-accent"
           : "border-input hover:border-ring")
