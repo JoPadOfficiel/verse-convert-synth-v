@@ -1005,11 +1005,22 @@ fn export_bundle_with_hook_and_progress(
             svp_group_id: group_id,
         });
     }
+    // A Part that owns an editable vocal projection has its own stem muted, so it
+    // cannot double the singer. When *every* Part owns one — which is the normal
+    // shape of a MIDI whose every track carries lyrics — that leaves no audible
+    // audio at all, and the user opens a bundle that promises an audible reference
+    // mix and plays silence until they unmute something by hand. So the reference
+    // becomes the fallback: muted whenever some accompaniment stem is already
+    // audible, active when none is. This is initial mixer state, not source
+    // evidence; the audio and the ledger are identical either way.
+    let has_audible_stem = rendered_stems
+        .iter()
+        .any(|stem| stem.descriptor.active_by_default);
     let reference_group_id = request.input.project.append_audio_reference(
         "Full score reference mix (MuseScore)".into(),
         project_audio_reference(AUDIO_RELATIVE_PATH),
         &reference_wav,
-        true,
+        has_audible_stem,
     )?;
     let project_path = safe_join(&root, &layout.project_relative_path)?;
     let project_bytes = request.input.project.to_bytes()?;
@@ -1072,7 +1083,7 @@ fn export_bundle_with_hook_and_progress(
             reference_mix: ReferenceMixRecord {
                 asset: reference_audio_record,
                 svp_group_id: reference_group_id,
-                muted_by_default: true,
+                muted_by_default: has_audible_stem,
             },
             stems: stem_audio_records,
             coverage: AudioCoverageRecord {
@@ -1724,9 +1735,26 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
         verify_artifact(root, record)?;
     }
     verify_audio_artifact(root, &manifest.audio.reference_mix.asset, false)?;
-    if !manifest.audio.reference_mix.muted_by_default {
+    // The reference is muted whenever an accompaniment stem is already audible, and
+    // active when none is, so a bundle can never open silent. What must never
+    // happen is *nothing* audible: that would deliver a promise of an audible
+    // reference mix as silence.
+    let audible_stems = manifest
+        .audio
+        .stems
+        .iter()
+        .filter(|stem| stem.active_by_default)
+        .count();
+    if manifest.audio.reference_mix.muted_by_default && audible_stems == 0 {
         return Err(BundleError::Integrity(
-            "the full-score reference mix must be muted by default".into(),
+            "no audio starts audible: the full-score reference mix must be active when every \
+             Part stem is muted"
+                .into(),
+        ));
+    }
+    if !manifest.audio.reference_mix.muted_by_default && audible_stems > 0 {
+        return Err(BundleError::Integrity(
+            "the full-score reference mix must be muted when a Part stem is already audible".into(),
         ));
     }
 
@@ -1885,7 +1913,7 @@ fn verify_svp_audio(
         &project_audio_reference(&manifest.audio.reference_mix.asset.artifact.path),
         &manifest.audio.reference_mix.asset.artifact.path,
         &manifest.audio.reference_mix.svp_group_id,
-        true,
+        manifest.audio.reference_mix.muted_by_default,
     )?;
     for stem in &manifest.audio.stems {
         verify_svp_audio_track(
@@ -1969,7 +1997,7 @@ fn verify_ustx_audio(
         &project,
         &manifest.audio.reference_mix.asset,
         &manifest.audio.reference_mix.svp_group_id,
-        true,
+        manifest.audio.reference_mix.muted_by_default,
     )?;
     for stem in &manifest.audio.stems {
         verify_ustx_wave_part(
@@ -3347,10 +3375,19 @@ mod tests {
         );
         let audited = ustx::audit(&committed).expect("the committed project is auditable");
         // The voice lane keeps track 0 and stays audible; the audio takes the
-        // indices after it, and the full-score reference is the muted one.
+        // indices after it, and the full-score reference is last.
         assert_eq!(audited.track_mutes.len(), stem_plan.stems.len() + 2);
         assert!(!audited.track_mutes[0]);
-        assert!(*audited.track_mutes.last().unwrap());
+        // This fixture's only Part owns the vocal projection, so its stem is muted
+        // to avoid doubling the singer and no accompaniment is left audible. The
+        // reference therefore starts ACTIVE: it used to be muted unconditionally,
+        // which opened a bundle that plays nothing at all and made the promise of
+        // an audible reference mix false for every source whose every Part sings.
+        assert!(!*audited.track_mutes.last().unwrap());
+        assert!(
+            audited.track_mutes.iter().any(|muted| !muted),
+            "a bundle must never open with every track muted"
+        );
         assert_eq!(
             audited
                 .wave_parts
