@@ -327,10 +327,15 @@ fn serialize_track(
                 duration: 0.0,
             },
             database: Database {
+                // All three stay blank for the same reason: Verse has never seen
+                // the voice database this track will be sung with. `name` and
+                // `phoneset` were always blank; a language filled beside them
+                // claimed to know something about a voice the user has not
+                // assigned yet, and assigning one sets all three anyway. Lyrics
+                // never depended on it — the language reached this field and
+                // nothing else, so source text of any language is unaffected.
                 name: String::new(),
-                // Selecting a voice-database language is a Synthesizer V
-                // concern. It never translates or phoneticizes source text.
-                language: project.language.clone(),
+                language: String::new(),
                 phoneset: String::new(),
             },
             dictionary: String::new(),
@@ -673,7 +678,7 @@ mod tests {
                     },
                     "mainRef": {
                         "audio": {"filename": "", "duration": 0.0},
-                        "database": {"name": "", "language": "japanese", "phoneset": ""},
+                        "database": {"name": "", "language": "", "phoneset": ""},
                         "dictionary": "",
                         "voice": {},
                         "groupID": "00000000-0000-4000-8000-000000000000",

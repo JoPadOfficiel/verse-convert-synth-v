@@ -62,7 +62,12 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
-  const [language, setLanguage] = useState<Language>("english");
+  // Kept as a fixed value only because the Tauri commands still accept the
+  // parameter for protocol compatibility. Nothing reads it: it used to reach
+  // `database.language` in the `.svp`, which Verse no longer fills because it has
+  // never seen the voice database the user will assign. Lyrics never depended on
+  // it, in any language.
+  const language: Language = "english";
   const [exportTarget, setExportTarget] = useState<ExportTarget>("svp");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [overrides, setOverrides] = useState<Overrides>({});
@@ -196,41 +201,7 @@ export default function App() {
     }
   }
 
-  async function changeLanguage(nextLanguage: Language) {
-    if (nextLanguage === language) return;
-    if (!items.length) {
-      setLanguage(nextLanguage);
-      return;
-    }
-    if (!beginBusy()) return;
-    setGlobalError(null);
-    try {
-      const results = await convertFiles(
-        items.map((item) => item.path),
-        false,
-        nextLanguage,
-        undefined,
-        overrides,
-        exportTarget,
-      );
-      setLanguage(nextLanguage);
-      setItems(results);
-      setSelected(
-        (previous) =>
-          new Set(
-            [...previous].filter((path) =>
-              results.some((result) => result.path === path && result.ok),
-            ),
-          ),
-      );
-    } catch (error) {
-      setGlobalError(commandErrorMessage(error));
-    } finally {
-      endBusy();
-    }
-  }
-
-  // Re-analyses on the same path as changeLanguage, because the target is part of
+  // Re-analyses every loaded file, because the target is part of
   // the convertibility verdict: OpenUtau's fixed 480 ticks per quarter refuse
   // timing Synthesizer V accepts, so the diagnostics belong to the target that was
   // analysed. The target is left unchanged when the re-analysis fails, so what is
@@ -533,46 +504,6 @@ export default function App() {
         <>
           <Dropzone onAdd={onAdd} dragging={dragging} disabled={busy} />
           <div className="flex flex-wrap items-center gap-2">
-            {/* Only Synthesizer V has anything to do with this. It names a voice
-                database and reaches exactly one field, `database.language` in the
-                `.svp`. OpenUtau resolves its phonemizer from the singer the user
-                assigns, so the target never writes a language and lyrics of any
-                language already survive byte for byte with nothing selected —
-                `tests/language_fidelity.rs` proves that. Showing the control under
-                the OpenUtau target would invite a choice that changes nothing. */}
-            {exportTarget === "svp" && (
-              <>
-                <span className="text-sm text-muted-foreground">
-                  Vocal language
-                </span>
-                <div className="inline-flex overflow-hidden rounded-md border">
-                  <button
-                    disabled={busy}
-                    onClick={() => void changeLanguage("english")}
-                    className={
-                      "px-3 py-1 text-sm disabled:opacity-50 " +
-                      (language === "english"
-                        ? "bg-primary text-primary-foreground"
-                        : "hover:bg-accent")
-                    }
-                  >
-                    English
-                  </button>
-                  <button
-                    disabled={busy}
-                    onClick={() => void changeLanguage("french")}
-                    className={
-                      "px-3 py-1 text-sm disabled:opacity-50 " +
-                      (language === "french"
-                        ? "bg-primary text-primary-foreground"
-                        : "hover:bg-accent")
-                    }
-                  >
-                    French
-                  </button>
-                </div>
-              </>
-            )}
             <span className="text-sm text-muted-foreground">Export target</span>
             <div className="inline-flex overflow-hidden rounded-md border">
               <button
