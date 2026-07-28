@@ -25,6 +25,7 @@ import {
   isAudioUnavailableErrorCode,
   pickFiles,
   uniqueSupportedPaths,
+  type ExportTarget,
   type FileResult,
   type Language,
   type Overrides,
@@ -62,6 +63,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [language, setLanguage] = useState<Language>("english");
+  const [exportTarget, setExportTarget] = useState<ExportTarget>("svp");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [overrides, setOverrides] = useState<Overrides>({});
   const [exportErrors, setExportErrors] = useState<Record<string, string>>({});
@@ -134,6 +136,7 @@ export default function App() {
           language,
           undefined,
           overrides,
+          exportTarget,
         );
         setItems((previous) => {
           const seen = new Set(previous.map((item) => item.path));
@@ -148,7 +151,7 @@ export default function App() {
         endBusy();
       }
     },
-    [beginBusy, endBusy, language, overrides],
+    [beginBusy, endBusy, exportTarget, language, overrides],
   );
 
   useEffect(() => {
@@ -208,9 +211,61 @@ export default function App() {
         nextLanguage,
         undefined,
         overrides,
+        exportTarget,
       );
       setLanguage(nextLanguage);
       setItems(results);
+      setSelected(
+        (previous) =>
+          new Set(
+            [...previous].filter((path) =>
+              results.some((result) => result.path === path && result.ok),
+            ),
+          ),
+      );
+    } catch (error) {
+      setGlobalError(commandErrorMessage(error));
+    } finally {
+      endBusy();
+    }
+  }
+
+  // Re-analyses on the same path as changeLanguage, because the target is part of
+  // the convertibility verdict: OpenUtau's fixed 480 ticks per quarter refuse
+  // timing Synthesizer V accepts, so the diagnostics belong to the target that was
+  // analysed. The target is left unchanged when the re-analysis fails, so what is
+  // displayed always matches the selected target.
+  async function changeTarget(nextTarget: ExportTarget) {
+    if (nextTarget === exportTarget) return;
+    if (!items.length) {
+      // Still takes the guard: an addPaths analysis can be in flight with the
+      // list still empty, and it captured the previous target. Switching outside
+      // the guard would let its results install while the selector already reads
+      // the other target, so the verdict on screen would belong to a format the
+      // user is no longer exporting to.
+      if (!beginBusy()) return;
+      setExportTarget(nextTarget);
+      endBusy();
+      return;
+    }
+    if (!beginBusy()) return;
+    setGlobalError(null);
+    try {
+      const results = await convertFiles(
+        items.map((item) => item.path),
+        false,
+        language,
+        undefined,
+        overrides,
+        nextTarget,
+      );
+      setExportTarget(nextTarget);
+      setItems(results);
+      // An export failure names the format it was written for, so a message from
+      // the previous target would contradict the new selection. The results are
+      // replaced wholesale here, so the paths they refer to are gone anyway.
+      setExportErrors({});
+      setExportProgress({});
       setSelected(
         (previous) =>
           new Set(
@@ -356,6 +411,7 @@ export default function App() {
         item,
         language,
         overrides[item.path],
+        exportTarget,
       );
       if (saved) {
         setItems((previous) =>
@@ -396,11 +452,11 @@ export default function App() {
         language,
         undefined,
         next,
+        exportTarget,
       );
       setItems((previous) =>
         previous.map(
-          (item) =>
-            results.find((result) => result.path === item.path) ?? item,
+          (item) => results.find((result) => result.path === item.path) ?? item,
         ),
       );
     } catch (error) {
@@ -440,7 +496,8 @@ export default function App() {
             Verse
           </h1>
           <p className="truncate text-xs text-muted-foreground sm:text-sm">
-            MIDI / score → Synthesizer V vocals + audible reference mix
+            MIDI / score → Synthesizer V or OpenUtau vocals + audible reference
+            mix
           </p>
         </div>
         <div className="flex items-center gap-1">
@@ -476,33 +533,73 @@ export default function App() {
         <>
           <Dropzone onAdd={onAdd} dragging={dragging} disabled={busy} />
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm text-muted-foreground">
-              Vocal language
-            </span>
+            {/* Only Synthesizer V has anything to do with this. It names a voice
+                database and reaches exactly one field, `database.language` in the
+                `.svp`. OpenUtau resolves its phonemizer from the singer the user
+                assigns, so the target never writes a language and lyrics of any
+                language already survive byte for byte with nothing selected —
+                `tests/language_fidelity.rs` proves that. Showing the control under
+                the OpenUtau target would invite a choice that changes nothing. */}
+            {exportTarget === "svp" && (
+              <>
+                <span className="text-sm text-muted-foreground">
+                  Vocal language
+                </span>
+                <div className="inline-flex overflow-hidden rounded-md border">
+                  <button
+                    disabled={busy}
+                    onClick={() => void changeLanguage("english")}
+                    className={
+                      "px-3 py-1 text-sm disabled:opacity-50 " +
+                      (language === "english"
+                        ? "bg-primary text-primary-foreground"
+                        : "hover:bg-accent")
+                    }
+                  >
+                    English
+                  </button>
+                  <button
+                    disabled={busy}
+                    onClick={() => void changeLanguage("french")}
+                    className={
+                      "px-3 py-1 text-sm disabled:opacity-50 " +
+                      (language === "french"
+                        ? "bg-primary text-primary-foreground"
+                        : "hover:bg-accent")
+                    }
+                  >
+                    French
+                  </button>
+                </div>
+              </>
+            )}
+            <span className="text-sm text-muted-foreground">Export target</span>
             <div className="inline-flex overflow-hidden rounded-md border">
               <button
                 disabled={busy}
-                onClick={() => void changeLanguage("english")}
+                onClick={() => void changeTarget("svp")}
+                title="Write a Synthesizer V .svp project"
                 className={
                   "px-3 py-1 text-sm disabled:opacity-50 " +
-                  (language === "english"
+                  (exportTarget === "svp"
                     ? "bg-primary text-primary-foreground"
                     : "hover:bg-accent")
                 }
               >
-                English
+                Synthesizer V
               </button>
               <button
                 disabled={busy}
-                onClick={() => void changeLanguage("french")}
+                onClick={() => void changeTarget("ustx")}
+                title="Write an OpenUtau .ustx project"
                 className={
                   "px-3 py-1 text-sm disabled:opacity-50 " +
-                  (language === "french"
+                  (exportTarget === "ustx"
                     ? "bg-primary text-primary-foreground"
                     : "hover:bg-accent")
                 }
               >
-                French
+                OpenUtau
               </button>
             </div>
             <div className="flex-1" />
@@ -555,6 +652,7 @@ export default function App() {
             busy={busy}
             exportErrors={exportErrors}
             exportProgress={exportProgress}
+            exportTarget={exportTarget}
             onBundle={(item) => void exportOneBundle(item)}
             onVocals={(item) => void exportVocals(item)}
             selected={selected}

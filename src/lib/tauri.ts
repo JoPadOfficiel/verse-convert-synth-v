@@ -3,7 +3,8 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   SUPPORTED_EXTENSIONS,
   defaultBundlePath,
-  defaultSvpPath,
+  defaultVocalPath,
+  type ExportTarget,
   type StructuredCommandError,
 } from "@/lib/file-utils";
 
@@ -13,7 +14,7 @@ export {
   commandError,
   commandErrorMessage,
   defaultBundlePath,
-  defaultSvpPath,
+  defaultVocalPath,
   isAudioUnavailableErrorCode,
   isSupported,
   uniqueSupportedPaths,
@@ -124,6 +125,12 @@ export type FileResult = {
 
 export type Overrides = Record<string, Record<number, boolean>>;
 export type Language = "english" | "french";
+/**
+ * Which format an export writes. Declared with the path helpers that consume it
+ * and surfaced here, beside `Language`, because this is the module the app
+ * imports its command types from.
+ */
+export type { ExportTarget };
 
 export type RendererStatus = {
   state: "available" | "missing" | "unsupported";
@@ -213,21 +220,34 @@ export async function chooseBundleTarget(
   return target || undefined;
 }
 
+/** The save-dialog filter per target, so the dialog offers the target's own name. */
+const VOCAL_TARGET_FILTER: Record<
+  ExportTarget,
+  { name: string; extensions: string[] }
+> = {
+  svp: { name: "Synthesizer V vocal project", extensions: ["svp"] },
+  ustx: { name: "OpenUtau project", extensions: ["ustx"] },
+};
+
 export async function exportVocalsWithDialog(
   file: FileResult,
   language: Language,
   overrides?: Record<number, boolean>,
+  exportTarget: ExportTarget = "svp",
 ): Promise<string | undefined> {
   const target = await save({
-    defaultPath: defaultSvpPath(file.path),
-    filters: [{ name: "Synthesizer V vocal project", extensions: ["svp"] }],
+    defaultPath: defaultVocalPath(file.path, exportTarget),
+    filters: [VOCAL_TARGET_FILTER[exportTarget]],
   });
   if (!target) return undefined;
+  // `target` is the output path and has been since 0.1.0; `exportTarget` is the
+  // format. The backend defaults it to `svp`, so the two stay independent.
   return await invoke<string>("export_svp", {
     path: file.path,
     target,
     language,
     overrides: overrides ?? null,
+    exportTarget,
   });
 }
 
@@ -259,12 +279,21 @@ export async function getRendererStatus(
   });
 }
 
+/**
+ * Analyses (`write = false`) or batch-exports (`write = true`) every path.
+ *
+ * `exportTarget` reaches analysis and not only the writer because the timing a
+ * target accepts is part of the convertibility verdict: OpenUtau's 480 ticks per
+ * quarter represent a strict subset of what Synthesizer V blicks do, so a source
+ * that analyses cleanly for one target can be refused by the other.
+ */
 export async function convertFiles(
   paths: string[],
   write: boolean,
   language: Language = "english",
   outDir?: string,
   overrides?: Overrides,
+  exportTarget: ExportTarget = "svp",
 ): Promise<FileResult[]> {
   return await invoke<FileResult[]>("convert_files", {
     paths,
@@ -272,5 +301,6 @@ export async function convertFiles(
     outDir: outDir ?? null,
     language,
     overrides: overrides ?? null,
+    exportTarget,
   });
 }

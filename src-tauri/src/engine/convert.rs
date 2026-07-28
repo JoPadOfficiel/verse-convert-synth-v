@@ -9,6 +9,7 @@ use crate::engine::midi::{
 use crate::engine::projection::{
     ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedProject, ProjectedTempo, ProjectedTrack,
 };
+use crate::engine::target::ExportTarget;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -536,6 +537,13 @@ struct TrackProjection<'a> {
     lanes: &'a [String],
     standalone: &'a HashMap<usize, TimedLyric>,
     evidence: &'a mut ProjectionEvidence,
+    /// The target the caller will export to. Nothing about the projection itself
+    /// depends on it; it exists only so the diagnostics below can ask whether
+    /// that target's application reads a source word differently.
+    target: ExportTarget,
+    /// Per-note diagnostics raised while projecting this lane, merged into the
+    /// source track's `TrackReport.warnings` by the caller.
+    diagnostics: &'a mut Vec<Diagnostic>,
 }
 
 /// Projects one monophonic lane. Positions stay in IR ticks and the lyric is
@@ -616,11 +624,30 @@ fn project_track(
         if let Some(source_id) = lyric_event_id {
             projection.evidence.source_ids.insert(source_id);
         }
-        projection.evidence.source_ids.insert(note_instance_id(
+        let note_id = note_instance_id(
             projection.source_track_id,
             &source_note.source,
             source_note.source_order,
-        ));
+        );
+        // The file will state this word exactly; the application that opens it may
+        // still read it as something else, and staying quiet about that would be
+        // silent loss. Only `LyricState::Text` is asked, so a marker Verse
+        // rendered itself is never diagnosed as a source word.
+        if let ProjectedLyric::Source(carried) = &lyric {
+            if let midi::LyricState::Text(text) = &carried.state {
+                if let Some(message) =
+                    crate::engine::target::lyric_reinterpretation(projection.target, text)
+                {
+                    projection.diagnostics.push(report_warning(
+                        crate::engine::target::LYRIC_REINTERPRETED_BY_TARGET,
+                        DiagnosticSeverity::Warning,
+                        message,
+                        &note_id,
+                    ));
+                }
+            }
+        }
+        projection.evidence.source_ids.insert(note_id);
         projection.evidence.source_ids.insert(format!(
             "event:{}:{}",
             projection.source_track_id, source_note.source_order
@@ -728,12 +755,31 @@ pub fn convert_midi(midi: &Midi, language: &str) -> ConvertOutcome {
 }
 
 /// Like `convert_midi`, with user overrides: `overrides[track_id] = true`
-/// requests an SVP vocal-note projection, while `false` leaves the track in
-/// the full-score reference mix only. Source roles never change.
+/// requests a vocal-note projection, while `false` leaves the track in the
+/// full-score reference mix only. Source roles never change.
+///
+/// Gates on the default target. A caller exporting anything else must use
+/// [`convert_midi_with_target`], because the timing a target accepts is part of
+/// the analysis verdict this returns.
 pub fn convert_midi_with(
     midi: &Midi,
     language: &str,
     overrides: Option<&HashMap<usize, bool>>,
+) -> ConvertOutcome {
+    convert_midi_with_target(midi, language, overrides, ExportTarget::default())
+}
+
+/// Like `convert_midi_with`, gating on the target the caller will export to.
+///
+/// The target belongs here rather than at the write boundary because a target's
+/// refusal to represent this timing is observable at *analysis* time: the
+/// frontend's "convertible" verdict comes from this function, and 480 USTX ticks
+/// accept a strictly smaller set of sources than Synthesizer V blicks do.
+pub fn convert_midi_with_target(
+    midi: &Midi,
+    language: &str,
+    overrides: Option<&HashMap<usize, bool>>,
+    target: ExportTarget,
 ) -> ConvertOutcome {
     let fail = |msg: String| ConvertOutcome {
         ok: false,
@@ -871,6 +917,7 @@ pub fn convert_midi_with(
         let explicit_override = overrides.and_then(|map| map.get(&index).copied());
         let sing = explicit_override.unwrap_or(source_vocal);
         let mut placed = 0usize;
+        let mut lyric_diagnostics: Vec<Diagnostic> = Vec::new();
         if sing {
             let no_assignment = HashMap::new();
             // Stacked verses under one melody are alternatives, not simultaneous
@@ -907,6 +954,8 @@ pub fn convert_midi_with(
                         lanes: group,
                         standalone,
                         evidence: &mut projection,
+                        target,
+                        diagnostics: &mut lyric_diagnostics,
                     },
                 );
                 if !projected_track.notes.is_empty() {
@@ -985,6 +1034,10 @@ pub fn convert_midi_with(
                 &track.id,
             ));
         }
+        // Appended last, and per note rather than aggregated, because each one
+        // names the exact note whose word the target's application will read
+        // differently. Empty for every target that reinterprets nothing.
+        warnings.extend(lyric_diagnostics);
         report.push(TrackReport {
             id: index,
             source_id: track.id.clone(),
@@ -1022,16 +1075,27 @@ pub fn convert_midi_with(
     // now and its answer discarded; the write boundary rebuilds it
     // deterministically from the same projection.
     //
-    // DEBT: this names one target, and it is the single place the seam is not
-    // one-directional. It must take the caller's chosen target once a second one
-    // lands. Synthesizer V positions a quarter note at 705_600_000 blicks while
-    // OpenUtau fixes 480 integer ticks, and 705_600_000 / 480 is exact, so the
-    // set of sources OpenUtau can represent is a strict subset. Asking this
-    // target on behalf of another would therefore clear a source the other must
-    // refuse, and the refusal would resurface at export — the very thing the
-    // paragraph above exists to prevent.
-    if let Err(error) = crate::engine::target::svp::serialize(&projected) {
-        return fail(format!("source timing cannot be projected safely: {error}"));
+    // The target asked is the caller's, and it is the single place the seam is
+    // not one-directional. It has to be the caller's: Synthesizer V positions a
+    // quarter note at 705_600_000 blicks while OpenUtau fixes 480 integer ticks,
+    // and 705_600_000 / 480 is exact, so the set of sources OpenUtau can
+    // represent is a strict subset — `480 = 2^5 * 3 * 5` cannot express a
+    // septuplet. Asking one target on behalf of another would clear a source the
+    // other must refuse, and the refusal would resurface at export, which is the
+    // very thing the paragraph above exists to prevent.
+    if let Err(error) = crate::engine::target::validate_for(target, &projected) {
+        // Synthesizer V keeps 0.4.9's wording verbatim, because every refusal it
+        // can raise really is a timing refusal. OpenUtau also refuses a syllable
+        // split, a chord in one monophonic lane and a held syllable across a gap,
+        // none of which is about timing, so telling the user to fix timing would
+        // send them after the wrong thing.
+        return fail(match target {
+            ExportTarget::Svp => format!("source timing cannot be projected safely: {error}"),
+            ExportTarget::Ustx => format!(
+                "the source cannot be projected safely to {}: {error}",
+                target.display_name()
+            ),
+        });
     }
     let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
@@ -2644,5 +2708,177 @@ mod tests {
             .projection
             .source_ids
             .contains("note:grace:grace-note:occurrence:0:event:0"));
+    }
+    /// A source lyric track plus one note per word, so a projected note carries
+    /// the exact text the source states.
+    fn worded_melody(words: &[(u32, &str)]) -> Midi {
+        let mut lyrics = Track::new("lyrics", 0);
+        for (order, (tick, value)) in words.iter().enumerate() {
+            lyrics.events.push(midi::Event::new(
+                *tick,
+                u32::try_from(order).expect("test order fits"),
+                Kind::Lyrics(Lyric::text(format!("lyric-{order}"), (*value).into())),
+            ));
+        }
+        let notes: Vec<(u32, u32, u8, u8)> = words
+            .iter()
+            .enumerate()
+            .map(|(index, (tick, _))| (*tick, 240, 60 + u8::try_from(index).expect("fits"), 0))
+            .collect();
+        kar_with(vec![lyrics, pitched_track("melody", &notes)])
+    }
+
+    fn ustx_of(outcome: &ConvertOutcome) -> String {
+        let bytes = crate::engine::target::serialize_to(
+            ExportTarget::Ustx,
+            outcome.svp.as_ref().expect("conversion succeeds"),
+        )
+        .expect("the projection is representable");
+        String::from_utf8(bytes).expect("USTX is UTF-8")
+    }
+
+    fn reinterpretations(outcome: &ConvertOutcome) -> Vec<&Diagnostic> {
+        outcome
+            .tracks
+            .iter()
+            .flat_map(|report| &report.warnings)
+            .filter(|warning| warning.code == crate::engine::target::LYRIC_REINTERPRETED_BY_TARGET)
+            .collect()
+    }
+
+    /// `UVoicePart.Validate` sets `Extends` on any lyric starting with `"+"`, so a
+    /// source word that genuinely begins with `+` is written byte-faithfully and
+    /// still read as a continuation of the previous note. The format offers no
+    /// escape, so refusing a whole score over one word would be disproportionate
+    /// — but silence would be silent loss. Diagnose the note and export anyway.
+    #[test]
+    fn a_source_word_starting_with_plus_is_diagnosed_for_openutau_and_written_unchanged() {
+        let midi = worded_melody(&[(0, "+plus"), (480, "ok")]);
+        let outcome = convert_midi_with_target(&midi, "english", None, ExportTarget::Ustx);
+        assert!(
+            outcome.ok,
+            "the export must still succeed: {:?}",
+            outcome.msg
+        );
+        assert_eq!(outcome.placed, 2);
+
+        let raised = reinterpretations(&outcome);
+        assert_eq!(raised.len(), 1, "one note, one diagnostic: {raised:?}");
+        assert_eq!(raised[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            raised[0].source_id.as_deref(),
+            Some("note:melody:melody-note-0:occurrence:0:event:0"),
+            "the diagnostic must name the note whose word is reinterpreted"
+        );
+        assert!(
+            raised[0].message.contains("\"+plus\""),
+            "the message must name the affected lyric text: {}",
+            raised[0].message
+        );
+        assert!(
+            raised[0].message.contains("continuation"),
+            "the message must say how OpenUtau will read it: {}",
+            raised[0].message
+        );
+
+        // The word itself is written exactly as the source states it.
+        let yaml = ustx_of(&outcome);
+        assert!(yaml.contains("lyric: \"+plus\"\n"), "{yaml}");
+        assert!(yaml.contains("lyric: \"ok\"\n"), "{yaml}");
+    }
+
+    /// `UNote.ToPhonemizerNote` replaces `\[(.*)\]` in the lyric, so bracketed
+    /// source text is taken for a phonetic hint and stripped before the phonemizer
+    /// sees it. Same contract: exact bytes, one diagnostic, export succeeds.
+    #[test]
+    fn a_bracketed_source_word_is_diagnosed_for_openutau_and_written_unchanged() {
+        let midi = worded_melody(&[(0, "sing [hint] it"), (480, "ok")]);
+        let outcome = convert_midi_with_target(&midi, "english", None, ExportTarget::Ustx);
+        assert!(
+            outcome.ok,
+            "the export must still succeed: {:?}",
+            outcome.msg
+        );
+
+        let raised = reinterpretations(&outcome);
+        assert_eq!(raised.len(), 1, "one note, one diagnostic: {raised:?}");
+        assert_eq!(raised[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            raised[0].source_id.as_deref(),
+            Some("note:melody:melody-note-0:occurrence:0:event:0")
+        );
+        assert!(
+            raised[0].message.contains("\"sing [hint] it\""),
+            "the message must name the affected lyric text: {}",
+            raised[0].message
+        );
+        assert!(
+            raised[0].message.contains("phonetic hint"),
+            "the message must say how OpenUtau will read it: {}",
+            raised[0].message
+        );
+
+        let yaml = ustx_of(&outcome);
+        assert!(yaml.contains("lyric: \"sing [hint] it\"\n"), "{yaml}");
+    }
+
+    /// The diagnostic belongs to the target, not to the source: the same score
+    /// analysed for Synthesizer V must report exactly what release 0.4.9 reported.
+    #[test]
+    fn the_reinterpretation_diagnostic_is_scoped_to_the_target_that_reinterprets() {
+        for words in [
+            [(0u32, "+plus"), (480, "ok")],
+            [(0, "sing [hint] it"), (480, "ok")],
+        ] {
+            let midi = worded_melody(&words);
+            let synthesizer_v = convert_midi_with_target(&midi, "english", None, ExportTarget::Svp);
+            assert!(synthesizer_v.ok);
+            assert!(
+                reinterpretations(&synthesizer_v).is_empty(),
+                "Synthesizer V analysis must be unchanged from 0.4.9"
+            );
+            assert!(
+                reinterpretations(&convert_midi_with(&midi, "english", None)).is_empty(),
+                "naming no target must be unchanged too"
+            );
+        }
+    }
+
+    /// The `"+"` Verse writes for a continuation is Verse's own marker, not a word
+    /// the source carries, so it must never be diagnosed. Only `LyricState::Text`
+    /// is inspected, which is what makes that distinction.
+    #[test]
+    fn a_continuation_marker_verse_rendered_itself_is_never_diagnosed() {
+        let mut lyrics = Track::new("lyrics", 0);
+        lyrics.events.push(midi::Event::new(
+            0,
+            0,
+            Kind::Lyrics(Lyric::text("lyric-0", "sing".into())),
+        ));
+        let mut held = Lyric::text("lyric-1", "held".into());
+        held.state = midi::LyricState::Continuation;
+        lyrics
+            .events
+            .push(midi::Event::new(480, 1, Kind::Lyrics(held)));
+        // The held note must begin exactly where its predecessor ends: OpenUtau
+        // wires `Extends` only on notes that touch, so a gap here would make the
+        // projection unrepresentable rather than exercise the diagnostic.
+        let melody = pitched_track("melody", &[(0, 480, 60, 0), (480, 240, 62, 0)]);
+        let outcome = convert_midi_with_target(
+            &kar_with(vec![lyrics, melody]),
+            "english",
+            None,
+            ExportTarget::Ustx,
+        );
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let yaml = ustx_of(&outcome);
+        assert!(
+            yaml.contains("lyric: \"+~\"\n"),
+            "the held-syllable marker is still written: {yaml}"
+        );
+        assert!(
+            reinterpretations(&outcome).is_empty(),
+            "Verse's own marker is not a source word"
+        );
     }
 }

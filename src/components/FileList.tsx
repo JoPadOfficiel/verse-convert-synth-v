@@ -9,6 +9,7 @@ import {
 import { Button } from "@/components/ui/button";
 import type {
   ExportRepresentation,
+  ExportTarget,
   FileResult,
   LyricStatus,
   PartInfo,
@@ -18,6 +19,7 @@ import {
   exportProgressPercent,
   type FileExportProgress,
 } from "@/lib/export-progress";
+import { groupDiagnostics } from "@/lib/diagnostics";
 
 const ROLE_LABEL: Record<SourceRole, string> = {
   vocal: "Source vocal",
@@ -29,12 +31,38 @@ const ROLE_LABEL: Record<SourceRole, string> = {
   ambiguous: "Unspecified musical role",
 };
 
-const REPRESENTATION_LABEL: Record<ExportRepresentation, string> = {
-  vocalNotes: "Vocal notes in SVP",
-  referenceMixMember: "Separate MuseScore Part stem in the bundle",
-  vocalNotesAndReferenceMix:
+/**
+ * The words this copy borrows from the selected export target. Each target names
+ * its own file format and its own singing-voice concept: Synthesizer V assigns a
+ * voice database, OpenUtau assigns a singer.
+ */
+const TARGET_COPY: Record<
+  ExportTarget,
+  { format: string; assignVoice: string; assignVoiceInApp: string }
+> = {
+  svp: {
+    format: "SVP",
+    assignVoice: "Assign a Synthesizer V voice before playback",
+    assignVoiceInApp: "A voice database must be assigned in Synthesizer V.",
+  },
+  ustx: {
+    format: "USTX",
+    assignVoice: "Assign an OpenUtau singer before playback",
+    assignVoiceInApp: "A singer must be assigned in OpenUtau.",
+  },
+};
+
+// Kept keyed by representation so a new one cannot be forgotten, and per-target
+// only where the label actually names the format.
+const REPRESENTATION_LABEL: Record<
+  ExportRepresentation,
+  (target: ExportTarget) => string
+> = {
+  vocalNotes: (target) => `Vocal notes in ${TARGET_COPY[target].format}`,
+  referenceMixMember: () => "Separate MuseScore Part stem in the bundle",
+  vocalNotesAndReferenceMix: () =>
     "Vocal notes + separate muted Part reference stem",
-  sourceOnly: "Preserved in source/manifest",
+  sourceOnly: () => "Preserved in source/manifest",
 };
 
 function lyricLabel(status: LyricStatus): string {
@@ -64,10 +92,12 @@ function exportsVocalNotes(representation: ExportRepresentation): boolean {
 function PartRow({
   part,
   disabled,
+  exportTarget,
   onToggle,
 }: {
   part: PartInfo;
   disabled: boolean;
+  exportTarget: ExportTarget;
   onToggle: (trackIds: number[], enabled: boolean) => void;
 }) {
   const vocalExport = exportsVocalNotes(part.exportRepresentation);
@@ -114,18 +144,26 @@ function PartRow({
             }
           >
             <SpeakerLoudIcon className="size-3" />
-            Vocal SVP {vocalExport ? "on" : "off"}
+            Vocal {TARGET_COPY[exportTarget].format}{" "}
+            {vocalExport ? "on" : "off"}
           </button>
         )}
       </div>
       <div className="ml-6 mt-1 text-xs text-muted-foreground">
-        {REPRESENTATION_LABEL[part.exportRepresentation]}
+        {REPRESENTATION_LABEL[part.exportRepresentation](exportTarget)}
         {part.requiresVoiceAssignment &&
-          " · Assign a Synthesizer V voice before playback"}
+          ` · ${TARGET_COPY[exportTarget].assignVoice}`}
       </div>
-      {part.warnings.map((warning) => (
+      {/* Grouped for display only: a per-note diagnostic is raised once per
+          affected note, and one identical sentence repeated hundreds of times
+          would hide every other diagnostic on this Part. */}
+      {groupDiagnostics(part.warnings).map((warning) => (
         <div
-          key={`${warning.code}-${warning.sourceId ?? ""}`}
+          key={JSON.stringify([
+            warning.severity,
+            warning.code,
+            warning.message,
+          ])}
           className={
             "ml-6 mt-1 text-xs " +
             (warning.severity === "warning"
@@ -134,6 +172,9 @@ function PartRow({
           }
         >
           {warning.message}
+          {/* "Occurrences" rather than "notes": the same grouping serves
+              track-level diagnostics, whose source ID is not a note. */}
+          {warning.count > 1 && ` · ${warning.count} occurrences`}
         </div>
       ))}
     </div>
@@ -145,6 +186,7 @@ function Row({
   busy,
   exportError,
   exportProgress,
+  exportTarget,
   onBundle,
   onVocals,
   selected,
@@ -155,6 +197,7 @@ function Row({
   busy: boolean;
   exportError?: string;
   exportProgress?: FileExportProgress;
+  exportTarget: ExportTarget;
   onBundle: (item: FileResult) => void;
   onVocals: (item: FileResult) => void;
   selected: boolean;
@@ -221,7 +264,7 @@ function Row({
             )}
             {item.requiresVoiceAssignment && (
               <div className="truncate text-xs text-warning">
-                A voice database must be assigned in Synthesizer V.
+                {TARGET_COPY[exportTarget].assignVoiceInApp}
               </div>
             )}
             {item.out && (
@@ -290,7 +333,10 @@ function Row({
             <Button
               size="sm"
               disabled={busy}
-              title="Create an auditable bundle with source, SVP, one audio stem per MuseScore Part, and a muted full-score reference"
+              // The bundle always carries a Synthesizer V project, whatever the
+              // export target selects: `.ustx` inside a `.versebundle` is not
+              // shipped, so naming the format here would be wrong.
+              title="Create an auditable bundle with source, a Synthesizer V project, one audio stem per MuseScore Part, and a muted full-score reference"
               onClick={() => onBundle(item)}
             >
               <DownloadIcon /> Complete project
@@ -323,6 +369,7 @@ function Row({
               key={part.sourceId}
               part={part}
               disabled={busy}
+              exportTarget={exportTarget}
               onToggle={(trackIds, enabled) =>
                 onToggleVocal(item.path, trackIds, enabled)
               }
@@ -339,6 +386,7 @@ export function FileList({
   busy,
   exportErrors,
   exportProgress,
+  exportTarget,
   onBundle,
   onVocals,
   selected,
@@ -349,6 +397,7 @@ export function FileList({
   busy: boolean;
   exportErrors: Record<string, string>;
   exportProgress: Record<string, FileExportProgress>;
+  exportTarget: ExportTarget;
   onBundle: (item: FileResult) => void;
   onVocals: (item: FileResult) => void;
   selected: Set<string>;
@@ -375,6 +424,7 @@ export function FileList({
           busy={busy}
           exportError={exportErrors[item.path]}
           exportProgress={exportProgress[item.path]}
+          exportTarget={exportTarget}
           onBundle={onBundle}
           onVocals={onVocals}
           selected={selected.has(item.path)}

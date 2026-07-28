@@ -6,7 +6,9 @@
 //! once requested, every missing fixture is a hard failure. The unroll tests
 //! below always run.
 use std::collections::HashMap;
-use verse_lib::engine::convert::{convert_auto, convert_bytes, convert_midi_with, ConvertOutcome};
+use verse_lib::engine::convert::{
+    convert_auto, convert_bytes, convert_midi_with, convert_midi_with_target, ConvertOutcome,
+};
 use verse_lib::engine::midi;
 use verse_lib::engine::target;
 
@@ -95,6 +97,199 @@ fn the_synthesizer_v_bytes_stay_identical_to_release_0_4_9() {
     let json = String::from_utf8(serde_json::to_vec(&svp).expect("serializes"))
         .expect("SVP JSON is UTF-8");
     assert_eq!(json, GOLDEN_SVP);
+}
+
+/// The OpenUtau project for the very same [`golden_source`], byte for byte.
+///
+/// Untexted E4 at tick 960 carries `lyric: ""` — the state no OpenUtau importer
+/// can express, and the reason this target exists. OpenUtau's own MIDI reader
+/// would write `"a"` there, and its lyric dictionary never reads the `TextEvent`
+/// a `.kar` stores words in at all.
+const GOLDEN_USTX: &str = concat!(
+    "ustx_version: \"0.6\"\n",
+    "resolution: 480\n",
+    "bpm: 120\n",
+    "beat_per_bar: 3\n",
+    "beat_unit: 4\n",
+    "time_signatures: [{bar_position: 0, beat_per_bar: 3, beat_unit: 4}, \
+     {bar_position: 1, beat_per_bar: 4, beat_unit: 4}]\n",
+    "tempos: [{position: 0, bpm: 120}, {position: 1440, bpm: 150}]\n",
+    "expressions: {}\n",
+    "tracks:\n",
+    "  - phonemizer: \"OpenUtau.Core.DefaultPhonemizer\"\n",
+    "    track_name: \"Track 0\"\n",
+    "    mute: false\n",
+    "    solo: false\n",
+    "    volume: 0\n",
+    "  - phonemizer: \"OpenUtau.Core.DefaultPhonemizer\"\n",
+    "    track_name: \"Track 1\"\n",
+    "    mute: false\n",
+    "    solo: false\n",
+    "    volume: 0\n",
+    "voice_parts:\n",
+    "  - name: \"Track 0\"\n",
+    "    track_no: 0\n",
+    "    position: 0\n",
+    "    notes:\n",
+    "      - position: 0\n",
+    "        duration: 480\n",
+    "        tone: 60\n",
+    "        lyric: \"let\"\n",
+    "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+    "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
+    "        phoneme_expressions: []\n",
+    "        phoneme_overrides: []\n",
+    "      - position: 480\n",
+    "        duration: 240\n",
+    "        tone: 62\n",
+    "        lyric: \"it\"\n",
+    "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+    "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
+    "        phoneme_expressions: []\n",
+    "        phoneme_overrides: []\n",
+    "      - position: 960\n",
+    "        duration: 480\n",
+    "        tone: 64\n",
+    "        lyric: \"\"\n",
+    "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+    "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
+    "        phoneme_expressions: []\n",
+    "        phoneme_overrides: []\n",
+    "    curves: []\n",
+    "  - name: \"Track 1\"\n",
+    "    track_no: 1\n",
+    "    position: 0\n",
+    "    notes:\n",
+    "      - position: 0\n",
+    "        duration: 960\n",
+    "        tone: 67\n",
+    "        lyric: \"sing\"\n",
+    "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+    "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
+    "        phoneme_expressions: []\n",
+    "        phoneme_overrides: []\n",
+    "    curves: []\n",
+    "wave_parts: []\n",
+);
+
+/// Pins the whole OpenUtau output for the same programmatic source the `.svp`
+/// golden above uses, so one projection pins both targets and neither can drift
+/// the other. Any change to a tick, a marker, a structural default, the
+/// `ustx_version`, the obsolete downgrade scalars or the field order fails here.
+#[test]
+fn the_openutau_bytes_are_pinned_for_the_same_source() {
+    let outcome = convert_midi_with_target(
+        &midi::parse(&golden_source()).expect("valid MIDI"),
+        "japanese",
+        None,
+        target::ExportTarget::Ustx,
+    );
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    assert_eq!(outcome.placed, 3);
+    let projected = outcome.svp.expect("a projection");
+    assert_eq!(projected.tracks.len(), 2);
+    let bytes = target::serialize_to(target::ExportTarget::Ustx, &projected)
+        .expect("480 PPQ is exactly representable");
+    let yaml = String::from_utf8(bytes).expect("USTX is UTF-8");
+    assert_eq!(yaml, GOLDEN_USTX);
+    // The tempo and the meter change both survive, which is what the 0.6 floor
+    // buys: below it, `Ustx.Load` replaces both lists with one entry each.
+    assert!(yaml.contains("{position: 1440, bpm: 150}"));
+    assert!(yaml.contains("{bar_position: 1, beat_per_bar: 4, beat_unit: 4}"));
+    // No lyric was invented for the untexted note, and nothing was written for
+    // the third source track, which carries notes but no lyric evidence.
+    assert_eq!(yaml.matches("lyric: \"\"").count(), 1);
+    assert!(!yaml.contains("lyric: \"a\""));
+    assert_eq!(yaml.matches("track_name:").count(), 2);
+}
+
+/// One projection, two targets, one file each — and the same bytes as the
+/// per-target goldens above. This is the seam: nothing above `serialize_to`
+/// decides anything format-specific.
+#[test]
+fn one_projection_writes_both_targets_from_the_same_analysis() {
+    let outcome = convert_bytes(&golden_source(), "japanese");
+    let projected = outcome.svp.expect("a projection");
+    let svp = target::serialize_to(target::ExportTarget::Svp, &projected).expect("representable");
+    let ustx = target::serialize_to(target::ExportTarget::Ustx, &projected).expect("representable");
+    assert_eq!(
+        String::from_utf8(svp).expect("SVP JSON is UTF-8"),
+        GOLDEN_SVP
+    );
+    assert_eq!(String::from_utf8(ustx).expect("USTX is UTF-8"), GOLDEN_USTX);
+}
+
+/// The reason the analysis gate has to take the caller's target: `480 = 2^5*3*5`
+/// cannot express a septuplet, so OpenUtau refuses a strict subset of what
+/// Synthesizer V blicks accept. Gating on one target for the other would clear a
+/// source the other must refuse, and the refusal would resurface at export.
+#[test]
+fn analysis_refuses_for_openutau_exactly_what_openutau_cannot_write() {
+    // PPQ 448 = 64 * 7. A note onset at tick 64 is a whole number of blicks
+    // (64 * 705_600_000 / 448 = 100_800_000) but not of 480ths of a quarter.
+    let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xc0".to_vec();
+    let track: Vec<u8> = vec![
+        0x40, 0xff, 0x05, 0x03, b'l', b'e', b't', // lyric "let" at tick 64
+        0x00, 0x90, 60, 100, // C4 on at 64
+        0x83, 0x40, 0x80, 60, 0, // off at 512, so a 448-tick quarter
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    data.extend_from_slice(b"MTrk");
+    data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    data.extend_from_slice(&track);
+    let parsed = midi::parse(&data).expect("valid MIDI");
+
+    let synthesizer_v =
+        convert_midi_with_target(&parsed, "english", None, target::ExportTarget::Svp);
+    assert!(
+        synthesizer_v.ok,
+        "blicks represent this source exactly: {:?}",
+        synthesizer_v.msg
+    );
+
+    let openutau = convert_midi_with_target(&parsed, "english", None, target::ExportTarget::Ustx);
+    assert!(!openutau.ok, "480 ticks per quarter cannot place tick 64");
+    assert!(openutau.svp.is_none(), "nothing may be written");
+    let message = openutau.msg.expect("a refusal message");
+    // Named for the target, not for timing: OpenUtau also refuses a syllable
+    // split, a chord in one monophonic lane and a held syllable across a gap, so
+    // "fix the timing" would send the user after the wrong thing. Synthesizer V
+    // keeps 0.4.9's timing wording, which
+    // `the_synthesizer_v_bytes_stay_identical_to_release_0_4_9` and the analysis
+    // test in `lib.rs` both still pin.
+    assert_eq!(
+        message,
+        "the source cannot be projected safely to OpenUtau: note onset on source track \
+         midi-track-0 at MIDI tick 64 cannot be represented exactly in OpenUtau's 480 ticks per \
+         quarter with PPQ 448"
+    );
+    // Parsing succeeded, so the refusal must not erase the source evidence.
+    assert_eq!(
+        openutau.topology.parts.len(),
+        synthesizer_v.topology.parts.len()
+    );
+}
+
+/// A caller that names no target keeps release 0.4.9's verdict and bytes, which
+/// is what lets the webview stay untouched.
+#[test]
+fn naming_no_target_is_synthesizer_v() {
+    let parsed = midi::parse(&golden_source()).expect("valid MIDI");
+    let unnamed = convert_midi_with(&parsed, "japanese", None);
+    let named =
+        convert_midi_with_target(&parsed, "japanese", None, target::ExportTarget::default());
+    assert!(unnamed.ok && named.ok);
+    assert_eq!(unnamed.svp, named.svp);
+    assert_eq!(target::ExportTarget::default(), target::ExportTarget::Svp);
+    let bytes = target::serialize_to(
+        target::ExportTarget::default(),
+        &unnamed.svp.expect("a projection"),
+    )
+    .expect("representable");
+    assert_eq!(
+        String::from_utf8(bytes).expect("SVP JSON is UTF-8"),
+        GOLDEN_SVP
+    );
 }
 
 /// The converter validates the meter before it walks the tracks and the timing

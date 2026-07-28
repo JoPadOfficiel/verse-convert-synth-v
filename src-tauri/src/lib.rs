@@ -8,10 +8,11 @@ use bundle::{
     BundleLayout, BundleProgressEvent, BundleRequest, BundleResult,
 };
 use engine::convert::{
-    convert_midi_with, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState, SourceRole,
-    TrackReport,
+    convert_midi_with_target, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState,
+    SourceRole, TrackReport,
 };
 use engine::midi::{Midi, SourceFormat, SourceTopology};
+use engine::target::{ExportTarget, SerializeError};
 use renderer::{
     AudioRenderer, MuseScoreConfig, MuseScoreRenderer, RenderLimits, DEFAULT_MAX_WAV_BYTES,
     DEFAULT_RENDER_TIMEOUT,
@@ -87,10 +88,12 @@ pub struct FileResult {
     pub out: Option<String>,
 }
 
-fn svp_out_path(path: &str, out_dir: Option<&str>) -> String {
+/// The batch-export filename. The `_LYRICS` stem is 0.4.9's and stays; only the
+/// extension follows the chosen target.
+fn vocal_out_path(path: &str, out_dir: Option<&str>, target: ExportTarget) -> String {
     let p = Path::new(path);
     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-    let fname = format!("{}_LYRICS.svp", stem);
+    let fname = format!("{}_LYRICS.{}", stem, target.extension());
     match out_dir {
         Some(d) if !d.is_empty() => Path::new(d).join(fname).to_string_lossy().to_string(),
         _ => p.with_file_name(fname).to_string_lossy().to_string(),
@@ -323,6 +326,7 @@ fn process_one(
     out_dir: Option<&str>,
     language: &str,
     overrides: Option<&HashMap<usize, bool>>,
+    target: ExportTarget,
 ) -> FileResult {
     let name = Path::new(path)
         .file_name()
@@ -378,7 +382,7 @@ fn process_one(
         Ok(midi) => midi,
         Err(message) => return err(name, "SOURCE_PARSE_FAILED", message),
     };
-    let r = convert_midi_with(&midi, language, overrides);
+    let r = convert_midi_with_target(&midi, language, overrides, target);
     let tracks: Vec<_> = r
         .tracks
         .iter()
@@ -418,26 +422,45 @@ fn process_one(
         .as_ref()
         .map(|message| CommandErrorDto::new("CONVERSION_FAILED", message.clone()));
     if write && ok {
-        // Only the `serialize` call below is new here, and a projection refusal
-        // is not a write fault: `export_svp` classifies exactly that condition as
-        // CONVERSION_FAILED, so this boundary matches it. Every pre-existing arm
-        // keeps the WRITE_FAILED code it had in 0.4.9.
+        // A projection refusal is not a write fault: the vocal-export command
+        // classifies exactly that condition as CONVERSION_FAILED, so this
+        // boundary matches it. Every pre-existing arm keeps the WRITE_FAILED code
+        // it had in 0.4.9.
         let write_result = (|| -> Result<String, (&'static str, String)> {
-            let projected = r
-                .svp
-                .as_ref()
-                .ok_or(("WRITE_FAILED", "no SVP output was produced".to_string()))?;
-            let out_path = svp_out_path(path, out_dir);
+            let projected = r.svp.as_ref().ok_or_else(|| {
+                (
+                    "WRITE_FAILED",
+                    format!(
+                        "no {} output was produced",
+                        target.extension().to_ascii_uppercase()
+                    ),
+                )
+            })?;
+            let out_path = vocal_out_path(path, out_dir, target);
             validate_new_output_target(Path::new(path), Path::new(&out_path))
                 .map_err(|message| ("WRITE_FAILED", message))?;
-            // The neutral projection becomes a Synthesizer V project only here,
-            // at the boundary that writes the file.
-            let svp = engine::target::svp::serialize(projected)
-                .map_err(|message| ("CONVERSION_FAILED", message))?;
-            let json = serde_json::to_vec(&svp)
-                .map_err(|error| ("WRITE_FAILED", format!("cannot serialize SVP ({error})")))?;
-            bundle::write_bytes_no_replace(Path::new(&out_path), &json)
-                .map_err(|error| ("WRITE_FAILED", format!("cannot write SVP ({error})")))?;
+            // The neutral projection becomes one target's file only here, at the
+            // boundary that writes it.
+            let bytes =
+                engine::target::serialize_to(target, projected).map_err(|error| match error {
+                    SerializeError::Unrepresentable(message) => ("CONVERSION_FAILED", message),
+                    SerializeError::Encode(message) => (
+                        "WRITE_FAILED",
+                        format!(
+                            "cannot serialize {} ({message})",
+                            target.extension().to_ascii_uppercase()
+                        ),
+                    ),
+                })?;
+            bundle::write_bytes_no_replace(Path::new(&out_path), &bytes).map_err(|error| {
+                (
+                    "WRITE_FAILED",
+                    format!(
+                        "cannot write {} ({error})",
+                        target.extension().to_ascii_uppercase()
+                    ),
+                )
+            })?;
             Ok(out_path)
         })();
         match write_result {
@@ -468,13 +491,20 @@ fn process_one(
     }
 }
 
+/// Writes one vocal-only project.
+///
+/// `target` is the **output path**, which it has been since 0.1.0, so the export
+/// format is `export_target` — an optional parameter that keeps every existing
+/// caller writing `.svp` exactly as before.
 #[tauri::command]
 fn export_svp(
     path: String,
     target: String,
     language: Option<String>,
     overrides: Option<HashMap<String, bool>>,
+    export_target: Option<ExportTarget>,
 ) -> Result<String, CommandErrorDto> {
+    let export_target = export_target.unwrap_or_default();
     let extension = Path::new(&path)
         .extension()
         .and_then(|e| e.to_str())
@@ -500,7 +530,7 @@ fn export_svp(
     let lang = language.as_deref().unwrap_or("english");
     let midi = parse_source_snapshot(&data, &extension)
         .map_err(|message| CommandErrorDto::new("SOURCE_PARSE_FAILED", message))?;
-    let r = convert_midi_with(&midi, lang, Some(&ov));
+    let r = convert_midi_with_target(&midi, lang, Some(&ov), export_target);
     if !r.ok {
         return Err(CommandErrorDto::new(
             "CONVERSION_FAILED",
@@ -512,14 +542,35 @@ fn export_svp(
         .ok_or_else(|| CommandErrorDto::new("CONVERSION_FAILED", "no output produced"))?;
     let source_path = Path::new(&path);
     let target_path = Path::new(&target);
+    // The output path and the export format arrive as independent arguments, and
+    // the save dialog's filter is only advisory. Writing OpenUtau YAML into a
+    // `.svp`, or a Synthesizer V project into a `.ustx`, produces a file neither
+    // application will open, so the two must agree.
+    let stated_extension = target_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if stated_extension.as_deref() != Some(export_target.extension()) {
+        return Err(CommandErrorDto::new(
+            "INVALID_OUTPUT",
+            format!(
+                "the output filename must end in .{} to hold a {} project",
+                export_target.extension(),
+                export_target.display_name()
+            ),
+        ));
+    }
     validate_new_output_target(source_path, target_path)
         .map_err(|message| CommandErrorDto::new("INVALID_OUTPUT", message))?;
-    // The neutral projection becomes a Synthesizer V project only here.
-    let svp = engine::target::svp::serialize(&projected)
-        .map_err(|message| CommandErrorDto::new("CONVERSION_FAILED", message))?;
-    let json = serde_json::to_vec(&svp)
-        .map_err(|error| CommandErrorDto::new("SERIALIZE_FAILED", error.to_string()))?;
-    bundle::write_bytes_no_replace(target_path, &json).map_err(|error| {
+    // The neutral projection becomes one target's file only here.
+    let bytes =
+        engine::target::serialize_to(export_target, &projected).map_err(|error| match error {
+            SerializeError::Unrepresentable(message) => {
+                CommandErrorDto::new("CONVERSION_FAILED", message)
+            }
+            SerializeError::Encode(message) => CommandErrorDto::new("SERIALIZE_FAILED", message),
+        })?;
+    bundle::write_bytes_no_replace(target_path, &bytes).map_err(|error| {
         CommandErrorDto::new("WRITE_FAILED", format!("cannot write file ({error})"))
     })?;
     Ok(target)
@@ -600,10 +651,13 @@ fn export_bundle_blocking(
         .into_iter()
         .filter_map(|(key, value)| key.parse::<usize>().ok().map(|key| (key, value)))
         .collect();
-    let outcome = engine::convert::convert_midi_with(
+    // A bundle carries a Synthesizer V project, so it gates on that target.
+    // `.ustx` inside a `.versebundle` is the next spec.
+    let outcome = engine::convert::convert_midi_with_target(
         &midi,
         language.as_deref().unwrap_or("english"),
         Some(&parsed_overrides),
+        ExportTarget::Svp,
     );
     if !outcome.ok {
         return Err(CommandErrorDto::new(
@@ -768,6 +822,12 @@ async fn renderer_status(renderer_path: Option<String>) -> RendererStatusDto {
     }
 }
 
+/// Analyses (`write = false`) or batch-exports (`write = true`) every path.
+///
+/// `export_target` is optional and defaults to Synthesizer V, so a caller that
+/// names no target gets 0.4.9's analysis verdict and 0.4.9's bytes. It reaches
+/// analysis and not only the writer because the timing a target accepts is part
+/// of the convertibility verdict this returns.
 #[tauri::command]
 fn convert_files(
     paths: Vec<String>,
@@ -775,8 +835,10 @@ fn convert_files(
     out_dir: Option<String>,
     language: Option<String>,
     overrides: Option<HashMap<String, HashMap<String, bool>>>,
+    export_target: Option<ExportTarget>,
 ) -> Vec<FileResult> {
     let lang = language.as_deref().unwrap_or("english");
+    let export_target = export_target.unwrap_or_default();
     let out_dir = out_dir.filter(|d| Path::new(d).is_dir());
     let overrides: HashMap<String, HashMap<usize, bool>> = overrides
         .unwrap_or_default()
@@ -798,6 +860,7 @@ fn convert_files(
                 out_dir.as_deref(),
                 lang,
                 overrides.get(p.as_str()),
+                export_target,
             )
         })
         .collect()
@@ -882,7 +945,14 @@ mod output_tests {
         data.extend_from_slice(&track);
         std::fs::write(&source, &data).unwrap();
 
-        let result = process_one(source.to_str().unwrap(), false, None, "english", None);
+        let result = process_one(
+            source.to_str().unwrap(),
+            false,
+            None,
+            "english",
+            None,
+            ExportTarget::Svp,
+        );
         assert!(!result.ok, "an unprojectable source is not convertible");
         assert_eq!(
             result.msg.as_deref(),
@@ -1110,7 +1180,14 @@ mod output_tests {
         let source = root.join("detached-lyrics.kar");
         std::fs::write(&source, detached_lyric_kar()).unwrap();
 
-        let analysis = process_one(source.to_str().unwrap(), false, None, "english", None);
+        let analysis = process_one(
+            source.to_str().unwrap(),
+            false,
+            None,
+            "english",
+            None,
+            ExportTarget::Svp,
+        );
         assert!(analysis.ok, "{:?}", analysis.msg);
         assert_eq!(analysis.placed, 1);
         assert_eq!(
@@ -1128,6 +1205,7 @@ mod output_tests {
             direct_target.to_string_lossy().into_owned(),
             Some("english".into()),
             None,
+            None,
         )
         .unwrap();
         let direct: serde_json::Value =
@@ -1140,6 +1218,31 @@ mod output_tests {
             .map(|note| note["lyrics"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(direct_lyrics, vec!["Hello"]);
+
+        // The output path and the export format arrive as independent arguments
+        // and the save dialog's filter is only advisory, so writing OpenUtau YAML
+        // into a `.svp` — a file neither application opens — has to be refused
+        // here rather than produced.
+        let mismatched = export_svp(
+            source.to_string_lossy().into_owned(),
+            root.join("wrong-extension.svp")
+                .to_string_lossy()
+                .into_owned(),
+            Some("english".into()),
+            None,
+            Some(ExportTarget::Ustx),
+        );
+        let error = mismatched.expect_err("a .svp path cannot hold an OpenUtau project");
+        assert_eq!(error.code, "INVALID_OUTPUT");
+        assert!(
+            error.message.contains(".ustx"),
+            "the message must name the extension the format needs: {}",
+            error.message
+        );
+        assert!(
+            !root.join("wrong-extension.svp").exists(),
+            "nothing may be written when the format and the filename disagree"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1163,7 +1266,14 @@ mod output_tests {
         )
         .unwrap();
 
-        let result = process_one(source.to_str().unwrap(), false, None, "english", None);
+        let result = process_one(
+            source.to_str().unwrap(),
+            false,
+            None,
+            "english",
+            None,
+            ExportTarget::Svp,
+        );
         assert!(result.ok, "{:?}", result.msg);
         assert_eq!(result.n_parts, 1);
         assert_eq!(result.n_voices, 2);

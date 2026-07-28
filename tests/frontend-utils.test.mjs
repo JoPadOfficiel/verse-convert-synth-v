@@ -57,8 +57,30 @@ test("bundle and vocal targets remain beside the source unless configured", () =
     "/exports/Song.versebundle",
   );
   assert.equal(
-    utils.defaultSvpPath("C:\\scores\\Song.mid"),
+    utils.defaultVocalPath("C:\\scores\\Song.mid"),
     "C:\\scores\\Song_LYRICS.svp",
+  );
+});
+
+test("the vocal target extension follows the export target and nothing else", () => {
+  // Only the extension moves: the `_LYRICS` stem, the source directory and the
+  // Windows separator behaviour are unchanged.
+  assert.equal(
+    utils.defaultVocalPath("/scores/Song.mid", "svp"),
+    "/scores/Song_LYRICS.svp",
+  );
+  assert.equal(
+    utils.defaultVocalPath("/scores/Song.mid", "ustx"),
+    "/scores/Song_LYRICS.ustx",
+  );
+  assert.equal(
+    utils.defaultVocalPath("C:\\scores\\Song.mid", "ustx"),
+    "C:\\scores\\Song_LYRICS.ustx",
+  );
+  // A caller that names no target keeps release 0.4.9's filename exactly.
+  assert.equal(
+    utils.defaultVocalPath("/scores/Song.mxl"),
+    utils.defaultVocalPath("/scores/Song.mxl", "svp"),
   );
 });
 
