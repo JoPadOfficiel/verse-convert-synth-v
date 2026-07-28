@@ -8,7 +8,8 @@ real full-score and Part audio. These operations work without MuseScore:
 - source analysis;
 - Part/voice/lyric inspection;
 - vocal projection overrides;
-- vocal-only `.svp` export.
+- export-target selection;
+- vocals-only `.svp` or `.ustx` export.
 
 Verse does not bundle MuseScore and has no fake-audio fallback.
 

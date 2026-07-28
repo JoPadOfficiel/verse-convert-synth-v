@@ -4,8 +4,9 @@
 **Primary languages:** Rust and TypeScript  
 **Architecture:** Modular desktop monolith with a provenance-preserving
 conversion pipeline  
-**Documentation baseline:** `e2a717cd5a0756a089f890478882045dcdf16e7c`  
-**Last updated:** 2026-07-25
+**Export targets:** Synthesizer V `.svp` and OpenUtau `.ustx`  
+**Documentation baseline:** `bea4a47`  
+**Last updated:** 2026-07-28
 
 ## Start here
 
@@ -21,7 +22,8 @@ conversion pipeline
 ## Product and format documentation
 
 - [Formats and fidelity](formats-and-fidelity.md) — MIDI/KAR, MusicXML,
-  MuseScore, lyric ownership, topology, and SVP projection rules.
+  MuseScore, lyric ownership, topology, the two export targets, and what each
+  one refuses.
 - [Bundle format](bundle-format.md) — `.versebundle` schema v2 layout,
   manifest, preservation ledger, stem policy, integrity, and atomic commit.
 - [MuseScore renderer](musescore-renderer.md) — supported versions,
@@ -55,8 +57,8 @@ You need only **one** compatible MuseScore installation:
   MuseScore 4 files.
 - MuseScore **3.6.2 or later in the 3.x line** is supported for files it can
   open.
-- MuseScore is optional for analysis and vocal-only `.svp` export, but it is
-  required for complete `.versebundle` exports.
+- MuseScore is optional for analysis and the vocals-only `.svp`/`.ustx` export,
+  but it is required for complete `.versebundle` exports.
 
 For development:
 
@@ -78,7 +80,3 @@ release metadata are the operational authority. Files under
 `_bmad-output/` are local planning and historical evidence; they are not
 shipped in Git. The authoritative BMAD architecture has therefore been
 reconciled into [architecture.md](architecture.md).
-
----
-
-_Generated and reconciled with the BMAD Method `document-project` workflow._

@@ -9,15 +9,147 @@ notes, pitches, voices, tracks, instruments, or audio.
 - A note without a lyric receives an empty lyric.
 - A continuation is emitted only when the source contains continuation or
   extension evidence.
-- Instrumental and percussion material is not serialized as vocal-shaped SVP
-  notes.
+- Instrumental and percussion material is not serialized as vocal-shaped notes
+  in either target.
 - Ambiguous ownership remains source-only or causes an explicit failure.
 - The byte-identical source remains the final authority inside a complete
   bundle.
 
-SVP is not a lossless notation container. “Source-faithful” means exact source
-preservation, evidence-backed projection, an auditable disposition ledger, and
-fail-closed handling of unrepresentable semantics.
+Neither `.svp` nor `.ustx` is a lossless notation container. “Source-faithful”
+means exact source preservation, evidence-backed projection, an auditable
+disposition ledger, and fail-closed handling of unrepresentable semantics.
+
+## Export targets
+
+Verse writes two project formats. The **Export target** selector chooses one;
+`ExportTarget` serializes as the stable lowercase values `"svp"` and `"ustx"`,
+and Synthesizer V is the default.
+
+| | Synthesizer V | OpenUtau |
+|---|---|---|
+| Output | `.svp`, project version 113 | `.ustx`, `ustx_version` 0.6 |
+| Time unit | blicks | integer ticks |
+| One quarter note | 705,600,000 blicks | 480 ticks |
+| Held syllable | `-` | `+~` |
+| Syllable split | `+` | `+` |
+| Untexted note | empty lyric | `lyric: ""` |
+| Inside a `.versebundle` | yes | yes |
+| Bundle audio reference | instrumental track, `blickOffset = 0` | `wave_parts` entry, all offsets `0` |
+
+Both targets read the same `engine/projection.rs` output, which stays in
+source-exact IR ticks and carries the source's `LyricState` rather than a
+rendered marker. A target owns its own grid, marker vocabulary, cosmetics and
+schema version, and cannot reach back into the conversion engine or change what
+the other target writes.
+
+### The 480-tick grid, and why a septuplet splits the two targets
+
+`UProject.resolution` is `[YamlIgnore] => 480` (`Ustx/UProject.cs:42`), so the
+`resolution:` Verse emits is ignored on load and rescaling is impossible. 480
+integer ticks per quarter note is a property of the format.
+
+`705,600,000 / 480 = 1,470,000`, an exact integer. Every position OpenUtau can
+state is therefore also a Synthesizer V position — but not the reverse. `480 =
+2^5 × 3 × 5` has no factor 7, so a septuplet has no exact representation at 480
+ticks per quarter while blicks state it exactly. A septuplet score exports to
+`.svp` and is **refused** for `.ustx`.
+
+That is why the export target is part of the convertibility verdict rather than
+a write-time detail: `engine::target::validate_for` runs the chosen target's own
+arithmetic during analysis, and changing the target re-analyses every loaded
+file. Asking one target on behalf of another would clear a source the other must
+refuse, and the refusal would resurface at export.
+
+Refusing is not a shortfall. OpenUtau's own MusicXML importer computes
+`int durTick = (int)note.Duration * uproject.resolution / divisions;`
+(`Format/MusicXML.cs:128`) — truncating integer division with no exactness
+check, so any duration that does not divide evenly is silently shortened.
+Refusing the same case is strictly more faithful than the software's native
+behaviour.
+
+### Two marker vocabularies that must never be swapped
+
+Synthesizer V spells a held syllable `-` and a syllable split `+`. OpenUtau
+spells the hold `+~` and the split `+`:
+
+- `Format/MusicXML.cs:157-160` writes `+~` for a slur, commented “OpenUtau uses
+  +~ for extending the current syllable”;
+- `Format/MusicXML.cs:147-149` writes `+` for the following syllables of a
+  multi-syllable word, and `NotePresets.SplittedLyric` is `"+"`;
+- `Format/MidiWriter.cs:209-211` converts an imported MIDI `-` into `+~`, and
+  `:272-274` converts it back on export.
+
+So `+` means the split in both targets, while `-` and `+~` mean the hold in one
+each. A naive string substitution would turn every hold into a split. Verse
+avoids that by never carrying rendered marker text through the projection: the
+neutral projection carries `LyricState`, and each target renders it.
+
+`UVoicePart.Validate` sets `Extends` on any lyric starting with `"+"`, which
+covers both OpenUtau markers, and wires it only when `Prev.End == position`. A
+marker on a note that does not touch its predecessor would reach the phonemizer
+as a lyric and be sung as a word, so Verse refuses that case instead. The test
+is on provenance, not on the emitted string: a source word may itself spell `+`
+or `+~`, and such a word is text.
+
+Text OpenUtau reinterprets before singing it is written byte-exactly and
+diagnosed under `LYRIC_REINTERPRETED_BY_TARGET`: a source word beginning with
+`+` (read as a continuation by `UVoicePart.Validate`) and bracketed text (taken
+as a phonetic hint and stripped by `UNote.ToPhonemizerNote`).
+
+### What each target refuses
+
+Both targets refuse a position or duration that does not divide exactly into
+their own grid, and report the offending MIDI tick and PPQ. Verse leaves the
+source untouched and never rounds.
+
+OpenUtau additionally refuses:
+
+- a note whose duration falls under the 10-tick floor. `UNote.Validate` does
+  `duration = Math.Max(10, duration)` and would silently lengthen it.
+- two overlapping notes in one voice part. One `voice_part` is monophonic and
+  OpenUtau sets `OverlapError` on the later note instead of singing it.
+- a held syllable or syllable split on a note that does not begin exactly where
+  its predecessor ends, including such a marker on the first note of a lane.
+- a position or a position-plus-duration beyond the C# `int` range every USTX
+  tick field uses.
+
+Notes are emitted at strictly increasing positions, because `UNote.CompareTo`
+falls back to `GetHashCode()` at equal positions and OpenUtau's load order would
+otherwise be undefined.
+
+### Structural defaults that assert nothing
+
+A `.ustx` note carries `pitch.data` with two `y: 0` points and a true
+`snap_first`, because `UNote.Validate` dereferences `pitch.data[0]` with no
+guard. `vibrato.length: 0` disables vibrato and every other vibrato field is the
+value OpenUtau's own `UVibrato` initializes. A track names
+`OpenUtau.Core.DefaultPhonemizer` because a track must carry one.
+
+`singer` and `renderer_settings` are deliberately absent: `URenderSettings`
+resolves the renderer from whatever singer the user assigns, and naming one
+would assert something about a voicebank Verse has never seen. `expressions`
+need not be authored — `Ustx.Load` calls `AddDefaultExpressions` on every load.
+
+`ustx_version` is emitted as `0.6` and never lower. For a project declaring
+less than `0.6`, `Ustx.Load` replaces the whole `time_signatures` and `tempos`
+lists with one entry each taken from the obsolete `bpm`/`beat_per_bar`/
+`beat_unit` scalars, destroying every tempo and meter change in the score. Those
+obsolete scalars are still written, set from the first tempo and meter, so that a
+mistaken downgrade loses the later changes rather than corrupting the opening of
+the score.
+
+### The YAML emitter
+
+`.ustx` is written by a hand-written deterministic emitter rather than a YAML
+dependency: the schema is closed and small, and byte-exact output is testable.
+Every string scalar is unconditionally double-quoted, which removes every YAML
+ambiguity for arbitrary lyric text — a `:`, a `#`, a quote, a backslash, a
+leading space — with no plain-scalar heuristic. Inside double quotes only `"`,
+`\` and the code points a YAML 1.1 reader may treat as a line break are escaped;
+every other code point, including all non-ASCII, is written literally as UTF-8.
+
+Keys are `snake_case` because OpenUtau's `Util/Yaml.cs` uses
+`UnderscoredNamingConvention`.
 
 ## Format detection
 
@@ -75,10 +207,11 @@ synthetic C4 lyric track.
 
 ### Voices inside one track
 
-A Synthesizer V vocal track is monophonic, so a source track that sounds two
-notes at once is split into one lane per simultaneous voice — the same
-decomposition score importers apply to a chord. Splitting is driven by sounding
-overlap alone: a track that never overlaps is projected unchanged.
+A Synthesizer V vocal track is monophonic, and so is one OpenUtau `voice_part`,
+so a source track that sounds two notes at once is split into one lane per
+simultaneous voice — the same decomposition score importers apply to a chord.
+Splitting is driven by sounding overlap alone: a track that never overlaps is
+projected unchanged.
 
 This matters beyond tidiness. A karaoke syllable landing on a stack of notes has
 no single note to own, and used to be dropped as ambiguous. Split into voices,
@@ -109,7 +242,7 @@ it has; a stem running past the end of the whole score is still refused.
 ### Explicit refusals
 
 - SMF format 2 independent sequences are not flattened.
-- SMPTE timing is parsed/preserved but not projected to SVP.
+- SMPTE timing is parsed/preserved but is not projected to either target.
 - More than 4,096 tracks or 2,000,000 events is rejected.
 - Malformed running status, chunks, lengths, ticks, or channel events is
   rejected.
@@ -172,10 +305,10 @@ lyric, and that lyric stays source-only with a diagnostic.
 
 ### Native ties
 
-Native MuseScore tie spanners are merged into one sustained SVP note, as
+Native MuseScore tie spanners are merged into one sustained projected note, as
 MusicXML tie chains already were. The tail of a chain keeps its source identity
 and loses only its played pitch, so the ledger still accounts for every source
-note while Synthesizer V sees a single attack held for the whole chain.
+note while the target application sees a single attack held for the whole chain.
 
 A pairing is accepted only when MuseScore's own back reference confirms it: the
 notes must be adjacent in time and the head must sit exactly where the tail's
@@ -237,43 +370,60 @@ Part → staff → voice → technical projection lanes
 
 A Part is a score-owned musical unit. A voice is a source-owned notational
 voice. A projection lane is an internal monophonic lane required to represent
-polyphony in Synthesizer V. Reporting and UI counts use Parts and source
-voices; technical lanes remain visible only in detailed track contracts.
+polyphony in a target whose vocal lane is monophonic. Reporting and UI counts
+use Parts and source voices; technical lanes remain visible only in detailed
+track contracts.
 
 Parts containing only metadata or rests remain in topology and the exact
 source. Only note-bearing Parts require WAV stems.
 
 ## Timing and target defaults
 
-One quarter note equals exactly 705,600,000 Synthesizer V blicks. Every
-projected note boundary and tempo position must divide exactly into this grid.
-Verse rejects an inexact position instead of rounding it.
+The projection keeps every position in source-exact IR ticks, whose PPQ is
+derived from the source itself — MuseScore's `Division`, or the LCM of the
+MusicXML `<divisions>` values — so no source duration is lost before a target
+sees it. Each target then converts once:
 
-Synthesizer V requires a usable timeline. If the source declares no meter or
+- Synthesizer V: one quarter note equals exactly 705,600,000 blicks;
+- OpenUtau: one quarter note equals exactly 480 integer ticks.
+
+Every projected note boundary and tempo position must divide exactly into the
+selected target's grid. Verse rejects an inexact position instead of rounding
+it, and the message names the MIDI tick and the source PPQ. See
+[Export targets](#export-targets) for why OpenUtau's grid accepts a strict
+subset of what blicks accept.
+
+Both targets require a usable timeline. If the source declares no meter or
 tempo, Verse supplies target defaults of 4/4 and 120 BPM at position zero.
 These are serializer defaults, not claims that the source contained those
 events; the preservation ledger does not mark them as source evidence.
 
 Meter changes are accepted only on exact measure boundaries. A change inside a
-measure is rejected because SVP stores meter positions by integer measure.
+measure is rejected because both formats index meter by integer bar: SVP
+`Meter{index, numerator, denominator}` and USTX
+`time_signatures[{bar_position, beat_per_bar, beat_unit}]`. No arithmetic
+converts between them.
 
-## Language selection
+## No language selection
 
-English/French selection sets the target Synthesizer V database language on
-vocal tracks. It does not:
+There is no language selector, and no language needs choosing. Lyrics are
+source text: they are written byte for byte, in any language, with nothing to
+configure. `src-tauri/tests/language_fidelity.rs` proves this for French,
+Spanish, English, Portuguese, German, Polish and Turkish, deliberately passing a
+language that is wrong for the content to show the text does not depend on it.
 
-- translate lyrics;
-- change spelling or Unicode;
-- generate phonemes;
-- transliterate text into Japanese;
-- change source role or ownership.
+Verse does not fill `database.language` in a `.svp`, and the OpenUtau target
+never writes a language at all. Verse has never seen the voice database or
+singer a track will be sung with, so it states nothing about it. Verse likewise
+never translates lyrics, changes spelling or Unicode, generates phonemes,
+transliterates text, or changes source role or ownership.
 
 ## User overrides
 
-The Part-level “Vocal SVP” control applies one explicit Boolean decision to all
-eligible projection lanes in that Part. It may request pitched notes as a vocal
-track or leave them in the reference audio. It never copies lyrics from another
-Part or changes the source classification.
+The Part-level “Vocal SVP” / “Vocal USTX” control applies one explicit Boolean
+decision to all eligible projection lanes in that Part. It may request pitched
+notes as a vocal track or leave them in the reference audio. It never copies
+lyrics from another Part or changes the source classification.
 
 ## Preservation outcomes
 

@@ -68,8 +68,8 @@ Distribution package names may differ outside Debian/Ubuntu.
 ## MuseScore for development
 
 MuseScore is not needed for frontend work, parser-only tests, source analysis,
-or vocal-only `.svp` export. It is required for complete bundle exports,
-real-render gates, and OpenScore render sampling.
+or the vocals-only `.svp`/`.ustx` export. It is required for complete bundle
+exports, real-render gates, and OpenScore render sampling.
 
 Install one compatible executable:
 
@@ -296,8 +296,11 @@ and is written to ignored `dist/`.
   text must not become control flow.
 - No missing lyric, pitch, track, instrument, or audio fallback may be added.
 - Output writes must preserve no-replace and transactional ownership rules.
-- A persisted bundle/SVP/ledger change requires corresponding documentation
+- A persisted bundle/SVP/USTX/ledger change requires corresponding documentation
   and compatibility tests.
+- An export target owns only its own format. Anything both targets need belongs
+  in `engine/projection.rs`, and every OpenUtau format fact must cite the
+  `0.1.568` source line that establishes it.
 
 See [Component inventory](component-inventory.md),
 [Architecture](architecture.md), and

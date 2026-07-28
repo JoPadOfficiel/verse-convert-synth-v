@@ -40,11 +40,18 @@ Rust.
 | Compressed score XML | At most 64 MiB after decompression per selected XML entry |
 | XML tree | At most 5,000,000 nodes |
 | XML nesting | At most 200 levels |
-| SVP timing | Exact positive PPQ that can be represented safely |
+| Projected timing | Exact positive PPQ that the selected export target can represent |
+| Synthesizer V tick range | Positions and durations must fit the blick range at 705,600,000 blicks per quarter |
+| OpenUtau tick range | Positions and durations must fit a C# `int` at 480 ticks per quarter, and a note must reach the 10-tick floor |
 
 MIDI format 2 contains independent sequences and is not flattened into a
-single SVP timeline. SMPTE division is parsed for preservation but is not
-projected to SVP. Zero or inconsistent PPQ is rejected.
+single project timeline. SMPTE division is parsed for preservation but is not
+projected to either target. Zero or inconsistent PPQ is rejected.
+
+Timing is converted once, from source-exact IR ticks onto the selected target's
+grid, and a quantity that does not divide exactly is refused with the tick and
+PPQ named. OpenUtau's grid accepts a strict subset of what Synthesizer V blicks
+accept, so the refusal set is target-dependent and is evaluated at analysis time.
 
 MusicXML parsing expects a `score-partwise` document. Unsupported encodings,
 malformed declarations, internal DTD subsets, entity declarations, and
@@ -60,7 +67,8 @@ Durations, divisions, pitches, tuplets, meters, repeats, and navigation are
 validated exactly. Values are not silently clamped or truncated. Nested
 repeats, non-converging playback, multiple ambiguous jumps, missing navigation
 targets, conflicting global durations, or an actual time-signature change
-inside a measure can therefore make a source ineligible for SVP projection.
+inside a measure can therefore make a source ineligible for projection to either
+target.
 
 ## Lyric and musical-evidence safety
 
@@ -77,14 +85,19 @@ Verse keeps source role and export representation separate:
   not authorize copying lyrics from another track.
 - A lyric-free MIDI file is valid and produces no synthetic vocal track.
 - Missing lyrics remain empty. Genuine source `la` remains `la`; Verse never
-  fills empty notes with `la`.
+  fills empty notes with `la`, and never with OpenUtau's own default `a`.
+- Lyric text is written byte for byte, in any language. Nothing configures it,
+  and no output names a voice database or singer.
 - Unmapped percussion, grace notes, unsupported vocal effects, and other
   non-projectable source items remain in the source inventory and full-score
   audio rather than becoming fabricated vocal notes.
 
-When no tempo or meter exists at all, the SVP timeline requires neutral
+When no tempo or meter exists at all, both project timelines require neutral
 defaults of 120 BPM and 4/4. These are project-timeline defaults, not source
-evidence and not permission to fabricate musical content.
+evidence and not permission to fabricate musical content. The same applies to
+the structural values a `.ustx` note must carry: two `y: 0` pitch points, because
+`UNote.Validate` dereferences `pitch.data[0]` with no guard, and
+`vibrato.length: 0`, which disables vibrato. Neither states an expression.
 
 ## MuseScore process boundary
 
@@ -152,13 +165,22 @@ The complete bundle requires:
 
 - exactly one rendered stem for every expected note-bearing Part;
 - matching expected, rendered, and recorded stem IDs;
-- one valid audio-backed SVP track per stem asset;
+- exactly one project audio reference per stem asset — one audio-backed SVP track
+  in a `.svp` bundle, one `wave_parts` entry in a `.ustx` bundle;
+- an empty `svpGroupId` in a `.ustx` bundle, so no Synthesizer V identity is
+  invented for a project that has none;
 - exact relative audio references that remain under the bundle root;
 - a muted full-score reference track;
 - valid mute state and group identity;
 - source and artifact size/SHA-256 matches;
 - one preservation disposition for every inventoried source item;
-- no duplicate, missing, unknown, or traversal artifact paths.
+- no duplicate, missing, or traversal path among the manifest-declared
+  artifacts, and no ledger reference outside that declared set.
+
+Verification is manifest-driven: it checks everything the manifest declares and
+never walks the bundle directory, so an extra unrelated file placed inside a
+committed bundle is not detected. See
+[Bundle format](bundle-format.md#integrity-validation).
 
 Verse does not downgrade a failed Part extraction to a mixed-only bundle and
 does not substitute a renderer output from another path.
@@ -192,10 +214,10 @@ remediation.
 | `SOURCE_TOO_LARGE` | Top-level source exceeds 128 MiB |
 | `SOURCE_READ_FAILED` | Source cannot be read as a regular file |
 | `SOURCE_PARSE_FAILED` | Format, encoding, archive, or source structure is invalid |
-| `CONVERSION_FAILED` | Exact SVP projection could not be produced |
-| `INVALID_OUTPUT` | Generated vocal-only SVP failed validation |
-| `SERIALIZE_FAILED` | Vocal-only SVP serialization failed |
-| `WRITE_FAILED` | Vocal-only output could not be written |
+| `CONVERSION_FAILED` | An exact projection to the selected target could not be produced |
+| `INVALID_OUTPUT` | The output path is invalid, already exists, is the source, or its extension does not match the selected export target |
+| `SERIALIZE_FAILED` | Encoding the target's own model into bytes failed. Distinct from `CONVERSION_FAILED`, which says the source cannot be represented |
+| `WRITE_FAILED` | Vocals-only output could not be written |
 | `INVALID_DESTINATION` | Bundle destination is not a valid new `.versebundle` directory |
 | `DESTINATION_EXISTS` | Verse refused to overwrite an existing destination |
 | `INVALID_SOURCE_NAME` | Source filename is unsafe or unrepresentable |

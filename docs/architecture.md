@@ -1,14 +1,14 @@
 # Verse Architecture
 
 **Status:** Authoritative current architecture and convergence guide  
-**Baseline:** `e2a717cd5a0756a089f890478882045dcdf16e7c`  
-**Updated:** 2026-07-25
+**Baseline:** `bea4a47` (two export targets)  
+**Updated:** 2026-07-28
 
 ## Design paradigm
 
 Verse is a **modular desktop monolith with a provenance-preserving compiler
 pipeline**. The Rust backend owns musical meaning and artifact integrity.
-React, Tauri, source formats, MuseScore, Synthesizer V serialization, and the
+React, Tauri, source formats, MuseScore, the export-target serializers, and the
 filesystem are adapters around that core.
 
 There is one deployed application process. GitHub Actions is delivery
@@ -23,10 +23,13 @@ flowchart LR
     UI -->|"typed Tauri commands"| RUST["Rust application"]
     RUST --> PARSERS["MIDI / MusicXML / MuseScore parsers"]
     RUST --> SVP["SVP v113 serializer"]
+    RUST --> USTX["USTX 0.6 serializer"]
     RUST --> BUNDLE["Bundle transaction"]
     RUST -->|"fixed argv"| MS["User-installed MuseScore 3.6.2+ or 4.x"]
     PARSERS --> SOURCE["Local source files"]
-    BUNDLE --> OUTPUT["Local .svp / .versebundle"]
+    SVP --> OUTPUT["Local .svp / .ustx / .versebundle"]
+    USTX --> OUTPUT
+    BUNDLE --> OUTPUT
     MS -->|"validated WAV + extracted Parts"| BUNDLE
 ```
 
@@ -45,10 +48,12 @@ files, build manifests, launch processes, or commit output.
 | Projection policy | `engine/convert.rs` | Classification, lyric ownership, vocal projection, diagnostics |
 | Input adapters | `engine/midi.rs`, `musicxml.rs`, `musescore.rs` | Format-specific parsing into the shared model |
 | Projection seam | `engine/projection.rs` | Target-neutral projection in source-exact IR ticks |
-| Target adapter | `engine/target/svp.rs` | Raw Synthesizer V project v113 serialization |
+| Target dispatch | `engine/target/mod.rs` | `ExportTarget`, the analysis gate `validate_for`, and the single write boundary `serialize_to` |
+| Target adapter | `engine/target/svp.rs` | Raw Synthesizer V project v113 serialization; blicks |
+| Target adapter | `engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 serialization; 480 ticks per quarter, and its own deterministic YAML emitter |
 | Stem policy | `stems.rs` | One stable stem per note-bearing source Part |
 | Renderer adapter | `renderer.rs` | MuseScore discovery, capability probe, extraction, render, validation |
-| Artifact adapter | `bundle.rs` | Ledger, staged files, integrity checks, no-replace commit |
+| Artifact adapter | `bundle.rs` | Ledger, staged files, the per-target bundle project and its audio references, integrity checks, no-replace commit |
 | Delivery | `.github/workflows/` | Locked tests, multi-platform builds, release publication |
 
 ## Conversion pipeline
@@ -59,9 +64,11 @@ flowchart LR
     DETECT --> PARSE["Owning format adapter"]
     PARSE --> IR["Midi shared IR + SourceTopology"]
     IR --> CLASSIFY["Source roles + lyric status"]
-    CLASSIFY --> PROJECT["Evidence-backed vocal projection"]
+    CLASSIFY --> PROJECT["Target-neutral projection in IR ticks"]
     IR --> STEMPLAN["Part stem plan"]
-    PROJECT --> SVP["SVP vocal project"]
+    PROJECT --> GATE["Selected target's exactness gate"]
+    GATE --> SVP["SVP vocal project"]
+    GATE --> USTX[".ustx vocal project"]
     STEMPLAN --> EXTRACT["MuseScore score-parts extraction"]
     EXTRACT --> RENDER["Sequential validated WAV renders"]
     RENDER --> AUDIO["Part stems + muted full-score reference"]
@@ -78,14 +85,51 @@ flowchart LR
 
 `convert_files(write=false)` reads each source once, rejects non-regular or
 oversized files, detects the correct parser, constructs stable topology,
-classifies tracks, projects eligible vocal notes, and returns a `FileResult`.
-No MuseScore process is required.
+classifies tracks, projects eligible vocal notes, asks the selected target
+whether it can represent the result, and returns a `FileResult`. No MuseScore
+process is required.
 
-### Vocal-only export
+The exactness gate belongs to analysis, not to export: a refusal the user only
+discovered at export would be a refusal the convertibility report had already
+cleared. `engine::target::validate_for` therefore runs the selected target's own
+arithmetic during analysis and discards the model, so the gate cannot drift from
+the write boundary. It is the one place the projection seam is deliberately
+one-directional.
 
-`export_svp` reparses the selected source and applies the explicit track
-overrides. It writes only the vocal-note project to a new path. Instrumental
-audio is intentionally absent.
+One gate answers for everything. Because a bundle now carries the chosen target's
+own project, its availability follows that target, so `bundle_ready` equals `ok`.
+It was asked of Synthesizer V independently while a bundle could only hold a
+`.svp`; keeping that would offer a bundle button for a source the bundle then
+refuses, moving the refusal to export time — the failure the gate exists to
+prevent. The field is retained for protocol stability, not because the two can
+diverge. A source the OpenUtau target refuses reaches a bundle by selecting
+Synthesizer V.
+
+### Target abstraction
+
+`ExportTarget` has two variants, `Svp` and `Ustx`, serialized as the stable
+lowercase protocol values `"svp"` and `"ustx"`, with Synthesizer V as the
+default so a caller naming no target keeps 0.4.9's behaviour.
+
+A target reads `ProjectedProject` and nothing else, so adding one cannot reach
+back into the conversion engine or change what another target writes. Everything
+a format decides for itself — its time grid, its marker vocabulary, its track
+cosmetics, its schema version — lives in its own module. Conversely,
+`projection.rs` holds no blicks, no colours, no display order and no rendered
+marker text.
+
+`SerializeError` keeps two arms apart because the Tauri boundary maps them to
+different codes: `Unrepresentable` is a target refusing this source and surfaces
+as `CONVERSION_FAILED`, while `Encode` is an encoder fault that says nothing
+about the source and surfaces as `SERIALIZE_FAILED`.
+
+### Vocals-only export
+
+`export_svp` reparses the selected source, applies the explicit track overrides,
+and writes only the vocal-note project to a new path in the format named by its
+`export_target` argument. The argument is optional and defaults to Synthesizer V.
+The output extension must match the chosen target. Instrumental audio is
+intentionally absent from both formats; a `.ustx` carries `wave_parts: []`.
 
 ### Complete bundle export
 
@@ -94,6 +138,23 @@ one `StemPlan`, builds the complete preservation ledger, probes MuseScore,
 extracts all score Parts, renders every expected Part and the original full
 score, validates all artifacts, and publishes a new bundle transactionally.
 There is no mixed-only or audio-less fallback.
+
+It takes an `export_target: Option<ExportTarget>` and writes that target's
+project into `project/`, referencing the same stems either way — SVP instrumental
+tracks in a `.svp`, `wave_parts` in a `.ustx`. `target` remains the destination
+path, not a format; the two parameters are independent.
+
+Adding the OpenUtau variant did not change the manifest schema. It stays at
+version 2 with every key's name intact, `svpGroupId` and
+`alignment.svpBlickOffset` included. `svpGroupId` carries the Synthesizer V group
+UUID for a `.svp` and must be the empty string for a `.ustx`, which verification
+enforces so no invented identity can slip in.
+
+Bundle verification is forked per target over one shared canonicalisation block,
+so both variants prove the same invariants: one project audio reference per stem,
+the muted full-score reference, and canonicalised paths confined to the bundle
+root. A committed `.ustx` is re-read through a strict reader that accepts only the
+layout the emitter writes.
 
 ## Source model
 
@@ -119,9 +180,10 @@ SourceTopology
             └── projection_track_ids
 ```
 
-Projection lanes are technical monophonic lanes required by Synthesizer V.
-They do not become fake source Parts or voices. Chord-member lanes stay grouped
-inside their original source voice and Part.
+Projection lanes are technical monophonic lanes required because a vocal lane is
+monophonic in both targets — a Synthesizer V vocal track and an OpenUtau
+`voice_part` alike. They do not become fake source Parts or voices. Chord-member
+lanes stay grouped inside their original source voice and Part.
 
 ## Authority separation
 
@@ -137,8 +199,12 @@ rewrite source role, copy lyrics from another track, or prove a vocal identity.
 ## Lyrics and no-invention policy
 
 - A real source `la` remains `la`.
-- A missing lyric stays empty; Verse never fills it.
-- `-` is emitted only from source continuation/extension evidence.
+- A missing lyric stays empty; Verse never fills it. In a `.ustx` that is
+  `lyric: ""`, a state no OpenUtau importer can produce.
+- A hold marker is emitted only from source continuation/extension evidence, and
+  each target spells it in its own vocabulary — `-` for Synthesizer V, `+~` for
+  OpenUtau. The projection carries `LyricState`, never rendered marker text, so
+  the two vocabularies can never be swapped.
 - Generic MIDI Text is metadata.
 - Soft Karaoke Text becomes lyric material only on a locally qualified
   karaoke track and only when the melody binding is unique, complete,
@@ -228,22 +294,29 @@ full mechanism is not yet present.
 | AD-8 | Recoverable typed jobs with bounded concurrency | Target; current UI has one busy guard and exports sequentially |
 | AD-9 | Narrow typed and handle-authorized IPC | Typed DTOs implemented; opaque handles are target |
 | AD-10 | Capability-bound renderer with no fallback | Implemented for MuseScore 3.6.2+/4.x |
-| AD-11 | Transactional no-replace publication | Implemented for `.svp` and bundle outputs |
+| AD-11 | Transactional no-replace publication | Implemented for `.svp`, `.ustx`, and bundle outputs |
 | AD-12 | Rust owns domain truth; React owns transient UI state | Implemented |
-| AD-13 | Persisted contracts have explicit compatibility ownership | Implemented for SVP v113 and bundle/ledger schema v2 |
+| AD-13 | Persisted contracts have explicit compatibility ownership | Implemented for SVP v113, USTX 0.6, and bundle/ledger schema v2 |
 | AD-14 | One bounded resource policy at trust boundaries | Implemented as explicit constants; central policy object is target |
 | AD-15 | Local structured observability without telemetry | Implemented through diagnostics, errors, manifests, and reports |
 | AD-16 | Release artifacts require evidence gates | Implemented in CI/release workflows |
 | AD-17 | Preserve the locked brownfield stack | Adopted |
 | AD-18 | One production parser authority per source family; no production fallback | Implemented |
 | AD-19 | Offline local desktop operational envelope | Implemented |
+| AD-20 | One target-neutral projection; each export target owns only its own format, and the exactness gate is target-parameterised at analysis time | Implemented for `.svp` and `.ustx` |
 
 ## Dependency and coding rules
 
 - Keep format-specific parsing in its adapter.
 - Keep cross-format evidence semantics in `midi.rs`/`convert.rs`.
-- Keep SVP serialization in `target/svp.rs`, and keep everything a second export
-  target would also need out of it and in `projection.rs`.
+- Keep SVP serialization in `target/svp.rs` and USTX serialization in
+  `target/ustx.rs`. Keep everything both targets need out of them and in
+  `projection.rs`: no blicks, no ticks-per-quarter, no colours, no display order,
+  no rendered marker text.
+- Keep target dispatch in `target/mod.rs`. Nothing above the write boundary
+  matches on `ExportTarget` except the code that chooses one.
+- Cite the OpenUtau source line for every format fact `target/ustx.rs` depends
+  on. The facts are read from the `0.1.568` sources, not from documentation.
 - Keep child-process control in `renderer.rs`.
 - Keep filesystem transaction and bundle validation in `bundle.rs`.
 - Do not solve format differences with a global nearest-note or cross-track
@@ -273,15 +346,22 @@ These are not missing parts of the current bundle v2 feature:
 - add Rust-to-TypeScript generated/fixture contract verification;
 - qualify blank lyrics, relative audio paths, Unicode, moves, and Save As
   across a supported Synthesizer V 1.x matrix;
+- confirm `lyric: ""` in a running OpenUtau. The representation is reasoned from
+  the `0.1.568` sources, not observed;
+- open a `.ustx` bundle in OpenUtau and confirm by ear that the stems play. The
+  references are written and verified against the manifest and the WAVs, but the
+  listening check has not been done;
 - qualify future MuseScore majors through a new capability profile and corpus;
-- support advanced navigation, intra-measure meters, native MuseScore tie
-  projection, SMPTE projection, or MIDI format 2 only after exact policies and
-  regression fixtures exist;
+- support advanced navigation, intra-measure meters, SMPTE projection, or MIDI
+  format 2 only after exact policies and regression fixtures exist. Native
+  MuseScore tie projection is shipped and is no longer deferred; the remaining
+  narrow case is a tie whose head is written in a later `<voice>` container of
+  the same measure;
 - add signing/notarization only with approved credentials and release policy.
 
 The implemented source topology, conservative KAR lyric binding, Part stems,
-bundle schema v2, MuseScore 3/4 profiles, and corpus runner are delivered
-architecture, not deferred work.
+bundle schema v2, MuseScore 3/4 profiles, corpus runner, and the two-target
+projection seam are delivered architecture, not deferred work.
 
 ## Change protocol
 

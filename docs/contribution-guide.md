@@ -1,9 +1,9 @@
 # Contribution Guide
 
-Verse converts source-owned musical evidence into Synthesizer V vocal
-projects and preservation bundles. Contributions must protect that evidence:
-successful conversion is never more important than avoiding fabricated or
-silently discarded content.
+Verse converts source-owned musical evidence into Synthesizer V `.svp` or
+OpenUtau `.ustx` vocal projects and preservation bundles. Contributions must
+protect that evidence: successful conversion is never more important than
+avoiding fabricated or silently discarded content.
 
 ## Development baseline
 
@@ -27,10 +27,10 @@ Start the desktop application with:
 npm run tauri -- dev
 ```
 
-MuseScore is not required for parser, projection, or vocal-only SVP work. A
-compatible user-installed MuseScore Studio 3.6.2 or 4 executable with
-`--score-parts` support is required for real reference-mix and Part-stem bundle
-tests.
+MuseScore is not required for parser, projection, or vocals-only export work in
+either target format. A compatible user-installed MuseScore Studio 3.6.2 or 4
+executable with `--score-parts` support is required for real reference-mix and
+Part-stem bundle tests.
 
 ## Architectural ownership
 
@@ -46,8 +46,14 @@ Keep responsibilities in their current boundaries:
 - `src-tauri/src/engine/convert.rs`: source classification, lyric ownership,
   vocal projection, and diagnostics;
 - `src-tauri/src/engine/projection.rs`: the target-neutral projection only — no
-  blicks, colours, display order or rendered marker text;
+  blicks, ticks-per-quarter, colours, display order or rendered marker text;
+- `src-tauri/src/engine/target/mod.rs`: `ExportTarget`, the analysis gate
+  `validate_for`, and the single write boundary `serialize_to`. Nothing above
+  this module matches on the target except the code that chooses one;
 - `src-tauri/src/engine/target/svp.rs`: SVP serialization only;
+- `src-tauri/src/engine/target/ustx.rs`: USTX serialization only. Every OpenUtau
+  format fact must cite the `0.1.568` source line that establishes it, read from
+  the source rather than from documentation;
 - `src-tauri/src/stems.rs`: source Part stem planning;
 - `src-tauri/src/renderer.rs`: bounded MuseScore process adapter;
 - `src-tauri/src/bundle.rs`: ledger, manifest, validation, and transactional
@@ -65,11 +71,23 @@ the same change.
 
 The following rules are release invariants:
 
-- Absence of a lyric remains an empty lyric. Never insert `la`, `あ`, a
-  default syllable, or a phonetic substitute.
-- Insert `-` only when a source extension or continuation proves it.
-- Preserve source lyric text. Vocal-language selection configures the target
-  voice language; it does not translate or normalize the words.
+- Absence of a lyric remains an empty lyric. Never insert `la`, `a`, `あ`, a
+  default syllable, or a phonetic substitute. In a `.ustx` an untexted note is
+  `lyric: ""`; `"+~"` would claim a hold and `"R"` would claim a rest.
+- Insert a hold or split marker only when a source extension or continuation
+  proves it, and let each target spell it in its own vocabulary — `-`/`+` for
+  Synthesizer V, `+~`/`+` for OpenUtau. Never carry rendered marker text through
+  the projection, and never map one target's markers onto the other's by string
+  substitution: `-` and `+~` mean the hold, `+` alone means the split.
+- Preserve source lyric text byte for byte. There is no language selection and
+  nothing about lyric text depends on one; never translate or normalize the
+  words.
+- Never name a Synthesizer V voice database, an OpenUtau singer, or a renderer in
+  the output. Verse has not seen the voice a track will be sung with.
+- Refuse rather than round. Timing that does not divide exactly into the selected
+  target's grid must fail with the tick and PPQ named, leaving the source
+  untouched. A target-specific refusal must be reachable from the analysis gate,
+  never only at export.
 - Generic MIDI Text is metadata. Treat it as a karaoke lyric only when the
   exact source track carries the required local karaoke evidence.
 - Never invent C4 or another pitch for an unpitched source without an explicit
@@ -153,6 +171,11 @@ Add tests at the boundary that owns the behavior:
 | MuseScore/MSCZ behavior | unit tests in `engine/musescore.rs` |
 | Cross-format semantic parity | `src-tauri/tests/parity.rs` |
 | Source and no-invention contract | `src-tauri/tests/source_fidelity.rs` |
+| Target-neutral projection | unit tests in `engine/projection.rs` |
+| SVP shape, blicks, or v113 compatibility | unit tests in `engine/target/svp.rs` |
+| USTX shape, 480-tick gate, markers, or YAML bytes | unit tests in `engine/target/ustx.rs` |
+| Target dispatch, gate/write agreement, protocol values | unit tests in `engine/target/mod.rs` |
+| Lyric text of any language reaching the output | `src-tauri/tests/language_fidelity.rs` |
 | Stem planning | unit tests in `stems.rs` |
 | MuseScore process, capabilities, limits, WAV validation | unit tests in `renderer.rs` |
 | Bundle layout, ledger, rollback, integrity | unit tests in `bundle.rs` |
@@ -258,9 +281,14 @@ process behavior.
 
 ## Release-sensitive changes
 
-Changes to persisted SVP or bundle schemas, renderer qualification, Tauri IPC,
-resource limits, supported platforms, version files, GitHub Actions, or
-release asset naming require explicit compatibility review.
+Changes to persisted SVP or USTX output, bundle schemas, the `ExportTarget`
+protocol values, renderer qualification, Tauri IPC, resource limits, supported
+platforms, version files, GitHub Actions, or release asset naming require
+explicit compatibility review.
+
+`"svp"` and `"ustx"` are a protocol contract with the webview: renaming one
+silently breaks the target selector. Synthesizer V must stay the default, so a
+caller that names no target keeps 0.4.9's behaviour.
 
 For workflow changes:
 
