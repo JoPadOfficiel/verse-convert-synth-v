@@ -119,6 +119,9 @@ export type FileResult = {
   tracks: TrackInfo[];
   audioStatus: AudioStatus;
   requiresVoiceAssignment: boolean;
+  /** A complete bundle always writes a Synthesizer V project, so this stays true
+   *  for a source only the OpenUtau target refuses. */
+  bundleReady: boolean;
   warnings: Diagnostic[];
   out: string | null;
 };

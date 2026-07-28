@@ -100,6 +100,10 @@ pub struct ConvertOutcome {
     pub tracks: Vec<TrackReport>,
     pub n_tracks: usize,
     pub placed: usize,
+    /// Whether Synthesizer V can represent this source, whatever target was
+    /// asked for. A complete bundle always writes a Synthesizer V project, so its
+    /// availability must not depend on a refusal that belongs to another target.
+    pub bundle_ready: bool,
     pub projection: ProjectionEvidence,
 }
 
@@ -691,6 +695,7 @@ pub fn convert_auto_with(
         tracks: vec![],
         n_tracks: 0,
         placed: 0,
+        bundle_ready: false,
         projection: ProjectionEvidence::default(),
     };
     if mx::looks_like_xml(data) {
@@ -741,6 +746,7 @@ pub fn convert_bytes(data: &[u8], language: &str) -> ConvertOutcome {
                 tracks: vec![],
                 n_tracks: 0,
                 placed: 0,
+                bundle_ready: false,
                 projection: ProjectionEvidence::default(),
             }
         }
@@ -791,6 +797,7 @@ pub fn convert_midi_with_target(
         tracks: vec![],
         n_tracks: 0,
         placed: 0,
+        bundle_ready: false,
         projection: ProjectionEvidence::default(),
     };
     let tpb = match midi.time_base {
@@ -1037,7 +1044,21 @@ pub fn convert_midi_with_target(
         // Appended last, and per note rather than aggregated, because each one
         // names the exact note whose word the target's application will read
         // differently. Empty for every target that reinterprets nothing.
-        warnings.extend(lyric_diagnostics);
+        // One vector is shared by every lane group of this source track, and each
+        // group walks the same notes. With verses stacked under one melody and no
+        // repeat pass per verse, a word common to several passes is therefore
+        // reported once per group with an identical code, message and note ID, so
+        // the per-note audit would overstate how many notes are affected. Keep the
+        // first of each identical triple; a genuinely different message on the same
+        // note is a different reinterpretation and must survive.
+        let mut seen: BTreeSet<(String, Option<String>, String)> = BTreeSet::new();
+        warnings.extend(lyric_diagnostics.into_iter().filter(|diagnostic| {
+            seen.insert((
+                diagnostic.code.clone(),
+                diagnostic.source_id.clone(),
+                diagnostic.message.clone(),
+            ))
+        }));
         report.push(TrackReport {
             id: index,
             source_id: track.id.clone(),
@@ -1083,19 +1104,25 @@ pub fn convert_midi_with_target(
     // septuplet. Asking one target on behalf of another would clear a source the
     // other must refuse, and the refusal would resurface at export, which is the
     // very thing the paragraph above exists to prevent.
+    // Asked of Synthesizer V regardless of the chosen target: a complete bundle
+    // always writes a `.svp`, so a source OpenUtau refuses must not lose the bundle
+    // that 0.4.9 would have written for it.
+    let bundle_ready = crate::engine::target::validate_for(ExportTarget::Svp, &projected).is_ok();
     if let Err(error) = crate::engine::target::validate_for(target, &projected) {
         // Synthesizer V keeps 0.4.9's wording verbatim, because every refusal it
         // can raise really is a timing refusal. OpenUtau also refuses a syllable
         // split, a chord in one monophonic lane and a held syllable across a gap,
         // none of which is about timing, so telling the user to fix timing would
         // send them after the wrong thing.
-        return fail(match target {
+        let mut refused = fail(match target {
             ExportTarget::Svp => format!("source timing cannot be projected safely: {error}"),
             ExportTarget::Ustx => format!(
                 "the source cannot be projected safely to {}: {error}",
                 target.display_name()
             ),
         });
+        refused.bundle_ready = bundle_ready;
+        return refused;
     }
     let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
@@ -1106,6 +1133,7 @@ pub fn convert_midi_with_target(
         tracks: report,
         n_tracks,
         placed: total_placed,
+        bundle_ready,
         projection,
     }
 }

@@ -447,7 +447,9 @@ export default function App() {
     });
   }
 
-  const validItems = items.filter((item) => item.ok);
+  // A bundle always carries a Synthesizer V project, so a source only the
+  // OpenUtau target refuses can still be bundled.
+  const validItems = items.filter((item) => item.ok || item.bundleReady);
   const cycleTheme = () =>
     setTheme(
       theme === "dark" ? "light" : theme === "light" ? "system" : "dark",

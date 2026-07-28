@@ -328,7 +328,12 @@ function Row({
             />
           )}
         </button>
-        {item.ok && (
+        {/* `bundleReady` rather than `item.ok`: a bundle always carries a
+            Synthesizer V project, so a source only the OpenUtau target refuses
+            must not lose the bundle Verse would otherwise write for it. The
+            vocals button below stays on `item.ok`, because that one really does
+            write the selected target. */}
+        {(item.ok || item.bundleReady) && (
           <div className="flex shrink-0 flex-col gap-1">
             <Button
               size="sm"

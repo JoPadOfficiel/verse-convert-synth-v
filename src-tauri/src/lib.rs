@@ -84,6 +84,10 @@ pub struct FileResult {
     pub tracks: Vec<TrackInfo>,
     pub audio_status: AudioStatusDto,
     pub requires_voice_assignment: bool,
+    /// Whether a complete bundle can be written for this source. A bundle always
+    /// writes a Synthesizer V project, so this stays true for a source only the
+    /// OpenUtau target refuses.
+    pub bundle_ready: bool,
     pub warnings: Vec<Diagnostic>,
     pub out: Option<String>,
 }
@@ -347,6 +351,7 @@ fn process_one(
         tracks: vec![],
         audio_status: AudioStatusDto::NotRendered,
         requires_voice_assignment: false,
+        bundle_ready: false,
         warnings: vec![],
         out: None,
     };
@@ -486,6 +491,7 @@ fn process_one(
         tracks,
         audio_status: AudioStatusDto::NotRendered,
         requires_voice_assignment,
+        bundle_ready: r.bundle_ready,
         warnings,
         out,
     }
