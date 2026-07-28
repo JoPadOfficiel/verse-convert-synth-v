@@ -282,6 +282,9 @@ export default function App() {
             [item.path]: progress,
           }));
         },
+        // The bundle carries the selected target's project, referencing the same
+        // stems the other target would.
+        exportTarget,
       );
       setItems((previous) =>
         previous.map((candidate) =>
@@ -447,8 +450,9 @@ export default function App() {
     });
   }
 
-  // A bundle always carries a Synthesizer V project, so a source only the
-  // OpenUtau target refuses can still be bundled.
+  // `bundleReady` is the backend's own answer to "can a bundle be written for
+  // this source", for the target that was analysed. The bundle carries that
+  // target's project, so this list is the set of rows a bundle export can act on.
   const validItems = items.filter((item) => item.ok || item.bundleReady);
   const cycleTheme = () =>
     setTheme(
@@ -511,7 +515,7 @@ export default function App() {
               <button
                 disabled={busy}
                 onClick={() => void changeTarget("svp")}
-                title="Write a Synthesizer V .svp project"
+                title="Write a Synthesizer V .svp project, in a vocal-only export and inside a complete bundle alike"
                 className={
                   "px-3 py-1 text-sm disabled:opacity-50 " +
                   (exportTarget === "svp"
@@ -524,7 +528,7 @@ export default function App() {
               <button
                 disabled={busy}
                 onClick={() => void changeTarget("ustx")}
-                title="Write an OpenUtau .ustx project"
+                title="Write an OpenUtau .ustx project, in a vocal-only export and inside a complete bundle alike"
                 className={
                   "px-3 py-1 text-sm disabled:opacity-50 " +
                   (exportTarget === "ustx"

@@ -5,7 +5,7 @@ pub mod stems;
 
 use bundle::{
     build_preservation_ledger, export_bundle_with_progress as write_bundle, BundleInput,
-    BundleLayout, BundleProgressEvent, BundleRequest, BundleResult,
+    BundleLayout, BundleProgressEvent, BundleProject, BundleRequest, BundleResult,
 };
 use engine::convert::{
     convert_midi_with_target, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState,
@@ -619,14 +619,22 @@ fn source_format_name(format: SourceFormat) -> &'static str {
     }
 }
 
+/// Writes one complete preservation bundle.
+///
+/// `target` is the **destination path**, which it has been since the bundle
+/// shipped, so the project format inside the bundle is `export_target` — optional,
+/// defaulting to Synthesizer V, so a caller that names no format writes 0.4.9's
+/// bundle exactly.
 fn export_bundle_blocking(
     path: String,
     target: String,
     language: Option<String>,
     overrides: Option<HashMap<String, bool>>,
     renderer_path: Option<String>,
+    export_target: Option<ExportTarget>,
     progress: &(dyn Fn(BundleProgressEvent) + Sync),
 ) -> Result<BundleResult, CommandErrorDto> {
+    let export_target = export_target.unwrap_or_default();
     let source_path = PathBuf::from(&path);
     let extension = source_path
         .extension()
@@ -657,13 +665,14 @@ fn export_bundle_blocking(
         .into_iter()
         .filter_map(|(key, value)| key.parse::<usize>().ok().map(|key| (key, value)))
         .collect();
-    // A bundle carries a Synthesizer V project, so it gates on that target.
-    // `.ustx` inside a `.versebundle` is the next spec.
+    // A bundle carries the chosen target's project, so it gates on that target: a
+    // source OpenUtau cannot represent must be refused here, before any staging
+    // exists, rather than surfacing after the renderer has run.
     let outcome = engine::convert::convert_midi_with_target(
         &midi,
         language.as_deref().unwrap_or("english"),
         Some(&parsed_overrides),
-        ExportTarget::Svp,
+        export_target,
     );
     if !outcome.ok {
         return Err(CommandErrorDto::new(
@@ -685,7 +694,8 @@ fn export_bundle_blocking(
             )
         })?
         .to_string();
-    let layout = BundleLayout::new(&destination, &original_name).map_err(CommandErrorDto::from)?;
+    let layout = BundleLayout::new(&destination, &original_name, export_target)
+        .map_err(CommandErrorDto::from)?;
     let stem_plan = stems::StemPlan::from_source(&midi, &outcome.tracks)
         .map_err(|error| CommandErrorDto::new("STEM_PLAN_INVALID", error.to_string()))?;
     let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
@@ -707,13 +717,19 @@ fn export_bundle_blocking(
             }
         })
         .collect();
-    let projected = outcome
-        .svp
-        .ok_or_else(|| CommandErrorDto::new("CONVERSION_FAILED", "no SVP project produced"))?;
-    // The neutral projection becomes a Synthesizer V project at this boundary,
-    // before the transaction starts; the bundle then appends its real
-    // audio-backed stem tracks to that shape.
-    let project = engine::target::svp::serialize(&projected)
+    let projected = outcome.svp.ok_or_else(|| {
+        CommandErrorDto::new(
+            "CONVERSION_FAILED",
+            format!(
+                "no {} project produced",
+                export_target.extension().to_ascii_uppercase()
+            ),
+        )
+    })?;
+    // The neutral projection becomes the chosen target's project at this boundary,
+    // before the transaction starts; the bundle then appends its real audio-backed
+    // stem references to whichever shape it received.
+    let project = BundleProject::from_projection(export_target, &projected)
         .map_err(|message| CommandErrorDto::new("CONVERSION_FAILED", message))?;
 
     let config = MuseScoreConfig {
@@ -755,12 +771,21 @@ async fn export_bundle(
     language: Option<String>,
     overrides: Option<HashMap<String, bool>>,
     renderer_path: Option<String>,
+    export_target: Option<ExportTarget>,
     on_progress: Channel<BundleProgressEvent>,
 ) -> Result<BundleResult, CommandErrorDto> {
     tauri::async_runtime::spawn_blocking(move || {
-        export_bundle_blocking(path, target, language, overrides, renderer_path, &|event| {
-            let _ = on_progress.send(event);
-        })
+        export_bundle_blocking(
+            path,
+            target,
+            language,
+            overrides,
+            renderer_path,
+            export_target,
+            &|event| {
+                let _ = on_progress.send(event);
+            },
+        )
     })
     .await
     .map_err(|error| {

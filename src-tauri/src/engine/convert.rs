@@ -100,9 +100,11 @@ pub struct ConvertOutcome {
     pub tracks: Vec<TrackReport>,
     pub n_tracks: usize,
     pub placed: usize,
-    /// Whether Synthesizer V can represent this source, whatever target was
-    /// asked for. A complete bundle always writes a Synthesizer V project, so its
-    /// availability must not depend on a refusal that belongs to another target.
+    /// Whether a complete preservation bundle can be written for this source.
+    ///
+    /// A bundle carries the requested target's own project, so this follows that
+    /// target: the webview asks one question and never has to re-derive which
+    /// format's rules apply to the bundle.
     pub bundle_ready: bool,
     pub projection: ProjectionEvidence,
 }
@@ -1104,25 +1106,24 @@ pub fn convert_midi_with_target(
     // septuplet. Asking one target on behalf of another would clear a source the
     // other must refuse, and the refusal would resurface at export, which is the
     // very thing the paragraph above exists to prevent.
-    // Asked of Synthesizer V regardless of the chosen target: a complete bundle
-    // always writes a `.svp`, so a source OpenUtau refuses must not lose the bundle
-    // that 0.4.9 would have written for it.
-    let bundle_ready = crate::engine::target::validate_for(ExportTarget::Svp, &projected).is_ok();
+    // A complete bundle now carries the chosen target's own project, so its
+    // availability follows that target too. It was asked of Synthesizer V while a
+    // bundle could only hold a `.svp`; keeping that would offer a bundle button for
+    // a source the bundle then refuses, which is the failure this whole block
+    // exists to prevent.
     if let Err(error) = crate::engine::target::validate_for(target, &projected) {
         // Synthesizer V keeps 0.4.9's wording verbatim, because every refusal it
         // can raise really is a timing refusal. OpenUtau also refuses a syllable
         // split, a chord in one monophonic lane and a held syllable across a gap,
         // none of which is about timing, so telling the user to fix timing would
         // send them after the wrong thing.
-        let mut refused = fail(match target {
+        return fail(match target {
             ExportTarget::Svp => format!("source timing cannot be projected safely: {error}"),
             ExportTarget::Ustx => format!(
                 "the source cannot be projected safely to {}: {error}",
                 target.display_name()
             ),
         });
-        refused.bundle_ready = bundle_ready;
-        return refused;
     }
     let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
@@ -1133,7 +1134,10 @@ pub fn convert_midi_with_target(
         tracks: report,
         n_tracks,
         placed: total_placed,
-        bundle_ready,
+        // The gate above cleared this target, which is the target the bundle
+        // carries, so the bundle is available for exactly the sources the vocal
+        // export is.
+        bundle_ready: true,
         projection,
     }
 }

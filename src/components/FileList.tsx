@@ -33,22 +33,30 @@ const ROLE_LABEL: Record<SourceRole, string> = {
 
 /**
  * The words this copy borrows from the selected export target. Each target names
- * its own file format and its own singing-voice concept: Synthesizer V assigns a
- * voice database, OpenUtau assigns a singer.
+ * its own file format, its own singing-voice concept — Synthesizer V assigns a
+ * voice database, OpenUtau assigns a singer — and its own way of referencing the
+ * bundle's rendered audio.
  */
 const TARGET_COPY: Record<
   ExportTarget,
-  { format: string; assignVoice: string; assignVoiceInApp: string }
+  {
+    format: string;
+    assignVoice: string;
+    assignVoiceInApp: string;
+    audioReference: string;
+  }
 > = {
   svp: {
     format: "SVP",
     assignVoice: "Assign a Synthesizer V voice before playback",
     assignVoiceInApp: "A voice database must be assigned in Synthesizer V.",
+    audioReference: "audio-backed instrumental track",
   },
   ustx: {
     format: "USTX",
     assignVoice: "Assign an OpenUtau singer before playback",
     assignVoiceInApp: "A singer must be assigned in OpenUtau.",
+    audioReference: "wave part",
   },
 };
 
@@ -345,20 +353,17 @@ function Row({
             />
           )}
         </button>
-        {/* `bundleReady` rather than `item.ok`: a bundle always carries a
-            Synthesizer V project, so a source only the OpenUtau target refuses
-            must not lose the bundle Verse would otherwise write for it. The
-            vocals button below stays on `item.ok`, because that one really does
-            write the selected target. */}
+        {/* `bundleReady` rather than `item.ok`: the backend answers whether a
+            bundle can be written for this source, so the webview never re-derives
+            which format's rules the bundle is held to. */}
         {(item.ok || item.bundleReady) && (
           <div className="flex shrink-0 flex-col gap-1">
             <Button
               size="sm"
               disabled={busy}
-              // The bundle always carries a Synthesizer V project, whatever the
-              // export target selects: `.ustx` inside a `.versebundle` is not
-              // shipped, so naming the format here would be wrong.
-              title="Create an auditable bundle with source, a Synthesizer V project, one audio stem per MuseScore Part, and a muted full-score reference"
+              // The bundle carries the selected target's project, referencing the
+              // same stems the other target would reference.
+              title={`Create an auditable bundle with source, a ${TARGET_COPY[exportTarget].format} project, one audio stem per MuseScore Part, and a muted full-score reference`}
               onClick={() => onBundle(item)}
             >
               <DownloadIcon /> Complete project
@@ -382,9 +387,10 @@ function Row({
       {open && item.ok && (
         <div className="border-t px-4 py-2 pl-11">
           <p className="mb-2 text-xs text-muted-foreground">
-            Each note-bearing source Part becomes its own MuseScore-rendered
-            audio track. Vocal reference Parts and the full-score reference are
-            muted by default; accompaniment Parts remain audible.
+            Each note-bearing source Part becomes its own MuseScore-rendered{" "}
+            {TARGET_COPY[exportTarget].audioReference}. Vocal reference Parts and
+            the full-score reference are muted by default; accompaniment Parts
+            remain audible.
           </p>
           {item.parts.map((part) => (
             <PartRow

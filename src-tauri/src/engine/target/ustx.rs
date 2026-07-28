@@ -76,6 +76,10 @@ pub struct UstxProject {
     pub tempos: Vec<UstxTempo>,
     pub tracks: Vec<UstxTrack>,
     pub voice_parts: Vec<UstxVoicePart>,
+    /// Audio parts. A projection carries no audio, so [`serialize`] always leaves
+    /// this empty; only a preservation bundle, which owns real rendered WAVs, adds
+    /// one through [`append_wave_part`].
+    pub wave_parts: Vec<UstxWavePart>,
 }
 
 /// Bar-indexed, exactly like Synthesizer V's meter, so no arithmetic converts it.
@@ -206,6 +210,124 @@ impl Default for UstxVibrato {
             drift: 0.0,
         }
     }
+}
+
+/// One audio part: a WAV the project plays as it stands, with no note, no lyric
+/// and no singer.
+///
+/// `UWavePart.AfterLoad` resolves the file as
+/// `Path.GetFullPath(Path.Combine(Path.GetDirectoryName(project.FilePath), relativePath))`,
+/// so `relative_path` is relative to the `.ustx` file's **own directory** and
+/// `../audio/…` reaches out of the directory the project sits in — exactly as the
+/// Synthesizer V case does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UstxWavePart {
+    /// Discarded on load: the `FilePath` setter assigns
+    /// `name = Path.GetFileName(value)` and `AfterLoad` sets `FilePath` from
+    /// `relative_path`, so OpenUtau always shows the file's own name whatever this
+    /// says. [`append_wave_part`] therefore writes exactly that, and the
+    /// human-readable label lives on the track, where it survives.
+    pub name: String,
+    pub comment: String,
+    /// `UProject.AfterLoad` indexes `tracks[part.trackNo]` with no bounds check,
+    /// so every wave part must name a track the project actually holds.
+    pub track_no: i32,
+    /// Ticks, on the same 480-per-quarter grid as a note.
+    pub position: i32,
+    pub relative_path: String,
+    /// Milliseconds. `UWavePart.fileDurationMs` is a C# `double`; `Load` replaces
+    /// it with the opened file's own length and falls back to what is written here
+    /// only when the file cannot be opened.
+    pub file_duration_ms: f64,
+    /// Ticks cut from the head of the file, per `GetSkipMs`.
+    pub skip: i32,
+    /// Ticks cut from the tail of the file, per `GetTrimMs`.
+    pub trim: i32,
+    /// Ticks of fade applied by `TrimSamples`.
+    pub fadein: i32,
+    pub fadeout: i32,
+}
+
+/// The declared length of a wave part, in milliseconds, from the two integers a
+/// WAV header states.
+///
+/// Derived from `frames` and `sample_rate` and never from a seconds-valued float:
+/// `frames * 1000` is exact in an `f64` for any WAV a bundle accepts, so a single
+/// division yields the correctly rounded value of the exact rational, while
+/// multiplying an already-rounded seconds quotient by 1000 rounds twice and can
+/// land on a different double.
+pub fn file_duration_ms(frames: u64, sample_rate: u32) -> f64 {
+    frames as f64 * 1000.0 / f64::from(sample_rate)
+}
+
+/// The name OpenUtau keeps for a wave part: the file's own name, because
+/// `UWavePart.FilePath`'s setter assigns `name = Path.GetFileName(value)` and
+/// `AfterLoad` sets `FilePath` from `relative_path`. Bundle references are always
+/// `/`-joined, which is the separator this splits on.
+fn wave_part_name(relative_path: &str) -> String {
+    relative_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(relative_path)
+        .to_string()
+}
+
+/// Adds one real audio-backed wave part, and the track it sits on, to a project
+/// this module already built.
+///
+/// The track is not optional: `UProject.AfterLoad` dereferences
+/// `tracks[part.trackNo]` unguarded, so a wave part without one makes the project
+/// unopenable. It carries the mute state because OpenUtau has no per-part mute —
+/// the same place Synthesizer V keeps it, on the track rather than on the
+/// reference.
+///
+/// Every other field states "play this file from the start, whole": `position`,
+/// `skip`, `trim`, `fadein` and `fadeout` are all `0`, which is the same claim the
+/// Synthesizer V path makes with `blickOffset: 0`. Returns the `track_no` the part
+/// was placed on.
+pub fn append_wave_part(
+    project: &mut UstxProject,
+    track_name: String,
+    relative_path: String,
+    frames: u64,
+    sample_rate: u32,
+    muted: bool,
+) -> Result<i32, String> {
+    // `UPart.trackNo` is a C# `int`, so a project with more lanes than that range
+    // must be refused rather than wrapped onto another track's audio.
+    let track_no = i32::try_from(project.tracks.len()).map_err(|_| {
+        "the project holds more tracks than OpenUtau stores a track index in".to_string()
+    })?;
+    let file_duration_ms = file_duration_ms(frames, sample_rate);
+    // `validate_wav` refuses a zero sample rate or frame count before a bundle
+    // ever reaches here, but a length YAML cannot state as a number must not be
+    // written even so: YamlDotNet would read `inf` back as a string.
+    if !file_duration_ms.is_finite() {
+        return Err(format!(
+            "{relative_path} states no length OpenUtau can hold in milliseconds \
+             ({frames} frames at {sample_rate} Hz)"
+        ));
+    }
+    project.tracks.push(UstxTrack {
+        phonemizer: DEFAULT_PHONEMIZER.into(),
+        track_name,
+        mute: muted,
+        solo: false,
+        volume: 0.0,
+    });
+    project.wave_parts.push(UstxWavePart {
+        name: wave_part_name(&relative_path),
+        comment: String::new(),
+        track_no,
+        position: 0,
+        relative_path,
+        file_duration_ms,
+        skip: 0,
+        trim: 0,
+        fadein: 0,
+        fadeout: 0,
+    });
+    Ok(track_no)
 }
 
 /// Converts a tick **quantity** onto OpenUtau's fixed 480-per-quarter grid — a
@@ -436,6 +558,9 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
         tempos,
         tracks,
         voice_parts,
+        // A projection carries notes and lyrics, never audio. Real rendered WAVs
+        // exist only inside a preservation bundle, which appends them itself.
+        wave_parts: Vec::new(),
     })
 }
 
@@ -659,9 +784,242 @@ pub fn to_yaml(project: &UstxProject) -> String {
             out.push_str("    curves: []\n");
         }
     }
-    // Audio belongs to the preservation bundle, which is the next spec.
-    out.push_str("wave_parts: []\n");
+    // Audio reaches a project only through a preservation bundle, which owns the
+    // rendered WAVs. A vocal-only export states an empty list rather than omitting
+    // the key, for the same reason every other list does.
+    if project.wave_parts.is_empty() {
+        out.push_str("wave_parts: []\n");
+    } else {
+        out.push_str("wave_parts:\n");
+        for part in &project.wave_parts {
+            // `UWavePart`'s members are ordered by `[YamlMember(Order = 100..105)]`
+            // after the four `UPart` fields, which is the order written here.
+            out.push_str(&format!("  - name: {}\n", quoted(&part.name)));
+            out.push_str(&format!("    comment: {}\n", quoted(&part.comment)));
+            out.push_str(&format!("    track_no: {}\n", part.track_no));
+            out.push_str(&format!("    position: {}\n", part.position));
+            out.push_str(&format!(
+                "    relative_path: {}\n",
+                quoted(&part.relative_path)
+            ));
+            out.push_str(&format!(
+                "    file_duration_ms: {}\n",
+                number(part.file_duration_ms)
+            ));
+            out.push_str(&format!("    skip: {}\n", part.skip));
+            out.push_str(&format!("    trim: {}\n", part.trim));
+            out.push_str(&format!("    fadein: {}\n", part.fadein));
+            out.push_str(&format!("    fadeout: {}\n", part.fadeout));
+        }
+    }
     out
+}
+
+/// Everything a preservation bundle has to be able to prove about a `.ustx` it
+/// committed, read back from the file's own bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditedProject {
+    /// One entry per `tracks:` item, in file order — the order `track_no` indexes,
+    /// because `UProject.AfterLoad` does `tracks[part.trackNo]`.
+    pub track_mutes: Vec<bool>,
+    pub wave_parts: Vec<AuditedWavePart>,
+}
+
+/// One `wave_parts:` item as the file states it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditedWavePart {
+    /// The scalar exactly as written, quotes and escapes included, so a caller
+    /// compares bytes against [`quoted`] instead of reversing an escape and
+    /// risking a mismatch between the two directions.
+    pub relative_path_scalar: String,
+    pub track_no: i32,
+    pub position: i32,
+    pub file_duration_ms: f64,
+    pub skip: i32,
+    pub trim: i32,
+    pub fadein: i32,
+    pub fadeout: i32,
+}
+
+const TRACK_MEMBERS: [&str; 5] = ["phonemizer", "track_name", "mute", "solo", "volume"];
+const WAVE_PART_MEMBERS: [&str; 10] = [
+    "name",
+    "comment",
+    "track_no",
+    "position",
+    "relative_path",
+    "file_duration_ms",
+    "skip",
+    "trim",
+    "fadein",
+    "fadeout",
+];
+
+/// Reads the audio facts back out of a project [`to_yaml`] wrote.
+///
+/// Deliberately not a YAML parser and deliberately not tolerant: it accepts
+/// exactly the layout this emitter produces — a top-level key in column zero, one
+/// `  - ` item head, `    key: value` members — and refuses anything else instead
+/// of guessing. A bundle has to prove what the file it is about to commit actually
+/// states, and a reader that accepted a shape this emitter never writes would be
+/// proving something about its own tolerance instead. Blocks other than `tracks:`
+/// and `wave_parts:` are skipped whole, because no audio invariant lives in them.
+pub fn audit(yaml: &str) -> Result<AuditedProject, String> {
+    let mut track_mutes: Option<Vec<bool>> = None;
+    let mut wave_parts: Option<Vec<AuditedWavePart>> = None;
+    let mut lines = yaml.lines().peekable();
+    while let Some(line) = lines.next() {
+        // Every scalar this emitter writes is indented, and `quoted` escapes every
+        // character a YAML reader could take for a line break, so a line in column
+        // zero is always a key and never source text.
+        let (key, rest) = line
+            .split_once(':')
+            .filter(|_| !line.starts_with(' '))
+            .ok_or_else(|| format!("{line:?} is not a top-level key of a Verse-written project"))?;
+        match key {
+            "tracks" => {
+                if track_mutes.is_some() {
+                    return Err("the project states tracks twice".into());
+                }
+                let mut mutes = Vec::with_capacity(4);
+                for item in read_block(key, rest, &mut lines)? {
+                    let members = checked_members("a track", &item, &TRACK_MEMBERS)?;
+                    mutes.push(match member("a track", &members, "mute")? {
+                        "true" => true,
+                        "false" => false,
+                        other => {
+                            return Err(format!("a track states a mute of {other:?}"));
+                        }
+                    });
+                }
+                track_mutes = Some(mutes);
+            }
+            "wave_parts" => {
+                if wave_parts.is_some() {
+                    return Err("the project states wave parts twice".into());
+                }
+                let mut parts = Vec::with_capacity(4);
+                for item in read_block(key, rest, &mut lines)? {
+                    let members = checked_members("a wave part", &item, &WAVE_PART_MEMBERS)?;
+                    parts.push(AuditedWavePart {
+                        relative_path_scalar: member("a wave part", &members, "relative_path")?
+                            .to_string(),
+                        track_no: integer(&members, "track_no")?,
+                        file_duration_ms: member("a wave part", &members, "file_duration_ms")?
+                            .parse()
+                            .map_err(|_| {
+                                "a wave part states a file duration that is not a number"
+                                    .to_string()
+                            })?,
+                        position: integer(&members, "position")?,
+                        skip: integer(&members, "skip")?,
+                        trim: integer(&members, "trim")?,
+                        fadein: integer(&members, "fadein")?,
+                        fadeout: integer(&members, "fadeout")?,
+                    });
+                }
+                wave_parts = Some(parts);
+            }
+            _ => skip_block(&mut lines),
+        }
+    }
+    Ok(AuditedProject {
+        track_mutes: track_mutes.ok_or_else(|| "the project states no tracks".to_string())?,
+        wave_parts: wave_parts.ok_or_else(|| "the project states no wave parts".to_string())?,
+    })
+}
+
+/// Collects one block's items. An empty block is the literal `[]` this emitter
+/// writes; anything else on the key's own line is a shape it never writes.
+fn read_block<'a>(
+    key: &str,
+    rest: &str,
+    lines: &mut std::iter::Peekable<std::str::Lines<'a>>,
+) -> Result<Vec<Vec<(&'a str, &'a str)>>, String> {
+    if rest == " []" {
+        return Ok(Vec::new());
+    }
+    if !rest.is_empty() {
+        return Err(format!("{key} states {rest:?} where a block was written"));
+    }
+    let mut items: Vec<Vec<(&'a str, &'a str)>> = Vec::new();
+    // Copied out of the peek so the block below can consume the line it just read.
+    while let Some(&line) = lines.peek() {
+        let member = if let Some(head) = line.strip_prefix("  - ") {
+            items.push(Vec::with_capacity(WAVE_PART_MEMBERS.len()));
+            head
+        } else if let Some(member) = line.strip_prefix("    ") {
+            member
+        } else if line.starts_with(' ') {
+            return Err(format!(
+                "{key} holds {line:?}, which this emitter never writes"
+            ));
+        } else {
+            break;
+        };
+        if member.starts_with(' ') {
+            return Err(format!(
+                "{key} holds {line:?}, which this emitter never writes"
+            ));
+        }
+        let entry = member
+            .split_once(": ")
+            .ok_or_else(|| format!("{key} holds a member {member:?} that states no value"))?;
+        items
+            .last_mut()
+            .ok_or_else(|| format!("{key} states a member before any item"))?
+            .push(entry);
+        lines.next();
+    }
+    Ok(items)
+}
+
+fn skip_block(lines: &mut std::iter::Peekable<std::str::Lines<'_>>) {
+    while lines.peek().is_some_and(|line| line.starts_with(' ')) {
+        lines.next();
+    }
+}
+
+/// Every member the emitter writes for this item and nothing besides. An unknown
+/// or repeated key is refused rather than ignored: a near-miss spelling is exactly
+/// how a verified field would stop being the field that was verified.
+fn checked_members<'a>(
+    kind: &str,
+    item: &[(&'a str, &'a str)],
+    allowed: &[&str],
+) -> Result<BTreeMap<&'a str, &'a str>, String> {
+    let mut members = BTreeMap::new();
+    for (key, value) in item {
+        if !allowed.contains(key) {
+            return Err(format!(
+                "{kind} states {key:?}, which this emitter never writes"
+            ));
+        }
+        if members.insert(*key, *value).is_some() {
+            return Err(format!("{kind} states {key:?} twice"));
+        }
+    }
+    if members.len() != allowed.len() {
+        return Err(format!(
+            "{kind} states {} members where this emitter writes {}",
+            members.len(),
+            allowed.len()
+        ));
+    }
+    Ok(members)
+}
+
+fn member<'a>(kind: &str, members: &BTreeMap<&str, &'a str>, key: &str) -> Result<&'a str, String> {
+    members
+        .get(key)
+        .copied()
+        .ok_or_else(|| format!("{kind} states no {key}"))
+}
+
+fn integer(members: &BTreeMap<&str, &str>, key: &str) -> Result<i32, String> {
+    member("a wave part", members, key)?
+        .parse()
+        .map_err(|_| format!("a wave part states a {key} that is not a 32-bit integer"))
 }
 
 /// A one-line flow sequence, the shape OpenUtau's own `time_signatures` and
@@ -722,7 +1080,11 @@ fn number(value: f64) -> String {
 /// special, plus anything a YAML reader may treat as a line break, so those are
 /// the only characters escaped and every other code point — including all
 /// non-ASCII — is written literally as UTF-8.
-fn quoted(text: &str) -> String {
+///
+/// Public because [`audit`] hands a caller the scalar exactly as the file states
+/// it: comparing bytes through this function is the one comparison that cannot
+/// disagree with what was written, whereas an inverse unescaper could.
+pub fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for character in text.chars() {
@@ -1685,5 +2047,208 @@ mod tests {
                 "{emitted}"
             );
         }
+    }
+
+    /// A vocal-only export references no audio at all. Real WAVs exist only inside
+    /// a preservation bundle, so a projection may never produce a wave part.
+    #[test]
+    fn a_projection_alone_states_no_wave_part() {
+        let emitted = serialize(&projected()).expect("480 PPQ is exactly representable");
+        assert!(emitted.wave_parts.is_empty());
+        assert!(yaml(&projected()).ends_with("wave_parts: []\n"));
+    }
+
+    /// One wave part, byte for byte: the file it references, the track it sits on,
+    /// and the claim that the whole file plays from the start of the score.
+    #[test]
+    fn a_wave_part_states_the_whole_file_and_the_track_it_sits_on() {
+        let mut project = serialize(&projected()).expect("480 PPQ is exactly representable");
+        let track_no = append_wave_part(
+            &mut project,
+            "Piano (MuseScore Part)".into(),
+            "../audio/stems/part-001-piano.wav".into(),
+            882,
+            44_100,
+            false,
+        )
+        .expect("a validated WAV has a length");
+        // The projection already holds one voice track, so the audio lands on the
+        // next index — the index `UProject.AfterLoad` will dereference.
+        assert_eq!(track_no, 1);
+        assert_eq!(project.tracks.len(), 2);
+        assert_eq!(project.tracks[1].track_name, "Piano (MuseScore Part)");
+        assert!(!project.tracks[1].mute);
+
+        let emitted = to_yaml(&project);
+        assert!(
+            emitted.ends_with(concat!(
+                "wave_parts:\n",
+                // OpenUtau overwrites this name with the file's own on load, so the
+                // file states what the application will show.
+                "  - name: \"part-001-piano.wav\"\n",
+                "    comment: \"\"\n",
+                "    track_no: 1\n",
+                "    position: 0\n",
+                "    relative_path: \"../audio/stems/part-001-piano.wav\"\n",
+                "    file_duration_ms: 20\n",
+                "    skip: 0\n",
+                "    trim: 0\n",
+                "    fadein: 0\n",
+                "    fadeout: 0\n",
+            )),
+            "{emitted}"
+        );
+        // The muted case is the full-score reference, and OpenUtau keeps the mute on
+        // the track because a part has none.
+        let muted = append_wave_part(
+            &mut project,
+            "Full score reference mix (MuseScore)".into(),
+            "../audio/full-score.wav".into(),
+            882,
+            44_100,
+            true,
+        )
+        .expect("a validated WAV has a length");
+        assert_eq!(muted, 2);
+        assert!(project.tracks[2].mute);
+        assert_eq!(project.wave_parts[1].track_no, 2);
+    }
+
+    /// The declared length comes from the two integers a WAV header states, never
+    /// from the seconds-valued quotient beside them: rounding a quotient and then
+    /// scaling it by 1000 rounds twice and lands on a different double.
+    #[test]
+    fn the_wave_part_duration_comes_from_the_frame_count_and_the_sample_rate() {
+        assert_eq!(file_duration_ms(882, 44_100), 20.0);
+        assert_eq!(file_duration_ms(441, 44_100), 10.0);
+        assert_eq!(file_duration_ms(48_000, 48_000), 1000.0);
+
+        // The case that proves which of the two derivations is used.
+        let frames = 1_234_567_u64;
+        let seconds_first = (frames as f64 / 44_100.0) * 1000.0;
+        assert_eq!(file_duration_ms(frames, 44_100), 27_994.716_553_287_98);
+        assert_ne!(
+            file_duration_ms(frames, 44_100),
+            seconds_first,
+            "the seconds quotient rounds twice and must not be the source of this value"
+        );
+
+        // A sample rate `validate_wav` would have refused must not reach the file as
+        // a value YAML cannot state as a number.
+        let mut project = serialize(&projected()).expect("480 PPQ is exactly representable");
+        let error = append_wave_part(
+            &mut project,
+            "Broken".into(),
+            "../audio/stems/broken.wav".into(),
+            882,
+            0,
+            false,
+        )
+        .expect_err("no length exists at zero samples per second");
+        assert!(error.contains("no length OpenUtau can hold"), "{error}");
+        assert!(
+            project.wave_parts.is_empty() && project.tracks.len() == 1,
+            "a refused wave part must leave no track behind"
+        );
+    }
+
+    /// The audit reads the audio facts back out of the file's own bytes, which is
+    /// what lets a bundle prove what it is about to commit.
+    #[test]
+    fn the_audit_reads_back_the_audio_a_bundle_must_verify() {
+        let mut project = serialize(&projected()).expect("480 PPQ is exactly representable");
+        append_wave_part(
+            &mut project,
+            "Piano (MuseScore Part)".into(),
+            "../audio/stems/part-001-piano.wav".into(),
+            882,
+            44_100,
+            false,
+        )
+        .expect("a validated WAV has a length");
+        append_wave_part(
+            &mut project,
+            "Full score reference mix (MuseScore)".into(),
+            "../audio/full-score.wav".into(),
+            1_234_567,
+            44_100,
+            true,
+        )
+        .expect("a validated WAV has a length");
+
+        let audited = audit(&to_yaml(&project)).expect("the emitter's own output");
+        // One entry per track, in the order `track_no` indexes.
+        assert_eq!(audited.track_mutes, vec![false, false, true]);
+        assert_eq!(audited.wave_parts.len(), 2);
+        assert_eq!(
+            audited.wave_parts[0].relative_path_scalar,
+            quoted("../audio/stems/part-001-piano.wav")
+        );
+        assert_eq!(audited.wave_parts[0].track_no, 1);
+        assert_eq!(audited.wave_parts[0].file_duration_ms, 20.0);
+        assert_eq!(
+            audited.wave_parts[1].file_duration_ms,
+            file_duration_ms(1_234_567, 44_100),
+            "the length must survive the round trip exactly, not approximately"
+        );
+        for part in &audited.wave_parts {
+            assert_eq!((part.position, part.skip, part.trim), (0, 0, 0));
+            assert_eq!((part.fadein, part.fadeout), (0, 0));
+        }
+
+        // A project with no audio still states both blocks, so the audit reports an
+        // empty list rather than refusing.
+        let empty = audit(&yaml(&projected())).expect("a vocal-only project is auditable");
+        assert!(empty.wave_parts.is_empty());
+        assert_eq!(empty.track_mutes, vec![false]);
+    }
+
+    /// The audit refuses a shape this emitter never writes instead of guessing at
+    /// it. Tolerating one would mean a verified field could quietly stop being the
+    /// field that was verified.
+    #[test]
+    fn the_audit_refuses_a_document_this_emitter_never_wrote() {
+        let mut project = serialize(&projected()).expect("480 PPQ is exactly representable");
+        append_wave_part(
+            &mut project,
+            "Piano (MuseScore Part)".into(),
+            "../audio/stems/part-001-piano.wav".into(),
+            882,
+            44_100,
+            false,
+        )
+        .expect("a validated WAV has a length");
+        let emitted = to_yaml(&project);
+        assert!(audit(&emitted).is_ok(), "the fixture must be auditable");
+
+        for (mutation, expected) in [
+            // A member this emitter never writes, including a near-miss spelling of
+            // one that is verified.
+            ("    track_no: 1\n", "    track_number: 1\n"),
+            ("    skip: 0\n", "    skipped: 0\n"),
+            // A value of the wrong kind.
+            ("    track_no: 1\n", "    track_no: first\n"),
+            ("    file_duration_ms: 20\n", "    file_duration_ms: long\n"),
+            ("    mute: false\n", "    mute: maybe\n"),
+            // A flow list where a block was written, and a duplicated block.
+            ("wave_parts:\n", "wave_parts: [{track_no: 1}]\n"),
+            ("wave_parts:\n", "wave_parts: []\nwave_parts:\n"),
+            // An indentation the emitter never produces inside a verified block.
+            // Keyed on `fadein`, which only a wave part carries: `position` is also a
+            // voice part's, and a mutation landing in a skipped block proves nothing.
+            ("    fadein: 0\n", "      fadein: 0\n"),
+        ] {
+            let broken = emitted.replacen(mutation, expected, 1);
+            assert_ne!(broken, emitted, "the mutation {mutation:?} must apply");
+            assert!(
+                audit(&broken).is_err(),
+                "the audit accepted {expected:?}, which this emitter never writes"
+            );
+        }
+
+        // A member dropped altogether, and a document that states no block at all.
+        assert!(audit(&emitted.replacen("    trim: 0\n", "", 1)).is_err());
+        assert!(audit("ustx_version: \"0.6\"\n").is_err());
+        assert!(audit("  indented: 1\n").is_err());
     }
 }

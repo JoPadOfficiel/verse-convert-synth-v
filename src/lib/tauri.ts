@@ -119,8 +119,8 @@ export type FileResult = {
   tracks: TrackInfo[];
   audioStatus: AudioStatus;
   requiresVoiceAssignment: boolean;
-  /** A complete bundle always writes a Synthesizer V project, so this stays true
-   *  for a source only the OpenUtau target refuses. */
+  /** Whether a complete bundle can be written for this source. The bundle carries
+   *  the selected export target's own project, so this follows that target. */
   bundleReady: boolean;
   warnings: Diagnostic[];
   out: string | null;
@@ -254,6 +254,15 @@ export async function exportVocalsWithDialog(
   });
 }
 
+/**
+ * Writes one complete preservation bundle.
+ *
+ * `target` is the bundle's destination path and has been since the bundle
+ * shipped; `exportTarget` is the format of the project inside it. The stems are
+ * the same WAVs at the same relative paths either way — only the project file that
+ * references them differs, so the bundle's own filename does not follow the
+ * format.
+ */
 export async function exportBundle(
   file: FileResult,
   target: string,
@@ -261,6 +270,7 @@ export async function exportBundle(
   overrides?: Record<number, boolean>,
   rendererPath?: string,
   onProgress?: (event: BundleProgressEvent) => void,
+  exportTarget: ExportTarget = "svp",
 ): Promise<BundleResult> {
   const progress = new Channel<BundleProgressEvent>();
   progress.onmessage = (event) => onProgress?.(event);
@@ -270,6 +280,7 @@ export async function exportBundle(
     language,
     overrides: overrides ?? null,
     rendererPath: rendererPath?.trim() || null,
+    exportTarget,
     onProgress: progress,
   });
 }
