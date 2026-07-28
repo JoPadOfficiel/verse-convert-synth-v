@@ -3423,16 +3423,15 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Splitting a lane is a projection decision, and the bundle must not notice
-    /// it.
+    /// A note left out of the vocal project is still a source note.
     ///
-    /// Stems come from the source Part topology and the ledger is keyed by source
-    /// item id, so neither may grow because a lane gained a companion. A second
-    /// stem would demand a WAV MuseScore was never asked to render, and a second
-    /// entry for one note would break the rule that every inventoried item gets
-    /// exactly one primary disposition.
+    /// It is exactly the case the ledger exists for: not written into the project,
+    /// preserved byte-exact in the source and audible in the stem rendered from
+    /// it. The ledger is keyed by source item id and the stem plan comes from the
+    /// source Part topology, so neither may shrink because the projection wrote
+    /// one note fewer.
     #[test]
-    fn an_untexted_companion_lane_adds_no_stem_and_no_ledger_entry() {
+    fn a_lane_that_leaves_untexted_notes_out_still_inventories_them() {
         let data = smf(&[
             0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // tempo
             0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // a real source lyric
@@ -3450,8 +3449,8 @@ mod tests {
                 .iter()
                 .map(|lane| (lane.muted, lane.notes.len()))
                 .collect::<Vec<_>>(),
-            vec![(false, 1), (true, 1)],
-            "the fixture must actually produce a companion"
+            vec![(false, 1)],
+            "the untexted note is not written into the project"
         );
 
         let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
@@ -3472,8 +3471,8 @@ mod tests {
                 .filter(|entry| entry.item_kind == SourceItemKind::Note)
                 .count(),
             2,
-            "two source notes, two note entries: the companion neither duplicates \
-             the note it received nor leaves it uninventoried"
+            "two source notes, two note entries: leaving one out of the project \
+             must not leave it out of the ledger"
         );
         let ids = ledger
             .entries
@@ -3509,23 +3508,20 @@ mod tests {
 
         let committed = fs::read_to_string(&result.project_path).unwrap();
         let audited = ustx::audit(&committed).expect("the committed project is auditable");
-        // The sung lane, its companion, one stem, and the full-score reference.
-        assert_eq!(audited.track_mutes.len(), stem_count + 3);
+        // The sung lane, one stem, and the full-score reference.
+        assert_eq!(audited.track_mutes.len(), stem_count + 2);
         assert!(!audited.track_mutes[0], "the sung lane stays audible");
-        assert!(audited.track_mutes[1], "the companion opens silent");
         assert!(
             audited.track_mutes.iter().any(|muted| !muted),
             "a bundle must never open with every track muted"
         );
-        // The audio still takes the indices after every vocal lane, so inserting
-        // a companion cannot leave a wave part pointing at the wrong track.
         assert_eq!(
             audited
                 .wave_parts
                 .iter()
                 .map(|part| part.track_no)
                 .collect::<Vec<_>>(),
-            (2..=stem_count as i32 + 2).collect::<Vec<_>>()
+            (1..=stem_count as i32 + 1).collect::<Vec<_>>()
         );
         fs::remove_dir_all(root).unwrap();
     }

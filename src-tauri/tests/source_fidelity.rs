@@ -30,15 +30,16 @@ fn lyric_free_midi_succeeds_without_a_synthetic_vocal_track() {
     );
 }
 
-/// A note the source never texts is moved, never filled in and never deleted.
+/// A note the source never texts is left out of the vocal project, never filled
+/// in and never deleted from the bundle.
 ///
-/// The companion lane is the one track Verse writes that no source track names,
-/// so it is held to the strictest reading of the no-invention rule: it carries
-/// only notes that were already there, with the lyric they already had, which
-/// for an untexted note is no lyric at all. `"a"`, `"la"`, `"+~"` and `"R"` are
-/// each a different way of putting a word in the singer's mouth.
+/// `"a"`, `"la"`, `"+~"` and `"R"` are each a different way of putting a word in
+/// the singer's mouth, and an empty lyric is not an option either: OpenUtau's
+/// phonemizer marks one `error`, so writing them produced a project that reads
+/// as a failed conversion. A wordless note is not vocal material — it stays in
+/// the preserved source and in the stem rendered from it.
 #[test]
-fn an_untexted_note_is_moved_to_a_muted_lane_and_never_given_a_word() {
+fn an_untexted_note_is_left_out_and_never_given_a_word() {
     let data = smf(&[
         0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // lyric "let"
         0x00, 0x90, 60, 100, // C4 on at 0
@@ -49,6 +50,8 @@ fn an_untexted_note_is_moved_to_a_muted_lane_and_never_given_a_word() {
     ]);
     let outcome = convert_auto(&data, "english");
     assert!(outcome.ok, "{:?}", outcome.msg);
+    // The source note is still inventoried: the report counts two.
+    assert_eq!(outcome.tracks[0].notes, 2);
     let projected = outcome.svp.expect("a projection");
     assert_eq!(
         projected
@@ -56,29 +59,26 @@ fn an_untexted_note_is_moved_to_a_muted_lane_and_never_given_a_word() {
             .iter()
             .map(|lane| (lane.name.as_str(), lane.muted, lane.notes.len()))
             .collect::<Vec<_>>(),
-        vec![("Track 0", false, 1), ("Track 0 — untexted notes", true, 1)],
+        vec![("Track 0", false, 1)],
+        "one lane, nothing muted beside it"
     );
-    // Both source notes are still written, with their own pitch and timing.
     assert_eq!(
-        projected
-            .tracks
+        projected.tracks[0]
+            .notes
             .iter()
-            .flat_map(|lane| lane.notes.iter())
             .map(|note| (note.onset_ticks, note.duration_ticks, note.pitch))
             .collect::<Vec<_>>(),
-        vec![(0, 480, 60), (480, 480, 62)],
+        vec![(0, 480, 60)],
     );
 
     let svp = target::svp::serialize(&projected).expect("exactly representable");
-    let companion = &svp.tracks[1];
-    assert!(companion.mixer.mute, "the companion opens silent");
-    assert!(
-        companion.render_enabled,
-        "it is a real vocal lane the user can unmute, not one excluded from rendering"
-    );
-    assert!(!companion.main_ref.is_instrumental);
-    assert_eq!(companion.main_group.notes[0].lyrics, "");
-    assert_eq!(companion.main_group.notes[0].phonemes, "");
+    assert!(svp.tracks[0].render_enabled);
+    assert!(!svp.tracks[0].main_ref.is_instrumental);
+    assert!(svp.tracks[0]
+        .main_group
+        .notes
+        .iter()
+        .all(|note| !note.lyrics.is_empty()));
 
     let ustx = target::ustx::serialize(&projected).expect("exactly representable");
     assert_eq!(
@@ -86,8 +86,7 @@ fn an_untexted_note_is_moved_to_a_muted_lane_and_never_given_a_word() {
             .iter()
             .map(|track| track.mute)
             .collect::<Vec<_>>(),
-        vec![false, true],
-        "both targets read the same mute decision off the same projection"
+        vec![false],
     );
     assert!(ustx.wave_parts.is_empty(), "a projection carries no audio");
     let yaml = target::ustx::to_yaml(&ustx);
@@ -96,8 +95,9 @@ fn an_untexted_note_is_moved_to_a_muted_lane_and_never_given_a_word() {
         "lyric: \"la\"",
         "lyric: \"+~\"",
         "lyric: \"R\"",
+        "lyric: \"\"",
     ] {
-        assert!(!yaml.contains(invented), "{invented} was invented");
+        assert!(!yaml.contains(invented), "{invented} must not be written");
     }
 }
 

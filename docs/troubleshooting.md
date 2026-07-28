@@ -77,40 +77,28 @@ report it, because that would be new.
 The full-score track is a source reference mix. It is not a vocal-removed
 accompaniment and remains muted by default to avoid doubling the Part stems.
 
-## A track named “— untexted notes” is muted, and that is deliberate
+## A note with no word is not in the project, and that is deliberate
 
-A lane whose source leaves notes untexted gets a companion beside it named
-`<lane> — untexted notes`, muted when the project opens. It holds those notes, so
-the sung track shows the words. It is an ordinary vocal track: unmute it to hear
-them, or delete it if you do not want them. Nothing is lost either way — the two
-lanes together are exactly the notes the score writes, and the notes it holds are
-ones Verse was already exporting with no lyric.
+A note the source never texted is not written into the vocal project. OpenUtau
+cannot sing an empty lyric — its phonemizer marks the note `error` — and
+Synthesizer V draws one as a greyed-out unsung `la`, so writing them fills a
+project with notes that look broken and sing nothing.
 
-A lane with no companion is not proof that every one of its notes carries a word.
-Two kinds of note stay on the sung lane without visible text: a `humming` or
-`laughing` vocalization, which is a sound the score asks for, and the note
-immediately before a held syllable, which has to stay there or the hold would
-attach itself to the wrong word. A lane that is wordless from end to end is left
-alone and audible rather than split, so a project never opens completely silent.
-
-Before deleting a companion, check that it is one: the name is built by
-suffixing, and a source track of your own that happens to end in
-`— untexted notes` would look the same. A generated companion is always muted and
-always sits directly under the lane it belongs to.
-
-## An untexted note has no lyric, and that is deliberate
-
-A note the source never texted is exported with no lyric. In a `.svp` the field
-is empty; in a `.ustx` it is written `lyric: ""`. That is the only honest
-representation: `"a"` invents a syllable, `"+~"` claims the previous syllable is
-held, and `"R"` claims a rest and converts the note into silence. Verse states
-what the source states, which here is nothing.
+The notes are not gone. They stay byte-exact in the bundle's `source/` and are
+audible in the stem MuseScore rendered from it. The analysis reports how many
+each track left out, under `UNTEXTED_NOTES_LEFT_OUT`.
 
 A held syllable is not this case. A word sustained across several notes texts
-only the first of them, and the rest carry a continuation the source proves; they
-stay on the sung lane and are never treated as untexted.
+only the first of them; the rest carry a continuation the source proves, they are
+sung, and they stay. So does the note immediately before a held syllable, which
+has to stay or the hold would attach itself to the wrong word.
 
-**No OpenUtau importer can express that state.** `UNote.lyric` is declared with
+If a track you expected to sing is missing words, the score did not write them
+there. Open it in MuseScore and check the lyric line under that staff.
+
+## Opening the source in OpenUtau puts `a` on every note
+
+That is OpenUtau's own default, not something Verse wrote. `UNote.lyric` is declared with
 a field initializer, `public string lyric = NotePresets.Default.DefaultLyric;`
 (`Ustx/UNote.cs`), and `NotePresets.DefaultLyric` is `"a"`
 (`Util/NotePresets.cs:61`). Its MusicXML note factory sets a lyric only for a
@@ -126,13 +114,6 @@ OpenUtau becomes `a`**.
 
 If you see `a` on notes the source never texted, you opened the source in
 OpenUtau instead of opening Verse's `.ustx`.
-
-The `.ustx` representation is reasoned from the OpenUtau `0.1.568` sources:
-`UVoicePart.Validate` tests `lyric.StartsWith("+")`, false for `""`, so nothing
-is wired and nothing crashes; `UNote.Validate` never reads the lyric; and
-`DefaultValuesHandling.OmitNull` omits nulls, not empty strings, so `lyric: ""`
-survives a save/reload round trip. If a future OpenUtau release ever refuses an
-empty lyric, report it — the fallback will still not be a syllable.
 
 ## `la` appears where the source note is blank
 

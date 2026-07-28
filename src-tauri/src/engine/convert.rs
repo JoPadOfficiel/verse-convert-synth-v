@@ -673,7 +673,8 @@ fn project_track(
         name: name.to_string(),
         source_track_id: projection.source_track_id.to_string(),
         // A lane the source texts is what the user came to sing. Only the
-        // companion `split_untexted` carves out of it opens silent.
+        // No projected lane opens silent today; the field exists so both
+        // targets read one decision rather than each inventing mute state.
         muted: false,
         notes: projected_notes,
     }
@@ -681,7 +682,9 @@ fn project_track(
 
 /// The suffix that names a lane's untexted companion, in the same shape as the
 /// verse-lane suffix `project_track`'s caller builds.
-const UNTEXTED_LANE_SUFFIX: &str = " — untexted notes";
+/// Reported when a lane left notes out of the project because the source never
+/// texted them, naming where they are still preserved.
+pub const UNTEXTED_NOTES_LEFT_OUT: &str = "UNTEXTED_NOTES_LEFT_OUT";
 
 /// Reported whenever a source wrote a word over a chord, naming which of the two
 /// readings was taken and the evidence that decided it.
@@ -691,12 +694,16 @@ pub const CHORD_READING: &str = "CHORD_READING";
 /// no target can sing and which would otherwise lose one of them silently.
 pub const LYRIC_VERSE_CLAIMED_TWICE: &str = "LYRIC_VERSE_CLAIMED_TWICE";
 
-/// Moves the notes the source does not text out of a sung lane and into a muted
-/// companion, so the lane the user actually sings holds only real words.
+/// Leaves out the notes the source does not text, so a sung lane holds only
+/// notes a singer can actually be asked to sing.
 ///
-/// Nothing is dropped, re-timed or re-pitched: the two returned tracks partition
-/// the lane's notes exactly, each note keeping the lyric it arrived with. Two
-/// rules bound the split.
+/// A note with no lyric is not vocal material. Written into a project anyway it
+/// is not merely blank: OpenUtau's phonemizer cannot phonemize an empty string
+/// and marks every such note `error`, so a file full of them reads as a broken
+/// conversion. Measured on one reported score, 505 of them. Those notes are not
+/// lost — they stay byte-exact in the bundle's source and are audible in the
+/// stem MuseScore renders from it, which is how every instrumental note has
+/// always been preserved.
 ///
 /// A note stays when the source asks for it to be sung, which includes both
 /// continuation markers and a vocalization no target can spell — see
@@ -706,19 +713,21 @@ pub const LYRIC_VERSE_CLAIMED_TWICE: &str = "LYRIC_VERSE_CLAIMED_TWICE";
 /// A note also stays when it is the note a continuation marker leans on, that is
 /// the note immediately before a marker in time. A marker carries the *previous*
 /// note's syllable, so which note precedes it decides which word is held, and the
-/// two targets punish moving it in different ways: OpenUtau refuses the whole
+/// two targets punish removing it in different ways: OpenUtau refuses the whole
 /// export when a marker does not begin exactly where its predecessor ends
 /// (`ustx.rs`, `serialize_voice_part`), while Synthesizer V checks nothing and
 /// would quietly rebind the hold to whatever note is left in front of it — a
 /// different syllable, sung, with no diagnostic. The second is the worse failure,
-/// which is why the predecessor is kept whether or not it touches the marker
-/// rather than only when it does.
+/// which is why the predecessor is kept whether or not it touches the marker.
 ///
-/// A lane with nothing left to sing is returned untouched and unmuted: there is
-/// no sung track to keep clean, and muting it would open a project in silence.
-/// The same early return covers a lane with nothing to move, so a fully texted
-/// lane is not copied at all.
-fn split_untexted(track: ProjectedTrack) -> (ProjectedTrack, Option<ProjectedTrack>) {
+/// A lane with nothing left to sing is returned whole: there is no sung line to
+/// keep clean, so the source's own notes stay exactly as they were projected.
+/// The same early return covers a lane with nothing to leave out, which is not
+/// copied at all.
+///
+/// Returns the lane and how many notes it left out, for the diagnostic that
+/// tells the user where they went.
+fn drop_untexted(track: ProjectedTrack) -> (ProjectedTrack, usize) {
     // The onset every marker leans on: the greatest onset strictly below it.
     // Collected once against a sorted index rather than rescanned per note, so a
     // lane of a hundred thousand notes costs a sort and not a square.
@@ -734,29 +743,15 @@ fn split_untexted(track: ProjectedTrack) -> (ProjectedTrack, Option<ProjectedTra
             after.checked_sub(1).map(|previous| onsets[previous])
         })
         .collect();
-    let moves =
+    let left_out =
         |note: &ProjectedNote| !note.lyric.is_sung() && !leaned_on.contains(&note.onset_ticks);
-    let moving = track.notes.iter().filter(|note| moves(note)).count();
-    if moving == 0 || moving == track.notes.len() {
-        return (track, None);
+    let count = track.notes.iter().filter(|note| left_out(note)).count();
+    if count == 0 || count == track.notes.len() {
+        return (track, 0);
     }
-    let (untexted, sung): (Vec<ProjectedNote>, Vec<ProjectedNote>) =
-        track.notes.iter().cloned().partition(moves);
-    let companion = ProjectedTrack {
-        name: format!("{}{UNTEXTED_LANE_SUFFIX}", track.name),
-        source_track_id: track.source_track_id.clone(),
-        muted: true,
-        notes: untexted,
-    };
-    (
-        ProjectedTrack {
-            name: track.name,
-            source_track_id: track.source_track_id,
-            muted: false,
-            notes: sung,
-        },
-        Some(companion),
-    )
+    let mut track = track;
+    track.notes.retain(|note| !left_out(note));
+    (track, count)
 }
 
 /// Detects the format (MIDI / MusicXML / MuseScore) and converts.
@@ -1009,6 +1004,7 @@ pub fn convert_midi_with_target(
         let explicit_override = overrides.and_then(|map| map.get(&index).copied());
         let sing = explicit_override.unwrap_or(source_vocal);
         let mut placed = 0usize;
+        let mut untexted_left_out = 0usize;
         let mut lyric_diagnostics: Vec<Diagnostic> = Vec::new();
         if sing {
             let no_assignment = HashMap::new();
@@ -1050,15 +1046,10 @@ pub fn convert_midi_with_target(
                         diagnostics: &mut lyric_diagnostics,
                     },
                 );
-                // The companion follows its own lane immediately: both targets
-                // return on the first lane they cannot represent, so putting it
-                // ahead would change which refusal the user reads.
-                let (sung_track, untexted_track) = split_untexted(projected_track);
+                let (sung_track, left_out) = drop_untexted(projected_track);
+                untexted_left_out += left_out;
                 if !sung_track.notes.is_empty() {
                     projected_tracks.push(sung_track);
-                    if let Some(untexted_track) = untexted_track {
-                        projected_tracks.push(untexted_track);
-                    }
                 }
             }
         }
@@ -1135,6 +1126,20 @@ pub fn convert_midi_with_target(
                      The source numbers a verse with its own field and omits it only for the \
                      first, so both words claim verse 1 and only the first is sung; the other \
                      stays in the source. Number the second verse in the score to sing it."
+                ),
+                &track.id,
+            ));
+        }
+        if untexted_left_out > 0 {
+            warnings.push(report_warning(
+                UNTEXTED_NOTES_LEFT_OUT,
+                DiagnosticSeverity::Info,
+                format!(
+                    "{untexted_left_out} note(s) of this track carry no lyric, so they are not \
+                     written into the vocal project: a note with no word is not something a \
+                     singer can be asked to sing, and OpenUtau marks an empty lyric as an error. \
+                     They remain byte-exact in the preserved source and audible in this Part's \
+                     rendered stem."
                 ),
                 &track.id,
             ));
@@ -2019,21 +2024,19 @@ mod tests {
     }
 
     #[test]
-    fn a_lane_keeps_its_words_and_sheds_its_wordless_notes() {
-        let (sung, companion) = split_untexted(lane(&[
+    fn a_lane_keeps_its_words_and_leaves_its_wordless_notes_out() {
+        let (sung, left_out) = drop_untexted(lane(&[
             (0, 480, word()),
             (480, 480, ProjectedLyric::Absent),
             (960, 480, word()),
         ]));
         assert_eq!(placement(&sung), vec![(0, 60), (960, 62)]);
         assert!(!sung.muted);
-        let companion = companion.expect("the wordless note has somewhere to go");
-        assert_eq!(placement(&companion), vec![(480, 61)]);
-        assert!(companion.muted);
-        assert_eq!(companion.name, format!("Voice{UNTEXTED_LANE_SUFFIX}"));
-        // Provenance is not rewritten: the companion still names the source
-        // track its notes came from.
-        assert_eq!(companion.source_track_id, sung.source_track_id);
+        assert_eq!(left_out, 1);
+        // Not a companion lane, not an empty lyric: OpenUtau's phonemizer marks
+        // an empty lyric `error`, so a project holding them reads as a broken
+        // conversion. The note stays in the preserved source and its stem.
+        assert!(sung.notes.iter().all(|note| note.lyric.is_sung()));
     }
 
     #[test]
@@ -2042,14 +2045,14 @@ mod tests {
             (0, 480, word()),
             (480, 480, stated(midi::LyricState::SyllableSplit)),
         ]);
-        let (sung, companion) = split_untexted(original.clone());
+        let (sung, left_out) = drop_untexted(original.clone());
         assert_eq!(sung, original);
-        assert!(companion.is_none());
+        assert_eq!(left_out, 0);
     }
 
     /// A humming or laughing vocalization is a sound the score asks for, only one
-    /// no target can spell. Moving it to a muted lane would silence a passage the
-    /// singer is meant to perform.
+    /// no target can spell. Leaving it out would silence a passage the singer is
+    /// meant to perform.
     #[test]
     fn a_melisma_and_a_vocalization_stay_on_the_sung_lane() {
         let original = lane(&[
@@ -2062,19 +2065,18 @@ mod tests {
             ),
             (1440, 480, stated(midi::LyricState::Continuation)),
         ]);
-        let (sung, companion) = split_untexted(original.clone());
+        let (sung, left_out) = drop_untexted(original.clone());
         assert_eq!(sung, original);
-        assert!(companion.is_none());
+        assert_eq!(left_out, 0);
     }
 
-    /// The guard, in the case where the marker touches the note it leans on.
-    /// `ustx.rs` refuses the whole export when a continuation marker does not
-    /// begin where its predecessor ends, so moving that note would turn a score
-    /// that converts today into a hard failure. The note stays even though the
-    /// source never texted it.
+    /// The guard, where the marker touches the note it leans on. `ustx.rs`
+    /// refuses the whole export when a continuation marker does not begin where
+    /// its predecessor ends, so removing that note would turn a score that
+    /// converts today into a hard failure.
     #[test]
     fn an_untexted_note_a_marker_leans_on_stays_where_it_is() {
-        let (sung, companion) = split_untexted(lane(&[
+        let (sung, left_out) = drop_untexted(lane(&[
             (0, 480, word()),
             (480, 480, ProjectedLyric::Absent),
             (960, 480, ProjectedLyric::Extension),
@@ -2085,18 +2087,12 @@ mod tests {
             vec![(0, 60), (480, 61), (960, 62)],
             "the note the extension begins on top of is kept"
         );
-        assert_eq!(
-            placement(&companion.expect("the trailing wordless note still moves")),
-            vec![(1440, 63)],
-        );
+        assert_eq!(left_out, 1);
 
-        // The point of keeping it, for this target: OpenUtau still accepts the
-        // lane. Without the guard the extension would begin 480 ticks after the
-        // note before it, and `serialize_voice_part` refuses exactly that.
-        // Synthesizer V accepts either lane — it performs no adjacency check —
-        // so its half of the loop below is a regression guard on the writer, not
-        // the reason the guard exists. The reason it exists on that target is
-        // covered by `a_wordless_note_a_marker_leans_on_across_a_gap_is_kept_too`.
+        // OpenUtau still accepts the lane. Synthesizer V accepts either — it
+        // performs no adjacency check — so its half of the loop is a regression
+        // guard on the writer, not the reason the rule exists; that is covered
+        // by `a_wordless_note_a_marker_leans_on_across_a_gap_is_kept_too`.
         let project = ProjectedProject {
             ticks_per_beat: 480,
             language: "english".into(),
@@ -2126,15 +2122,12 @@ mod tests {
     }
 
     /// The same guard across a gap, which is the case that decides its shape.
-    ///
-    /// OpenUtau already refuses this lane, so nothing worse can happen there. But
-    /// Synthesizer V performs no adjacency check at all: moving the wordless note
+    /// Synthesizer V performs no adjacency check at all, so removing the note
     /// would leave the hold sitting behind `word` and quietly sustain *that*
-    /// syllable instead, sung, with no diagnostic anywhere. Keeping the note the
-    /// marker leans on keeps the binding the source stated.
+    /// syllable instead, sung, with no diagnostic anywhere.
     #[test]
     fn a_wordless_note_a_marker_leans_on_across_a_gap_is_kept_too() {
-        let (sung, companion) = split_untexted(lane(&[
+        let (sung, left_out) = drop_untexted(lane(&[
             (0, 480, word()),
             (480, 240, ProjectedLyric::Absent),
             (960, 480, ProjectedLyric::Extension),
@@ -2145,62 +2138,54 @@ mod tests {
             vec![(0, 60), (480, 61), (960, 62)],
             "the note the marker leans on stays even though it does not touch it"
         );
-        assert_eq!(
-            placement(&companion.expect("the note no marker leans on still moves")),
-            vec![(1440, 63)],
-        );
+        assert_eq!(left_out, 1);
     }
 
     /// A marker with nothing before it is already broken and already refused by
     /// OpenUtau. Nothing is pinned, so an unrelated wordless note after it must
-    /// still be free to move.
+    /// still be free to go.
     #[test]
     fn a_marker_that_opens_a_lane_pins_nothing() {
-        let (sung, companion) = split_untexted(lane(&[
+        let (sung, left_out) = drop_untexted(lane(&[
             (0, 480, ProjectedLyric::Extension),
             (480, 480, word()),
             (960, 480, ProjectedLyric::Absent),
         ]));
         assert_eq!(placement(&sung), vec![(0, 60), (480, 61)]);
-        assert_eq!(
-            placement(&companion.expect("the trailing wordless note moves")),
-            vec![(960, 62)],
-        );
+        assert_eq!(left_out, 1);
     }
 
     /// An explicitly empty lyric is the source stating that nothing is sung here,
     /// which is the same silence as saying nothing at all.
     #[test]
-    fn an_explicitly_empty_lyric_moves_with_the_wordless_notes() {
-        let (sung, companion) = split_untexted(lane(&[
+    fn an_explicitly_empty_lyric_is_left_out_with_the_wordless_notes() {
+        let (sung, left_out) = drop_untexted(lane(&[
             (0, 480, word()),
             (480, 480, stated(midi::LyricState::ExplicitEmpty)),
         ]));
         assert_eq!(placement(&sung), vec![(0, 60)]);
-        assert_eq!(
-            placement(&companion.expect("the empty lyric moves")),
-            vec![(480, 61)],
-        );
+        assert_eq!(left_out, 1);
     }
 
-    /// Nothing to keep clean, and muting the only lane would open the project in
-    /// silence. This is the lane a user override projects from a track that binds
-    /// no word at all.
+    /// Nothing to keep clean. This is the lane a user override projects from a
+    /// track that binds no word at all, and emptying it would delete the only
+    /// thing the override asked for.
     #[test]
-    fn a_lane_with_nothing_to_sing_is_never_split_or_muted() {
+    fn a_lane_with_nothing_to_sing_is_returned_whole() {
         let original = lane(&[
             (0, 480, ProjectedLyric::Absent),
             (480, 480, stated(midi::LyricState::ExplicitEmpty)),
         ]);
-        let (sung, companion) = split_untexted(original.clone());
+        let (sung, left_out) = drop_untexted(original.clone());
         assert_eq!(sung, original);
         assert!(!sung.muted);
-        assert!(companion.is_none());
+        assert_eq!(left_out, 0);
     }
 
-    /// Whatever the shape, the two lanes together are the lane that went in.
+    /// Whatever the shape, what stays plus what was left out is what went in,
+    /// and nothing that stays is wordless.
     #[test]
-    fn the_split_partitions_a_lane_and_invents_nothing() {
+    fn what_stays_and_what_is_left_out_account_for_the_whole_lane() {
         let shapes: Vec<Vec<(u32, u32, ProjectedLyric)>> = vec![
             vec![(0, 480, word()), (480, 480, ProjectedLyric::Absent)],
             vec![
@@ -2214,17 +2199,16 @@ mod tests {
         ];
         for shape in shapes {
             let original = lane(&shape);
-            let (sung, companion) = split_untexted(original.clone());
-            let mut rejoined = sung.notes.clone();
-            rejoined.extend(
-                companion
-                    .iter()
-                    .flat_map(|track| track.notes.iter().cloned()),
+            let (sung, left_out) = drop_untexted(original.clone());
+            assert_eq!(
+                sung.notes.len() + left_out,
+                original.notes.len(),
+                "every note is either kept or accounted for"
             );
-            rejoined.sort_by_key(|note| (note.onset_ticks, note.pitch));
-            let mut expected = original.notes.clone();
-            expected.sort_by_key(|note| (note.onset_ticks, note.pitch));
-            assert_eq!(rejoined, expected, "shape {:?}", original.notes.len());
+            assert!(
+                sung.notes.iter().all(|note| original.notes.contains(note)),
+                "no note is invented or rewritten"
+            );
         }
     }
 
@@ -2721,19 +2705,15 @@ mod tests {
             .map(|note| note.lyrics.as_str())
             .collect();
         assert_eq!(sung, vec!["one", "two"]);
-        // The replayed note is still not given verse 2's word — and it is not
-        // gone either. It moved to the muted companion, untexted, so the three
-        // source notes are still three notes.
-        assert_eq!(project.tracks.len(), 2);
-        assert!(project.tracks[1].name.ends_with(UNTEXTED_LANE_SUFFIX));
-        assert!(project.tracks[1].mixer.mute);
-        let untexted: Vec<_> = project.tracks[1]
+        // The replayed note is still not given verse 2's word, and it is not
+        // written into the project as a wordless note either: it is preserved in
+        // the source and the rendered stem, where an unsung note belongs.
+        assert_eq!(project.tracks.len(), 1);
+        assert!(project.tracks[0]
             .main_group
             .notes
             .iter()
-            .map(|note| note.lyrics.as_str())
-            .collect();
-        assert_eq!(untexted, vec![""]);
+            .all(|note| !note.lyrics.is_empty()));
     }
 
     #[test]
@@ -2863,21 +2843,14 @@ mod tests {
 </museScore>"#;
         // Verse 2's silence on the second note is preserved as silence, not
         // borrowed from verse 1 — and the note itself survives on the muted
-        // companion, so the repeat still yields four notes.
+        // wordless, and a wordless note is not written into a vocal project.
         assert_eq!(
             lanes(xml),
-            vec![
-                (
-                    "Voice".to_string(),
-                    false,
-                    vec!["o".to_string(), "pened".into(), "ne".into()],
-                ),
-                (
-                    format!("Voice{UNTEXTED_LANE_SUFFIX}"),
-                    true,
-                    vec![String::new()],
-                ),
-            ]
+            vec![(
+                "Voice".to_string(),
+                false,
+                vec!["o".to_string(), "pened".into(), "ne".into()],
+            )]
         );
     }
 

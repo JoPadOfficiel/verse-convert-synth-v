@@ -43,14 +43,14 @@ NotePresets.Default.DefaultLyric;` (`Ustx/UNote.cs`), and that default is `"a"`
 Verse uses only evidence present in the source:
 
 - a genuine source lyric such as `la` remains `la`;
-- an untexted note remains untexted — in a `.ustx` it is written `lyric: ""`,
-  a state no OpenUtau importer can produce — and it is moved to its lane's muted
-  `— untexted notes` companion, so the sung track carries the words;
+- a note the source never texted is not written into the vocal project — OpenUtau
+  marks an empty lyric `error` and cannot sing one — and it stays byte-exact in
+  the bundle's source and audible in its rendered stem;
 - generic MIDI Text is metadata, not a lyric;
 - a normal MIDI file without lyrics succeeds with zero generated words;
-- no fallback pitch, lyric, instrument or audio is fabricated; the companion lane
-  carries source notes only, and the audio tracks a `.versebundle` adds reference
-  WAVs MuseScore rendered from the source itself;
+- no fallback pitch, lyric, track, instrument or audio is fabricated; the audio
+  tracks a `.versebundle` adds reference WAVs MuseScore rendered from the source
+  itself;
 - timing is exact or refused, never truncated to fit.
 
 ## Supported input formats
