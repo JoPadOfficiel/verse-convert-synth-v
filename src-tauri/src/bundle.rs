@@ -593,6 +593,18 @@ pub fn build_preservation_ledger(
         }
     }
     entries.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    // One source lyric can be reached by more than one projection lane: a chord
+    // carrying a lyric is split into several monophonic lanes, and each lane
+    // inventories the same `lyric:…:note-event:…` instance. That is genuinely the
+    // same source item seen twice, not two items, so identical entries collapse.
+    // Two entries that share an ID but disagree on disposition are still a real
+    // conflict and are left for `validate` to reject.
+    entries.dedup_by(|later, earlier| {
+        later.source_id == earlier.source_id
+            && later.item_kind == earlier.item_kind
+            && later.disposition == earlier.disposition
+            && later.artifact_paths == earlier.artifact_paths
+    });
     let expected_source_ids = entries
         .iter()
         .map(|entry| entry.source_id.clone())
