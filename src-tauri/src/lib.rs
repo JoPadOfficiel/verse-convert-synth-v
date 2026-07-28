@@ -418,25 +418,34 @@ fn process_one(
         .as_ref()
         .map(|message| CommandErrorDto::new("CONVERSION_FAILED", message.clone()));
     if write && ok {
-        let write_result = (|| -> Result<String, String> {
-            let svp = r
+        // Only the `serialize` call below is new here, and a projection refusal
+        // is not a write fault: `export_svp` classifies exactly that condition as
+        // CONVERSION_FAILED, so this boundary matches it. Every pre-existing arm
+        // keeps the WRITE_FAILED code it had in 0.4.9.
+        let write_result = (|| -> Result<String, (&'static str, String)> {
+            let projected = r
                 .svp
                 .as_ref()
-                .ok_or_else(|| "no SVP output was produced".to_string())?;
+                .ok_or(("WRITE_FAILED", "no SVP output was produced".to_string()))?;
             let out_path = svp_out_path(path, out_dir);
-            validate_new_output_target(Path::new(path), Path::new(&out_path))?;
-            let json = serde_json::to_vec(svp)
-                .map_err(|error| format!("cannot serialize SVP ({error})"))?;
+            validate_new_output_target(Path::new(path), Path::new(&out_path))
+                .map_err(|message| ("WRITE_FAILED", message))?;
+            // The neutral projection becomes a Synthesizer V project only here,
+            // at the boundary that writes the file.
+            let svp = engine::target::svp::serialize(projected)
+                .map_err(|message| ("CONVERSION_FAILED", message))?;
+            let json = serde_json::to_vec(&svp)
+                .map_err(|error| ("WRITE_FAILED", format!("cannot serialize SVP ({error})")))?;
             bundle::write_bytes_no_replace(Path::new(&out_path), &json)
-                .map_err(|error| format!("cannot write SVP ({error})"))?;
+                .map_err(|error| ("WRITE_FAILED", format!("cannot write SVP ({error})")))?;
             Ok(out_path)
         })();
         match write_result {
             Ok(path) => out = Some(path),
-            Err(write_error) => {
+            Err((code, write_error)) => {
                 ok = false;
                 msg = Some(write_error.clone());
-                error = Some(CommandErrorDto::new("WRITE_FAILED", write_error));
+                error = Some(CommandErrorDto::new(code, write_error));
             }
         }
     }
@@ -498,13 +507,16 @@ fn export_svp(
             r.msg.unwrap_or_else(|| "conversion failed".into()),
         ));
     }
-    let svp = r
+    let projected = r
         .svp
         .ok_or_else(|| CommandErrorDto::new("CONVERSION_FAILED", "no output produced"))?;
     let source_path = Path::new(&path);
     let target_path = Path::new(&target);
     validate_new_output_target(source_path, target_path)
         .map_err(|message| CommandErrorDto::new("INVALID_OUTPUT", message))?;
+    // The neutral projection becomes a Synthesizer V project only here.
+    let svp = engine::target::svp::serialize(&projected)
+        .map_err(|message| CommandErrorDto::new("CONVERSION_FAILED", message))?;
     let json = serde_json::to_vec(&svp)
         .map_err(|error| CommandErrorDto::new("SERIALIZE_FAILED", error.to_string()))?;
     bundle::write_bytes_no_replace(target_path, &json).map_err(|error| {
@@ -635,9 +647,14 @@ fn export_bundle_blocking(
             }
         })
         .collect();
-    let project = outcome
+    let projected = outcome
         .svp
         .ok_or_else(|| CommandErrorDto::new("CONVERSION_FAILED", "no SVP project produced"))?;
+    // The neutral projection becomes a Synthesizer V project at this boundary,
+    // before the transaction starts; the bundle then appends its real
+    // audio-backed stem tracks to that shape.
+    let project = engine::target::svp::serialize(&projected)
+        .map_err(|message| CommandErrorDto::new("CONVERSION_FAILED", message))?;
 
     let config = MuseScoreConfig {
         executable: renderer_path
@@ -839,6 +856,47 @@ mod output_tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"first");
         assert!(bundle::write_bytes_no_replace(&target, b"second").is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The analysis pass, not the export, is what tells the user whether a
+    /// source is convertible. A target that cannot represent the timing must
+    /// therefore refuse here, with `write=false` and nothing written: moving
+    /// that refusal to export time would have Verse call the file fine and then
+    /// fail on the way out.
+    #[test]
+    fn analysis_still_refuses_timing_no_target_can_represent_exactly() {
+        let root = temp_dir();
+        let source = root.join("inexact.mid");
+        // PPQ 1024: a one-tick duration is not representable on the
+        // Synthesizer V blick grid, and is refused rather than rounded.
+        let track: Vec<u8> = vec![
+            0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', //
+            0x00, 0x90, 60, 100, //
+            0x01, 0x80, 60, 0, //
+            0x00, 0xff, 0x2f, 0x00,
+        ];
+        let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x04\x00".to_vec();
+        data.extend_from_slice(b"MTrk");
+        data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        data.extend_from_slice(&track);
+        std::fs::write(&source, &data).unwrap();
+
+        let result = process_one(source.to_str().unwrap(), false, None, "english", None);
+        assert!(!result.ok, "an unprojectable source is not convertible");
+        assert_eq!(
+            result.msg.as_deref(),
+            Some(
+                "source timing cannot be projected safely: note duration on source track \
+                 midi-track-0 at MIDI tick 1 cannot be represented exactly in Synthesizer V \
+                 blicks with PPQ 1024"
+            )
+        );
+        assert_eq!(
+            result.error.as_ref().map(|error| error.code.as_str()),
+            Some("CONVERSION_FAILED")
+        );
+        assert!(result.out.is_none(), "analysis writes nothing");
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,9 +1,14 @@
-//! MIDI -> Synthesizer V conversion logic. 1:1 port of kar2svp_core.py.
+//! Evidence-only projection of the musical IR onto singable vocal material.
+//! Decides *what* the source asks to be sung and hands it to a target as
+//! `projection::ProjectedProject`, in source-exact IR ticks. Originally a 1:1
+//! port of kar2svp_core.py, whose Synthesizer V output remains the contract.
 use crate::engine::midi::{
     self, Kind, LineBreak, Lyric, Midi, MidiTextProfile, NoteOn, SourceTopology, TimeBase, Track,
     TrackRoleHint,
 };
-use crate::engine::svp::*;
+use crate::engine::projection::{
+    ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedProject, ProjectedTempo, ProjectedTrack,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -87,7 +92,9 @@ pub struct TrackReport {
 pub struct ConvertOutcome {
     pub ok: bool,
     pub msg: Option<String>,
-    pub svp: Option<SvpProject>,
+    /// The target-neutral projection, in source-exact IR ticks. An export
+    /// target turns this into its own file shape; the converter never does.
+    pub svp: Option<ProjectedProject>,
     pub topology: SourceTopology,
     pub tracks: Vec<TrackReport>,
     pub n_tracks: usize,
@@ -307,59 +314,72 @@ fn track_tokens(track: &Track) -> Vec<TimedLyric> {
     tokens
 }
 
-const BLICKS_PER_QUARTER_INTEGER: u64 = 705_600_000;
-
-fn exact_blick_position(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i64, String> {
-    if ticks_per_beat == 0 {
-        return Err("MIDI PPQ division must be non-zero".into());
-    }
-    let numerator = u128::from(ticks) * u128::from(BLICKS_PER_QUARTER_INTEGER);
-    let denominator = u128::from(ticks_per_beat);
-    if numerator % denominator != 0 {
-        return Err(format!(
-            "{context} at MIDI tick {ticks} cannot be represented exactly in Synthesizer V blicks \
-             with PPQ {ticks_per_beat}"
-        ));
-    }
-    i64::try_from(numerator / denominator)
-        .map_err(|_| format!("{context} exceeds the Synthesizer V blick range"))
-}
-
-fn read_tempo(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Tempo>, BTreeSet<String>), String> {
-    let mut seen: BTreeMap<i64, (f64, String)> = BTreeMap::new();
+/// Tempo in IR ticks. Every event is carried in discovery order with duplicates
+/// intact, because a target validates each one in that order before collapsing
+/// the map, and that order decides which event a refusal names. Deduplicating by
+/// tick is the same decision as deduplicating by a target position — the
+/// conversion is strictly increasing — so the surviving entry and its evidence ID
+/// are unchanged either way.
+fn read_tempo(midi: &Midi) -> (Vec<ProjectedTempo>, BTreeSet<String>) {
+    let mut seen: BTreeMap<u32, (f64, String, String, usize)> = BTreeMap::new();
+    let mut discovered = 0usize;
     for track in &midi.tracks {
         for event in &track.events {
             if let Kind::Tempo(us) = event.kind {
                 if us > 0 {
-                    let pos = exact_blick_position(
-                        event.tick,
-                        ticks_per_beat,
-                        &format!("tempo event {}:{}", track.id, event.order),
-                    )?;
                     let bpm = (60_000_000.0 / us as f64 * 1e6).round() / 1e6;
-                    seen.insert(pos, (bpm, format!("event:{}:{}", track.id, event.order)));
+                    let evidence = format!("event:{}:{}", track.id, event.order);
+                    let source = format!("{}:{}", track.id, event.order);
+                    match seen.entry(event.tick) {
+                        // A later event at the same tick takes effect and owns
+                        // the evidence, but the refusal keeps naming the first
+                        // event at that tick and its place in discovery order,
+                        // because that is the event the source revealed first.
+                        std::collections::btree_map::Entry::Occupied(mut slot) => {
+                            let held = slot.get_mut();
+                            held.0 = bpm;
+                            held.1 = evidence;
+                        }
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert((bpm, evidence, source, discovered));
+                            discovered += 1;
+                        }
+                    }
                 }
             }
         }
     }
     if seen.is_empty() {
-        return Ok((
-            vec![Tempo {
+        return (
+            vec![ProjectedTempo {
+                tick: 0,
                 bpm: 120.0,
-                position: 0,
+                source: None,
+                discovery_index: 0,
             }],
             BTreeSet::new(),
-        ));
+        );
     }
-    let evidence = seen.values().map(|(_, id)| id.clone()).collect();
+    let evidence = seen.values().map(|(_, id, _, _)| id.clone()).collect();
     let tempo = seen
         .into_iter()
-        .map(|(position, (bpm, _))| Tempo { bpm, position })
+        .map(|(tick, (bpm, _, source, discovery_index))| ProjectedTempo {
+            tick,
+            bpm,
+            source: Some(source),
+            discovery_index,
+        })
         .collect();
-    Ok((tempo, evidence))
+    (tempo, evidence)
 }
 
-fn read_meter(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Meter>, BTreeSet<String>), String> {
+/// Meter is already target-neutral: it is stated as a bar index, which is what
+/// every target's time-signature list wants, so no arithmetic converts it and a
+/// change inside a bar is rejected here rather than rounded anywhere.
+fn read_meter(
+    midi: &Midi,
+    ticks_per_beat: u16,
+) -> Result<(Vec<ProjectedMeter>, BTreeSet<String>), String> {
     if ticks_per_beat == 0 {
         return Err("MIDI PPQ division must be non-zero".into());
     }
@@ -411,10 +431,10 @@ fn read_meter(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Meter>, BTreeSet<
             .ok_or_else(|| "MIDI meter position exceeds the supported range".to_string())?;
         let index = u32::try_from(measure_index)
             .map_err(|_| "MIDI meter position exceeds the supported range".to_string())?;
-        out.push(Meter {
-            denominator: u32::from(den),
-            index,
+        out.push(ProjectedMeter {
+            bar_index: index,
             numerator: u32::from(num),
+            denominator: u32::from(den),
         });
         if let Some(source_id) = source_id {
             evidence.insert(source_id);
@@ -423,55 +443,6 @@ fn read_meter(midi: &Midi, ticks_per_beat: u16) -> Result<(Vec<Meter>, BTreeSet<
         previous_meter = (num, den);
     }
     Ok((out, evidence))
-}
-
-fn build_track(idx: usize, name: String, notes: Vec<Note>) -> SvpTrack {
-    let uid = uuid(idx);
-    SvpTrack {
-        name,
-        disp_color: COLORS[idx % COLORS.len()].to_string(),
-        disp_order: idx as u32,
-        render_enabled: true,
-        mixer: Mixer {
-            gain_decibel: 0.0,
-            pan: 0.0,
-            mute: false,
-            solo: false,
-            display: true,
-        },
-        main_ref: MainRef {
-            audio: Audio {
-                filename: String::new(),
-                duration: 0.0,
-            },
-            database: Database {
-                name: String::new(),
-                language: String::new(),
-                phoneset: String::new(),
-            },
-            dictionary: String::new(),
-            voice: serde_json::json!({}),
-            group_id: uid.clone(),
-            is_instrumental: false,
-            blick_offset: 0,
-        },
-        main_group: MainGroup {
-            name: "main".into(),
-            uuid: uid,
-            parameters: Parameters::default(),
-            notes,
-        },
-        groups: vec![],
-    }
-}
-
-fn lyric_text(lyric: &Lyric) -> String {
-    match &lyric.state {
-        midi::LyricState::Text(text) => text.clone(),
-        midi::LyricState::Continuation => "-".into(),
-        midi::LyricState::SyllableSplit => "+".into(),
-        midi::LyricState::ExplicitEmpty | midi::LyricState::Unsupported(_) => String::new(),
-    }
 }
 
 /// Picks the lyric a note sings. `lanes` is indexed by repeat pass: a single
@@ -567,14 +538,15 @@ struct TrackProjection<'a> {
     evidence: &'a mut ProjectionEvidence,
 }
 
-fn make_track(
-    idx: usize,
+/// Projects one monophonic lane. Positions stay in IR ticks and the lyric is
+/// carried whole, so no target decision is taken here — including which marker
+/// text a continuation gets, which is not the same string in every target.
+fn project_track(
     name: &str,
     notes: &[SourceNote],
-    ticks_per_beat: u16,
     projection: TrackProjection<'_>,
-) -> Result<SvpTrack, String> {
-    let mut svp_notes = Vec::with_capacity(notes.len());
+) -> ProjectedTrack {
+    let mut projected_notes = Vec::with_capacity(notes.len());
     let replayed = replayed_note_ids(notes);
     let lane_words = lane_words_by_measure(notes);
     let mut explicit_extension_end = None;
@@ -592,7 +564,7 @@ fn make_track(
             } else {
                 explicit_extension_end = None;
             }
-            let text = lyric_text(attached);
+            let carried = ProjectedLyric::Source(Box::new(attached.clone()));
             match attached.extension {
                 Some(midi::LyricExtension::Start)
                 | Some(midi::LyricExtension::Continue)
@@ -612,7 +584,7 @@ fn make_track(
                 &source_note.source,
                 source_note.source_order,
             ));
-            text
+            carried
         } else if let Some(standalone) = projection.standalone.get(&index) {
             lyric_source_id = Some(standalone_lyric_instance_id(
                 &standalone.lyric,
@@ -623,14 +595,14 @@ fn make_track(
                 "event:{}:{}",
                 standalone.track_id, standalone.order
             ));
-            lyric_text(&standalone.lyric)
+            ProjectedLyric::Source(Box::new(standalone.lyric.clone()))
         } else if musicxml_extension_open
             || explicit_extension_end.is_some_and(|end| source_note.onset < end)
         {
             // Continuation is emitted only from a source lyric extension.
-            "-".into()
+            ProjectedLyric::Extension
         } else {
-            String::new()
+            ProjectedLyric::Absent
         };
         let Some(pitch) = source_note.pitch else {
             continue;
@@ -657,29 +629,18 @@ fn make_track(
             "event:{}:{}",
             projection.source_track_id, source_note.end_order
         ));
-        let onset = exact_blick_position(
-            source_note.onset,
-            ticks_per_beat,
-            &format!("note onset on source track {}", projection.source_track_id),
-        )?;
-        let duration = exact_blick_position(
-            source_note.duration,
-            ticks_per_beat,
-            &format!(
-                "note duration on source track {}",
-                projection.source_track_id
-            ),
-        )?;
-        svp_notes.push(Note {
-            attributes: serde_json::json!({}),
-            duration,
-            lyrics: lyric,
-            onset,
-            phonemes: String::new(),
+        projected_notes.push(ProjectedNote {
+            onset_ticks: source_note.onset,
+            duration_ticks: source_note.duration,
             pitch,
+            lyric,
         });
     }
-    Ok(build_track(idx, name.to_string(), svp_notes))
+    ProjectedTrack {
+        name: name.to_string(),
+        source_track_id: projection.source_track_id.to_string(),
+        notes: projected_notes,
+    }
 }
 
 /// Detects the format (MIDI / MusicXML / MuseScore) and converts.
@@ -821,7 +782,7 @@ pub fn convert_midi_with(
         }
     };
 
-    let mut svp_tracks: Vec<SvpTrack> = Vec::new();
+    let mut projected_tracks: Vec<ProjectedTrack> = Vec::new();
     let mut report: Vec<TrackReport> = Vec::new();
     let mut total_placed = 0usize;
     let mut projection = ProjectionEvidence::default();
@@ -938,26 +899,18 @@ pub fn convert_midi_with(
                     [lane] if lanes.len() > 1 => format!("{name} — lyric lane {lane}"),
                     _ => name.clone(),
                 };
-                let mut svp_track = match make_track(
-                    svp_tracks.len(),
+                let projected_track = project_track(
                     &lane_name,
                     notes,
-                    tpb,
                     TrackProjection {
                         source_track_id: &track.id,
                         lanes: group,
                         standalone,
                         evidence: &mut projection,
                     },
-                ) {
-                    Ok(track) => track,
-                    Err(error) => {
-                        return fail(format!("source timing cannot be projected safely: {error}"));
-                    }
-                };
-                if !svp_track.main_group.notes.is_empty() {
-                    svp_track.main_ref.database.language = language.to_string();
-                    svp_tracks.push(svp_track);
+                );
+                if !projected_track.notes.is_empty() {
+                    projected_tracks.push(projected_track);
                 }
             }
         }
@@ -1051,30 +1004,40 @@ pub fn convert_midi_with(
         });
     }
 
-    for (display_order, track) in svp_tracks.iter_mut().enumerate() {
-        track.disp_order = display_order as u32;
-        track.disp_color = COLORS[display_order % COLORS.len()].to_string();
-    }
-
-    let (tempo, tempo_evidence) = match read_tempo(midi, tpb) {
-        Ok(tempo) => tempo,
-        Err(error) => {
-            return fail(format!("source timing cannot be projected safely: {error}"));
-        }
-    };
+    let (tempo, tempo_evidence) = read_tempo(midi);
     projection.source_ids.extend(meter_evidence);
     projection.source_ids.extend(tempo_evidence);
-    let svp = SvpProject {
-        version: 113,
-        time: Time { meter, tempo },
-        render_config: RenderConfig::default(),
-        tracks: svp_tracks,
+    let projected = ProjectedProject {
+        ticks_per_beat: tpb,
+        language: language.to_string(),
+        meters: meter,
+        tempos: tempo,
+        tracks: projected_tracks,
     };
+    // A target's refusal to represent this timing is observable behaviour, not
+    // an export detail: `convert_files(write=false)` is the analysis path, and
+    // its verdict is what the frontend reports as "convertible". Letting the
+    // refusal wait until a file is written would make Verse call an
+    // unprojectable source fine and then fail at export. So the target is asked
+    // now and its answer discarded; the write boundary rebuilds it
+    // deterministically from the same projection.
+    //
+    // DEBT: this names one target, and it is the single place the seam is not
+    // one-directional. It must take the caller's chosen target once a second one
+    // lands. Synthesizer V positions a quarter note at 705_600_000 blicks while
+    // OpenUtau fixes 480 integer ticks, and 705_600_000 / 480 is exact, so the
+    // set of sources OpenUtau can represent is a strict subset. Asking this
+    // target on behalf of another would therefore clear a source the other must
+    // refuse, and the refusal would resurface at export — the very thing the
+    // paragraph above exists to prevent.
+    if let Err(error) = crate::engine::target::svp::serialize(&projected) {
+        return fail(format!("source timing cannot be projected safely: {error}"));
+    }
     let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
         ok: true,
         msg: None,
-        svp: Some(svp),
+        svp: Some(projected),
         topology: midi.topology.clone(),
         tracks: report,
         n_tracks,
@@ -1880,11 +1843,12 @@ mod tests {
         track
     }
 
-    #[test]
-    fn genuine_la_is_preserved_but_absence_stays_empty() {
-        let lyric = Lyric::text("source", "la".into());
-        assert_eq!(lyric_text(&lyric), "la");
-        assert_eq!(lyric_text(&Lyric::text("empty", String::new())), "");
+    /// The Synthesizer V project the seam builds from an outcome. A test that
+    /// asserts rendered lyric text or blick timing asserts it on the shape that
+    /// is written out, not on the target-neutral projection.
+    fn svp(outcome: &ConvertOutcome) -> crate::engine::target::svp::SvpProject {
+        crate::engine::target::svp::serialize(outcome.svp.as_ref().expect("conversion succeeds"))
+            .expect("the projection is exactly representable")
     }
 
     #[test]
@@ -1955,7 +1919,10 @@ mod tests {
         let (meter, evidence) =
             read_meter(&midi_with(vec![track]), 480).expect("meter changes are bar-aligned");
         assert_eq!(
-            meter.iter().map(|meter| meter.index).collect::<Vec<_>>(),
+            meter
+                .iter()
+                .map(|meter| meter.bar_index)
+                .collect::<Vec<_>>(),
             vec![0, 2, 3]
         );
         assert_eq!(evidence.len(), 3);
@@ -2034,8 +2001,7 @@ mod tests {
             ),
         ];
         let midi = midi_with(vec![first, second]);
-        let (tempo, tempo_evidence) =
-            read_tempo(&midi, 480).expect("tick zero is exactly representable");
+        let (tempo, tempo_evidence) = read_tempo(&midi);
         let (meter, meter_evidence) =
             read_meter(&midi, 480).expect("same-tick meter changes are bar-aligned");
         assert_eq!(tempo.len(), 1);
@@ -2080,7 +2046,7 @@ mod tests {
         track.events = note_events("voice", 0, 480, vec![first, second]);
 
         let outcome = convert_midi(&midi_with(vec![track]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(project.tracks.len(), 2);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "one");
         assert_eq!(project.tracks[1].main_group.notes[0].lyrics, "two");
@@ -2150,7 +2116,7 @@ mod tests {
         );
 
         let outcome = convert_midi(&midi_with(vec![track]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(project.tracks.len(), 1);
         let sung: Vec<_> = project.tracks[0]
             .main_group
@@ -2201,7 +2167,7 @@ mod tests {
         track.events = events;
 
         let outcome = convert_midi(&midi_with(vec![track]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(project.tracks.len(), 1);
         let sung: Vec<_> = project.tracks[0]
             .main_group
@@ -2250,7 +2216,7 @@ mod tests {
         track.events = events;
 
         let outcome = convert_midi(&midi_with(vec![track]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         let sung: Vec<_> = project.tracks[0]
             .main_group
             .notes
@@ -2274,7 +2240,7 @@ mod tests {
         );
 
         let outcome = convert_midi(&midi_with(vec![track]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(project.tracks.len(), 2);
         assert!(outcome.tracks.iter().any(|report| report
             .warnings
@@ -2292,9 +2258,7 @@ mod tests {
     fn sung_lyrics(xml: &str) -> Vec<String> {
         let outcome = convert_auto(xml.as_bytes(), "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
-        outcome
-            .svp
-            .expect("valid SVP")
+        svp(&outcome)
             .tracks
             .first()
             .expect("one vocal track")
@@ -2379,7 +2343,7 @@ mod tests {
             .insert(1, midi::Event::new(0, 1, Kind::Lyrics(standalone.clone())));
 
         let outcome = convert_midi(&midi_with(vec![track]), "english");
-        let project = outcome.svp.as_ref().expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "owned");
@@ -2420,7 +2384,7 @@ mod tests {
 
         let midi = kar_with(vec![lyrics, melody]);
         let automatic = convert_midi(&midi, "english");
-        let project = automatic.svp.expect("conversion succeeds");
+        let project = svp(&automatic);
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "let");
         assert_eq!(automatic.placed, 1);
@@ -2451,7 +2415,7 @@ mod tests {
         let melody = pitched_track("melody", &[(0, 480, 60, 0)]);
 
         let outcome = convert_midi(&midi_with(vec![lyrics, melody]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(outcome.placed, 0);
         assert!(project.tracks.is_empty());
         assert!(!outcome
@@ -2483,7 +2447,7 @@ mod tests {
 
         let outcome = convert_midi(&kar_with(vec![detached, melody]), "english");
         assert_eq!(outcome.placed, 1);
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "owned");
         assert!(!outcome
@@ -2514,7 +2478,7 @@ mod tests {
             "english",
             Some(&HashMap::from([(2usize, true)])),
         );
-        let project = outcome.svp.expect("override still exports the notes");
+        let project = svp(&outcome);
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "");
         assert_eq!(outcome.placed, 0);
@@ -2529,7 +2493,7 @@ mod tests {
         let melody = pitched_track("melody", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
 
         let outcome = convert_midi(&kar_with(vec![lyrics, melody]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(outcome.placed, 2);
         assert_eq!(
             project.tracks[0]
@@ -2554,18 +2518,14 @@ mod tests {
         let partial_melody = pitched_track("short", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
         let partial = convert_midi(&kar_with(vec![partial_words, partial_melody]), "english");
         assert_eq!(partial.placed, 0);
-        assert!(partial.svp.expect("conversion succeeds").tracks.is_empty());
+        assert!(svp(&partial).tracks.is_empty());
 
         let ambiguous_words = karaoke_text_track("ambiguous", &[(0, "\\one"), (480, "two")]);
         let first = pitched_track("first", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
         let second = pitched_track("second", &[(0, 240, 65, 1), (480, 240, 67, 1)]);
         let ambiguous = convert_midi(&kar_with(vec![ambiguous_words, first, second]), "english");
         assert_eq!(ambiguous.placed, 0);
-        assert!(ambiguous
-            .svp
-            .expect("conversion succeeds")
-            .tracks
-            .is_empty());
+        assert!(svp(&ambiguous).tracks.is_empty());
         assert!(ambiguous.tracks[0]
             .warnings
             .iter()
@@ -2578,7 +2538,7 @@ mod tests {
         let percussion = pitched_track("drums", &[(0, 240, 36, 9)]);
         let rejected = convert_midi(&kar_with(vec![percussion_words, percussion]), "english");
         assert_eq!(rejected.placed, 0);
-        assert!(rejected.svp.expect("conversion succeeds").tracks.is_empty());
+        assert!(svp(&rejected).tracks.is_empty());
 
         let words = karaoke_text_track("words", &[(0, "\\one"), (480, "two")]);
         let chord = pitched_track(
@@ -2586,7 +2546,7 @@ mod tests {
             &[(0, 240, 60, 0), (0, 240, 64, 0), (480, 240, 67, 0)],
         );
         let outcome = convert_midi(&kar_with(vec![words, chord]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(outcome.placed, 1);
         assert_eq!(
             project.tracks[0]
@@ -2620,7 +2580,7 @@ mod tests {
         }
         let melody = pitched_track("melody", &[(0, 240, 60, 0), (480, 240, 62, 0)]);
         let outcome = convert_midi(&kar_with(vec![lyrics, melody]), "english");
-        let project = outcome.svp.expect("conversion succeeds");
+        let project = svp(&outcome);
         assert_eq!(outcome.placed, 2);
         assert_eq!(
             project.tracks[0]
@@ -2679,7 +2639,7 @@ mod tests {
         let outcome = convert_midi(&midi_with(vec![track]), "english");
         assert_eq!(outcome.tracks[0].notes, 1);
         assert_eq!(outcome.placed, 0);
-        assert!(outcome.svp.expect("conversion succeeds").tracks.is_empty());
+        assert!(svp(&outcome).tracks.is_empty());
         assert!(!outcome
             .projection
             .source_ids

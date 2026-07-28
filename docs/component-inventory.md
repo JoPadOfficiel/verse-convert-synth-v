@@ -115,7 +115,8 @@ resources and Tauri IPC; it does not authorize arbitrary web connections.
 | `src-tauri/src/engine/musicxml.rs` | MusicXML/XML/MXL decoding into the shared model |
 | `src-tauri/src/engine/musescore.rs` | Native MSCX/MSCZ decoding into the shared model |
 | `src-tauri/src/engine/convert.rs` | Source classification, lyric ownership, diagnostics, overrides, and evidence-backed vocal projection |
-| `src-tauri/src/engine/svp.rs` | Synthesizer V project v113 data model and serialization |
+| `src-tauri/src/engine/projection.rs` | Target-neutral projection consumed by every export target |
+| `src-tauri/src/engine/target/svp.rs` | Synthesizer V project v113 data model and serialization |
 | `src-tauri/src/stems.rs` | Stable one-stem-per-note-bearing-Part plan and default mute policy |
 | `src-tauri/src/renderer.rs` | MuseScore discovery, capability probe, Part extraction, bounded rendering, process cleanup, and WAV validation |
 | `src-tauri/src/bundle.rs` | Preservation ledger, staging, rendering orchestration, integrity validation, rollback, and no-replace commit |

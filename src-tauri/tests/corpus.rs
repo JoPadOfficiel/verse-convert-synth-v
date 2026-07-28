@@ -3,7 +3,7 @@
 //! mandatory.
 
 use std::path::{Path, PathBuf};
-use verse_lib::engine::{convert::convert_midi, midi, musescore, musicxml};
+use verse_lib::engine::{convert::convert_midi, midi, musescore, musicxml, target};
 use verse_lib::stems::StemPlan;
 
 type ScoreParser = fn(&[u8]) -> Result<midi::Midi, String>;
@@ -82,7 +82,9 @@ fn audited_kar_corpus_keeps_only_proven_lyric_bindings() {
             "{name}: every emitted lyric must have one source evidence ID"
         );
 
-        let project = outcome.svp.expect("successful conversion has a project");
+        let project =
+            target::svp::serialize(&outcome.svp.expect("successful conversion has a project"))
+                .expect("exactly representable");
         for lyric in project
             .tracks
             .iter()
@@ -160,13 +162,16 @@ fn audited_score_corpus_has_stable_part_staff_voice_topology() {
             "{name}: every note-bearing source Part needs exactly one stem"
         );
         assert!(
-            outcome
-                .svp
-                .as_ref()
-                .expect("successful conversion has a project")
-                .tracks
-                .iter()
-                .all(|track| !track.main_group.notes.is_empty()),
+            target::svp::serialize(
+                outcome
+                    .svp
+                    .as_ref()
+                    .expect("successful conversion has a project")
+            )
+            .expect("exactly representable")
+            .tracks
+            .iter()
+            .all(|track| !track.main_group.notes.is_empty()),
             "{name}: no empty vocal track may be serialized"
         );
 

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use verse_lib::engine::convert::convert_auto;
 use verse_lib::engine::midi::{self, Kind, LyricState, SourceFormat};
-use verse_lib::engine::{musescore, musicxml};
+use verse_lib::engine::{musescore, musicxml, target};
 
 fn smf(track: &[u8]) -> Vec<u8> {
     let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
@@ -22,7 +22,12 @@ fn lyric_free_midi_succeeds_without_a_synthetic_vocal_track() {
     assert_eq!(outcome.tracks.len(), 1);
     assert_eq!(outcome.tracks[0].notes, 1);
     assert_eq!(outcome.tracks[0].role, "backing");
-    assert!(outcome.svp.expect("valid empty project").tracks.is_empty());
+    assert!(
+        target::svp::serialize(&outcome.svp.expect("valid empty project"))
+            .expect("exactly representable")
+            .tracks
+            .is_empty()
+    );
 }
 
 #[test]
@@ -64,7 +69,10 @@ fn generic_midi_text_is_not_a_lyric_and_performance_events_survive() {
     let outcome = convert_auto(&data, "english");
     assert!(outcome.ok);
     assert_eq!(outcome.placed, 0);
-    assert!(outcome.svp.expect("valid project").tracks.is_empty());
+    assert!(target::svp::serialize(&outcome.svp.expect("valid project"))
+        .expect("exactly representable")
+        .tracks
+        .is_empty());
 }
 
 #[test]
@@ -140,7 +148,7 @@ fn merging_a_tie_sustains_the_note_without_losing_any_source_identity() {
 
     let outcome = convert_auto(xml.as_bytes(), "english");
     assert!(outcome.ok, "{:?}", outcome.msg);
-    let svp = outcome.svp.expect("valid SVP");
+    let svp = target::svp::serialize(&outcome.svp.expect("valid SVP")).expect("valid SVP");
     let notes = &svp.tracks[0].main_group.notes;
     assert_eq!(notes.len(), 1, "the tie is sung as one sustained note");
     assert_eq!(notes[0].lyrics, "shine");
@@ -172,7 +180,7 @@ fn supplied_musescore_gate_when_configured() {
 
     let outcome = convert_auto(&data, "english");
     assert!(outcome.ok, "{:?}", outcome.msg);
-    let svp = outcome.svp.expect("valid SVP");
+    let svp = target::svp::serialize(&outcome.svp.expect("valid SVP")).expect("valid SVP");
     let vocal = svp
         .tracks
         .iter()

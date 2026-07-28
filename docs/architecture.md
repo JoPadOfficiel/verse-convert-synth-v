@@ -44,7 +44,8 @@ files, build manifests, launch processes, or commit output.
 | Shared musical model | `engine/midi.rs` | Events, source evidence, topology, timing, repeats/navigation |
 | Projection policy | `engine/convert.rs` | Classification, lyric ownership, vocal projection, diagnostics |
 | Input adapters | `engine/midi.rs`, `musicxml.rs`, `musescore.rs` | Format-specific parsing into the shared model |
-| Target adapter | `engine/svp.rs` | Raw Synthesizer V project v113 serialization |
+| Projection seam | `engine/projection.rs` | Target-neutral projection in source-exact IR ticks |
+| Target adapter | `engine/target/svp.rs` | Raw Synthesizer V project v113 serialization |
 | Stem policy | `stems.rs` | One stable stem per note-bearing source Part |
 | Renderer adapter | `renderer.rs` | MuseScore discovery, capability probe, extraction, render, validation |
 | Artifact adapter | `bundle.rs` | Ledger, staged files, integrity checks, no-replace commit |
@@ -241,7 +242,8 @@ full mechanism is not yet present.
 
 - Keep format-specific parsing in its adapter.
 - Keep cross-format evidence semantics in `midi.rs`/`convert.rs`.
-- Keep SVP serialization in `svp.rs`.
+- Keep SVP serialization in `target/svp.rs`, and keep everything a second export
+  target would also need out of it and in `projection.rs`.
 - Keep child-process control in `renderer.rs`.
 - Keep filesystem transaction and bundle validation in `bundle.rs`.
 - Do not solve format differences with a global nearest-note or cross-track

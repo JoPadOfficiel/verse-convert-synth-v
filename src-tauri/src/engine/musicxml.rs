@@ -2250,13 +2250,14 @@ mod tests {
         );
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable");
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "hold");
         assert_eq!(
             project.tracks[0].main_group.notes[0].duration,
-            crate::engine::svp::BLICKS_PER_QUARTER as i64 * 2
+            crate::engine::target::svp::BLICKS_PER_QUARTER as i64 * 2
         );
     }
 
@@ -2285,7 +2286,12 @@ mod tests {
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
         assert_eq!(outcome.placed, 0);
-        assert!(outcome.svp.unwrap().tracks.is_empty());
+        assert!(
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+                .expect("exactly representable")
+                .tracks
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2319,7 +2325,8 @@ mod tests {
         assert!(outcome.ok, "{:?}", outcome.msg);
         assert_eq!(outcome.n_tracks, 1);
         assert_eq!(outcome.topology, midi.topology);
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable");
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].pitch, 60);
@@ -2426,7 +2433,8 @@ mod tests {
         assert_eq!(lyrics[1].lane, "2");
 
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable");
         assert_eq!(project.tracks.len(), 2);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "one");
         assert_eq!(project.tracks[1].main_group.notes[0].lyrics, "two");

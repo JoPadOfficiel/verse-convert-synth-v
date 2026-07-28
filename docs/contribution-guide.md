@@ -45,7 +45,9 @@ Keep responsibilities in their current boundaries:
 - `src-tauri/src/engine/musescore.rs`: MSCX/MSCZ adapter;
 - `src-tauri/src/engine/convert.rs`: source classification, lyric ownership,
   vocal projection, and diagnostics;
-- `src-tauri/src/engine/svp.rs`: SVP serialization only;
+- `src-tauri/src/engine/projection.rs`: the target-neutral projection only — no
+  blicks, colours, display order or rendered marker text;
+- `src-tauri/src/engine/target/svp.rs`: SVP serialization only;
 - `src-tauri/src/stems.rs`: source Part stem planning;
 - `src-tauri/src/renderer.rs`: bounded MuseScore process adapter;
 - `src-tauri/src/bundle.rs`: ledger, manifest, validation, and transactional

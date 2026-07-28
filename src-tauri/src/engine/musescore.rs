@@ -2088,7 +2088,10 @@ mod tests {
         assert_eq!(meters, vec![(0, 3, 4)]);
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
-        let meter = &outcome.svp.expect("SVP project").time.meter;
+        let project =
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().expect("SVP project"))
+                .expect("exactly representable");
+        let meter = &project.time.meter;
         assert_eq!(
             meter
                 .iter()
@@ -2356,14 +2359,14 @@ mod tests {
         assert!(outcome.ok, "{:?}", outcome.msg);
         assert_eq!(outcome.topology, midi.topology);
         assert_eq!(outcome.placed, 2);
-        let sung: Vec<_> = outcome
-            .svp
-            .expect("valid SVP")
-            .tracks
-            .iter()
-            .flat_map(|track| track.main_group.notes.iter())
-            .map(|note| (note.pitch, note.lyrics.clone()))
-            .collect();
+        let sung: Vec<_> =
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().expect("valid SVP"))
+                .expect("exactly representable")
+                .tracks
+                .iter()
+                .flat_map(|track| track.main_group.notes.iter())
+                .map(|note| (note.pitch, note.lyrics.clone()))
+                .collect();
         assert_eq!(
             sung,
             vec![(60, "together".into()), (64, "together".into())],
@@ -2647,7 +2650,12 @@ Melodie</trackName>
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert_eq!(outcome.tracks[0].notes, 1);
         assert_eq!(outcome.placed, 0);
-        assert!(outcome.svp.unwrap().tracks.is_empty());
+        assert!(
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+                .expect("exactly representable")
+                .tracks
+                .is_empty()
+        );
     }
 
     #[test]

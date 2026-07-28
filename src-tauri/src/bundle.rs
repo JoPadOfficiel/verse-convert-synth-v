@@ -10,7 +10,7 @@ use crate::engine::convert::{
     ProjectionEvidence,
 };
 use crate::engine::midi::{self, Kind, Midi, MidiTextProfile, SourceTopology};
-use crate::engine::svp::{append_instrumental_track, SvpProject};
+use crate::engine::target::svp::{append_instrumental_track, SvpProject};
 use crate::renderer::{
     sha256_bytes, sha256_file, validate_wav, validate_wav_allowing_silence, AudioRenderer,
     ExtractedScorePart, RenderError, RenderLimits, RendererIdentity, WavInfo,
@@ -1989,7 +1989,7 @@ impl BundleHook for NoopHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::svp::{RenderConfig, Time};
+    use crate::engine::target::svp::{RenderConfig, Time};
     use crate::renderer::{MuseScoreRenderer, RendererCapabilities, WavInfo};
     use crate::stems::{StemDescriptor, StemPlan, StemRole};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -3044,7 +3044,8 @@ mod tests {
             .entries
             .iter()
             .all(|entry| !entry.source_id.contains("la")));
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(&outcome.svp.unwrap())
+            .expect("exactly representable");
         assert_eq!(
             project.tracks[0]
                 .main_group
@@ -3125,7 +3126,10 @@ mod tests {
                     original_name,
                     source_format: source_format.into(),
                     source_bytes: source_bytes.clone(),
-                    project: outcome.svp.expect("SVP projection"),
+                    project: crate::engine::target::svp::serialize(
+                        &outcome.svp.expect("SVP projection"),
+                    )
+                    .expect("exactly representable"),
                     stem_plan: stem_plan.clone(),
                     ledger,
                     warnings: vec![],
@@ -3161,7 +3165,10 @@ mod tests {
         assert!(outcome.ok);
         let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
         let expected_stems = stem_plan.stems.len();
-        let vocal_tracks = outcome.svp.as_ref().unwrap().tracks.len();
+        let vocal_tracks = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable")
+            .tracks
+            .len();
         let root = temp_dir("real-bundle-gate");
         let destination = root.join("Real.versebundle");
         let original_name = source_path
@@ -3178,7 +3185,8 @@ mod tests {
                 original_name,
                 source_format: "museScore".into(),
                 source_bytes,
-                project: outcome.svp.unwrap(),
+                project: crate::engine::target::svp::serialize(&outcome.svp.unwrap())
+                    .expect("exactly representable"),
                 stem_plan,
                 ledger,
                 warnings: vec![],

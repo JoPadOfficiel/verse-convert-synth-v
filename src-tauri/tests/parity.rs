@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use verse_lib::engine::convert::{convert_auto, convert_bytes, convert_midi_with, ConvertOutcome};
 use verse_lib::engine::midi;
+use verse_lib::engine::target;
 
 fn read_fixture(name: &str) -> Vec<u8> {
     let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
@@ -22,6 +23,112 @@ fn conv(name: &str) -> ConvertOutcome {
 
 fn conv_auto(name: &str) -> ConvertOutcome {
     convert_auto(&read_fixture(name), "english")
+}
+
+/// A Standard MIDI File assembled from raw track chunks, so the golden test
+/// below needs no committed fixture. Same construction as
+/// `source_fidelity.rs`'s `smf`, widened to format 1 for several tracks.
+fn smf(tracks: &[&[u8]]) -> Vec<u8> {
+    let mut data = b"MThd\0\0\0\x06\0\x01".to_vec();
+    data.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
+    data.extend_from_slice(&480u16.to_be_bytes());
+    for track in tracks {
+        data.extend_from_slice(b"MTrk");
+        data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        data.extend_from_slice(track);
+    }
+    data
+}
+
+/// Two sung tracks, a tempo change, a meter change at a bar boundary, an
+/// untexted note, and a third track with notes but no lyric evidence anywhere.
+fn golden_source() -> Vec<u8> {
+    let sung: Vec<u8> = vec![
+        0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // 120 bpm at tick 0
+        0x00, 0xff, 0x58, 0x04, 0x03, 0x02, 0x18, 0x08, // 3/4 at tick 0
+        0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // lyric "let"
+        0x00, 0x90, 60, 100, // C4 on at 0
+        0x83, 0x60, 0x80, 60, 0, // off at 480
+        0x00, 0xff, 0x05, 0x02, b'i', b't', // lyric "it" at 480
+        0x00, 0x90, 62, 100, // D4 on at 480
+        0x81, 0x70, 0x80, 62, 0, // off at 720
+        0x81, 0x70, 0x90, 64, 100, // E4 on at 960, no lyric of its own
+        0x83, 0x60, 0x80, 64, 0, // off at 1440
+        0x00, 0xff, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08, // 4/4 at tick 1440, bar 1
+        0x00, 0xff, 0x51, 0x03, 0x06, 0x1a, 0x80, // 150 bpm at tick 1440
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    let second_voice: Vec<u8> = vec![
+        0x00, 0xff, 0x05, 0x04, b's', b'i', b'n', b'g', // lyric "sing"
+        0x00, 0x90, 67, 80, // G4 on at 0
+        0x87, 0x40, 0x80, 67, 0, // off at 960
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    // No lyric evidence anywhere on this track, so it is never projected as a
+    // vocal lane. The colours and display order below must therefore follow the
+    // projected sequence, not the source track index.
+    let instrumental: Vec<u8> = vec![
+        0x00, 0x90, 48, 90, //
+        0x83, 0x60, 0x80, 48, 0, //
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    smf(&[&sung, &second_voice, &instrumental])
+}
+
+/// Release 0.4.9's `.svp` for [`golden_source`], byte for byte.
+const GOLDEN_SVP: &str = r#"{"version":113,"time":{"meter":[{"denominator":4,"index":0,"numerator":3},{"denominator":4,"index":1,"numerator":4}],"tempo":[{"bpm":120.0,"position":0},{"bpm":150.0,"position":2116800000}]},"renderConfig":{"aspirationFormat":"noAspiration","bitDepth":16,"destination":"./","exportMixDown":true,"filename":"untitled","numChannels":1,"sampleRate":44100},"tracks":[{"name":"Track 0","dispColor":"ff7db235","dispOrder":0,"renderEnabled":true,"mixer":{"gainDecibel":0.0,"pan":0.0,"mute":false,"solo":false,"display":true},"mainRef":{"audio":{"filename":"","duration":0.0},"database":{"name":"","language":"japanese","phoneset":""},"dictionary":"","voice":{},"groupID":"00000000-0000-4000-8000-000000000000","isInstrumental":false,"blickOffset":0},"mainGroup":{"name":"main","uuid":"00000000-0000-4000-8000-000000000000","parameters":{"breathiness":{"mode":"cubic","points":[]},"gender":{"mode":"cubic","points":[]},"loudness":{"mode":"cubic","points":[]},"pitchDelta":{"mode":"cubic","points":[]},"tension":{"mode":"cubic","points":[]},"vibratoEnv":{"mode":"cubic","points":[]},"voicing":{"mode":"cubic","points":[]}},"notes":[{"attributes":{},"duration":705600000,"lyrics":"let","onset":0,"phonemes":"","pitch":60},{"attributes":{},"duration":352800000,"lyrics":"it","onset":705600000,"phonemes":"","pitch":62},{"attributes":{},"duration":705600000,"lyrics":"","onset":1411200000,"phonemes":"","pitch":64}]},"groups":[]},{"name":"Track 1","dispColor":"ff4a90d9","dispOrder":1,"renderEnabled":true,"mixer":{"gainDecibel":0.0,"pan":0.0,"mute":false,"solo":false,"display":true},"mainRef":{"audio":{"filename":"","duration":0.0},"database":{"name":"","language":"japanese","phoneset":""},"dictionary":"","voice":{},"groupID":"00000001-0000-4000-8000-000000000000","isInstrumental":false,"blickOffset":0},"mainGroup":{"name":"main","uuid":"00000001-0000-4000-8000-000000000000","parameters":{"breathiness":{"mode":"cubic","points":[]},"gender":{"mode":"cubic","points":[]},"loudness":{"mode":"cubic","points":[]},"pitchDelta":{"mode":"cubic","points":[]},"tension":{"mode":"cubic","points":[]},"vibratoEnv":{"mode":"cubic","points":[]},"voicing":{"mode":"cubic","points":[]}},"notes":[{"attributes":{},"duration":1411200000,"lyrics":"sing","onset":0,"phonemes":"","pitch":67}]},"groups":[]}]}"#;
+
+/// Pins the whole Synthesizer V output, not just its shape. The value was taken
+/// from release 0.4.9 before the target seam existed, so this test is the
+/// standing proof that no later target work drifts a single `.svp` byte:
+/// a blick, a colour, a display order, a group UUID, a marker, `version: 113`,
+/// the render config, or the field order they are written in.
+#[test]
+fn the_synthesizer_v_bytes_stay_identical_to_release_0_4_9() {
+    let outcome = convert_bytes(&golden_source(), "japanese");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    assert_eq!(outcome.placed, 3);
+    let projected = outcome.svp.expect("a projection");
+    // Only the two tracks with source lyric evidence become vocal lanes.
+    assert_eq!(projected.tracks.len(), 2);
+    let svp = target::svp::serialize(&projected).expect("480 PPQ is exactly representable");
+    let json = String::from_utf8(serde_json::to_vec(&svp).expect("serializes"))
+        .expect("SVP JSON is UTF-8");
+    assert_eq!(json, GOLDEN_SVP);
+}
+
+/// The converter validates the meter before it walks the tracks and the timing
+/// grid after, so a source that fails both must report the meter. That order is
+/// observable message text: moving the timing gate ahead of the meter check
+/// would silently change which reason the user is given.
+#[test]
+fn a_source_failing_both_meter_and_timing_still_reports_the_meter() {
+    // PPQ 1024, so a one-tick duration misses the blick grid, and a 3/4 -> 4/4
+    // change at tick 1, which is inside the first bar.
+    let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x04\x00".to_vec();
+    let track: Vec<u8> = vec![
+        0x00, 0xff, 0x58, 0x04, 0x03, 0x02, 0x18, 0x08, // 3/4 at tick 0
+        0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', //
+        0x00, 0x90, 60, 100, //
+        0x01, 0x80, 60, 0, // duration 1 tick, not blick-exact
+        0x00, 0xff, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08, // 4/4 at tick 1, mid-bar
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    data.extend_from_slice(b"MTrk");
+    data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    data.extend_from_slice(&track);
+
+    let outcome = convert_bytes(&data, "english");
+    assert!(!outcome.ok);
+    assert!(outcome.svp.is_none());
+    assert_eq!(
+        outcome.msg.as_deref(),
+        Some(
+            "MIDI meter cannot be projected safely: time signature change at MIDI tick 1 \
+             (event:midi-track-0:4) falls inside a 3/4 measure; Synthesizer V meter changes \
+             require a measure boundary"
+        )
+    );
 }
 
 #[test]
@@ -138,7 +245,7 @@ fn hound_dog_multitrack() {
         .find(|t| t.role == "vocal")
         .expect("one singing track");
     assert_eq!(vox.placed, 244);
-    let svp = r.svp.unwrap();
+    let svp = target::svp::serialize(&r.svp.unwrap()).unwrap();
     assert_eq!(
         svp.tracks
             .iter()
@@ -207,7 +314,7 @@ fn help_kar_binds_words_only_to_the_unique_lead_track() {
         .iter()
         .any(|t| t.track.contains("Harm 2") && t.placed == 0));
     // the 3 explicitly selected singing tracks are the only SVP tracks
-    let svp = r.svp.unwrap();
+    let svp = target::svp::serialize(&r.svp.unwrap()).unwrap();
     assert_eq!(svp.tracks.len(), 3);
     assert!(svp.tracks[0].name.contains("Lead") || svp.tracks[0].name.contains("Harm"));
     assert_eq!(
@@ -236,7 +343,7 @@ fn musicxml_help_lyrics() {
         "at least one singing track"
     );
     assert!(r.placed > 100, "many syllables placed, got {}", r.placed);
-    let svp = r.svp.unwrap();
+    let svp = target::svp::serialize(&r.svp.unwrap()).unwrap();
     let has = |w: &str| {
         svp.tracks.iter().any(|tr| {
             tr.main_group
@@ -262,7 +369,7 @@ fn musescore_mscz_native() {
     let vocal = r.tracks.iter().filter(|t| t.role == "vocal").count();
     assert!(vocal >= 3, "the 3 voices must sing, got {}", vocal);
     assert!(r.placed > 300, "many syllables placed, got {}", r.placed);
-    let svp = r.svp.unwrap();
+    let svp = target::svp::serialize(&r.svp.unwrap()).unwrap();
     let has = |w: &str| {
         svp.tracks.iter().any(|tr| {
             tr.main_group
@@ -296,10 +403,8 @@ fn the_same_score_projects_identically_from_mscz_and_mxl() {
     let from_mscz = conv_auto("help.mscz");
     let from_mxl = conv_auto("help.mxl");
     let voices = |outcome: &ConvertOutcome| {
-        outcome
-            .svp
-            .as_ref()
-            .expect("conversion succeeds")
+        target::svp::serialize(outcome.svp.as_ref().expect("conversion succeeds"))
+            .expect("exactly representable")
             .tracks
             .iter()
             .map(|track| {
@@ -384,7 +489,8 @@ fn queen_lyrics_without_source_melody_do_not_create_c4() {
         r.tracks.iter().all(|t| t.role != "vocal_synth"),
         "the converter must not invent a synthetic melody track"
     );
-    let svp = r.svp.expect("a valid, possibly empty SVP project");
+    let svp = target::svp::serialize(&r.svp.expect("a valid, possibly empty SVP project"))
+        .expect("exactly representable");
     assert!(
         svp.tracks
             .iter()
@@ -480,7 +586,8 @@ fn assert_no_syllable_is_lost(fixture: &str) {
     let outcome = convert_bytes(&data, "english");
     assert!(outcome.ok, "{fixture}: {:?}", outcome.msg);
     let mut projected: HashMap<&str, usize> = HashMap::new();
-    let project = outcome.svp.as_ref().expect("valid SVP");
+    let project = target::svp::serialize(outcome.svp.as_ref().expect("valid SVP"))
+        .expect("exactly representable");
     for note in project
         .tracks
         .iter()
