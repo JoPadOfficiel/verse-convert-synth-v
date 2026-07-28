@@ -68,7 +68,7 @@ export default function App() {
   // never seen the voice database the user will assign. Lyrics never depended on
   // it, in any language.
   const language: Language = "english";
-  const [exportTarget, setExportTarget] = useState<ExportTarget>("svp");
+  const [exportTarget, setExportTarget] = useState<ExportTarget>("ustx");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [overrides, setOverrides] = useState<Overrides>({});
   const [exportErrors, setExportErrors] = useState<Record<string, string>>({});
@@ -514,19 +514,6 @@ export default function App() {
             <div className="inline-flex overflow-hidden rounded-md border">
               <button
                 disabled={busy}
-                onClick={() => void changeTarget("svp")}
-                title="Write a Synthesizer V .svp project, in a vocal-only export and inside a complete bundle alike"
-                className={
-                  "px-3 py-1 text-sm disabled:opacity-50 " +
-                  (exportTarget === "svp"
-                    ? "bg-primary text-primary-foreground"
-                    : "hover:bg-accent")
-                }
-              >
-                Synthesizer V
-              </button>
-              <button
-                disabled={busy}
                 onClick={() => void changeTarget("ustx")}
                 title="Write an OpenUtau .ustx project, in a vocal-only export and inside a complete bundle alike"
                 className={
@@ -537,6 +524,19 @@ export default function App() {
                 }
               >
                 OpenUtau
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => void changeTarget("svp")}
+                title="Write a Synthesizer V .svp project, in a vocal-only export and inside a complete bundle alike"
+                className={
+                  "px-3 py-1 text-sm disabled:opacity-50 " +
+                  (exportTarget === "svp"
+                    ? "bg-primary text-primary-foreground"
+                    : "hover:bg-accent")
+                }
+              >
+                Synthesizer V
               </button>
             </div>
             <div className="flex-1" />
