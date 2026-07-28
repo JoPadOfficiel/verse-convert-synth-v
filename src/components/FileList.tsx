@@ -223,6 +223,12 @@ function Row({
   const progressPercent = exportProgress
     ? exportProgressPercent(exportProgress)
     : 0;
+  // Counted after grouping, so one sentence repeated over 300 notes reads as one
+  // warning rather than 300 — the same collapse the expanded rows show.
+  const warningCount = item.parts.reduce(
+    (total, part) => total + groupDiagnostics(part.warnings).length,
+    0,
+  );
 
   return (
     <div className="rounded-lg border bg-card">
@@ -250,6 +256,17 @@ function Row({
                 ? `${item.nParts} source Parts · ${item.nVoices} voices · ${vocalTracks} vocal exports · ${item.placed} projected lyrics`
                 : analysisError}
             </div>
+            {/* Diagnostics used to live only inside the expanded Part rows, so a
+                warning about a lyric the target reinterprets went unseen unless the
+                row happened to be opened. Surfaced here as a count, with the
+                detail still one click away. */}
+            {item.ok && warningCount > 0 && (
+              <div className="flex items-center gap-1 truncate text-xs text-warning">
+                <ExclamationTriangleIcon className="size-3 shrink-0" />
+                {warningCount} warning{warningCount === 1 ? "" : "s"} · expand
+                for detail
+              </div>
+            )}
             {item.ok && (
               <div
                 className={
