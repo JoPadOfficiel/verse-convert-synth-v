@@ -1045,10 +1045,20 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                     .find(|node| node.has_tag_name("instrument-name"))
                     .map(crate::engine::musescore::deep_text)
                     .filter(|value| !value.is_empty());
+                // MusicXML states the same taxonomy MuseScore writes into
+                // `<instrumentId>`, under a different tag. It was parsed by
+                // neither adapter before, which left every MusicXML choir with
+                // no declaration of what it is.
+                let sound_id = score_instrument
+                    .children()
+                    .find(|node| node.has_tag_name("instrument-sound"))
+                    .map(crate::engine::musescore::deep_text)
+                    .filter(|value| !value.is_empty());
                 instruments.insert(
                     id.to_string(),
                     InstrumentInfo {
                         id: Some(id.to_string()),
+                        sound_id,
                         name: instrument_name,
                         ..InstrumentInfo::default()
                     },
@@ -1567,6 +1577,11 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 text_profile: MidiTextProfile::Generic,
                 instrument: instruments.first().cloned(),
                 instruments,
+                // MusicXML attaches `<lyric>` to a `<note>`, never to the chord,
+                // so it already states which member sings and there is no
+                // reading to take. `<instrument-sound>` is still captured above,
+                // for anything that needs to know what the part is.
+                chord_reading: None,
                 events,
             });
         }
@@ -1582,6 +1597,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 text_profile: MidiTextProfile::Generic,
                 instruments: Vec::new(),
                 instrument: None,
+                chord_reading: None,
                 events: Vec::new(),
             });
         }

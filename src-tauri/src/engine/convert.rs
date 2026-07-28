@@ -683,6 +683,14 @@ fn project_track(
 /// verse-lane suffix `project_track`'s caller builds.
 const UNTEXTED_LANE_SUFFIX: &str = " — untexted notes";
 
+/// Reported whenever a source wrote a word over a chord, naming which of the two
+/// readings was taken and the evidence that decided it.
+pub const CHORD_READING: &str = "CHORD_READING";
+
+/// Reported when one note carries two different words for the same verse, which
+/// no target can sing and which would otherwise lose one of them silently.
+pub const LYRIC_VERSE_CLAIMED_TWICE: &str = "LYRIC_VERSE_CLAIMED_TWICE";
+
 /// Moves the notes the source does not text out of a sung lane and into a muted
 /// companion, so the lane the user actually sings holds only real words.
 ///
@@ -1091,6 +1099,65 @@ pub fn convert_midi_with_target(
             index,
             source_binding_active.is_some() || target_binding.is_some(),
         );
+        // A chord carrying one word can mean two different things, and which one
+        // was read decides how many notes sing it. Never leave that silent: the
+        // reading is a decision about the music, and the evidence behind it is
+        // what lets a user tell a wrong call from a badly written score.
+        // Two lyric elements claiming the same verse is the source contradicting
+        // itself. An exact duplicate is a notation artefact and harmless — the
+        // projector sings it once — but two *different* words cannot both be
+        // sung, and the one that loses would vanish with nothing said.
+        let contradicting = track
+            .events
+            .iter()
+            .filter(|event| matches!(&event.kind, Kind::NoteOn(note) if note.velocity != Some(0)))
+            .filter(|event| {
+                let Kind::NoteOn(note) = &event.kind else {
+                    return false;
+                };
+                let mut claimed: HashMap<&str, &str> = HashMap::new();
+                note.lyrics.iter().any(|lyric| {
+                    let midi::LyricState::Text(text) = &lyric.state else {
+                        return false;
+                    };
+                    claimed
+                        .insert(lyric.lane.as_str(), text.as_str())
+                        .is_some_and(|previous| previous != text)
+                })
+            })
+            .count();
+        if contradicting > 0 {
+            warnings.push(report_warning(
+                LYRIC_VERSE_CLAIMED_TWICE,
+                DiagnosticSeverity::Warning,
+                format!(
+                    "{contradicting} note(s) carry two different words for the same verse. \
+                     The source numbers a verse with its own field and omits it only for the \
+                     first, so both words claim verse 1 and only the first is sung; the other \
+                     stays in the source. Number the second verse in the score to sing it."
+                ),
+                &track.id,
+            ));
+        }
+        if let Some((reading, evidence)) = &track.chord_reading {
+            let message = match reading {
+                midi::ChordReading::Harmonised => format!(
+                    "Chords here are read as harmony, so every note of a chord sings the word \
+                     written under it: {evidence}."
+                ),
+                midi::ChordReading::Reduction => format!(
+                    "Chords here are read as an accompaniment under one singer, so the highest \
+                     note of a chord sings the word written under it and the notes below it are \
+                     kept without one: {evidence}."
+                ),
+            };
+            warnings.push(report_warning(
+                CHORD_READING,
+                DiagnosticSeverity::Info,
+                message,
+                &track.id,
+            ));
+        }
         if unplaced_verses > 0 {
             warnings.push(report_warning(
                 "LYRIC_VERSES_EXCEED_REPEAT_PASSES",

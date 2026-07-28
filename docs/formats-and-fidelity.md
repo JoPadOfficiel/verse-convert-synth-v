@@ -345,17 +345,50 @@ only Excerpts, malformed XML, and unsafe timing/pitch values.
 
 ### Lyrics on chords
 
-The members of a chord are simultaneous voices of one line, not candidates to
-choose between. Each becomes its own monophonic lane and each sings the word
-written under it: a passage harmonised in thirds keeps both voices, both carry
-the text, and either can be given its own voice database.
+A word written under a chord means one of two things, and they are opposites.
 
-Verse never picks the highest, lowest or first note as "the melody" — that would
-silently delete the other voice. Reading a chord as ambiguous and leaving its
-lyric source-only did the same damage from the other side: it deleted whole
-sung phrases, such as an entire refrain line of a score whose banjo doubles the
-melody a sixth below. Only a chord with no note at all has nothing to carry its
-lyric, and that lyric stays source-only with a diagnostic.
+In a choir it is a **harmony**: the members are simultaneous voices of one line,
+each sings that word, and each can be given its own voice database. A passage
+harmonised in thirds keeps both voices and both carry the text.
+
+In a reduction it is an **accompaniment**: one singer over chords no singer could
+produce, since a voice sounds one note at a time. Reading such a chord as a
+harmony asks one written syllable to be sung several times at once — measured on
+one reported piano score, 491 sung syllables where the score writes 363, two of
+them asked for nine times over.
+
+Verse does not guess between the two. It reads what the part declares itself to
+be, using the language-independent instrument identifier every notation program
+writes — MuseScore `<instrumentId>`, MusicXML `<instrument-sound>`, a General MIDI
+program. `voice.*` and `vocal.*`, and GM programs 52–54, are singing instruments
+and select the harmony reading; anything else selects the reduction, where the
+chord's highest note takes the word and the notes below it are kept without one.
+Matching on the identifier and never on a display name is not a detail: the score
+that exposed this names its instrument `Piano, Фортепиано`.
+
+A part that declares no instrument at all is measured against its own chords: a
+harmony if at least half of its chords carrying a word hold more than one note, a
+reduction otherwise. A choir harmonises throughout; a reduction carries the
+occasional chord under an otherwise single-note melody.
+
+Both readings are reported under `CHORD_READING`, with the evidence that decided
+them, whenever a source writes a word over a chord at all.
+
+Under either reading, Verse never picks a note as "the melody" in order to *drop*
+the others: the notes that do not take the word are kept, without one. And the
+older failure must never return — reading a chord as ambiguous and leaving its
+lyric source-only deleted whole sung phrases, such as an entire refrain line of a
+score whose banjo doubles the melody a sixth below. Only a chord with no note at
+all has nothing to carry its lyric, and that lyric stays source-only with a
+diagnostic.
+
+### Verse numbers
+
+MuseScore numbers a verse with `<no>`, and omits it only for the first one. Two
+`<Lyrics>` elements that both omit it are therefore one verse written twice —
+something real files contain — and not a second verse. Reading the second
+element's position among its siblings as a verse number copied every lane of a
+score out a second time, note for note, and doubled its sung syllables.
 
 ### Native ties
 
