@@ -3423,6 +3423,113 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Splitting a lane is a projection decision, and the bundle must not notice
+    /// it.
+    ///
+    /// Stems come from the source Part topology and the ledger is keyed by source
+    /// item id, so neither may grow because a lane gained a companion. A second
+    /// stem would demand a WAV MuseScore was never asked to render, and a second
+    /// entry for one note would break the rule that every inventoried item gets
+    /// exactly one primary disposition.
+    #[test]
+    fn an_untexted_companion_lane_adds_no_stem_and_no_ledger_entry() {
+        let data = smf(&[
+            0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // tempo
+            0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // a real source lyric
+            0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, // the note carrying it
+            0x00, 0x90, 62, 100, 0x83, 0x60, 0x80, 62, 0, // a note it never texts
+            0x00, 0xff, 0x2f, 0x00,
+        ]);
+        let midi = crate::engine::midi::parse(&data).unwrap();
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let projected = outcome.svp.as_ref().expect("a projection");
+        assert_eq!(
+            projected
+                .tracks
+                .iter()
+                .map(|lane| (lane.muted, lane.notes.len()))
+                .collect::<Vec<_>>(),
+            vec![(false, 1), (true, 1)],
+            "the fixture must actually produce a companion"
+        );
+
+        let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+        assert_eq!(
+            stem_plan.stems.len(),
+            1,
+            "one source Part means one stem, whatever the projection does with it"
+        );
+
+        let root = temp_dir("ustx-untexted-companion");
+        let destination = root.join("Song.versebundle");
+        let layout = BundleLayout::new(&destination, "source.mid", ExportTarget::Ustx).unwrap();
+        let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
+        assert_eq!(
+            ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.item_kind == SourceItemKind::Note)
+                .count(),
+            2,
+            "two source notes, two note entries: the companion neither duplicates \
+             the note it received nor leaves it uninventoried"
+        );
+        let ids = ledger
+            .entries
+            .iter()
+            .map(|entry| entry.source_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<BTreeSet<_>>().len(),
+            "one primary disposition per source id"
+        );
+
+        let stem_count = stem_plan.stems.len();
+        let renderer = Arc::new(FakeRenderer::with_parts(FakeMode::Success, stem_count));
+        let result = export_bundle(BundleRequest {
+            destination,
+            input: BundleInput {
+                original_name: "source.mid".into(),
+                source_format: "standardMidi".into(),
+                source_bytes: data.clone(),
+                project: BundleProject::Ustx(ustx::serialize(projected).expect("representable")),
+                stem_plan: stem_plan.clone(),
+                ledger,
+                warnings: vec![],
+            },
+            renderer,
+            render_limits: RenderLimits {
+                timeout: std::time::Duration::from_secs(1),
+                max_output_bytes: 1024 * 1024,
+            },
+        })
+        .expect("a bundle with a companion lane passes every verification");
+
+        let committed = fs::read_to_string(&result.project_path).unwrap();
+        let audited = ustx::audit(&committed).expect("the committed project is auditable");
+        // The sung lane, its companion, one stem, and the full-score reference.
+        assert_eq!(audited.track_mutes.len(), stem_count + 3);
+        assert!(!audited.track_mutes[0], "the sung lane stays audible");
+        assert!(audited.track_mutes[1], "the companion opens silent");
+        assert!(
+            audited.track_mutes.iter().any(|muted| !muted),
+            "a bundle must never open with every track muted"
+        );
+        // The audio still takes the indices after every vocal lane, so inserting
+        // a companion cannot leave a wave part pointing at the wrong track.
+        assert_eq!(
+            audited
+                .wave_parts
+                .iter()
+                .map(|part| part.track_no)
+                .collect::<Vec<_>>(),
+            (2..=stem_count as i32 + 2).collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// The stems are the bundle's, not the project's: both targets reference the
     /// same WAVs by the same relative paths, and only the file that references them
     /// differs.

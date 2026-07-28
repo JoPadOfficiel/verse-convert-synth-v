@@ -396,14 +396,11 @@ fn lyric_text(lyric: &ProjectedLyric) -> String {
 /// be recognised by comparing the emitted string: a source word may spell `"+"`
 /// or `"+~"` itself, and that word is text, not a marker.
 fn is_rendered_marker(lyric: &ProjectedLyric) -> bool {
-    match lyric {
-        ProjectedLyric::Extension => true,
-        ProjectedLyric::Source(source) => matches!(
-            source.state,
-            LyricState::Continuation | LyricState::SyllableSplit
-        ),
-        ProjectedLyric::Absent => false,
-    }
+    // Deliberately the seam's own answer rather than a second copy of the match:
+    // `convert.rs` keeps an untexted note on its lane precisely when this returns
+    // true for the note that follows it, and two definitions of "continues the
+    // previous note" drifting apart would silently reopen the refusal below.
+    lyric.continues_previous_note()
 }
 
 /// Reports text that OpenUtau will read as something other than the word it
@@ -492,7 +489,9 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
         tracks.push(UstxTrack {
             phonemizer: DEFAULT_PHONEMIZER.into(),
             track_name: track.name.clone(),
-            mute: false,
+            // OpenUtau carries mute on the track and nowhere else, so a lane the
+            // projection opens silent has to state it here.
+            mute: track.muted,
             solo: false,
             volume: 0.0,
         });
@@ -1181,6 +1180,7 @@ mod tests {
             tracks: vec![ProjectedTrack {
                 name: "Voice".into(),
                 source_track_id: "voice".into(),
+                muted: false,
                 notes: vec![
                     note(0, 480, 60, source("word", "sing")),
                     note(
@@ -1699,6 +1699,7 @@ mod tests {
         project.tracks.push(ProjectedTrack {
             name: "Voice 2".into(),
             source_track_id: "second".into(),
+            muted: false,
             notes: vec![note(0, 960, 67, source("second", "sing"))],
         });
         let emitted = serialize(&project).expect("480 PPQ is exactly representable");

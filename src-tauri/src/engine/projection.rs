@@ -10,7 +10,7 @@
 //! `musicxml.rs` from the LCM of every `divisions`) precisely so that every
 //! source duration is exactly representable. Ticks are therefore the one unit
 //! that loses nothing, and each target converts out of them exactly once.
-use crate::engine::midi::Lyric;
+use crate::engine::midi::{Lyric, LyricState};
 
 /// One source, projected. A target consumes this and nothing else.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -75,7 +75,18 @@ pub struct ProjectedTrack {
     pub name: String,
     /// The source track this lane was projected from. Provenance, and the
     /// identifier a target names when it must refuse this lane's timing.
+    ///
+    /// Not a key: several lanes legitimately share one source track. Stacked
+    /// verses do it, and so does a lane and its untexted companion.
     pub source_track_id: String,
+    /// Whether this lane opens silent in the target application.
+    ///
+    /// Playback state, not a target cosmetic: the source decides it by leaving
+    /// notes untexted, and both targets must agree or the same project would
+    /// sing different notes depending on which file the user opened. Each target
+    /// still owns *where* it writes the flag — OpenUtau puts it on the track,
+    /// Synthesizer V inside the track's mixer.
+    pub muted: bool,
     pub notes: Vec<ProjectedNote>,
 }
 
@@ -105,4 +116,38 @@ pub enum ProjectedLyric {
     /// The source says nothing here. Absence is not the same as an
     /// `ExplicitEmpty` lyric, which is the source stating that nothing is sung.
     Absent,
+}
+
+impl ProjectedLyric {
+    /// Whether this lyric carries the previous note's syllable onto this note.
+    ///
+    /// Every target spells the marker differently — `-` and `+~` and `+` — but
+    /// none can state one across a gap, so all of them need the previous note to
+    /// end exactly where this one begins. That dependency is a property of the
+    /// projection, not of one format, and it lives here so the converter and the
+    /// targets cannot drift apart on which notes carry it.
+    pub fn continues_previous_note(&self) -> bool {
+        match self {
+            ProjectedLyric::Extension => true,
+            ProjectedLyric::Source(source) => matches!(
+                source.state,
+                LyricState::Continuation | LyricState::SyllableSplit
+            ),
+            ProjectedLyric::Absent => false,
+        }
+    }
+
+    /// Whether the source asks for this note to be sung at all.
+    ///
+    /// `Unsupported` is sung: a humming or laughing vocalization is a sound the
+    /// score asks for, only one no target can spell. `ExplicitEmpty` is the
+    /// opposite — the source stating that nothing is sung here — and `Absent` is
+    /// the source stating nothing at all.
+    pub fn is_sung(&self) -> bool {
+        match self {
+            ProjectedLyric::Extension => true,
+            ProjectedLyric::Source(source) => !matches!(source.state, LyricState::ExplicitEmpty),
+            ProjectedLyric::Absent => false,
+        }
+    }
 }

@@ -159,6 +159,7 @@ mod tests {
             tracks: vec![ProjectedTrack {
                 name: "Voice".into(),
                 source_track_id: "voice".into(),
+                muted: false,
                 notes: vec![ProjectedNote {
                     onset_ticks: 0,
                     duration_ticks: 480,

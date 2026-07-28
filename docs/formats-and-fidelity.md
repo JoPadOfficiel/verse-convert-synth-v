@@ -3,10 +3,12 @@
 ## Fidelity contract
 
 Verse projects only source-backed musical evidence. It never invents lyrics,
-notes, pitches, voices, tracks, instruments, or audio.
+notes, pitches, voices, instruments, or audio, and the only track it writes that
+no source track names is the untexted companion described below, which holds
+source notes and nothing else.
 
 - A genuine source lyric such as `la` is retained.
-- A note without a lyric receives an empty lyric.
+- A note without a lyric receives an empty lyric, on a companion lane.
 - A continuation is emitted only when the source contains continuation or
   extension evidence.
 - Instrumental and percussion material is not serialized as vocal-shaped notes
@@ -33,6 +35,7 @@ and Synthesizer V is the default.
 | Held syllable | `-` | `+~` |
 | Syllable split | `+` | `+` |
 | Untexted note | empty lyric | `lyric: ""` |
+| Muted lane | `mixer.mute` | `mute` on the track |
 | Inside a `.versebundle` | yes | yes |
 | Bundle audio reference | instrumental track, `blickOffset = 0` | `wave_parts` entry, all offsets `0` |
 
@@ -41,6 +44,57 @@ source-exact IR ticks and carries the source's `LyricState` rather than a
 rendered marker. A target owns its own grid, marker vocabulary, cosmetics and
 schema version, and cannot reach back into the conversion engine or change what
 the other target writes.
+
+### The untexted companion lane
+
+A lane the source texts usually also carries notes it never texts: an
+instrumental doubling, an introduction, a harmony line the words do not reach.
+Written into the sung track, those notes are blank placeholders the singer has to
+find and silence by hand — and Synthesizer V draws an empty lyric as its own
+greyed-out `la`, which reads like an invented syllable even though it is not.
+
+Verse therefore moves them. Each lane keeps the notes the source asks to be sung
+and sheds the rest onto a companion lane named `<lane> — untexted notes`, written
+directly after it and muted by default. The companion is a normal vocal lane: it
+can be unmuted, edited or deleted in one action, and it carries the notes exactly
+as they were projected — same onset, duration, pitch and empty lyric. Nothing is
+deleted and nothing is filled in.
+
+Three rules bound it.
+
+- A note stays on the sung lane whenever the source asks for it to be sung. That
+  includes a `humming` or `laughing` vocalization no target can spell — a sound
+  the score asks for — and it includes every note of a melisma the source states:
+  a MusicXML `<extend>`, a MuseScore extension length, or a qualified Soft
+  Karaoke phrase. Those notes carry a continuation, and moving them would shorten
+  a word the score sustains.
+- A note also stays when it is the note a continuation marker leans on: the note
+  immediately before that marker in time, whether or not the two touch. A marker
+  carries the *previous* note's syllable, so which note precedes it decides which
+  word is held. OpenUtau refuses the export outright when the two do not touch;
+  Synthesizer V checks nothing and would silently rebind the hold to whatever
+  note was left in front of it, sustaining a different syllable with no
+  diagnostic. The second is the worse failure, and it is why the predecessor is
+  kept in both cases.
+- A lane with nothing left to sing is not split and not muted. A lyric-free MIDI
+  and a user override on a wordless track both keep exactly the lane they had, so
+  a project never opens entirely silent.
+
+Two consequences are worth stating plainly, because they bound what the sung lane
+promises.
+
+A melisma is a source claim, not a guess. Where a source states no continuation —
+most Standard MIDI files, and any `.kar` whose karaoke evidence does not qualify —
+Verse has never read a wordless note following a syllable as a held one, and
+writes it with no lyric rather than inventing a hold. Those notes are untexted as
+far as any evidence goes, and they move to the companion. This is the same
+reading as before the companion existed; what changed is where the note is
+written, not whether it is sung.
+
+A sung lane may therefore still hold a note with no visible text: a vocalization,
+or a note pinned by the rule above. The companion is where untexted notes go, not
+a complete inventory of them, and a lane without a companion is not proof that
+every note of it carries a word.
 
 ### The 480-tick grid, and why a septuplet splits the two targets
 

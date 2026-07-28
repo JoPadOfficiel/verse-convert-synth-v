@@ -77,48 +77,159 @@ fn golden_source() -> Vec<u8> {
     smf(&[&sung, &second_voice, &instrumental])
 }
 
+/// [`golden_source`] with the untexted E4 given a word of its own.
+///
+/// Nothing is then left for the untexted split to move, so this source projects
+/// exactly as release 0.4.9 projected it — which is what lets
+/// [`a_fully_texted_source_still_writes_release_0_4_9_bytes`] keep pinning
+/// 0.4.9's bytes after the split changed what [`golden_source`] produces.
+fn fully_texted_source() -> Vec<u8> {
+    let sung: Vec<u8> = vec![
+        0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // 120 bpm at tick 0
+        0x00, 0xff, 0x58, 0x04, 0x03, 0x02, 0x18, 0x08, // 3/4 at tick 0
+        0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // lyric "let"
+        0x00, 0x90, 60, 100, // C4 on at 0
+        0x83, 0x60, 0x80, 60, 0, // off at 480
+        0x00, 0xff, 0x05, 0x02, b'i', b't', // lyric "it" at 480
+        0x00, 0x90, 62, 100, // D4 on at 480
+        0x81, 0x70, 0x80, 62, 0, // off at 720
+        // The one difference from `golden_source`: this E4 is texted.
+        0x81, 0x70, 0xff, 0x05, 0x05, b's', b'h', b'i', b'n', b'e', // lyric at 960
+        0x00, 0x90, 64, 100, // E4 on at 960
+        0x83, 0x60, 0x80, 64, 0, // off at 1440
+        0x00, 0xff, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08, // 4/4 at tick 1440, bar 1
+        0x00, 0xff, 0x51, 0x03, 0x06, 0x1a, 0x80, // 150 bpm at tick 1440
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    let second_voice: Vec<u8> = vec![
+        0x00, 0xff, 0x05, 0x04, b's', b'i', b'n', b'g', // lyric "sing"
+        0x00, 0x90, 67, 80, // G4 on at 0
+        0x87, 0x40, 0x80, 67, 0, // off at 960
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    let instrumental: Vec<u8> = vec![
+        0x00, 0x90, 48, 90, //
+        0x83, 0x60, 0x80, 48, 0, //
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    smf(&[&sung, &second_voice, &instrumental])
+}
+
 /// Release 0.4.9's `.svp` for [`golden_source`], byte for byte.
 const GOLDEN_SVP: &str = r#"{"version":113,"time":{"meter":[{"denominator":4,"index":0,"numerator":3},{"denominator":4,"index":1,"numerator":4}],"tempo":[{"bpm":120.0,"position":0},{"bpm":150.0,"position":2116800000}]},"renderConfig":{"aspirationFormat":"noAspiration","bitDepth":16,"destination":"./","exportMixDown":true,"filename":"untitled","numChannels":1,"sampleRate":44100},"tracks":[{"name":"Track 0","dispColor":"ff7db235","dispOrder":0,"renderEnabled":true,"mixer":{"gainDecibel":0.0,"pan":0.0,"mute":false,"solo":false,"display":true},"mainRef":{"audio":{"filename":"","duration":0.0},"database":{"name":"","language":"","phoneset":""},"dictionary":"","voice":{},"groupID":"00000000-0000-4000-8000-000000000000","isInstrumental":false,"blickOffset":0},"mainGroup":{"name":"main","uuid":"00000000-0000-4000-8000-000000000000","parameters":{"breathiness":{"mode":"cubic","points":[]},"gender":{"mode":"cubic","points":[]},"loudness":{"mode":"cubic","points":[]},"pitchDelta":{"mode":"cubic","points":[]},"tension":{"mode":"cubic","points":[]},"vibratoEnv":{"mode":"cubic","points":[]},"voicing":{"mode":"cubic","points":[]}},"notes":[{"attributes":{},"duration":705600000,"lyrics":"let","onset":0,"phonemes":"","pitch":60},{"attributes":{},"duration":352800000,"lyrics":"it","onset":705600000,"phonemes":"","pitch":62},{"attributes":{},"duration":705600000,"lyrics":"","onset":1411200000,"phonemes":"","pitch":64}]},"groups":[]},{"name":"Track 1","dispColor":"ff4a90d9","dispOrder":1,"renderEnabled":true,"mixer":{"gainDecibel":0.0,"pan":0.0,"mute":false,"solo":false,"display":true},"mainRef":{"audio":{"filename":"","duration":0.0},"database":{"name":"","language":"","phoneset":""},"dictionary":"","voice":{},"groupID":"00000001-0000-4000-8000-000000000000","isInstrumental":false,"blickOffset":0},"mainGroup":{"name":"main","uuid":"00000001-0000-4000-8000-000000000000","parameters":{"breathiness":{"mode":"cubic","points":[]},"gender":{"mode":"cubic","points":[]},"loudness":{"mode":"cubic","points":[]},"pitchDelta":{"mode":"cubic","points":[]},"tension":{"mode":"cubic","points":[]},"vibratoEnv":{"mode":"cubic","points":[]},"voicing":{"mode":"cubic","points":[]}},"notes":[{"attributes":{},"duration":1411200000,"lyrics":"sing","onset":0,"phonemes":"","pitch":67}]},"groups":[]}]}"#;
 
-/// Pins the whole Synthesizer V output, not just its shape. The value was taken
-/// from release 0.4.9 before the target seam existed, so this test is the
-/// standing proof that no later target work drifts a single `.svp` byte:
-/// a blick, a colour, a display order, a group UUID, a marker, `version: 113`,
-/// the render config, or the field order they are written in.
+/// The same source once the untexted split runs: `GOLDEN_SVP` plus one muted
+/// companion track, with the note that moved into it removed from `Track 0`.
+const GOLDEN_SVP_WITH_COMPANION: &str = r#"{"version":113,"time":{"meter":[{"denominator":4,"index":0,"numerator":3},{"denominator":4,"index":1,"numerator":4}],"tempo":[{"bpm":120.0,"position":0},{"bpm":150.0,"position":2116800000}]},"renderConfig":{"aspirationFormat":"noAspiration","bitDepth":16,"destination":"./","exportMixDown":true,"filename":"untitled","numChannels":1,"sampleRate":44100},"tracks":[{"name":"Track 0","dispColor":"ff7db235","dispOrder":0,"renderEnabled":true,"mixer":{"gainDecibel":0.0,"pan":0.0,"mute":false,"solo":false,"display":true},"mainRef":{"audio":{"filename":"","duration":0.0},"database":{"name":"","language":"","phoneset":""},"dictionary":"","voice":{},"groupID":"00000000-0000-4000-8000-000000000000","isInstrumental":false,"blickOffset":0},"mainGroup":{"name":"main","uuid":"00000000-0000-4000-8000-000000000000","parameters":{"breathiness":{"mode":"cubic","points":[]},"gender":{"mode":"cubic","points":[]},"loudness":{"mode":"cubic","points":[]},"pitchDelta":{"mode":"cubic","points":[]},"tension":{"mode":"cubic","points":[]},"vibratoEnv":{"mode":"cubic","points":[]},"voicing":{"mode":"cubic","points":[]}},"notes":[{"attributes":{},"duration":705600000,"lyrics":"let","onset":0,"phonemes":"","pitch":60},{"attributes":{},"duration":352800000,"lyrics":"it","onset":705600000,"phonemes":"","pitch":62}]},"groups":[]},{"name":"Track 0 — untexted notes","dispColor":"ff4a90d9","dispOrder":1,"renderEnabled":true,"mixer":{"gainDecibel":0.0,"pan":0.0,"mute":true,"solo":false,"display":true},"mainRef":{"audio":{"filename":"","duration":0.0},"database":{"name":"","language":"","phoneset":""},"dictionary":"","voice":{},"groupID":"00000001-0000-4000-8000-000000000000","isInstrumental":false,"blickOffset":0},"mainGroup":{"name":"main","uuid":"00000001-0000-4000-8000-000000000000","parameters":{"breathiness":{"mode":"cubic","points":[]},"gender":{"mode":"cubic","points":[]},"loudness":{"mode":"cubic","points":[]},"pitchDelta":{"mode":"cubic","points":[]},"tension":{"mode":"cubic","points":[]},"vibratoEnv":{"mode":"cubic","points":[]},"voicing":{"mode":"cubic","points":[]}},"notes":[{"attributes":{},"duration":705600000,"lyrics":"","onset":1411200000,"phonemes":"","pitch":64}]},"groups":[]},{"name":"Track 1","dispColor":"ffd9534f","dispOrder":2,"renderEnabled":true,"mixer":{"gainDecibel":0.0,"pan":0.0,"mute":false,"solo":false,"display":true},"mainRef":{"audio":{"filename":"","duration":0.0},"database":{"name":"","language":"","phoneset":""},"dictionary":"","voice":{},"groupID":"00000002-0000-4000-8000-000000000000","isInstrumental":false,"blickOffset":0},"mainGroup":{"name":"main","uuid":"00000002-0000-4000-8000-000000000000","parameters":{"breathiness":{"mode":"cubic","points":[]},"gender":{"mode":"cubic","points":[]},"loudness":{"mode":"cubic","points":[]},"pitchDelta":{"mode":"cubic","points":[]},"tension":{"mode":"cubic","points":[]},"vibratoEnv":{"mode":"cubic","points":[]},"voicing":{"mode":"cubic","points":[]}},"notes":[{"attributes":{},"duration":1411200000,"lyrics":"sing","onset":0,"phonemes":"","pitch":67}]},"groups":[]}]}"#;
+
+/// Pins the whole Synthesizer V output, not just its shape. `GOLDEN_SVP` was
+/// taken from release 0.4.9 before the target seam existed, so this test is the
+/// standing proof that no later work drifts a single `.svp` byte: a blick, a
+/// colour, a display order, a group UUID, a marker, `version: 113`, the render
+/// config, or the field order they are written in.
+///
+/// It runs on [`fully_texted_source`] rather than [`golden_source`] because the
+/// untexted split now moves `golden_source`'s E4 to a companion lane. The
+/// expectation is still 0.4.9's own value, reached by the one substitution
+/// texting that note causes and nothing else: the note keeps its onset, its
+/// duration, its pitch, its track and its position in the track, so no other
+/// byte of the release output can move. Deriving it instead of re-recording it
+/// is the point — a value copied out of the code under test would pin that code
+/// to itself.
 #[test]
-fn the_synthesizer_v_bytes_stay_identical_to_release_0_4_9() {
-    let outcome = convert_bytes(&golden_source(), "japanese");
+fn a_fully_texted_source_still_writes_release_0_4_9_bytes() {
+    let expected = GOLDEN_SVP.replace(
+        r#"{"attributes":{},"duration":705600000,"lyrics":"","onset":1411200000,"phonemes":"","pitch":64}"#,
+        r#"{"attributes":{},"duration":705600000,"lyrics":"shine","onset":1411200000,"phonemes":"","pitch":64}"#,
+    );
+    assert_ne!(expected, GOLDEN_SVP, "the substitution must actually apply");
+
+    let outcome = convert_bytes(&fully_texted_source(), "japanese");
     assert!(outcome.ok, "{:?}", outcome.msg);
-    assert_eq!(outcome.placed, 3);
+    assert_eq!(outcome.placed, 4);
     let projected = outcome.svp.expect("a projection");
-    // Only the two tracks with source lyric evidence become vocal lanes.
+    // Nothing to move, so no companion: still only the two tracks with source
+    // lyric evidence, and neither of them muted.
     assert_eq!(projected.tracks.len(), 2);
+    assert!(projected.tracks.iter().all(|track| !track.muted));
     let svp = target::svp::serialize(&projected).expect("480 PPQ is exactly representable");
     let json = String::from_utf8(serde_json::to_vec(&svp).expect("serializes"))
         .expect("SVP JSON is UTF-8");
-    assert_eq!(json, GOLDEN_SVP);
+    assert_eq!(json, expected);
+}
+
+/// The same source with the E4 left untexted: that note leaves the sung lane for
+/// a muted companion, and nothing else about the file changes.
+///
+/// Asserted against `GOLDEN_SVP` rather than against a second recorded constant,
+/// so the diff this feature is allowed to make is stated here in full: one track
+/// inserted, one note moved into it, and the colour, display order and group
+/// UUID of every later track shifted by that insertion. Any other drift fails.
+#[test]
+fn an_untexted_note_leaves_the_sung_lane_for_a_muted_companion() {
+    let outcome = convert_bytes(&golden_source(), "japanese");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    // The projected lyric count is about words, not notes, so moving a wordless
+    // note must not change it.
+    assert_eq!(outcome.placed, 3);
+    let projected = outcome.svp.expect("a projection");
+    assert_eq!(
+        projected
+            .tracks
+            .iter()
+            .map(|track| (track.name.as_str(), track.muted, track.notes.len()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Track 0", false, 2),
+            ("Track 0 — untexted notes", true, 1),
+            ("Track 1", false, 1),
+        ],
+        "the companion follows its own lane and carries the wordless note"
+    );
+
+    let svp = target::svp::serialize(&projected).expect("480 PPQ is exactly representable");
+    let json = String::from_utf8(serde_json::to_vec(&svp).expect("serializes"))
+        .expect("SVP JSON is UTF-8");
+    assert_eq!(json, GOLDEN_SVP_WITH_COMPANION);
+
+    // Every note release 0.4.9 wrote is still written, with the same onset,
+    // duration and pitch — only its track changed.
+    let notes = |document: &str| {
+        document
+            .split(r#"{"attributes":{},"#)
+            .skip(1)
+            .map(|note| note.split('}').next().expect("a note object").to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(notes(&json), notes(GOLDEN_SVP));
 }
 
 /// The OpenUtau project for the very same [`golden_source`], byte for byte.
 ///
-/// Untexted E4 at tick 960 carries `lyric: ""` — the state no OpenUtau importer
-/// can express, and the reason this target exists. OpenUtau's own MIDI reader
-/// would write `"a"` there, and its lyric dictionary never reads the `TextEvent`
-/// a `.kar` stores words in at all.
+/// The untexted E4 at tick 960 carries `lyric: ""` — the state no OpenUtau
+/// importer can express, and the reason this target exists. OpenUtau's own MIDI
+/// reader would write `"a"` there, and its lyric dictionary never reads the
+/// `TextEvent` a `.kar` stores words in at all. It sits on the muted companion
+/// lane rather than in `Track 0`, which is where the split puts a note the
+/// source never texted.
 const GOLDEN_USTX: &str = concat!(
     "ustx_version: \"0.6\"\n",
     "resolution: 480\n",
     "bpm: 120\n",
     "beat_per_bar: 3\n",
     "beat_unit: 4\n",
-    "time_signatures: [{bar_position: 0, beat_per_bar: 3, beat_unit: 4}, \
-     {bar_position: 1, beat_per_bar: 4, beat_unit: 4}]\n",
+    "time_signatures: [{bar_position: 0, beat_per_bar: 3, beat_unit: 4}, {bar_position: 1, beat_per_bar: 4, beat_unit: 4}]\n",
     "tempos: [{position: 0, bpm: 120}, {position: 1440, bpm: 150}]\n",
     "expressions: {}\n",
     "tracks:\n",
     "  - phonemizer: \"OpenUtau.Core.DefaultPhonemizer\"\n",
     "    track_name: \"Track 0\"\n",
     "    mute: false\n",
+    "    solo: false\n",
+    "    volume: 0\n",
+    "  - phonemizer: \"OpenUtau.Core.DefaultPhonemizer\"\n",
+    "    track_name: \"Track 0 — untexted notes\"\n",
+    "    mute: true\n",
     "    solo: false\n",
     "    volume: 0\n",
     "  - phonemizer: \"OpenUtau.Core.DefaultPhonemizer\"\n",
@@ -147,6 +258,11 @@ const GOLDEN_USTX: &str = concat!(
     "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
     "        phoneme_expressions: []\n",
     "        phoneme_overrides: []\n",
+    "    curves: []\n",
+    "  - name: \"Track 0 — untexted notes\"\n",
+    "    track_no: 1\n",
+    "    position: 0\n",
+    "    notes:\n",
     "      - position: 960\n",
     "        duration: 480\n",
     "        tone: 64\n",
@@ -157,7 +273,7 @@ const GOLDEN_USTX: &str = concat!(
     "        phoneme_overrides: []\n",
     "    curves: []\n",
     "  - name: \"Track 1\"\n",
-    "    track_no: 1\n",
+    "    track_no: 2\n",
     "    position: 0\n",
     "    notes:\n",
     "      - position: 0\n",
@@ -187,7 +303,10 @@ fn the_openutau_bytes_are_pinned_for_the_same_source() {
     assert!(outcome.ok, "{:?}", outcome.msg);
     assert_eq!(outcome.placed, 3);
     let projected = outcome.svp.expect("a projection");
-    assert_eq!(projected.tracks.len(), 2);
+    // Two lanes with lyric evidence, and the untexted companion one of them
+    // sheds. OpenUtau needs a real track behind every voice part, so a muted
+    // companion is a track of its own here, not a flag on an existing one.
+    assert_eq!(projected.tracks.len(), 3);
     let bytes = target::serialize_to(target::ExportTarget::Ustx, &projected)
         .expect("480 PPQ is exactly representable");
     let yaml = String::from_utf8(bytes).expect("USTX is UTF-8");
@@ -200,7 +319,11 @@ fn the_openutau_bytes_are_pinned_for_the_same_source() {
     // the third source track, which carries notes but no lyric evidence.
     assert_eq!(yaml.matches("lyric: \"\"").count(), 1);
     assert!(!yaml.contains("lyric: \"a\""));
-    assert_eq!(yaml.matches("track_name:").count(), 2);
+    assert_eq!(yaml.matches("track_name:").count(), 3);
+    // Exactly one lane opens silent, and it is the companion. A project whose
+    // every track were muted would open sounding like a failed conversion.
+    assert_eq!(yaml.matches("mute: true").count(), 1);
+    assert_eq!(yaml.matches("mute: false").count(), 2);
 }
 
 /// One projection, two targets, one file each — and the same bytes as the
@@ -214,7 +337,7 @@ fn one_projection_writes_both_targets_from_the_same_analysis() {
     let ustx = target::serialize_to(target::ExportTarget::Ustx, &projected).expect("representable");
     assert_eq!(
         String::from_utf8(svp).expect("SVP JSON is UTF-8"),
-        GOLDEN_SVP
+        GOLDEN_SVP_WITH_COMPANION
     );
     assert_eq!(String::from_utf8(ustx).expect("USTX is UTF-8"), GOLDEN_USTX);
 }
@@ -288,7 +411,7 @@ fn naming_no_target_is_synthesizer_v() {
     .expect("representable");
     assert_eq!(
         String::from_utf8(bytes).expect("SVP JSON is UTF-8"),
-        GOLDEN_SVP
+        GOLDEN_SVP_WITH_COMPANION
     );
 }
 
@@ -508,9 +631,19 @@ fn help_kar_binds_words_only_to_the_unique_lead_track() {
     assert!(vocal
         .iter()
         .any(|t| t.track.contains("Harm 2") && t.placed == 0));
-    // the 3 explicitly selected singing tracks are the only SVP tracks
+    // the 3 explicitly selected singing tracks are the only audible SVP tracks;
+    // any track beyond them is a muted companion one of them shed, and a lane
+    // that binds no word at all (both Harm tracks) is never split.
     let svp = target::svp::serialize(&r.svp.unwrap()).unwrap();
-    assert_eq!(svp.tracks.len(), 3);
+    assert_eq!(
+        svp.tracks.iter().filter(|track| !track.mixer.mute).count(),
+        3
+    );
+    assert!(svp
+        .tracks
+        .iter()
+        .filter(|track| track.mixer.mute)
+        .all(|track| track.name.ends_with(" — untexted notes")));
     assert!(svp.tracks[0].name.contains("Lead") || svp.tracks[0].name.contains("Harm"));
     assert_eq!(
         svp.tracks
@@ -597,19 +730,41 @@ fn the_same_score_projects_identically_from_mscz_and_mxl() {
     // 214/210/231 — and both dropped the syllable sitting on a tied note.
     let from_mscz = conv_auto("help.mscz");
     let from_mxl = conv_auto("help.mxl");
+    // A lane and the untexted companion it sheds are one staff of the score, so
+    // they are folded back together before counting: this parity is about what
+    // the two files say, not about how the projection distributes it across
+    // tracks. The companion always directly follows its own lane, which is what
+    // makes folding by position sound.
     let voices = |outcome: &ConvertOutcome| {
-        target::svp::serialize(outcome.svp.as_ref().expect("conversion succeeds"))
-            .expect("exactly representable")
-            .tracks
-            .iter()
-            .map(|track| {
-                track
-                    .main_group
-                    .notes
-                    .iter()
-                    .map(|note| (note.onset, note.duration, note.pitch, note.lyrics.clone()))
-                    .collect::<Vec<_>>()
-            })
+        let serialized = target::svp::serialize(outcome.svp.as_ref().expect("conversion succeeds"))
+            .expect("exactly representable");
+        let mut staves: Vec<FoldedStave> = Vec::new();
+        for track in &serialized.tracks {
+            let notes = track
+                .main_group
+                .notes
+                .iter()
+                .map(|note| (note.onset, note.duration, note.pitch, note.lyrics.clone()));
+            match track.name.strip_suffix(" — untexted notes") {
+                // Checked, not assumed: the name is built by suffixing, so a
+                // source track of its own that ends this way must not be folded
+                // into an unrelated lane and silently disappear from the count.
+                Some(owner) => {
+                    let (previous, folded) = staves
+                        .last_mut()
+                        .expect("a companion never precedes the lane it belongs to");
+                    assert_eq!(previous, owner, "{} is not {owner}'s companion", track.name);
+                    folded.extend(notes);
+                }
+                None => staves.push((track.name.clone(), notes.collect())),
+            }
+        }
+        for (_, notes) in &mut staves {
+            notes.sort_by_key(|note| (note.0, note.2));
+        }
+        staves
+            .into_iter()
+            .map(|(_, notes)| notes)
             .collect::<Vec<_>>()
     };
     let mscz = voices(&from_mscz);
@@ -763,6 +918,197 @@ fn kar_syllable_streams(data: &[u8]) -> Vec<Vec<String>> {
         })
         .collect()
 }
+
+/// Splitting a lane must move notes, never lose them.
+///
+/// The sibling of [`assert_no_syllable_is_lost`], one level down: that one proves
+/// no *word* is lost on the way to the project, this one proves no *note* is. It
+/// runs on sources built here rather than on a fixture, so it gates CI instead of
+/// waiting for a private file, and it compares against the projection with the
+/// split disabled — reconstructed by folding every companion back into the lane
+/// it came from, which is the exact inverse of what the split does.
+/// A lane name, and the `(onset, duration, pitch)` of every note that belongs to
+/// it once its companion has been folded back in.
+type FoldedLane = (String, Vec<(u32, u32, u8)>);
+
+/// The same, as one staff reaches Synthesizer V: the lane name and every note's
+/// `(onset, duration, pitch, lyric)` with the companion folded back in.
+type FoldedStave = (String, Vec<(i64, i64, u8, String)>);
+
+#[test]
+fn the_split_moves_notes_between_lanes_and_never_loses_one() {
+    // Two sung tracks, an untexted note, a repeat, a tie, a melisma, stacked
+    // verses and a lyric-free track: every shape the split has to leave intact.
+    let sources: Vec<(&str, Vec<u8>)> = vec![
+        ("golden", golden_source()),
+        ("fully texted", fully_texted_source()),
+        ("melisma and repeat", MELISMA_AND_REPEAT.as_bytes().to_vec()),
+    ];
+    for (name, data) in sources {
+        // `convert_auto`, not `convert_bytes`: the sources below are two MIDIs
+        // and one MuseScore score, and the split must behave the same on both
+        // parsers.
+        let outcome = convert_auto(&data, "english");
+        assert!(outcome.ok, "{name}: {:?}", outcome.msg);
+        let projected = outcome.svp.expect("a projection");
+
+        // Fold each companion back into the lane it followed, then compare the
+        // reconstructed lanes to what a lane holds when nothing is moved.
+        let mut folded: Vec<FoldedLane> = Vec::new();
+        for lane in &projected.tracks {
+            let notes = lane
+                .notes
+                .iter()
+                .map(|note| (note.onset_ticks, note.duration_ticks, note.pitch));
+            match lane.name.strip_suffix(" — untexted notes") {
+                Some(owner) => {
+                    let (target_name, target_notes) = folded
+                        .last_mut()
+                        .expect("a companion never precedes its own lane");
+                    assert_eq!(
+                        target_name, owner,
+                        "{name}: a companion must directly follow the lane it names"
+                    );
+                    assert!(lane.muted, "{name}: a companion opens muted");
+                    assert!(
+                        lane.notes.iter().all(|note| !note.lyric.is_sung()),
+                        "{name}: a companion carries only notes the source does not sing"
+                    );
+                    target_notes.extend(notes);
+                }
+                None => {
+                    assert!(!lane.muted, "{name}: a sung lane is never muted");
+                    folded.push((lane.name.clone(), notes.collect()));
+                }
+            }
+        }
+        for (_, notes) in &mut folded {
+            notes.sort_unstable();
+        }
+
+        // A lane that keeps every note is exactly a lane the split left alone,
+        // so the source note count is the oracle either way.
+        let total: usize = folded.iter().map(|(_, notes)| notes.len()).sum();
+        let projected_total: usize = projected.tracks.iter().map(|lane| lane.notes.len()).sum();
+        assert_eq!(
+            total, projected_total,
+            "{name}: folding must account for every projected note exactly once"
+        );
+        for (lane, notes) in &folded {
+            let mut unique = notes.clone();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                notes.len(),
+                "{name}: {lane} must not hold the same note twice after folding"
+            );
+        }
+    }
+
+    // The melisma specifically: `A` is held across the note that follows it, so
+    // that note carries no text of its own and yet must not be treated as
+    // untexted. Moving it would shorten a word the score sustains — the failure
+    // this whole rule exists to prevent — so it is asserted by position, not
+    // inferred from the conservation check above, which a wrong split passes.
+    let outcome = convert_auto(MELISMA_AND_REPEAT.as_bytes(), "english");
+    let projected = outcome.svp.expect("a projection");
+    let sung = &projected.tracks[0];
+    assert_eq!(
+        sung.notes
+            .iter()
+            .map(|note| (note.onset_ticks, note.pitch, note.lyric.is_sung()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 60, true),
+            (960, 62, true),
+            (1920, 64, true),
+            (3840, 60, true),
+            (4800, 62, true),
+            (5760, 64, true),
+        ],
+        "the held note of a melisma stays on the sung lane, on both repeat passes"
+    );
+    assert!(projected.tracks[1]
+        .notes
+        .iter()
+        .all(|note| note.pitch == 65));
+}
+
+/// A bare note after a syllable is not a melisma unless the source says so.
+///
+/// Standard MIDI cannot state a continuation, so a syllable sustained across
+/// several notes is written as one lyric event and several bare notes — exactly
+/// how a syllable followed by unsung notes is written. Verse has never guessed
+/// between the two readings: it wrote those notes with no lyric before the
+/// companion lane existed, and it moves them to the companion now. Same reading,
+/// different track.
+///
+/// Pinned because the opposite reading is tempting and would invent a hold the
+/// source never stated. [`MELISMA_AND_REPEAT`] is the contrasting case: a source
+/// that *does* state the extension keeps every held note on the sung lane.
+#[test]
+fn a_bare_midi_note_after_a_syllable_is_untexted_and_not_a_melisma() {
+    let data = smf(&[&[
+        0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // 120 bpm
+        0x00, 0xff, 0x05, 0x01, b'A', // lyric "A"
+        0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, // C4 0..480
+        0x00, 0x90, 62, 100, 0x83, 0x60, 0x80, 62, 0, // D4 480..960, bare
+        0x00, 0x90, 64, 100, 0x83, 0x60, 0x80, 64, 0, // E4 960..1440, bare
+        0x00, 0xff, 0x05, 0x03, b'm', b'e', b'n', // lyric "men" at 1440
+        0x00, 0x90, 65, 100, 0x83, 0x60, 0x80, 65, 0, // F4 1440..1920
+        0x00, 0xff, 0x2f, 0x00,
+    ]]);
+    let outcome = convert_auto(&data, "english");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    let svp = target::svp::serialize(&outcome.svp.expect("a projection"))
+        .expect("480 PPQ is exactly representable");
+    let lane = |index: usize| {
+        svp.tracks[index]
+            .main_group
+            .notes
+            .iter()
+            .map(|note| (note.pitch, note.lyrics.as_str()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lane(0), vec![(60, "A"), (65, "men")]);
+    assert!(!svp.tracks[0].mixer.mute);
+    assert_eq!(lane(1), vec![(62, ""), (64, "")]);
+    assert!(svp.tracks[1].mixer.mute);
+    // No hold was invented on the way out, in either target's vocabulary.
+    let json = serde_json::to_string(&svp).expect("serializes");
+    assert!(!json.contains(r#""lyrics":"-""#));
+    assert!(!json.contains(r#""lyrics":"+""#));
+}
+
+/// One voice holding a syllable across several notes, under a repeat, beside a
+/// note the score leaves wordless. The melisma must survive the split whole.
+const MELISMA_AND_REPEAT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure><startRepeat/><voice>
+        <Chord><durationType>half</durationType>
+          <Lyrics><text>A</text><ticks>1920</ticks></Lyrics>
+          <Note><pitch>60</pitch></Note>
+        </Chord>
+        <Chord><durationType>half</durationType>
+          <Note><pitch>62</pitch></Note>
+        </Chord>
+      </voice></Measure>
+      <Measure><voice>
+        <Chord><durationType>half</durationType>
+          <Lyrics><text>men</text></Lyrics>
+          <Note><pitch>64</pitch></Note>
+        </Chord>
+        <Chord><durationType>half</durationType>
+          <Note><pitch>65</pitch></Note>
+        </Chord>
+      </voice><endRepeat>2</endRepeat></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
 
 /// Every syllable the source writes must reach the project. A KAR may transcribe
 /// the same passage in two competing text tracks, so the fullest stream is the

@@ -317,7 +317,10 @@ fn serialize_track(
         mixer: Mixer {
             gain_decibel: 0.0,
             pan: 0.0,
-            mute: false,
+            // Synthesizer V keeps mute inside the mixer. `render_enabled` above
+            // is a different switch and stays true: the lane is a real vocal
+            // track the user can unmute, not one excluded from rendering.
+            mute: track.muted,
             solo: false,
             display: true,
         },
@@ -469,6 +472,7 @@ mod tests {
             tracks: vec![ProjectedTrack {
                 name: "Voice".into(),
                 source_track_id: "voice".into(),
+                muted: false,
                 notes: vec![
                     ProjectedNote {
                         onset_ticks: 0,

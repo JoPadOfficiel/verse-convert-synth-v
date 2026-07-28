@@ -73,7 +73,8 @@ The lock files are build authority. CI uses Node.js 22 and Rust 1.93.0.
   approximation — including timing that misses OpenUtau's 480-tick grid, which
   OpenUtau's own MusicXML importer silently truncates.
 - An untexted note written as `lyric: ""` in a `.ustx`, a state no OpenUtau
-  importer can express.
+  importer can express, carried on a muted companion lane so the sung track
+  holds only real words while nothing is deleted or filled in.
 - One audio stem per note-bearing source Part, keeping technical chord lanes
   grouped with their source Part.
 - Transactional, no-replace bundle publication with complete hash and

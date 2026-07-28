@@ -44,10 +44,13 @@ Verse uses only evidence present in the source:
 
 - a genuine source lyric such as `la` remains `la`;
 - an untexted note remains untexted — in a `.ustx` it is written `lyric: ""`,
-  a state no OpenUtau importer can produce;
+  a state no OpenUtau importer can produce — and it is moved to its lane's muted
+  `— untexted notes` companion, so the sung track carries the words;
 - generic MIDI Text is metadata, not a lyric;
 - a normal MIDI file without lyrics succeeds with zero generated words;
-- no fallback pitch, lyric, track, instrument or audio is fabricated;
+- no fallback pitch, lyric, instrument or audio is fabricated; the companion lane
+  carries source notes only, and the audio tracks a `.versebundle` adds reference
+  WAVs MuseScore rendered from the source itself;
 - timing is exact or refused, never truncated to fit.
 
 ## Supported input formats

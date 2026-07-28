@@ -77,6 +77,27 @@ report it, because that would be new.
 The full-score track is a source reference mix. It is not a vocal-removed
 accompaniment and remains muted by default to avoid doubling the Part stems.
 
+## A track named “— untexted notes” is muted, and that is deliberate
+
+A lane whose source leaves notes untexted gets a companion beside it named
+`<lane> — untexted notes`, muted when the project opens. It holds those notes, so
+the sung track shows the words. It is an ordinary vocal track: unmute it to hear
+them, or delete it if you do not want them. Nothing is lost either way — the two
+lanes together are exactly the notes the score writes, and the notes it holds are
+ones Verse was already exporting with no lyric.
+
+A lane with no companion is not proof that every one of its notes carries a word.
+Two kinds of note stay on the sung lane without visible text: a `humming` or
+`laughing` vocalization, which is a sound the score asks for, and the note
+immediately before a held syllable, which has to stay there or the hold would
+attach itself to the wrong word. A lane that is wordless from end to end is left
+alone and audible rather than split, so a project never opens completely silent.
+
+Before deleting a companion, check that it is one: the name is built by
+suffixing, and a source track of your own that happens to end in
+`— untexted notes` would look the same. A generated companion is always muted and
+always sits directly under the lane it belongs to.
+
 ## An untexted note has no lyric, and that is deliberate
 
 A note the source never texted is exported with no lyric. In a `.svp` the field
@@ -84,6 +105,10 @@ is empty; in a `.ustx` it is written `lyric: ""`. That is the only honest
 representation: `"a"` invents a syllable, `"+~"` claims the previous syllable is
 held, and `"R"` claims a rest and converts the note into silence. Verse states
 what the source states, which here is nothing.
+
+A held syllable is not this case. A word sustained across several notes texts
+only the first of them, and the rest carry a continuation the source proves; they
+stay on the sung lane and are never treated as untexted.
 
 **No OpenUtau importer can express that state.** `UNote.lyric` is declared with
 a field initializer, `public string lyric = NotePresets.Default.DefaultLyric;`

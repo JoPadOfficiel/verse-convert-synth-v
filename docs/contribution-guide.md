@@ -74,6 +74,15 @@ The following rules are release invariants:
 - Absence of a lyric remains an empty lyric. Never insert `la`, `a`, `あ`, a
   default syllable, or a phonetic substitute. In a `.ustx` an untexted note is
   `lyric: ""`; `"+~"` would claim a hold and `"R"` would claim a rest.
+- An untexted note may be moved to its lane's muted companion, never deleted and
+  never filled in. Anything the source asks to be sung stays on the sung lane —
+  a continuation marker, a `humming` or `laughing` vocalization, and every note
+  of a melisma the source actually states. So does the note immediately before a
+  marker, touching it or not: OpenUtau refuses a marker that does not touch its
+  predecessor, while Synthesizer V checks nothing and would rebind the hold to a
+  different syllable in silence. Never weaken that rule to the touching case — a
+  silent rebinding is worse than a refusal. A lane with nothing left to sing is
+  not split at all.
 - Insert a hold or split marker only when a source extension or continuation
   proves it, and let each target spell it in its own vocabulary — `-`/`+` for
   Synthesizer V, `+~`/`+` for OpenUtau. Never carry rendered marker text through
