@@ -1,8 +1,8 @@
 # Verse Component Inventory
 
-**Baseline:** `e2a717cd5a0756a089f890478882045dcdf16e7c`
+**Baseline:** `bea4a47` (two export targets)
 
-**Updated:** 2026-07-25
+**Updated:** 2026-07-28
 
 ## Runtime composition
 
@@ -19,7 +19,10 @@ flowchart LR
     COMMANDS --> BUNDLE["Stem plan and bundle transaction"]
     BUNDLE --> MUSESCORE["User-installed MuseScore"]
     ENGINE --> SVP["SVP v113"]
-    BUNDLE --> DISK["Local .versebundle"]
+    ENGINE --> USTX["USTX 0.6"]
+    SVP --> DISK["Local .svp / .ustx / .versebundle"]
+    USTX --> DISK
+    BUNDLE --> DISK
 ```
 
 There is no router, frontend state library, server, database, account,
@@ -30,7 +33,7 @@ telemetry client, or runtime network API.
 | Component | Source | Responsibility | State or dependencies |
 |---|---|---|---|
 | React entry point | `src/main.tsx` | Mounts React in Strict Mode and installs the theme provider | `ReactDOM`, `ThemeProvider` |
-| `App` | `src/App.tsx` | Coordinates selection, analysis, language, renderer status, Part overrides, batch selection, export, and errors | All workflow state is local React state |
+| `App` | `src/App.tsx` | Coordinates selection, analysis, export-target choice, renderer status, Part overrides, batch selection, export, and errors | All workflow state is local React state |
 | `Dropzone` | `src/components/Dropzone.tsx` | Presents the file-selection button and the accepted extensions | Native selection is delegated to `App`; Tauri webview events handle drag/drop |
 | `FileList` | `src/components/FileList.tsx` | Renders file summaries, expandable source Parts, diagnostics, selection, and export actions | Contains private `Row` and `PartRow` presentation components |
 | `Settings` | `src/components/Settings.tsx` | Configures appearance, output folder, MuseScore path, and displays renderer status | Uses native directory/executable dialogs |
@@ -47,24 +50,28 @@ sequential.
 | `items` | Session | Current analysis results |
 | `selected` | Session | Sources selected for batch bundle export |
 | `overrides` | Session | Explicit per-source, per-track vocal projection choices |
-| `language` | Session | Synthesizer V database language, English or French |
+| `exportTarget` | Session | Which project format the vocals-only export writes, `"svp"` or `"ustx"`; defaults to `"svp"` |
 | `outDir` | Session | Optional bundle output directory |
 | `rendererStatus` | Session | Result of the latest renderer probe |
 | `exportErrors`, `globalError` | Session | Structured errors prepared for display |
 | `verse.rendererPath` | Persistent local storage | Optional user-selected MuseScore executable |
 | `verse-theme` | Persistent local storage | Light, dark, or system theme |
 
-Changing language reanalyzes all current sources. It does not translate,
-normalize, or phoneticize source lyrics. A Part-level vocal toggle updates all
-of that Part's eligible projection track IDs in one immutable map operation,
-reanalyzes the source, and restores the previous map if the command fails.
+Changing the export target reanalyzes all current sources, because the exactness
+gate — and therefore the convertibility verdict and the diagnostics — is
+target-dependent. It cannot be a plain `setState`. There is no language state to
+change: lyrics are source text and need no configuration.
+
+A Part-level vocal toggle updates all of that Part's eligible projection track
+IDs in one immutable map operation, reanalyzes the source, and restores the
+previous map if the command fails.
 
 ## Frontend adapters and helpers
 
 | Module | Responsibility |
 |---|---|
 | `src/lib/tauri.ts` | Mirrors Rust DTOs, opens native dialogs, and invokes the four Tauri commands |
-| `src/lib/file-utils.ts` | Defines supported extensions, deduplicates paths, derives default output paths, and normalizes structured command errors |
+| `src/lib/file-utils.ts` | Defines supported extensions and the `ExportTarget` union, deduplicates paths, derives per-target default output paths, and normalizes structured command errors |
 | `src/lib/vocal-overrides.ts` | Applies one Part choice atomically across its eligible track IDs |
 | `src/lib/utils.ts` | Merges conditional Tailwind class names |
 | `src/index.css` | Tailwind CSS 4 import, light/dark OKLCH design tokens, and base layout |
@@ -82,8 +89,9 @@ The supported source extensions are `.kar`, `.mid`, `.midi`, `.mxl`, `.xml`,
 | `src/components/ui/switch.tsx` | Present but not imported by the current application |
 
 `@radix-ui/react-scroll-area` and `@radix-ui/react-select` are installed but
-not used. The scaffold assets under `public/` and `src/assets/` are also not
-used by the current UI.
+not used; the export-target selector is a segmented `Button` group, so it needed
+no new dependency and no `ui/select.tsx`. The scaffold assets under `public/` and
+`src/assets/` are also not used by the current UI.
 
 ## Tauri IPC surface
 
@@ -92,9 +100,9 @@ The TypeScript adapter is `src/lib/tauri.ts`; the Rust adapter is
 
 | Command | Frontend use | Rust execution |
 |---|---|---|
-| `convert_files` | Analyze one or more paths and return Parts, tracks, lyrics, roles, and diagnostics | Synchronous parse and projection; the UI passes `write=false` |
-| `export_svp` | Save editable vocal notes to a new `.svp` path | Reparse, project, serialize, and commit without replacement |
-| `export_bundle` | Create a complete preservation bundle | Runs on Tauri's blocking pool because it parses, renders, validates, and commits |
+| `convert_files` | Analyze one or more paths and return Parts, tracks, lyrics, roles, and diagnostics | Synchronous parse and projection; the UI passes `write=false` and the selected `exportTarget` |
+| `export_svp` | Save editable vocal notes to a new `.svp` or `.ustx` path | Reparse, project, serialize for the given `exportTarget`, and commit without replacement |
+| `export_bundle` | Create a complete preservation bundle | Runs on Tauri's blocking pool because it parses, renders, validates, and commits; `exportTarget` selects the project format written into `project/` |
 | `renderer_status` | Probe configured or auto-detected MuseScore | Runs on the blocking pool and returns available, missing, or unsupported |
 
 Source bytes, the parsed musical model, and WAV data never cross IPC. Rust
@@ -115,11 +123,14 @@ resources and Tauri IPC; it does not authorize arbitrary web connections.
 | `src-tauri/src/engine/musicxml.rs` | MusicXML/XML/MXL decoding into the shared model |
 | `src-tauri/src/engine/musescore.rs` | Native MSCX/MSCZ decoding into the shared model |
 | `src-tauri/src/engine/convert.rs` | Source classification, lyric ownership, diagnostics, overrides, and evidence-backed vocal projection |
-| `src-tauri/src/engine/svp.rs` | Synthesizer V project v113 data model and serialization |
+| `src-tauri/src/engine/projection.rs` | Target-neutral projection consumed by every export target, in source-exact IR ticks |
+| `src-tauri/src/engine/target/mod.rs` | `ExportTarget`, `SerializeError`, the analysis gate `validate_for`, the write boundary `serialize_to`, and the `LYRIC_REINTERPRETED_BY_TARGET` audit |
+| `src-tauri/src/engine/target/svp.rs` | Synthesizer V project v113 data model and serialization; blicks |
+| `src-tauri/src/engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 data model, the 480-tick exactness gate, the OpenUtau marker vocabulary, and a deterministic always-double-quote YAML emitter |
 | `src-tauri/src/stems.rs` | Stable one-stem-per-note-bearing-Part plan and default mute policy |
 | `src-tauri/src/renderer.rs` | MuseScore discovery, capability probe, Part extraction, bounded rendering, process cleanup, and WAV validation |
-| `src-tauri/src/bundle.rs` | Preservation ledger, staging, rendering orchestration, integrity validation, rollback, and no-replace commit |
-| `src-tauri/src/bin/corpus_audit.rs` | Standalone pinned public-corpus audit command |
+| `src-tauri/src/bundle.rs` | Preservation ledger, staging, rendering orchestration, the per-target bundle project and its audio references, integrity validation, rollback, and no-replace commit |
+| `src-tauri/examples/corpus_audit.rs` | Standalone pinned public-corpus audit command, run as a Cargo example so that `verse` remains the only application binary |
 
 The shared source type is historically named `Midi`, but MusicXML and
 MuseScore adapters also populate it. Cross-format policy belongs in the shared
@@ -133,6 +144,7 @@ model or `convert.rs`; format-specific syntax belongs in the owning parser.
 | Local filesystem | Rust to disk | Read immutable source snapshots and publish only to new destinations |
 | MuseScore Studio | Rust child process | Fixed `--version`, `--help`, `--score-parts`, and WAV-render commands |
 | Synthesizer V Studio | Persisted file consumer | Opens raw SVP project version 113; Verse does not automate or embed Synthesizer V |
+| OpenUtau | Persisted file consumer | Opens `.ustx` at `ustx_version` 0.6; format facts are read from the `0.1.568` sources. Verse does not automate, embed, or bundle OpenUtau, and names no singer |
 | GitHub Actions | Delivery only | Tests and packages releases; it is not a runtime dependency |
 
 MuseScore is optional for analysis and vocal-only export. A complete bundle
@@ -152,6 +164,7 @@ verified MuseScore 4.x installation. See
 | `src-tauri/tests/source_fidelity.rs` | No-invention and optional real score gates |
 | `src-tauri/tests/corpus.rs` | Ignored private multi-format corpus expectations |
 | `src-tauri/tests/parity.rs` | Cross-format semantics and private parity fixtures |
+| `src-tauri/tests/language_fidelity.rs` | Lyrics of any language survive byte-exactly with nothing configured, across fr, es, en, pt, de, pl, and tr |
 
 The frontend suite does not currently render React components or run an
 end-to-end desktop workflow. `npm run build` is the strict TypeScript

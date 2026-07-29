@@ -234,9 +234,113 @@ pub struct TrackSource {
     pub voice: Option<String>,
 }
 
+/// What a chord carrying one written lyric asks for.
+///
+/// The two readings are both correct, for different sources, so the source has
+/// to say which one applies. A choir harmonising a line writes the word once
+/// under a chord and means every voice to sing it; a piano reduction writes the
+/// same thing and means one singer over an accompaniment. Reading a reduction as
+/// a harmony asks one syllable to be sung several times at once; reading a
+/// harmony as a reduction silences real voices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChordReading {
+    /// Several voices sounding one written line. Every member keeps the word.
+    Harmonised,
+    /// An accompaniment reduction. The highest note keeps the word; the rest are
+    /// preserved as notes without one.
+    Reduction,
+}
+
+/// The instrument identifiers that name something that sings, in the taxonomy
+/// MuseScore and MusicXML share.
+///
+/// Matched on the identifier and never on a display name: this project's own
+/// reported score names its instrument `Piano, Фортепиано`, so any rule reading
+/// names would fail on the first source that is not in English. Bare `bass` is
+/// deliberately absent — it names a bass guitar as often as a bass voice, and
+/// the dotted `voice.bass` a notation program writes is unambiguous.
+const SINGING_INSTRUMENT_NAMES: &[&str] = &[
+    "voice",
+    "vocals",
+    "soprano",
+    "mezzo-soprano",
+    "alto",
+    "contralto",
+    "countertenor",
+    "tenor",
+    "baritone",
+    "choir",
+];
+
+/// The General MIDI programs that name a singing timbre: Choir Aahs, Voice Oohs
+/// and Synth Voice, zero-based.
+const SINGING_MIDI_PROGRAMS: std::ops::RangeInclusive<u8> = 52..=54;
+
+impl InstrumentInfo {
+    /// Whether this instrument is one that sings, according to what the source
+    /// declares and nothing else.
+    ///
+    /// `None` when the source declares no instrument at all, which is a
+    /// different answer from "declared, and not a singer": the caller decides
+    /// what to do with an absent declaration, and must not read it as a no.
+    pub fn declares_a_singer(&self) -> Option<bool> {
+        let stated = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        // An empty `<instrumentId>` must not shadow a usable `id`, so both are
+        // filtered before either is preferred.
+        if let Some(identifier) = stated(&self.sound_id).or_else(|| stated(&self.id)) {
+            let identifier = identifier.to_ascii_lowercase();
+            // `musescore.rs` suffixes a per-channel identity onto `id`, so the
+            // declaration reaching here can read `soprano:channel:0`. Comparing
+            // that whole string against the taxonomy answered "not a singer" for
+            // every choir whose file states no `<instrumentId>` — which real
+            // MuseScore files do.
+            let identifier = identifier
+                .split_once(":channel:")
+                .map_or(identifier.as_str(), |(identity, _)| identity);
+            let family = identifier
+                .split_once('.')
+                .map_or(identifier, |(family, _)| family);
+            return Some(
+                matches!(family, "voice" | "vocal" | "vocals")
+                    || SINGING_INSTRUMENT_NAMES.contains(&identifier),
+            );
+        }
+        self.program
+            .map(|program| SINGING_MIDI_PROGRAMS.contains(&program))
+    }
+}
+
+/// Whether a part's instruments declare a singer, reading all of them.
+///
+/// A part can state several channels, and they can disagree. One channel naming
+/// a singing instrument is taken as the answer for the whole part: silencing a
+/// real voice is the worse mistake, and a part that sings on any channel is a
+/// part that sings.
+pub fn part_declares_a_singer(instruments: &[InstrumentInfo]) -> Option<bool> {
+    let declared: Vec<bool> = instruments
+        .iter()
+        .filter_map(InstrumentInfo::declares_a_singer)
+        .collect();
+    if declared.is_empty() {
+        return None;
+    }
+    Some(declared.into_iter().any(|sings| sings))
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InstrumentInfo {
     pub id: Option<String>,
+    /// The instrument's place in the notation taxonomy, when the source states
+    /// one: MuseScore `<instrumentId>`, MusicXML `<instrument-sound>`. Kept
+    /// apart from `id`, which is a source-owned identity used for topology and
+    /// stem alignment and must keep naming exactly what it named before.
+    pub sound_id: Option<String>,
     pub name: Option<String>,
     /// Value exactly as written by the source. MusicXML uses one-based
     /// channel/program values while MIDI and MuseScore use zero-based values.
@@ -269,6 +373,11 @@ pub struct Track {
     pub instruments: Vec<InstrumentInfo>,
     /// Primary instrument retained for callers that only need one summary.
     pub instrument: Option<InstrumentInfo>,
+    /// The reading this track's chords were projected under, and the evidence
+    /// that decided it, when the source held a chord carrying a word at all. A
+    /// reading changes which notes are sung, so it is carried out to a
+    /// diagnostic rather than left as a silent parser decision.
+    pub chord_reading: Option<(ChordReading, String)>,
     pub events: Vec<Event>,
 }
 
@@ -285,6 +394,7 @@ impl Track {
             text_profile: MidiTextProfile::Generic,
             instruments: Vec::new(),
             instrument: None,
+            chord_reading: None,
             events: Vec::new(),
         }
     }
@@ -1629,6 +1739,7 @@ mod tests {
             text_profile: MidiTextProfile::Generic,
             instruments: Vec::new(),
             instrument: None,
+            chord_reading: None,
             events: Vec::new(),
         };
         let tracks = vec![

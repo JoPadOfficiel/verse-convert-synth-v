@@ -15,6 +15,24 @@ export type StructuredCommandError = {
   remediation?: string | null;
 };
 
+/**
+ * Mirrors `engine::target::ExportTarget`. The values are the Rust serde values,
+ * so they travel to the backend as they are written here. Declared beside the
+ * path helpers because those are what read it, and because they are tested
+ * without a webview.
+ */
+export type ExportTarget = "svp" | "ustx";
+
+/**
+ * The output extension per target, spelled out rather than derived from the
+ * target name: the two happen to be the same string today, and a target whose
+ * name is not its extension must not silently inherit the wrong one.
+ */
+const TARGET_EXTENSION: Record<ExportTarget, string> = {
+  svp: "svp",
+  ustx: "ustx",
+};
+
 const supportedPattern = new RegExp(
   `\\.(${SUPPORTED_EXTENSIONS.join("|")})$`,
   "i",
@@ -37,9 +55,16 @@ function splitSourcePath(sourcePath: string) {
   return { sep, directory, stem };
 }
 
-export function defaultSvpPath(sourcePath: string): string {
+/**
+ * The vocal-only default filename, mirroring `vocal_out_path` in Rust: the
+ * `_LYRICS` stem is unchanged and only the extension follows the target.
+ */
+export function defaultVocalPath(
+  sourcePath: string,
+  target: ExportTarget = "svp",
+): string {
   const { directory, stem } = splitSourcePath(sourcePath);
-  return `${directory}${stem}_LYRICS.svp`;
+  return `${directory}${stem}_LYRICS.${TARGET_EXTENSION[target]}`;
 }
 
 export function defaultBundlePath(

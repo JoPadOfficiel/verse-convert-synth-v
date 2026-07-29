@@ -9,6 +9,7 @@ import {
 import { Button } from "@/components/ui/button";
 import type {
   ExportRepresentation,
+  ExportTarget,
   FileResult,
   LyricStatus,
   PartInfo,
@@ -18,6 +19,7 @@ import {
   exportProgressPercent,
   type FileExportProgress,
 } from "@/lib/export-progress";
+import { groupDiagnostics } from "@/lib/diagnostics";
 
 const ROLE_LABEL: Record<SourceRole, string> = {
   vocal: "Source vocal",
@@ -29,12 +31,46 @@ const ROLE_LABEL: Record<SourceRole, string> = {
   ambiguous: "Unspecified musical role",
 };
 
-const REPRESENTATION_LABEL: Record<ExportRepresentation, string> = {
-  vocalNotes: "Vocal notes in SVP",
-  referenceMixMember: "Separate MuseScore Part stem in the bundle",
-  vocalNotesAndReferenceMix:
+/**
+ * The words this copy borrows from the selected export target. Each target names
+ * its own file format, its own singing-voice concept — Synthesizer V assigns a
+ * voice database, OpenUtau assigns a singer — and its own way of referencing the
+ * bundle's rendered audio.
+ */
+const TARGET_COPY: Record<
+  ExportTarget,
+  {
+    format: string;
+    assignVoice: string;
+    assignVoiceInApp: string;
+    audioReference: string;
+  }
+> = {
+  svp: {
+    format: "SVP",
+    assignVoice: "Assign a Synthesizer V voice before playback",
+    assignVoiceInApp: "A voice database must be assigned in Synthesizer V.",
+    audioReference: "audio-backed instrumental track",
+  },
+  ustx: {
+    format: "USTX",
+    assignVoice: "Assign an OpenUtau singer before playback",
+    assignVoiceInApp: "A singer must be assigned in OpenUtau.",
+    audioReference: "wave part",
+  },
+};
+
+// Kept keyed by representation so a new one cannot be forgotten, and per-target
+// only where the label actually names the format.
+const REPRESENTATION_LABEL: Record<
+  ExportRepresentation,
+  (target: ExportTarget) => string
+> = {
+  vocalNotes: (target) => `Vocal notes in ${TARGET_COPY[target].format}`,
+  referenceMixMember: () => "Separate MuseScore Part stem in the bundle",
+  vocalNotesAndReferenceMix: () =>
     "Vocal notes + separate muted Part reference stem",
-  sourceOnly: "Preserved in source/manifest",
+  sourceOnly: () => "Preserved in source/manifest",
 };
 
 function lyricLabel(status: LyricStatus): string {
@@ -64,10 +100,12 @@ function exportsVocalNotes(representation: ExportRepresentation): boolean {
 function PartRow({
   part,
   disabled,
+  exportTarget,
   onToggle,
 }: {
   part: PartInfo;
   disabled: boolean;
+  exportTarget: ExportTarget;
   onToggle: (trackIds: number[], enabled: boolean) => void;
 }) {
   const vocalExport = exportsVocalNotes(part.exportRepresentation);
@@ -114,18 +152,26 @@ function PartRow({
             }
           >
             <SpeakerLoudIcon className="size-3" />
-            Vocal SVP {vocalExport ? "on" : "off"}
+            Vocal {TARGET_COPY[exportTarget].format}{" "}
+            {vocalExport ? "on" : "off"}
           </button>
         )}
       </div>
       <div className="ml-6 mt-1 text-xs text-muted-foreground">
-        {REPRESENTATION_LABEL[part.exportRepresentation]}
+        {REPRESENTATION_LABEL[part.exportRepresentation](exportTarget)}
         {part.requiresVoiceAssignment &&
-          " · Assign a Synthesizer V voice before playback"}
+          ` · ${TARGET_COPY[exportTarget].assignVoice}`}
       </div>
-      {part.warnings.map((warning) => (
+      {/* Grouped for display only: a per-note diagnostic is raised once per
+          affected note, and one identical sentence repeated hundreds of times
+          would hide every other diagnostic on this Part. */}
+      {groupDiagnostics(part.warnings).map((warning) => (
         <div
-          key={`${warning.code}-${warning.sourceId ?? ""}`}
+          key={JSON.stringify([
+            warning.severity,
+            warning.code,
+            warning.message,
+          ])}
           className={
             "ml-6 mt-1 text-xs " +
             (warning.severity === "warning"
@@ -134,6 +180,9 @@ function PartRow({
           }
         >
           {warning.message}
+          {/* "Occurrences" rather than "notes": the same grouping serves
+              track-level diagnostics, whose source ID is not a note. */}
+          {warning.count > 1 && ` · ${warning.count} occurrences`}
         </div>
       ))}
     </div>
@@ -145,6 +194,7 @@ function Row({
   busy,
   exportError,
   exportProgress,
+  exportTarget,
   onBundle,
   onVocals,
   selected,
@@ -155,6 +205,7 @@ function Row({
   busy: boolean;
   exportError?: string;
   exportProgress?: FileExportProgress;
+  exportTarget: ExportTarget;
   onBundle: (item: FileResult) => void;
   onVocals: (item: FileResult) => void;
   selected: boolean;
@@ -180,6 +231,18 @@ function Row({
   const progressPercent = exportProgress
     ? exportProgressPercent(exportProgress)
     : 0;
+  // Counted after grouping, so one sentence repeated over 300 notes reads as one
+  // entry rather than 300 — the same collapse the expanded rows show.
+  //
+  // Severity is counted separately because it decides what the summary may call
+  // them. Every diagnostic used to be summarised as a warning, so a conversion
+  // whose notes were all informational — where each note went, which reading a
+  // chord took — announced itself as "9 warnings" and read as broken.
+  const grouped = item.parts.flatMap((part) => groupDiagnostics(part.warnings));
+  const warningCount = grouped.filter(
+    (entry) => entry.severity === "warning",
+  ).length;
+  const noteCount = grouped.length - warningCount;
 
   return (
     <div className="rounded-lg border bg-card">
@@ -207,6 +270,32 @@ function Row({
                 ? `${item.nParts} source Parts · ${item.nVoices} voices · ${vocalTracks} vocal exports · ${item.placed} projected lyrics`
                 : analysisError}
             </div>
+            {/* Diagnostics used to live only inside the expanded Part rows, so a
+                warning about a lyric the target reinterprets went unseen unless the
+                row happened to be opened. Surfaced here as a count, with the
+                detail still one click away. */}
+            {item.ok && (warningCount > 0 || noteCount > 0) && (
+              <div
+                className={`flex items-center gap-1 truncate text-xs ${
+                  warningCount > 0 ? "text-warning" : "text-muted-foreground"
+                }`}
+              >
+                {warningCount > 0 && (
+                  <ExclamationTriangleIcon className="size-3 shrink-0" />
+                )}
+                {[
+                  warningCount > 0
+                    ? `${warningCount} warning${warningCount === 1 ? "" : "s"}`
+                    : null,
+                  noteCount > 0
+                    ? `${noteCount} note${noteCount === 1 ? "" : "s"}`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(", ")}{" "}
+                · expand for detail
+              </div>
+            )}
             {item.ok && (
               <div
                 className={
@@ -221,7 +310,7 @@ function Row({
             )}
             {item.requiresVoiceAssignment && (
               <div className="truncate text-xs text-warning">
-                A voice database must be assigned in Synthesizer V.
+                {TARGET_COPY[exportTarget].assignVoiceInApp}
               </div>
             )}
             {item.out && (
@@ -285,12 +374,17 @@ function Row({
             />
           )}
         </button>
-        {item.ok && (
+        {/* `bundleReady` rather than `item.ok`: the backend answers whether a
+            bundle can be written for this source, so the webview never re-derives
+            which format's rules the bundle is held to. */}
+        {(item.ok || item.bundleReady) && (
           <div className="flex shrink-0 flex-col gap-1">
             <Button
               size="sm"
               disabled={busy}
-              title="Create an auditable bundle with source, SVP, one audio stem per MuseScore Part, and a muted full-score reference"
+              // The bundle carries the selected target's project, referencing the
+              // same stems the other target would reference.
+              title={`Create an auditable bundle with source, a ${TARGET_COPY[exportTarget].format} project, one audio stem per MuseScore Part, and a muted full-score reference`}
               onClick={() => onBundle(item)}
             >
               <DownloadIcon /> Complete project
@@ -314,15 +408,17 @@ function Row({
       {open && item.ok && (
         <div className="border-t px-4 py-2 pl-11">
           <p className="mb-2 text-xs text-muted-foreground">
-            Each note-bearing source Part becomes its own MuseScore-rendered
-            audio track. Vocal reference Parts and the full-score reference are
-            muted by default; accompaniment Parts remain audible.
+            Each note-bearing source Part becomes its own MuseScore-rendered{" "}
+            {TARGET_COPY[exportTarget].audioReference}. Vocal reference Parts and
+            the full-score reference are muted by default; accompaniment Parts
+            remain audible.
           </p>
           {item.parts.map((part) => (
             <PartRow
               key={part.sourceId}
               part={part}
               disabled={busy}
+              exportTarget={exportTarget}
               onToggle={(trackIds, enabled) =>
                 onToggleVocal(item.path, trackIds, enabled)
               }
@@ -339,6 +435,7 @@ export function FileList({
   busy,
   exportErrors,
   exportProgress,
+  exportTarget,
   onBundle,
   onVocals,
   selected,
@@ -349,6 +446,7 @@ export function FileList({
   busy: boolean;
   exportErrors: Record<string, string>;
   exportProgress: Record<string, FileExportProgress>;
+  exportTarget: ExportTarget;
   onBundle: (item: FileResult) => void;
   onVocals: (item: FileResult) => void;
   selected: Set<string>;
@@ -375,6 +473,7 @@ export function FileList({
           busy={busy}
           exportError={exportErrors[item.path]}
           exportProgress={exportProgress[item.path]}
+          exportTarget={exportTarget}
           onBundle={onBundle}
           onVocals={onVocals}
           selected={selected.has(item.path)}

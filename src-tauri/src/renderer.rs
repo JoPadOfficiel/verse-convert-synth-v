@@ -384,15 +384,21 @@ impl ScoreLoadRetryPolicy {
     }
 }
 
-fn needs_macos_score_load_workaround(version_output: &str) -> bool {
-    musescore_version(version_output).is_none_or(|version| {
-        version
-            < (MuseScoreVersion {
-                major: 4,
-                minor: 7,
-                patch: 0,
-            })
-    })
+/// Always true on a MuseScore 4 host.
+///
+/// This used to return false from 4.7.0 onward, on the grounds that upstream
+/// PR #31084 fixed the abort there. Measured against 4.7.4 on macOS 15: a bare
+/// private home aborts with `mutex lock failed: Invalid argument` in **four of
+/// five** consecutive `--score-parts` runs of the same score. The upstream fix
+/// narrowed the race but did not close it, and gating the workaround on 4.7 left
+/// exactly the newest installations with `max_attempts = 1` and no cooldown — so
+/// a bundle export failed almost every time on a current MuseScore.
+///
+/// Serializing and retrying costs a few seconds on a host that would not have
+/// raced; not retrying costs the export. The parameter is kept so the signature
+/// still documents that this is version-dependent behaviour upstream may yet fix.
+fn needs_macos_score_load_workaround(_version_output: &str) -> bool {
+    true
 }
 
 fn needs_macos_complete_stdout_workaround(version_output: &str) -> bool {
@@ -2435,11 +2441,19 @@ mod tests {
         }
     }
 
+    /// This test previously asserted the opposite for 4.7 and later, on the
+    /// grounds that upstream PR #31084 fixed the abort. Measured against a real
+    /// MuseScore4 4.7.4 on macOS: a bare private home aborts with `mutex lock
+    /// failed: Invalid argument` in four of five consecutive `--score-parts` runs
+    /// of the same score. The old gate therefore left the newest installations
+    /// with one attempt and no cooldown, which is why a complete bundle export
+    /// failed on a current MuseScore almost every time. The expectations below
+    /// follow the measurement, not the upstream release note.
     #[test]
-    fn macos_score_load_cooldown_is_limited_to_musescore_four_before_four_seven() {
+    fn every_macos_musescore_four_gets_the_score_load_cooldown() {
         assert!(needs_macos_score_load_workaround("MuseScore 4.6.4"));
-        assert!(!needs_macos_score_load_workaround("MuseScore 4.7.0"));
-        assert!(!needs_macos_score_load_workaround(
+        assert!(needs_macos_score_load_workaround("MuseScore 4.7.0"));
+        assert!(needs_macos_score_load_workaround(
             "MuseScore4 4.7.4.252060402"
         ));
         assert!(needs_macos_score_load_workaround("unparseable MuseScore"));

@@ -1,6 +1,6 @@
 # Verse Source Tree Analysis
 
-**Date:** 2026-07-25
+**Date:** 2026-07-28
 
 ## Overview
 
@@ -39,15 +39,20 @@ control, filesystem transactions, and persisted artifacts.
 │   └── main.tsx
 ├── src-tauri/
 │   ├── capabilities/default.json
+│   ├── examples/
+│   │   └── corpus_audit.rs
 │   ├── icons/
 │   ├── src/
-│   │   ├── bin/corpus_audit.rs
 │   │   ├── engine/
 │   │   │   ├── convert.rs
 │   │   │   ├── midi.rs
 │   │   │   ├── musescore.rs
 │   │   │   ├── musicxml.rs
-│   │   │   └── svp.rs
+│   │   │   ├── projection.rs
+│   │   │   └── target/
+│   │   │       ├── mod.rs
+│   │   │       ├── svp.rs
+│   │   │       └── ustx.rs
 │   │   ├── bundle.rs
 │   │   ├── lib.rs
 │   │   ├── main.rs
@@ -55,6 +60,7 @@ control, filesystem transactions, and persisted artifacts.
 │   │   └── stems.rs
 │   ├── tests/
 │   │   ├── corpus.rs
+│   │   ├── language_fidelity.rs
 │   │   ├── parity.rs
 │   │   └── source_fidelity.rs
 │   ├── Cargo.lock
@@ -85,7 +91,7 @@ Generated and private trees are intentionally excluded:
 | `src/App.tsx` | Owns transient UI state and all user workflows |
 | `src-tauri/src/main.rs` | Starts the desktop binary |
 | `src-tauri/src/lib.rs::run` | Configures Tauri plugins and command handlers |
-| `src-tauri/src/bin/corpus_audit.rs` | Standalone public-corpus audit CLI |
+| `src-tauri/examples/corpus_audit.rs` | Standalone public-corpus audit CLI, run as `cargo run --example corpus_audit`. It is a Cargo example, not a second binary: `verse` is the only application binary |
 
 ## Critical directories
 
@@ -93,7 +99,12 @@ Generated and private trees are intentionally excluded:
 
 The source and target format boundary. It contains the shared musical model,
 source topology, exact event evidence, MIDI/KAR parser, MusicXML and MuseScore
-adapters, vocal projection, and SVP v113 serialization.
+adapters, vocal projection, and the two export-target serializers.
+
+`projection.rs` is the target-neutral seam, in source-exact IR ticks.
+`target/mod.rs` owns `ExportTarget`, the analysis gate and the single write
+boundary; `target/svp.rs` writes Synthesizer V v113 and `target/ustx.rs` writes
+OpenUtau `.ustx` 0.6. A target reads the projection and nothing else.
 
 Format-specific rules stay in the owning parser. Cross-format lyric, timing,
 role, and projection semantics stay in `midi.rs` and `convert.rs`.
@@ -125,6 +136,9 @@ Cross-module behavior:
   with optional real `.mxl`/`.mscz` fixtures.
 - `corpus.rs` runs exact expectations over a private, ignored multi-format
   corpus.
+- `language_fidelity.rs` proves lyrics of any language reach the `.ustx`
+  byte-exactly with nothing configured, passing a deliberately wrong language to
+  show the text does not depend on it.
 
 ### `.github/workflows/`
 

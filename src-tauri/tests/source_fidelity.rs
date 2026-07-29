@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use verse_lib::engine::convert::convert_auto;
 use verse_lib::engine::midi::{self, Kind, LyricState, SourceFormat};
-use verse_lib::engine::{musescore, musicxml};
+use verse_lib::engine::{musescore, musicxml, target};
 
 fn smf(track: &[u8]) -> Vec<u8> {
     let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
@@ -22,7 +22,83 @@ fn lyric_free_midi_succeeds_without_a_synthetic_vocal_track() {
     assert_eq!(outcome.tracks.len(), 1);
     assert_eq!(outcome.tracks[0].notes, 1);
     assert_eq!(outcome.tracks[0].role, "backing");
-    assert!(outcome.svp.expect("valid empty project").tracks.is_empty());
+    assert!(
+        target::svp::serialize(&outcome.svp.expect("valid empty project"))
+            .expect("exactly representable")
+            .tracks
+            .is_empty()
+    );
+}
+
+/// A note the source never texts is left out of the vocal project, never filled
+/// in and never deleted from the bundle.
+///
+/// `"a"`, `"la"`, `"+~"` and `"R"` are each a different way of putting a word in
+/// the singer's mouth, and an empty lyric is not an option either: OpenUtau's
+/// phonemizer marks one `error`, so writing them produced a project that reads
+/// as a failed conversion. A wordless note is not vocal material — it stays in
+/// the preserved source and in the stem rendered from it.
+#[test]
+fn an_untexted_note_is_left_out_and_never_given_a_word() {
+    let data = smf(&[
+        0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // lyric "let"
+        0x00, 0x90, 60, 100, // C4 on at 0
+        0x83, 0x60, 0x80, 60, 0, // off at 480
+        0x00, 0x90, 62, 100, // D4 on at 480, never texted
+        0x83, 0x60, 0x80, 62, 0, // off at 960
+        0x00, 0xff, 0x2f, 0x00,
+    ]);
+    let outcome = convert_auto(&data, "english");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    // The source note is still inventoried: the report counts two.
+    assert_eq!(outcome.tracks[0].notes, 2);
+    let projected = outcome.svp.expect("a projection");
+    assert_eq!(
+        projected
+            .tracks
+            .iter()
+            .map(|lane| (lane.name.as_str(), lane.muted, lane.notes.len()))
+            .collect::<Vec<_>>(),
+        vec![("Track 0", false, 1)],
+        "one lane, nothing muted beside it"
+    );
+    assert_eq!(
+        projected.tracks[0]
+            .notes
+            .iter()
+            .map(|note| (note.onset_ticks, note.duration_ticks, note.pitch))
+            .collect::<Vec<_>>(),
+        vec![(0, 480, 60)],
+    );
+
+    let svp = target::svp::serialize(&projected).expect("exactly representable");
+    assert!(svp.tracks[0].render_enabled);
+    assert!(!svp.tracks[0].main_ref.is_instrumental);
+    assert!(svp.tracks[0]
+        .main_group
+        .notes
+        .iter()
+        .all(|note| !note.lyrics.is_empty()));
+
+    let ustx = target::ustx::serialize(&projected).expect("exactly representable");
+    assert_eq!(
+        ustx.tracks
+            .iter()
+            .map(|track| track.mute)
+            .collect::<Vec<_>>(),
+        vec![false],
+    );
+    assert!(ustx.wave_parts.is_empty(), "a projection carries no audio");
+    let yaml = target::ustx::to_yaml(&ustx);
+    for invented in [
+        "lyric: \"a\"",
+        "lyric: \"la\"",
+        "lyric: \"+~\"",
+        "lyric: \"R\"",
+        "lyric: \"\"",
+    ] {
+        assert!(!yaml.contains(invented), "{invented} must not be written");
+    }
 }
 
 #[test]
@@ -64,7 +140,10 @@ fn generic_midi_text_is_not_a_lyric_and_performance_events_survive() {
     let outcome = convert_auto(&data, "english");
     assert!(outcome.ok);
     assert_eq!(outcome.placed, 0);
-    assert!(outcome.svp.expect("valid project").tracks.is_empty());
+    assert!(target::svp::serialize(&outcome.svp.expect("valid project"))
+        .expect("exactly representable")
+        .tracks
+        .is_empty());
 }
 
 #[test]
@@ -140,7 +219,7 @@ fn merging_a_tie_sustains_the_note_without_losing_any_source_identity() {
 
     let outcome = convert_auto(xml.as_bytes(), "english");
     assert!(outcome.ok, "{:?}", outcome.msg);
-    let svp = outcome.svp.expect("valid SVP");
+    let svp = target::svp::serialize(&outcome.svp.expect("valid SVP")).expect("valid SVP");
     let notes = &svp.tracks[0].main_group.notes;
     assert_eq!(notes.len(), 1, "the tie is sung as one sustained note");
     assert_eq!(notes[0].lyrics, "shine");
@@ -172,14 +251,46 @@ fn supplied_musescore_gate_when_configured() {
 
     let outcome = convert_auto(&data, "english");
     assert!(outcome.ok, "{:?}", outcome.msg);
-    let svp = outcome.svp.expect("valid SVP");
+    let projected = outcome.svp.expect("valid SVP");
+    let svp = target::svp::serialize(&projected).expect("valid SVP");
+    let soprano = |companion: bool| {
+        projected
+            .tracks
+            .iter()
+            .find(|lane| {
+                lane.name.contains("Soprano")
+                    && lane.name.ends_with(" — untexted notes") == companion
+            })
+            .expect("the soprano lane")
+    };
+    // The score opens on an untexted F4. It is not sung, so it no longer opens
+    // the sung lane — and it is not invented away either: it opens the muted
+    // companion instead, still an F4 and still untexted.
+    let sung = soprano(false);
+    assert!(
+        sung.notes.iter().all(|note| note.lyric.is_sung()),
+        "the sung lane holds only notes the source asks to be sung"
+    );
+    assert!(!sung.muted);
+    let untexted = soprano(true);
+    assert!(untexted.muted, "the companion opens silent");
+    assert!(untexted.notes.iter().all(|note| !note.lyric.is_sung()));
+    assert_eq!(untexted.notes[0].pitch, 65);
+    // The companion directly follows the lane it belongs to, which is what lets
+    // a reader pair them by position rather than by parsing names.
+    let position = |lane: &verse_lib::engine::projection::ProjectedTrack| {
+        projected
+            .tracks
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, lane))
+            .expect("the lane is in the projection")
+    };
+    assert_eq!(position(untexted), position(sung) + 1);
     let vocal = svp
         .tracks
         .iter()
         .find(|track| track.name.contains("Soprano"))
         .expect("source-owned soprano track");
-    assert_eq!(vocal.main_group.notes[0].pitch, 65);
-    assert_eq!(vocal.main_group.notes[0].lyrics, "");
     assert_eq!(
         vocal
             .main_group

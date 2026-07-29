@@ -4,10 +4,10 @@
 //! Staff/Measure/voice, TimeSig, Tempo, Chord (dots, tuplets, graces),
 //! Rest (including full measures), location, and all source lyric lanes.
 use crate::engine::midi::{
-    merge_measure_marks, unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricFragment,
-    LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource, SourceFormat,
-    SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track, TrackRoleHint,
-    TrackSource,
+    merge_measure_marks, unroll, ChordReading, Event, InstrumentInfo, Jump, Kind, Lyric,
+    LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource,
+    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track,
+    TrackRoleHint, TrackSource,
 };
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -806,6 +806,108 @@ fn is_grace(chord: roxmltree::Node) -> bool {
     })
 }
 
+/// A `<Note>`'s written pitch, used only to compare the members of one chord.
+///
+/// Returns `None` rather than an error for anything unreadable: the projection
+/// loop below reads the same value and refuses there, naming the note, so this
+/// must not be a second place that decides whether a file is valid.
+fn chord_note_pitch(note: roxmltree::Node) -> Option<u8> {
+    child_text(note, "pitch")
+        .and_then(|text| text.parse::<i64>().ok())
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| *value <= 127)
+}
+
+/// Which reading this part's chords are projected under, and the evidence that
+/// decided it.
+///
+/// The declaration wins whenever the source makes one, because it is a statement
+/// and the alternative is a measurement. Only a part that declares nothing at all
+/// is measured, and then only against its own chords: a choir that harmonises
+/// does so throughout, while a reduction carries the occasional chord under an
+/// otherwise single-note melody.
+/// Whether a chord writes a word at all.
+///
+/// MuseScore writes an empty `<Lyrics>` on a tied note to state that nothing is
+/// sung there, so the presence of the element proves nothing. Counting those as
+/// texted let a single empty continuation on a piano chord tip a whole part into
+/// the harmony reading — the exact misreading this rule exists to prevent.
+fn chord_carries_a_word(chord: roxmltree::Node) -> bool {
+    chord
+        .children()
+        .filter(|node| node.has_tag_name("Lyrics"))
+        .any(|lyric| {
+            child(lyric, "text").is_some_and(|text| {
+                let mut raw = String::new();
+                deep_text_raw(text, &mut raw);
+                !raw.trim().is_empty()
+            })
+        })
+}
+
+fn resolve_chord_reading(
+    instruments: &[InstrumentInfo],
+    measures: &[roxmltree::Node],
+) -> (ChordReading, String, bool) {
+    let mut texted = 0usize;
+    let mut harmonised = 0usize;
+    for measure in measures {
+        for chord in measure
+            .descendants()
+            .filter(|node| node.has_tag_name("Chord"))
+        {
+            if !chord_carries_a_word(chord) {
+                continue;
+            }
+            texted += 1;
+            if chord
+                .children()
+                .filter(|node| node.has_tag_name("Note"))
+                .count()
+                > 1
+            {
+                harmonised += 1;
+            }
+        }
+    }
+    // Only a staff that actually writes a word over a chord had a reading to
+    // take, so only that staff reports one.
+    let decided_anything = harmonised > 0;
+    if let Some(sings) = crate::engine::midi::part_declares_a_singer(instruments) {
+        let named = instruments
+            .iter()
+            .find_map(|instrument| {
+                instrument
+                    .sound_id
+                    .clone()
+                    .or_else(|| instrument.id.clone())
+            })
+            .unwrap_or_else(|| "its MIDI program".to_string());
+        return if sings {
+            (
+                ChordReading::Harmonised,
+                format!("the part declares the singing instrument {named}"),
+                decided_anything,
+            )
+        } else {
+            (
+                ChordReading::Reduction,
+                format!("the part declares {named}, which does not sing"),
+                decided_anything,
+            )
+        };
+    }
+    let evidence = format!(
+        "the part declares no instrument, and {harmonised} of its {texted} chords \
+         carrying a word hold more than one note"
+    );
+    if texted > 0 && harmonised * 2 >= texted {
+        (ChordReading::Harmonised, evidence, decided_anything)
+    } else {
+        (ChordReading::Reduction, evidence, decided_anything)
+    }
+}
+
 /// Every lyric lane owned by a MuseScore chord. Selection for a repeat pass is
 /// deferred to the SVP projector so no source verse is discarded here.
 fn chord_lyrics(
@@ -818,12 +920,17 @@ fn chord_lyrics(
         .filter(|child| child.has_tag_name("Lyrics"))
         .enumerate()
         .map(|(index, lyric_node)| {
+            // `<no>` is how MuseScore numbers a verse, and it omits it only for
+            // the first one. Falling back to the element's position among its
+            // siblings invented a verse out of a chord that simply carries the
+            // same `<Lyrics>` twice — which real files do: the reported score
+            // held 99 such duplicates and every lane of it was written out a
+            // second time, note for note, as a phantom verse 2.
             let zero_based = match child_text(lyric_node, "no") {
                 Some(text) => text
                     .parse::<u32>()
                     .map_err(|_| format!("MuseScore lyric lane number is invalid: {text:?}"))?,
-                None => u32::try_from(index)
-                    .map_err(|_| "MuseScore lyric lane index exceeds the supported range")?,
+                None => 0,
             };
             let verse = zero_based
                 .checked_add(1)
@@ -1079,6 +1186,12 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 .attribute("id")
                 .map(str::to_string)
                 .or_else(|| child_text(instrument_node, "instrumentId").map(str::to_string));
+            // Kept separately from `id`, which stays whatever it has always been
+            // because topology and stem alignment are keyed on it. `instrumentId`
+            // is the taxonomy value — `keyboard.piano`, `voice.soprano` — and it
+            // is the only statement of what a part *is* that does not depend on
+            // the language its name is written in.
+            let sound_id = child_text(instrument_node, "instrumentId").map(str::to_string);
             let instrument_name = child(instrument_node, "longName")
                 .map(|node| collapse_ws(&deep_text(node)))
                 .filter(|value| !value.is_empty())
@@ -1094,6 +1207,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             if channels.is_empty() {
                 instruments.push(InstrumentInfo {
                     id,
+                    sound_id: sound_id.clone(),
                     name: instrument_name,
                     percussion,
                     ..InstrumentInfo::default()
@@ -1128,6 +1242,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                         id: id
                             .clone()
                             .map(|value| format!("{value}:channel:{channel_index}")),
+                        sound_id: sound_id.clone(),
                         name: instrument_name.clone(),
                         source_channel,
                         source_program,
@@ -1250,6 +1365,37 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .map(str::to_string)
             .unwrap_or_else(|| format!("anonymous-{}", tracks.len() + 1));
         let info = staff_info.get(&staff_id).cloned().unwrap_or_default();
+        // A part with several staves gives each of them the part's name, which
+        // wrote two different lanes into a project under one identical label.
+        // Number them only when there is something to tell apart, so a
+        // single-staff part keeps the name it has always had.
+        // Counted over the staves the score body actually holds, in the order it
+        // writes them — not over what the Part declares and not in key order. A
+        // Part can declare a staff its body never carries, and staff ids sort
+        // lexicographically, so `10` would otherwise come before `9` and the
+        // second staff of a piano would be labelled the first.
+        let siblings: Vec<&str> = score_staves
+            .iter()
+            .filter_map(|other| other.attribute("id"))
+            .filter(|other| {
+                staff_info
+                    .get(*other)
+                    .is_some_and(|other| other.part_id == info.part_id)
+            })
+            .collect();
+        let staff_ordinal = (siblings.len() > 1)
+            .then(|| {
+                siblings
+                    .iter()
+                    .position(|other| *other == staff_id)
+                    .map(|index| index + 1)
+            })
+            .flatten();
+        // What a chord carrying one written word asks for, decided once per
+        // staff before any of its music is read, so every chord of a part is
+        // projected under the same reading.
+        let (chord_reading, chord_reading_evidence, chord_reading_decided) =
+            resolve_chord_reading(&info.instruments, &staff_measures[staff_index]);
         let mut voice_events: BTreeMap<(usize, Option<usize>), Vec<Event>> = BTreeMap::new();
         let mut unassigned_chord_lyrics = Vec::new();
         // Scoped with `voice_events`, so tie state is per staff without needing
@@ -1491,16 +1637,12 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                     .filter(|child| child.has_tag_name("Note"))
                                     .collect();
                                 let polyphonic = notes.len() > 1;
-                                // A chord sings its word in every voice it
-                                // sounds. Its members are simultaneous voices
-                                // of one line, not candidates to choose
-                                // between, and each becomes its own monophonic
-                                // lane. Leaving the lyric standalone because no
-                                // single pitch "owns" it deleted whole phrases
-                                // from harmonised passages. Only a chord with
-                                // no note at all has nothing to carry it.
-                                let ambiguous_lyric_ownership = notes.is_empty();
-                                if ambiguous_lyric_ownership {
+                                // Only a chord with no note at all has nothing
+                                // to carry its word. Leaving a lyric standalone
+                                // because no single pitch "owns" it deleted
+                                // whole phrases from harmonised passages, and
+                                // must never come back under either reading.
+                                if notes.is_empty() {
                                     for lyric in &lyrics {
                                         push_event(
                                             &mut unassigned_chord_lyrics,
@@ -1509,6 +1651,39 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         );
                                     }
                                 }
+                                // Under the harmonised reading a chord's members
+                                // are simultaneous voices of one line and each
+                                // sings the word. Under the reduction reading
+                                // they are an accompaniment under one singer:
+                                // the highest note takes the word and joins the
+                                // voice's own lane, so the sung line stays in
+                                // one place instead of scattering across a lane
+                                // per chord depth. Ties in pitch go to the
+                                // first note in document order, so the choice is
+                                // never dependent on iteration order.
+                                // A chord that writes no word has nothing to give
+                                // to one member, so it keeps the lanes it always
+                                // had: the reading must not silently reshuffle
+                                // purely instrumental chords, nor the ties that
+                                // run through them.
+                                let singing_member = match chord_reading {
+                                    ChordReading::Harmonised => None,
+                                    ChordReading::Reduction
+                                        if !polyphonic || !chord_carries_a_word(el) =>
+                                    {
+                                        None
+                                    }
+                                    ChordReading::Reduction => notes
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(index, note)| {
+                                            chord_note_pitch(*note).map(|pitch| (index, pitch))
+                                        })
+                                        .max_by_key(|(index, pitch)| {
+                                            (*pitch, std::cmp::Reverse(*index))
+                                        })
+                                        .map(|(index, _)| index),
+                                };
                                 for (note_index, note) in notes.into_iter().enumerate() {
                                     let pitch_text = child_text(note, "pitch").ok_or_else(|| {
                                         format!(
@@ -1530,7 +1705,18 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         .instruments
                                         .first()
                                         .and_then(|instrument| instrument.channel);
-                                    let chord_member = polyphonic.then_some(note_index);
+                                    // The note the word goes to under a
+                                    // reduction joins its voice's own lane, so
+                                    // the sung line is continuous; every other
+                                    // member keeps a lane of its own because
+                                    // they sound together and one lane cannot
+                                    // hold two simultaneous notes.
+                                    let sings =
+                                        singing_member.is_none_or(|singing| singing == note_index);
+                                    let chord_member = match singing_member {
+                                        Some(singing) if singing == note_index => None,
+                                        _ => polyphonic.then_some(note_index),
+                                    };
                                     let bucket = (voice_index, chord_member);
                                     let ties = note_ties(note)?;
                                     // Resolve a tie stop before borrowing this
@@ -1605,15 +1791,11 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                 grace,
                                                 unpitched: None,
                                             },
-                                            // MuseScore owns lyrics at Chord level. A
-                                            // single-note chord has one unambiguous target;
-                                            // a polyphonic chord keeps its lyric standalone
-                                            // and source-only instead of assigning a pitch.
-                                            lyrics: if !ambiguous_lyric_ownership {
-                                                lyrics.clone()
-                                            } else {
-                                                Vec::new()
-                                            },
+                                            // MuseScore owns lyrics at Chord level, so which
+                                            // note receives one is decided by the reading
+                                            // above: every member under a harmonised part,
+                                            // the highest note alone under a reduction.
+                                            lyrics: if sings { lyrics.clone() } else { Vec::new() },
                                         }),
                                     );
                                     push_event(
@@ -1709,12 +1891,18 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                         }
                         None => format!("Staff {staff_id}"),
                     }
-                } else if let Some(member) = chord_member {
-                    format!("{} — polyphonic member {}", info.name, member + 1)
-                } else if voice_index == 0 {
-                    info.name.clone()
                 } else {
-                    format!("{} — voice {}", info.name, voice_index + 1)
+                    let mut name = info.name.clone();
+                    if let Some(ordinal) = staff_ordinal {
+                        name = format!("{name} — staff {ordinal}");
+                    }
+                    if let Some(member) = chord_member {
+                        format!("{name} — polyphonic member {}", member + 1)
+                    } else if voice_index == 0 {
+                        name
+                    } else {
+                        format!("{name} — voice {}", voice_index + 1)
+                    }
                 },
                 source: TrackSource {
                     source_track: tracks.len(),
@@ -1726,6 +1914,8 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 text_profile: MidiTextProfile::Generic,
                 instruments: info.instruments.clone(),
                 instrument: info.instruments.first().cloned(),
+                chord_reading: chord_reading_decided
+                    .then(|| (chord_reading, chord_reading_evidence.clone())),
                 events,
             };
             if track
@@ -1734,6 +1924,11 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 .any(|event| matches!(&event.kind, Kind::NoteOn(note) if !note.lyrics.is_empty()))
             {
                 track.role_hint = TrackRoleHint::Vocal;
+            } else {
+                // The reading is a statement about what is sung, so only a lane
+                // that sings reports it. Repeating it on every silent member of
+                // every chord would bury it.
+                track.chord_reading = None;
             }
             tracks.push(track);
         }
@@ -1756,6 +1951,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 text_profile: MidiTextProfile::Generic,
                 instruments: Vec::new(),
                 instrument: None,
+                chord_reading: None,
                 events: unassigned_chord_lyrics,
             });
         }
@@ -1778,6 +1974,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 text_profile: MidiTextProfile::Generic,
                 instruments: Vec::new(),
                 instrument: None,
+                chord_reading: None,
                 events: Vec::new(),
             });
         }
@@ -2088,7 +2285,10 @@ mod tests {
         assert_eq!(meters, vec![(0, 3, 4)]);
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
-        let meter = &outcome.svp.expect("SVP project").time.meter;
+        let project =
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().expect("SVP project"))
+                .expect("exactly representable");
+        let meter = &project.time.meter;
         assert_eq!(
             meter
                 .iter()
@@ -2356,14 +2556,14 @@ mod tests {
         assert!(outcome.ok, "{:?}", outcome.msg);
         assert_eq!(outcome.topology, midi.topology);
         assert_eq!(outcome.placed, 2);
-        let sung: Vec<_> = outcome
-            .svp
-            .expect("valid SVP")
-            .tracks
-            .iter()
-            .flat_map(|track| track.main_group.notes.iter())
-            .map(|note| (note.pitch, note.lyrics.clone()))
-            .collect();
+        let sung: Vec<_> =
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().expect("valid SVP"))
+                .expect("exactly representable")
+                .tracks
+                .iter()
+                .flat_map(|track| track.main_group.notes.iter())
+                .map(|note| (note.pitch, note.lyrics.clone()))
+                .collect();
         assert_eq!(
             sung,
             vec![(60, "together".into()), (64, "together".into())],
@@ -2647,7 +2847,310 @@ Melodie</trackName>
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert_eq!(outcome.tracks[0].notes, 1);
         assert_eq!(outcome.placed, 0);
-        assert!(outcome.svp.unwrap().tracks.is_empty());
+        assert!(
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+                .expect("exactly representable")
+                .tracks
+                .is_empty()
+        );
+    }
+
+    /// One score body, parameterised by what the part declares and by the notes
+    /// of its single lyric-bearing chord.
+    fn chord_score(instrument: &str, pitches: &[u16], lyrics: &str) -> String {
+        let notes: String = pitches
+            .iter()
+            .map(|pitch| format!("<Note><pitch>{pitch}</pitch></Note>"))
+            .collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Part</trackName>{instrument}<Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure><voice>
+        <Chord><durationType>whole</durationType>{lyrics}{notes}</Chord>
+      </voice></Measure>
+    </Staff>
+  </Score>
+</museScore>"#
+        )
+    }
+
+    /// Every note the parser emitted, with the lyric text it carries.
+    fn sung_pitches(midi: &Midi) -> Vec<(u8, Option<String>)> {
+        let mut out: Vec<_> = midi
+            .tracks
+            .iter()
+            .flat_map(|track| track.events.iter())
+            .filter_map(|event| match &event.kind {
+                Kind::NoteOn(note) if note.velocity != Some(0) => Some((
+                    note.key?,
+                    note.lyrics.first().map(|lyric| match &lyric.state {
+                        LyricState::Text(text) => text.clone(),
+                        other => format!("{other:?}"),
+                    }),
+                )),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// MuseScore omits `<no>` only for the first verse, so two `<Lyrics>` that
+    /// both omit it are one verse written twice — not a second verse. Reading
+    /// the sibling index as a verse number copied a whole score's lanes out a
+    /// second time, note for note.
+    #[test]
+    fn two_lyrics_without_a_number_stay_one_verse() {
+        let xml = chord_score(
+            "",
+            &[60],
+            "<Lyrics><text>dit</text></Lyrics><Lyrics><text>dit</text></Lyrics>",
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        let lanes: Vec<_> = midi
+            .tracks
+            .iter()
+            .flat_map(|track| track.events.iter())
+            .filter_map(|event| match &event.kind {
+                Kind::NoteOn(note) => Some(note.lyrics.iter().map(|l| l.lane.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(lanes, vec!["1", "1"], "both belong to the first verse");
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        let project = outcome.svp.expect("a projection");
+        assert_eq!(project.tracks.len(), 1, "one verse means one lane");
+    }
+
+    /// A verse the source really numbers still becomes its own lane.
+    #[test]
+    fn a_numbered_second_verse_still_makes_its_own_lane() {
+        let xml = chord_score(
+            "",
+            &[60],
+            "<Lyrics><text>one</text></Lyrics><Lyrics><no>1</no><text>two</text></Lyrics>",
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        let project = outcome.svp.expect("a projection");
+        assert_eq!(project.tracks.len(), 2);
+    }
+
+    /// A declared non-singing instrument reads a chord as an accompaniment: one
+    /// singer takes the word, and a singer sings the top line of a reduction.
+    #[test]
+    fn a_piano_chord_gives_its_word_to_the_highest_note_only() {
+        let xml = chord_score(
+            "<Instrument id=\"piano\"><instrumentId>keyboard.piano</instrumentId></Instrument>",
+            &[60, 64, 67],
+            "<Lyrics><text>dit</text></Lyrics>",
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(
+            sung_pitches(&midi),
+            vec![(60, None), (64, None), (67, Some("dit".into())),],
+            "every note survives; only the highest carries the word"
+        );
+    }
+
+    /// A declared singing instrument reads the same chord as harmony, which is
+    /// what a choir writes, so nothing is taken away from any member.
+    #[test]
+    fn a_choral_chord_keeps_the_word_on_every_member() {
+        for declared in [
+            "<Instrument id=\"soprano\"><instrumentId>voice.soprano</instrumentId></Instrument>",
+            "<Instrument id=\"voice\"><instrumentId>voice.vocals</instrumentId></Instrument>",
+        ] {
+            let xml = chord_score(declared, &[60, 64, 67], "<Lyrics><text>dit</text></Lyrics>");
+            let midi = parse_mscx(&xml).unwrap();
+            assert_eq!(
+                sung_pitches(&midi),
+                vec![
+                    (60, Some("dit".into())),
+                    (64, Some("dit".into())),
+                    (67, Some("dit".into())),
+                ],
+                "{declared} must keep every voice singing"
+            );
+        }
+    }
+
+    /// Nothing declared: the part is measured against its own chords. A part
+    /// whose texted chords are polyphonic throughout is a harmony; one that
+    /// carries the occasional chord under a single-note melody is not.
+    #[test]
+    fn an_undeclared_part_is_measured_against_its_own_chords() {
+        let harmonised = chord_score("", &[60, 64], "<Lyrics><text>dit</text></Lyrics>");
+        assert_eq!(
+            sung_pitches(&parse_mscx(&harmonised).unwrap()),
+            vec![(60, Some("dit".into())), (64, Some("dit".into()))],
+            "its only texted chord is polyphonic, so it reads as harmony"
+        );
+
+        // The same chord, now one of four texted chords, three of which are a
+        // single note. That is a melody with an occasional chord under it.
+        let reduction = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Part</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure><voice>
+        <Chord><durationType>quarter</durationType><Lyrics><text>a</text></Lyrics><Note><pitch>60</pitch></Note></Chord>
+        <Chord><durationType>quarter</durationType><Lyrics><text>b</text></Lyrics><Note><pitch>62</pitch></Note></Chord>
+        <Chord><durationType>quarter</durationType><Lyrics><text>c</text></Lyrics><Note><pitch>64</pitch></Note></Chord>
+        <Chord><durationType>quarter</durationType><Lyrics><text>d</text></Lyrics><Note><pitch>65</pitch></Note><Note><pitch>72</pitch></Note></Chord>
+      </voice></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        let sung = sung_pitches(&parse_mscx(reduction).unwrap());
+        assert_eq!(sung.iter().filter(|(_, lyric)| lyric.is_some()).count(), 4);
+        assert!(
+            sung.contains(&(72, Some("d".into()))) && sung.contains(&(65, None)),
+            "the chord's word goes to its highest note alone: {sung:?}"
+        );
+    }
+
+    /// MuseScore writes an empty `<Lyrics>` on a tied note to say nothing is sung
+    /// there. Counting it as a word let one such element on a piano chord tip a
+    /// whole part into the harmony reading — the misreading this rule exists to
+    /// prevent, arriving through the rule itself.
+    #[test]
+    fn an_empty_lyric_element_does_not_make_a_chord_texted() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Part</trackName><Staff id="1"/></Part>
+    <Staff id="1"><Measure><voice>
+      <Chord><durationType>half</durationType><Lyrics><text>word</text></Lyrics><Note><pitch>60</pitch></Note></Chord>
+      <Chord><durationType>half</durationType><Lyrics><text></text></Lyrics><Note><pitch>64</pitch></Note><Note><pitch>72</pitch></Note></Chord>
+    </voice></Measure></Staff>
+  </Score>
+</museScore>"#;
+        let sung = sung_pitches(&parse_mscx(xml).unwrap());
+        assert_eq!(
+            sung.iter().filter(|(_, lyric)| lyric.is_some()).count(),
+            3,
+            "the empty element is still carried, it just is not a word: {sung:?}"
+        );
+        assert!(
+            sung.contains(&(60, Some("word".into()))),
+            "the only real word is untouched: {sung:?}"
+        );
+    }
+
+    /// A real MuseScore file often states no `<instrumentId>`, and the parser
+    /// suffixes a per-channel identity onto the `id` it falls back to. Comparing
+    /// that whole string against the taxonomy answered "not a singer" for every
+    /// such choir.
+    #[test]
+    fn a_channel_suffixed_identifier_still_declares_a_singer() {
+        let singer = InstrumentInfo {
+            id: Some("soprano:channel:0".into()),
+            ..InstrumentInfo::default()
+        };
+        assert_eq!(singer.declares_a_singer(), Some(true));
+        let empty_sound_id = InstrumentInfo {
+            sound_id: Some("   ".into()),
+            id: Some("voice.alto".into()),
+            ..InstrumentInfo::default()
+        };
+        assert_eq!(
+            empty_sound_id.declares_a_singer(),
+            Some(true),
+            "an empty taxonomy value must not shadow a usable id"
+        );
+        let piano = InstrumentInfo {
+            sound_id: Some("keyboard.piano".into()),
+            ..InstrumentInfo::default()
+        };
+        assert_eq!(piano.declares_a_singer(), Some(false));
+        assert_eq!(InstrumentInfo::default().declares_a_singer(), None);
+    }
+
+    /// A part with several staves gave every one of them the part's name, so a
+    /// project opened with two different lanes under one identical label.
+    #[test]
+    fn the_staves_of_one_part_are_told_apart_by_name() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Piano</trackName><Staff id="1"/><Staff id="2"/></Part>
+    <Staff id="1"><Measure><voice>
+      <Chord><durationType>whole</durationType><Lyrics><text>up</text></Lyrics><Note><pitch>72</pitch></Note></Chord>
+    </voice></Measure></Staff>
+    <Staff id="2"><Measure><voice>
+      <Chord><durationType>whole</durationType><Lyrics><text>down</text></Lyrics><Note><pitch>48</pitch></Note></Chord>
+    </voice></Measure></Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        let names: Vec<_> = midi.tracks.iter().map(|track| track.name.clone()).collect();
+        assert_eq!(names, vec!["Piano — staff 1", "Piano — staff 2"]);
+    }
+
+    /// Staff ids are strings, so `10` sorts before `9`. Numbering them by key
+    /// order labelled the second staff of a piano as the first.
+    #[test]
+    fn staves_are_numbered_in_the_order_the_score_writes_them() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Piano</trackName><Staff id="9"/><Staff id="10"/></Part>
+    <Staff id="9"><Measure><voice>
+      <Chord><durationType>whole</durationType><Lyrics><text>up</text></Lyrics><Note><pitch>72</pitch></Note></Chord>
+    </voice></Measure></Staff>
+    <Staff id="10"><Measure><voice>
+      <Chord><durationType>whole</durationType><Lyrics><text>down</text></Lyrics><Note><pitch>48</pitch></Note></Chord>
+    </voice></Measure></Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        let named: Vec<_> = midi
+            .tracks
+            .iter()
+            .map(|track| (track.name.as_str(), track.source.staff_id.clone()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("Piano — staff 1", Some("9".to_string())),
+                ("Piano — staff 2", Some("10".to_string())),
+            ]
+        );
+    }
+
+    /// A single-staff part must keep exactly the name it has always had, even
+    /// when the Part element declares a staff the score body never carries.
+    #[test]
+    fn a_part_with_one_written_staff_keeps_its_plain_name() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/><Staff id="2"/></Part>
+    <Staff id="1"><Measure><voice>
+      <Chord><durationType>whole</durationType><Lyrics><text>la</text></Lyrics><Note><pitch>60</pitch></Note></Chord>
+    </voice></Measure></Staff>
+  </Score>
+</museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        assert_eq!(
+            midi.tracks
+                .iter()
+                .map(|track| track.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["Voice"]
+        );
     }
 
     #[test]

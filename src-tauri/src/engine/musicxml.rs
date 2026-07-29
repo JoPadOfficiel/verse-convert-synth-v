@@ -1045,10 +1045,20 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                     .find(|node| node.has_tag_name("instrument-name"))
                     .map(crate::engine::musescore::deep_text)
                     .filter(|value| !value.is_empty());
+                // MusicXML states the same taxonomy MuseScore writes into
+                // `<instrumentId>`, under a different tag. It was parsed by
+                // neither adapter before, which left every MusicXML choir with
+                // no declaration of what it is.
+                let sound_id = score_instrument
+                    .children()
+                    .find(|node| node.has_tag_name("instrument-sound"))
+                    .map(crate::engine::musescore::deep_text)
+                    .filter(|value| !value.is_empty());
                 instruments.insert(
                     id.to_string(),
                     InstrumentInfo {
                         id: Some(id.to_string()),
+                        sound_id,
                         name: instrument_name,
                         ..InstrumentInfo::default()
                     },
@@ -1567,6 +1577,11 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 text_profile: MidiTextProfile::Generic,
                 instrument: instruments.first().cloned(),
                 instruments,
+                // MusicXML attaches `<lyric>` to a `<note>`, never to the chord,
+                // so it already states which member sings and there is no
+                // reading to take. `<instrument-sound>` is still captured above,
+                // for anything that needs to know what the part is.
+                chord_reading: None,
                 events,
             });
         }
@@ -1582,6 +1597,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 text_profile: MidiTextProfile::Generic,
                 instruments: Vec::new(),
                 instrument: None,
+                chord_reading: None,
                 events: Vec::new(),
             });
         }
@@ -2250,13 +2266,14 @@ mod tests {
         );
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable");
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "hold");
         assert_eq!(
             project.tracks[0].main_group.notes[0].duration,
-            crate::engine::svp::BLICKS_PER_QUARTER as i64 * 2
+            crate::engine::target::svp::BLICKS_PER_QUARTER as i64 * 2
         );
     }
 
@@ -2285,7 +2302,12 @@ mod tests {
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert!(outcome.ok, "{:?}", outcome.msg);
         assert_eq!(outcome.placed, 0);
-        assert!(outcome.svp.unwrap().tracks.is_empty());
+        assert!(
+            crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+                .expect("exactly representable")
+                .tracks
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2319,7 +2341,8 @@ mod tests {
         assert!(outcome.ok, "{:?}", outcome.msg);
         assert_eq!(outcome.n_tracks, 1);
         assert_eq!(outcome.topology, midi.topology);
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable");
         assert_eq!(project.tracks.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes.len(), 1);
         assert_eq!(project.tracks[0].main_group.notes[0].pitch, 60);
@@ -2426,7 +2449,8 @@ mod tests {
         assert_eq!(lyrics[1].lane, "2");
 
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable");
         assert_eq!(project.tracks.len(), 2);
         assert_eq!(project.tracks[0].main_group.notes[0].lyrics, "one");
         assert_eq!(project.tracks[1].main_group.notes[0].lyrics, "two");

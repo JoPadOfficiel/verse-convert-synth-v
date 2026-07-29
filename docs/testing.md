@@ -1,25 +1,23 @@
 # Testing
 
-Verse tests source fidelity, projection safety, renderer behavior, bundle
-integrity, and the desktop frontend separately. A successful test run is not
-defined only by producing an SVP file: every emitted lyric and note must retain
-source evidence, source topology must remain stable, and a complete bundle must
-contain exactly the audio assets declared by its manifest.
+Verse tests source fidelity, projection safety, target representability,
+renderer behavior, bundle integrity, and the desktop frontend separately. A
+successful test run is not defined only by producing a project file: every
+emitted lyric and note must retain source evidence, source topology must remain
+stable, timing must be exact or refused, and a complete bundle must contain
+exactly the audio assets declared by its manifest.
 
 ## Current verified baseline
 
-At the documented revision, the local suite contains:
+The authoritative count is whatever the gate commands below report on the
+revision under test; the suite grows with every change, so no fixed total is
+recorded here.
 
-- 191 Rust tests in total;
-- 179 active Rust tests, all passing;
-- 12 ignored Rust tests;
-- 9 Node tests, all passing.
+Some Rust tests are ignored by design:
 
-The 12 ignored Rust tests are intentional:
-
-- seven private KAR parity fixtures;
-- two private-corpus gates;
-- three child-process helpers launched by their parent renderer tests.
+- private KAR parity fixtures;
+- private-corpus gates;
+- child-process helpers launched by their parent renderer tests.
 
 Ignored private tests are not optional once explicitly requested. They fail if
 their required fixtures are missing. Copyrighted fixtures remain outside Git.
@@ -75,12 +73,28 @@ The Rust suites exercise:
   encodings, percussion, archive safety, and exact rational timing;
 - native MuseScore 2/3/4 parsing, master-score selection, styled lyrics,
   voice topology, grace notes, local meters, and malformed archives;
-- SVP serialization and validation;
+- SVP serialization and validation, including that the blick grid refuses an
+  inexact position rather than rounding it;
+- USTX serialization: byte-exact YAML output, the 480-tick exactness gate
+  refusing a septuplet, the 10-tick duration floor, the `+~`/`+` marker
+  vocabulary, `lyric: ""` for an untexted note, monophonic overlap refusal, and a
+  marker refused across a gap;
+- target dispatch: that the analysis gate refuses exactly what the write boundary
+  refuses, that `ExportTarget`'s serde values are the stable `"svp"`/`"ustx"`
+  protocol strings with Synthesizer V as the default, and that a refusal stays
+  distinguishable from an encoder fault;
+- that lyric text of any language reaches the output byte-exactly with nothing
+  configured (`tests/language_fidelity.rs`, covering fr, es, en, pt, de, pl, tr);
 - Part-level stem planning;
 - renderer probing, fixed arguments, timeouts, process-tree termination,
   output validation, Part extraction, and the bounded macOS retry policy;
 - preservation-ledger completeness, hashes, audio references, staging,
   rollback, destination races, and atomic no-replace bundle publication;
+- both bundle project variants: that a `.ustx` bundle references the same stems
+  as its `.svp` counterpart, that `svpGroupId` is empty in a `.ustx` bundle and
+  verification refuses a non-empty one, that a wave part's offsets are all zero
+  and its `file_duration_ms` matches the validated WAV, and that the committed
+  `.ustx` re-reads through the strict reader;
 - public-corpus auditing and deterministic render sampling.
 
 The integration tests also lock these behaviors:
@@ -96,9 +110,9 @@ The integration tests also lock these behaviors:
 
 ### Frontend tests
 
-The nine Node tests cover frontend utilities, structured error parsing, the
+The Node tests cover frontend utilities, structured error parsing, the
 distinction between renderer/audio errors and other export failures, vocal
-override state, and version-check behavior.
+override state, per-target default output paths, and version-check behavior.
 
 ## Real-file fidelity gates
 
@@ -156,7 +170,7 @@ The private score fixtures lock:
 - “Help” MSCZ: 6 Parts and 10 source voices;
 - “Iko Iko”: 8 Parts and 9 source voices;
 - exactly one stem per note-bearing Part;
-- no empty vocal track in the generated SVP.
+- no empty vocal track in the generated project.
 
 ## Public OpenScore corpus
 
@@ -223,11 +237,17 @@ exactly. A regression exists when one of these occurs:
 
 - source evidence disappears from the inventory or preservation ledger;
 - an emitted note or lyric has no source evidence;
-- an empty lyric becomes `la` or another fabricated syllable;
+- an empty lyric becomes `la`, `a`, or another fabricated syllable;
 - an arbitrary source pitch becomes a fallback pitch;
 - Parts or source voices are merged unexpectedly;
+- a timing that does not divide exactly into the selected target's grid is
+  rounded, truncated, or lengthened instead of refused;
+- a hold marker is emitted in the other target's vocabulary, turning a hold into
+  a split or a split into a hold;
+- a refusal appears for the first time at export instead of at analysis;
+- changing the export target changes the bytes the other target writes;
 - a renderer failure leaves a published or partial destination;
-- a manifest, hash, stem identity, WAV, or SVP reference passes despite being
+- a manifest, hash, stem identity, WAV, or project audio reference passes despite being
   inconsistent.
 
 When adding support for a previously ineligible construct, add a focused unit

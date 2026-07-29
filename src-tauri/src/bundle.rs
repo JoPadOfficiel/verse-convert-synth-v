@@ -1,16 +1,25 @@
 //! Transactional preservation-bundle export.
 //!
 //! A bundle is the preservation unit: the original source is retained
-//! byte-for-byte, genuine vocal material remains editable in the SVP, and the
-//! note-bearing source Parts are rendered into real audio-backed instrumental
-//! tracks alongside a muted full-score reference.
+//! byte-for-byte, genuine vocal material remains editable in the vocal project,
+//! and the note-bearing source Parts are rendered into real audio-backed
+//! references alongside a muted full-score reference.
+//!
+//! Which vocal project a bundle carries is the export target's decision: a
+//! Synthesizer V project referencing the stems through instrumental tracks, or an
+//! OpenUtau project referencing the very same WAVs through `wave_parts`. Only the
+//! project file differs; the source, the stems, the ledger and every relative
+//! path are the same bytes either way.
 
 use crate::engine::convert::{
     attached_lyric_instance_id, karaoke_text_lyric, note_instance_id, standalone_lyric_instance_id,
     ProjectionEvidence,
 };
 use crate::engine::midi::{self, Kind, Midi, MidiTextProfile, SourceTopology};
-use crate::engine::svp::{append_instrumental_track, SvpProject};
+use crate::engine::projection::ProjectedProject;
+use crate::engine::target::svp::{append_instrumental_track, SvpProject};
+use crate::engine::target::ustx::{self, UstxProject};
+use crate::engine::target::ExportTarget;
 use crate::renderer::{
     sha256_bytes, sha256_file, validate_wav, validate_wav_allowing_silence, AudioRenderer,
     ExtractedScorePart, RenderError, RenderLimits, RendererIdentity, WavInfo,
@@ -27,15 +36,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const AUDIO_RELATIVE_PATH: &str = "audio/full-score.wav";
-pub const PROJECT_AUDIO_REFERENCE: &str = "../audio/full-score.wav";
 pub const STEM_AUDIO_DIRECTORY: &str = "audio/stems";
 pub const PRESERVATION_RELATIVE_PATH: &str = "preservation.json";
 pub const MANIFEST_RELATIVE_PATH: &str = "manifest.json";
 const SCHEMA_VERSION: u32 = 2;
 const MAX_TOTAL_AUDIO_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// How a project file inside `project/` names one of the bundle's own audio
+/// artifacts.
+///
+/// The single place the `../` is stated. It belongs to the bundle's directory
+/// layout and to neither format: Synthesizer V resolves an instrumental
+/// `audio.filename` against the project file's directory, and OpenUtau resolves a
+/// `wave_parts` `relative_path` with
+/// `Path.Combine(Path.GetDirectoryName(project.FilePath), relativePath)`, so one
+/// derivation serves both and no target can drift from the other.
+pub fn project_audio_reference(audio_relative_path: &str) -> String {
+    format!("../{audio_relative_path}")
+}
+
 #[derive(Clone, Debug)]
 pub struct BundleLayout {
+    /// Which project this bundle carries. It fixes the project file's extension
+    /// and, at verification time, which audio invariant applies to it.
+    pub target: ExportTarget,
     pub project_relative_path: String,
     pub audio_relative_path: String,
     pub source_relative_path: String,
@@ -44,14 +68,19 @@ pub struct BundleLayout {
 }
 
 impl BundleLayout {
-    pub fn new(destination: &Path, original_name: &str) -> Result<Self, BundleError> {
+    pub fn new(
+        destination: &Path,
+        original_name: &str,
+        target: ExportTarget,
+    ) -> Result<Self, BundleError> {
         validate_original_name(original_name)?;
         let stem = destination
             .file_stem()
             .and_then(|value| value.to_str())
             .ok_or(BundleError::InvalidDestination)?;
-        let project_name = format!("{}.svp", sanitize_filename(stem));
+        let project_name = format!("{}.{}", sanitize_filename(stem), target.extension());
         Ok(Self {
+            target,
             project_relative_path: format!("project/{project_name}"),
             audio_relative_path: AUDIO_RELATIVE_PATH.into(),
             source_relative_path: format!("source/{original_name}"),
@@ -67,9 +96,89 @@ impl BundleLayout {
             sanitize_stem_slug(&stem.display_name)
         )
     }
+}
 
-    pub fn project_stem_audio_reference(&self, stem: &StemDescriptor) -> String {
-        format!("../{}", self.stem_audio_relative_path(stem))
+/// The one vocal project a bundle carries, already in its target's own shape.
+///
+/// A bundle never holds two: the source, the stems and the ledger are identical
+/// across targets, and a second project file would give an auditor two answers to
+/// the same question. The neutral projection becomes one of these at the boundary
+/// before the transaction starts, and the transaction then appends its real
+/// audio-backed references to whichever shape it received.
+pub enum BundleProject {
+    Svp(SvpProject),
+    Ustx(UstxProject),
+}
+
+impl BundleProject {
+    /// Builds the project a bundle carries from the target-neutral projection.
+    ///
+    /// The refusal is the target's own: OpenUtau's fixed 480 ticks per quarter
+    /// accept a strict subset of what Synthesizer V blicks do, so a source one
+    /// target bundles is legitimately refused by the other.
+    pub fn from_projection(
+        target: ExportTarget,
+        projected: &ProjectedProject,
+    ) -> Result<Self, String> {
+        match target {
+            ExportTarget::Svp => crate::engine::target::svp::serialize(projected).map(Self::Svp),
+            ExportTarget::Ustx => ustx::serialize(projected).map(Self::Ustx),
+        }
+    }
+
+    pub fn target(&self) -> ExportTarget {
+        match self {
+            Self::Svp(_) => ExportTarget::Svp,
+            Self::Ustx(_) => ExportTarget::Ustx,
+        }
+    }
+
+    /// Adds one real audio-backed reference to a rendered WAV, and returns the
+    /// Synthesizer V group UUID that identifies it — empty for any target that has
+    /// no such thing, because a bundle states what a format holds and never
+    /// invents an identity to fill a field.
+    ///
+    /// Both targets make the same claim about the audio: play the whole file from
+    /// the start of the score. Synthesizer V spells it `blickOffset: 0`, OpenUtau
+    /// spells it `position`, `skip`, `trim`, `fadein` and `fadeout` all `0`.
+    fn append_audio_reference(
+        &mut self,
+        name: String,
+        relative_path: String,
+        wav: &WavInfo,
+        muted: bool,
+    ) -> Result<String, BundleError> {
+        match self {
+            Self::Svp(project) => Ok(append_instrumental_track(
+                project,
+                name,
+                relative_path,
+                wav.duration_seconds,
+                0,
+                muted,
+            )),
+            Self::Ustx(project) => {
+                // The duration comes from the two integers the WAV header states,
+                // never from the seconds-valued quotient beside them.
+                ustx::append_wave_part(
+                    project,
+                    name,
+                    relative_path,
+                    wav.frames,
+                    wav.sample_rate,
+                    muted,
+                )
+                .map_err(BundleError::Integrity)?;
+                Ok(String::new())
+            }
+        }
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, BundleError> {
+        match self {
+            Self::Svp(project) => Ok(serde_json::to_vec(project)?),
+            Self::Ustx(project) => Ok(ustx::to_yaml(project).into_bytes()),
+        }
     }
 }
 
@@ -77,7 +186,7 @@ pub struct BundleInput {
     pub original_name: String,
     pub source_format: String,
     pub source_bytes: Vec<u8>,
-    pub project: SvpProject,
+    pub project: BundleProject,
     pub stem_plan: StemPlan,
     pub ledger: PreservationLedger,
     /// Source/projection diagnostics that must remain visible after the UI is
@@ -116,6 +225,14 @@ pub struct AudioArtifactRecord {
 #[serde(rename_all = "camelCase")]
 pub struct ReferenceMixRecord {
     pub asset: AudioArtifactRecord,
+    /// The Synthesizer V group UUID carrying this audio, and the empty string in a
+    /// bundle whose project is not a Synthesizer V one.
+    ///
+    /// Blank rather than repurposed: an OpenUtau wave part has no group UUID, and
+    /// writing a track index under a key named after another format would be a
+    /// claim the file cannot support. What ties an OpenUtau reference to this
+    /// record is `asset.artifact.path`, which verification already proves is
+    /// referenced exactly once.
     pub svp_group_id: String,
     pub muted_by_default: bool,
 }
@@ -131,6 +248,8 @@ pub struct StemAudioRecord {
     pub isolation_method: String,
     pub active_by_default: bool,
     pub asset: AudioArtifactRecord,
+    /// See [`ReferenceMixRecord::svp_group_id`]: the Synthesizer V group UUID, and
+    /// the empty string when the bundle's project is not a Synthesizer V one.
     pub svp_group_id: String,
 }
 
@@ -474,6 +593,18 @@ pub fn build_preservation_ledger(
         }
     }
     entries.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    // One source lyric can be reached by more than one projection lane: a chord
+    // carrying a lyric is split into several monophonic lanes, and each lane
+    // inventories the same `lyric:…:note-event:…` instance. That is genuinely the
+    // same source item seen twice, not two items, so identical entries collapse.
+    // Two entries that share an ID but disagree on disposition are still a real
+    // conflict and are left for `validate` to reject.
+    entries.dedup_by(|later, earlier| {
+        later.source_id == earlier.source_id
+            && later.item_kind == earlier.item_kind
+            && later.disposition == earlier.disposition
+            && later.artifact_paths == earlier.artifact_paths
+    });
     let expected_source_ids = entries
         .iter()
         .map(|entry| entry.source_id.clone())
@@ -635,7 +766,11 @@ fn export_bundle_with_hook_and_progress(
     progress: &(dyn Fn(BundleProgressEvent) + Sync),
 ) -> Result<BundleResult, BundleError> {
     validate_destination(&request.destination)?;
-    let layout = BundleLayout::new(&request.destination, &request.input.original_name)?;
+    let layout = BundleLayout::new(
+        &request.destination,
+        &request.input.original_name,
+        request.input.project.target(),
+    )?;
     request
         .input
         .stem_plan
@@ -857,14 +992,12 @@ fn export_bundle_with_hook_and_progress(
         "MuseScore Part"
     };
     for stem in &rendered_stems {
-        let group_id = append_instrumental_track(
-            &mut request.input.project,
+        let group_id = request.input.project.append_audio_reference(
             format!("{} ({stem_origin})", stem.descriptor.display_name),
-            format!("../{}", stem.relative_path),
-            stem.wav.duration_seconds,
-            0,
+            project_audio_reference(&stem.relative_path),
+            &stem.wav,
             !stem.descriptor.active_by_default,
-        );
+        )?;
         stem_audio_records.push(StemAudioRecord {
             stem_id: stem.descriptor.stem_id.clone(),
             display_name: stem.descriptor.display_name.clone(),
@@ -884,17 +1017,26 @@ fn export_bundle_with_hook_and_progress(
             svp_group_id: group_id,
         });
     }
-    let reference_group_id = append_instrumental_track(
-        &mut request.input.project,
+    // A Part that owns an editable vocal projection has its own stem muted, so it
+    // cannot double the singer. When *every* Part owns one — which is the normal
+    // shape of a MIDI whose every track carries lyrics — that leaves no audible
+    // audio at all, and the user opens a bundle that promises an audible reference
+    // mix and plays silence until they unmute something by hand. So the reference
+    // becomes the fallback: muted whenever some accompaniment stem is already
+    // audible, active when none is. This is initial mixer state, not source
+    // evidence; the audio and the ledger are identical either way.
+    let has_audible_stem = rendered_stems
+        .iter()
+        .any(|stem| stem.descriptor.active_by_default);
+    let reference_group_id = request.input.project.append_audio_reference(
         "Full score reference mix (MuseScore)".into(),
-        PROJECT_AUDIO_REFERENCE.into(),
-        reference_wav.duration_seconds,
-        0,
-        true,
-    );
+        project_audio_reference(AUDIO_RELATIVE_PATH),
+        &reference_wav,
+        has_audible_stem,
+    )?;
     let project_path = safe_join(&root, &layout.project_relative_path)?;
-    let project_json = serde_json::to_vec(&request.input.project)?;
-    write_new(&project_path, &project_json, "write Synthesizer V project")?;
+    let project_bytes = request.input.project.to_bytes()?;
+    write_new(&project_path, &project_bytes, write_project_phase(&layout))?;
     hook.checkpoint(FaultPoint::AfterProject)?;
 
     let preservation_path = safe_join(&root, &layout.preservation_relative_path)?;
@@ -923,9 +1065,14 @@ fn export_bundle_with_hook_and_progress(
         .map(|stem| stem.stem_id.clone())
         .collect::<Vec<_>>();
     let mut warnings = request.input.warnings;
-    warnings.push(
-        "The full-score reference mix is retained muted; source Parts are rendered as separate audio-backed SVP tracks.".into(),
-    );
+    // Named after the shape the project actually holds. The Synthesizer V sentence
+    // is 0.4.9's, verbatim, because it is part of a manifest that must not change.
+    warnings.push(match layout.target {
+        ExportTarget::Svp =>
+            "The full-score reference mix is retained muted; source Parts are rendered as separate audio-backed SVP tracks.".into(),
+        ExportTarget::Ustx =>
+            "The full-score reference mix is retained muted; source Parts are rendered as separate audio-backed OpenUtau wave parts.".to_string(),
+    });
     for stem in &rendered_stems {
         if normalize_part_name(&stem.extracted_name)
             != normalize_part_name(&stem.descriptor.display_name)
@@ -948,7 +1095,7 @@ fn export_bundle_with_hook_and_progress(
             reference_mix: ReferenceMixRecord {
                 asset: reference_audio_record,
                 svp_group_id: reference_group_id,
-                muted_by_default: true,
+                muted_by_default: has_audible_stem,
             },
             stems: stem_audio_records,
             coverage: AudioCoverageRecord {
@@ -1068,6 +1215,22 @@ struct RenderedStem {
     relative_path: String,
     extracted_name: String,
     wav: WavInfo,
+}
+
+/// The I/O phase names, per target, so a write or reopen failure still names the
+/// project the bundle actually holds. The Synthesizer V strings are 0.4.9's.
+fn write_project_phase(layout: &BundleLayout) -> &'static str {
+    match layout.target {
+        ExportTarget::Svp => "write Synthesizer V project",
+        ExportTarget::Ustx => "write OpenUtau project",
+    }
+}
+
+fn reopen_project_phase(layout: &BundleLayout) -> &'static str {
+    match layout.target {
+        ExportTarget::Svp => "reopen Synthesizer V project",
+        ExportTarget::Ustx => "reopen OpenUtau project",
+    }
 }
 
 /// True when the source is a MIDI file, whose stems Verse divides itself.
@@ -1584,9 +1747,26 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
         verify_artifact(root, record)?;
     }
     verify_audio_artifact(root, &manifest.audio.reference_mix.asset, false)?;
-    if !manifest.audio.reference_mix.muted_by_default {
+    // The reference is muted whenever an accompaniment stem is already audible, and
+    // active when none is, so a bundle can never open silent. What must never
+    // happen is *nothing* audible: that would deliver a promise of an audible
+    // reference mix as silence.
+    let audible_stems = manifest
+        .audio
+        .stems
+        .iter()
+        .filter(|stem| stem.active_by_default)
+        .count();
+    if manifest.audio.reference_mix.muted_by_default && audible_stems == 0 {
         return Err(BundleError::Integrity(
-            "the full-score reference mix must be muted by default".into(),
+            "no audio starts audible: the full-score reference mix must be active when every \
+             Part stem is muted"
+                .into(),
+        ));
+    }
+    if !manifest.audio.reference_mix.muted_by_default && audible_stems > 0 {
+        return Err(BundleError::Integrity(
+            "the full-score reference mix must be muted when a Part stem is already audible".into(),
         ));
     }
 
@@ -1642,40 +1822,48 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
         verify_audio_artifact(root, &stem.asset, true)?;
     }
 
+    // The manifest names the project file it recorded; the extension it names must
+    // be the one this transaction wrote, or the invariant applied below would be
+    // the wrong format's.
     let project_path = safe_join(root, &manifest.project.path)?;
-    let project: serde_json::Value =
-        serde_json::from_slice(&fs::read(&project_path).map_err(|source| BundleError::Io {
-            phase: "reopen Synthesizer V project",
-            source,
-        })?)?;
-    let tracks = project["tracks"]
-        .as_array()
-        .ok_or_else(|| BundleError::Integrity("SVP has no tracks array".into()))?;
+    if Path::new(&manifest.project.path)
+        .extension()
+        .and_then(|value| value.to_str())
+        != Some(layout.target.extension())
+    {
+        return Err(BundleError::Integrity(format!(
+            "the manifest records {} where this bundle holds a {} project",
+            manifest.project.path,
+            layout.target.display_name()
+        )));
+    }
+    let project_bytes = fs::read(&project_path).map_err(|source| BundleError::Io {
+        phase: reopen_project_phase(layout),
+        source,
+    })?;
     let canonical_root = fs::canonicalize(root).map_err(|source| BundleError::Io {
         phase: "resolve bundle root",
         source,
     })?;
-    verify_svp_audio_track(
-        root,
-        &canonical_root,
-        &project_path,
-        tracks,
-        PROJECT_AUDIO_REFERENCE,
-        &manifest.audio.reference_mix.asset.artifact.path,
-        &manifest.audio.reference_mix.svp_group_id,
-        true,
-    )?;
-    for stem in &manifest.audio.stems {
-        verify_svp_audio_track(
+    // One audio invariant per target, each checking the same four things about the
+    // same WAVs: exactly one reference per artifact, the mute state the manifest
+    // recorded, a reference that resolves inside the bundle, and equality with the
+    // manifest's own path.
+    match layout.target {
+        ExportTarget::Svp => verify_svp_audio(
             root,
             &canonical_root,
             &project_path,
-            tracks,
-            &format!("../{}", stem.asset.artifact.path),
-            &stem.asset.artifact.path,
-            &stem.svp_group_id,
-            !stem.active_by_default,
-        )?;
+            &project_bytes,
+            &manifest,
+        )?,
+        ExportTarget::Ustx => verify_ustx_audio(
+            root,
+            &canonical_root,
+            &project_path,
+            &project_bytes,
+            &manifest,
+        )?,
     }
 
     let ledger_path = safe_join(root, &manifest.preservation.path)?;
@@ -1716,6 +1904,44 @@ fn verify_audio_artifact(
     Ok(())
 }
 
+/// Every audio reference a Synthesizer V bundle must hold: the muted full-score
+/// reference and one instrumental track per stem.
+fn verify_svp_audio(
+    root: &Path,
+    canonical_root: &Path,
+    project_path: &Path,
+    project_bytes: &[u8],
+    manifest: &BundleManifest,
+) -> Result<(), BundleError> {
+    let project: serde_json::Value = serde_json::from_slice(project_bytes)?;
+    let tracks = project["tracks"]
+        .as_array()
+        .ok_or_else(|| BundleError::Integrity("SVP has no tracks array".into()))?;
+    verify_svp_audio_track(
+        root,
+        canonical_root,
+        project_path,
+        tracks,
+        &project_audio_reference(&manifest.audio.reference_mix.asset.artifact.path),
+        &manifest.audio.reference_mix.asset.artifact.path,
+        &manifest.audio.reference_mix.svp_group_id,
+        manifest.audio.reference_mix.muted_by_default,
+    )?;
+    for stem in &manifest.audio.stems {
+        verify_svp_audio_track(
+            root,
+            canonical_root,
+            project_path,
+            tracks,
+            &project_audio_reference(&stem.asset.artifact.path),
+            &stem.asset.artifact.path,
+            &stem.svp_group_id,
+            !stem.active_by_default,
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_svp_audio_track(
     root: &Path,
@@ -1751,12 +1977,157 @@ fn verify_svp_audio_track(
             "SVP audio track for {artifact_path} has an invalid schema or mute state"
         )));
     }
+    verify_project_audio_reference(
+        root,
+        canonical_root,
+        project_path,
+        project_reference,
+        artifact_path,
+        "SVP",
+    )
+}
+
+/// Every audio reference an OpenUtau bundle must hold: the muted full-score
+/// reference and one wave part per stem, on the same WAVs and the same relative
+/// paths the Synthesizer V bundle uses.
+fn verify_ustx_audio(
+    root: &Path,
+    canonical_root: &Path,
+    project_path: &Path,
+    project_bytes: &[u8],
+    manifest: &BundleManifest,
+) -> Result<(), BundleError> {
+    let project = ustx::audit(
+        std::str::from_utf8(project_bytes)
+            .map_err(|error| BundleError::Integrity(format!("USTX is not UTF-8: {error}")))?,
+    )
+    .map_err(BundleError::Integrity)?;
+    verify_ustx_wave_part(
+        root,
+        canonical_root,
+        project_path,
+        &project,
+        &manifest.audio.reference_mix.asset,
+        &manifest.audio.reference_mix.svp_group_id,
+        manifest.audio.reference_mix.muted_by_default,
+    )?;
+    for stem in &manifest.audio.stems {
+        verify_ustx_wave_part(
+            root,
+            canonical_root,
+            project_path,
+            &project,
+            &stem.asset,
+            &stem.svp_group_id,
+            !stem.active_by_default,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_ustx_wave_part(
+    root: &Path,
+    canonical_root: &Path,
+    project_path: &Path,
+    project: &ustx::AuditedProject,
+    asset: &AudioArtifactRecord,
+    svp_group_id: &str,
+    expected_muted: bool,
+) -> Result<(), BundleError> {
+    let artifact_path = asset.artifact.path.as_str();
+    // A Synthesizer V group UUID in a project that has none would be an invented
+    // identity, so an OpenUtau bundle must state none.
+    if !svp_group_id.is_empty() {
+        return Err(BundleError::Integrity(format!(
+            "the manifest states a Synthesizer V group for {artifact_path} in an OpenUtau bundle"
+        )));
+    }
+    let project_reference = project_audio_reference(artifact_path);
+    // Compared as the scalar the file states, byte for byte, so the equality proves
+    // what was written rather than what an unescaper made of it.
+    let expected_scalar = ustx::quoted(&project_reference);
+    let matches = project
+        .wave_parts
+        .iter()
+        .filter(|part| part.relative_path_scalar == expected_scalar)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(BundleError::Integrity(format!(
+            "USTX must contain exactly one wave part for {artifact_path}, found {}",
+            matches.len()
+        )));
+    }
+    let part = matches[0];
+    // The whole file, from the start of the score: the same claim the Synthesizer V
+    // path makes with `blickOffset: 0`. Anything else would state an edit the source
+    // never asked for.
+    if part.position != 0
+        || part.skip != 0
+        || part.trim != 0
+        || part.fadein != 0
+        || part.fadeout != 0
+    {
+        return Err(BundleError::Integrity(format!(
+            "USTX wave part for {artifact_path} is offset, trimmed or faded"
+        )));
+    }
+    // Recomputed from the two integers the validated WAV states, so a duration that
+    // drifted from the audio cannot be committed.
+    if part.file_duration_ms != ustx::file_duration_ms(asset.frames, asset.sample_rate) {
+        return Err(BundleError::Integrity(format!(
+            "USTX wave part for {artifact_path} states a duration the WAV does not"
+        )));
+    }
+    // `UProject.AfterLoad` dereferences `tracks[part.trackNo]` unguarded, so a wave
+    // part naming no track is a project OpenUtau cannot open at all. The mute state
+    // lives on that track, which is where the manifest's claim has to be checked.
+    let track_mute = usize::try_from(part.track_no)
+        .ok()
+        .and_then(|track_no| project.track_mutes.get(track_no))
+        .ok_or_else(|| {
+            BundleError::Integrity(format!(
+                "USTX wave part for {artifact_path} sits on track {}, which the project does not hold",
+                part.track_no
+            ))
+        })?;
+    if *track_mute != expected_muted {
+        return Err(BundleError::Integrity(format!(
+            "USTX track for {artifact_path} has an invalid mute state"
+        )));
+    }
+    verify_project_audio_reference(
+        root,
+        canonical_root,
+        project_path,
+        &project_reference,
+        artifact_path,
+        "USTX",
+    )
+}
+
+/// Resolves one project audio reference the way the application that opens the
+/// project resolves it — against the project file's own directory — and proves it
+/// lands on the validated artifact the manifest recorded, inside the bundle.
+///
+/// Format-neutral on purpose: Synthesizer V combines an instrumental
+/// `audio.filename` with the project's directory and OpenUtau combines a wave
+/// part's `relative_path` with the same directory, so the resolution, the
+/// containment and the equality are one rule and neither target can hold a weaker
+/// version of it.
+fn verify_project_audio_reference(
+    root: &Path,
+    canonical_root: &Path,
+    project_path: &Path,
+    project_reference: &str,
+    artifact_path: &str,
+    format: &str,
+) -> Result<(), BundleError> {
     let referenced = project_path
         .parent()
-        .ok_or_else(|| BundleError::Integrity("SVP project has no parent".into()))?
+        .ok_or_else(|| BundleError::Integrity(format!("{format} project has no parent")))?
         .join(project_reference);
     let referenced = fs::canonicalize(referenced).map_err(|source| BundleError::Io {
-        phase: "resolve SVP audio reference",
+        phase: "resolve project audio reference",
         source,
     })?;
     let canonical_audio =
@@ -1766,7 +2137,7 @@ fn verify_svp_audio_track(
         })?;
     if !referenced.starts_with(canonical_root) || referenced != canonical_audio {
         return Err(BundleError::Integrity(format!(
-            "SVP audio reference for {artifact_path} escapes or mismatches the bundle"
+            "{format} audio reference for {artifact_path} escapes or mismatches the bundle"
         )));
     }
     Ok(())
@@ -1989,7 +2360,7 @@ impl BundleHook for NoopHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::svp::{RenderConfig, Time};
+    use crate::engine::target::svp::{RenderConfig, Time};
     use crate::renderer::{MuseScoreRenderer, RendererCapabilities, WavInfo};
     use crate::stems::{StemDescriptor, StemPlan, StemRole};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -2247,21 +2618,50 @@ mod tests {
         path
     }
 
-    fn empty_project() -> SvpProject {
-        SvpProject {
-            version: 113,
-            time: Time {
-                meter: vec![],
-                tempo: vec![],
-            },
-            render_config: RenderConfig::default(),
-            tracks: vec![],
+    /// A project holding no vocal track at all, in the shape the target wants. The
+    /// bundle appends only audio references, so this is the smallest input that
+    /// still exercises every one of them.
+    fn empty_project(target: ExportTarget) -> BundleProject {
+        match target {
+            ExportTarget::Svp => BundleProject::Svp(SvpProject {
+                version: 113,
+                time: Time {
+                    meter: vec![],
+                    tempo: vec![],
+                },
+                render_config: RenderConfig::default(),
+                tracks: vec![],
+            }),
+            ExportTarget::Ustx => BundleProject::Ustx(
+                ustx::serialize(&ProjectedProject {
+                    ticks_per_beat: 480,
+                    meters: vec![crate::engine::projection::ProjectedMeter {
+                        bar_index: 0,
+                        numerator: 4,
+                        denominator: 4,
+                    }],
+                    tempos: vec![crate::engine::projection::ProjectedTempo {
+                        tick: 0,
+                        bpm: 120.0,
+                        source: None,
+                        discovery_index: 0,
+                    }],
+                    ..ProjectedProject::default()
+                })
+                .expect("a bare time base is exactly representable"),
+            ),
         }
     }
 
+    /// A Synthesizer V bundle request: the shape every test that predates a second
+    /// target uses, so those tests keep exercising 0.4.9's path unchanged.
     fn request(root: &Path, mode: FakeMode) -> BundleRequest {
+        request_for(root, mode, ExportTarget::Svp)
+    }
+
+    fn request_for(root: &Path, mode: FakeMode, target: ExportTarget) -> BundleRequest {
         let destination = root.join("Song.versebundle");
-        let layout = BundleLayout::new(&destination, "source.mid").unwrap();
+        let layout = BundleLayout::new(&destination, "source.mid", target).unwrap();
         let stem_plan = StemPlan {
             stems: vec![StemDescriptor {
                 stem_id: "part-001-test".into(),
@@ -2290,7 +2690,7 @@ mod tests {
                 original_name: "source.mid".into(),
                 source_format: "standardMidi".into(),
                 source_bytes: one_track_midi(),
-                project: empty_project(),
+                project: empty_project(target),
                 stem_plan,
                 ledger: PreservationLedger {
                     schema_version: SCHEMA_VERSION,
@@ -2366,7 +2766,7 @@ mod tests {
         assert_eq!(project["tracks"][0]["mixer"]["mute"], false);
         assert_eq!(
             project["tracks"][1]["mainRef"]["audio"]["filename"],
-            PROJECT_AUDIO_REFERENCE
+            project_audio_reference(AUDIO_RELATIVE_PATH)
         );
         assert_eq!(project["tracks"][1]["mixer"]["mute"], true);
         let manifest: BundleManifest =
@@ -2417,10 +2817,11 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn multiple_source_parts_become_distinct_audio_tracks_with_safe_mute_defaults() {
-        let root = temp_dir("multiple-stems");
-        let mut request = request(&root, FakeMode::Success);
+    /// Two stems whose mute defaults differ: a muted vocal reference Part and an
+    /// audible accompaniment Part, plus the muted full-score reference every bundle
+    /// carries. The one fixture that exercises every mute state a bundle can state.
+    fn two_stem_request(root: &Path, mode: FakeMode, target: ExportTarget) -> BundleRequest {
+        let mut request = request_for(root, mode, target);
         request.input.source_bytes = two_track_midi();
         request.input.stem_plan.stems[0].role = StemRole::VocalReference;
         request.input.stem_plan.stems[0].active_by_default = false;
@@ -2433,7 +2834,7 @@ mod tests {
             role: StemRole::Accompaniment,
             active_by_default: true,
         };
-        let second_path = BundleLayout::new(&request.destination, "source.mid")
+        let second_path = BundleLayout::new(&request.destination, "source.mid", target)
             .unwrap()
             .stem_audio_relative_path(&second);
         request.input.stem_plan.stems.push(second.clone());
@@ -2451,7 +2852,14 @@ mod tests {
             .expected_source_ids
             .push(entry.source_id.clone());
         request.input.ledger.entries.push(entry);
-        request.renderer = Arc::new(FakeRenderer::with_parts(FakeMode::Success, 2));
+        request.renderer = Arc::new(FakeRenderer::with_parts(mode, 2));
+        request
+    }
+
+    #[test]
+    fn multiple_source_parts_become_distinct_audio_tracks_with_safe_mute_defaults() {
+        let root = temp_dir("multiple-stems");
+        let request = two_stem_request(&root, FakeMode::Success, ExportTarget::Svp);
 
         let result = export_bundle(request).unwrap();
         let project: serde_json::Value =
@@ -2656,8 +3064,11 @@ mod tests {
     fn verification_selects_the_bundle_owned_audio_reference() {
         let root = temp_dir("preexisting-instrumental");
         let mut request = request(&root, FakeMode::Success);
+        let BundleProject::Svp(project) = &mut request.input.project else {
+            panic!("this fixture is a Synthesizer V bundle");
+        };
         append_instrumental_track(
-            &mut request.input.project,
+            project,
             "Existing instrumental".into(),
             "legacy-audio.wav".into(),
             1.0,
@@ -2673,7 +3084,8 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|track| {
-                    track["mainRef"]["audio"]["filename"] == PROJECT_AUDIO_REFERENCE
+                    track["mainRef"]["audio"]["filename"]
+                        == project_audio_reference(AUDIO_RELATIVE_PATH)
                 })
                 .count(),
             1
@@ -2743,30 +3155,688 @@ mod tests {
         }
     }
 
+    /// The staging directory of an in-flight export, found by the ownership marker
+    /// the transaction writes: its name carries a timestamp and a counter no test
+    /// can predict.
+    fn staging_root(parent: &Path) -> PathBuf {
+        let mut candidates = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.join(".verse-staging").is_file())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "exactly one staging directory is in flight"
+        );
+        candidates.pop().unwrap()
+    }
+
+    /// Rewrites one staged file mid-transaction, so a bundle whose project or
+    /// manifest states something the other does not can be proven blocking.
+    ///
+    /// A project mutation lands at `AfterProject`, before the manifest records the
+    /// project's hash: mutating it later would fail the hash check first and never
+    /// reach the audio invariants under test.
+    struct MutateStagedFile {
+        parent: PathBuf,
+        at: FaultPoint,
+        relative_path: String,
+        from: &'static str,
+        to: &'static str,
+    }
+
+    impl BundleHook for MutateStagedFile {
+        fn checkpoint(&self, point: FaultPoint) -> Result<(), BundleError> {
+            if point != self.at {
+                return Ok(());
+            }
+            let path = staging_root(&self.parent).join(path_from_manifest(&self.relative_path));
+            let original = fs::read_to_string(&path).unwrap();
+            let mutated = original.replacen(self.from, self.to, 1);
+            assert_ne!(mutated, original, "the mutation {:?} must apply", self.from);
+            fs::write(&path, mutated).unwrap();
+            Ok(())
+        }
+    }
+
+    fn mutate_staged_project(
+        root: &Path,
+        from: &'static str,
+        to: &'static str,
+    ) -> MutateStagedFile {
+        MutateStagedFile {
+            parent: root.to_path_buf(),
+            at: FaultPoint::AfterProject,
+            relative_path: "project/Song.ustx".into(),
+            from,
+            to,
+        }
+    }
+
+    /// A bundle whose project is an OpenUtau one references the same stems the
+    /// Synthesizer V bundle does, through `wave_parts`, with the mute state each
+    /// stem's role asks for and the full-score reference muted.
     #[test]
-    fn every_transaction_phase_rolls_back() {
-        for (index, point) in [
-            FaultPoint::AfterSource,
-            FaultPoint::AfterAudio,
-            FaultPoint::AfterProject,
-            FaultPoint::AfterPreservation,
-            FaultPoint::AfterManifest,
-            FaultPoint::BeforeCommit,
-            FaultPoint::AfterRename,
+    fn an_openutau_bundle_references_every_stem_and_the_muted_full_score_reference() {
+        let root = temp_dir("ustx-bundle");
+        let request = two_stem_request(&root, FakeMode::Success, ExportTarget::Ustx);
+        let stem_paths = request
+            .input
+            .stem_plan
+            .stems
+            .iter()
+            .map(|stem| {
+                BundleLayout::new(&request.destination, "source.mid", ExportTarget::Ustx)
+                    .unwrap()
+                    .stem_audio_relative_path(stem)
+            })
+            .collect::<Vec<_>>();
+
+        let result = export_bundle(request).expect("an OpenUtau bundle is complete");
+        assert!(
+            result.project_path.ends_with("project/Song.ustx"),
+            "{:?}",
+            result.project_path
+        );
+        let project = fs::read_to_string(&result.project_path).unwrap();
+        let audited = ustx::audit(&project).expect("the committed project is auditable");
+
+        // One wave part per stem plus the full-score reference, each naming the very
+        // WAV the bundle rendered.
+        assert_eq!(audited.wave_parts.len(), 3);
+        assert_eq!(
+            audited
+                .wave_parts
+                .iter()
+                .map(|part| part.relative_path_scalar.as_str())
+                .collect::<Vec<_>>(),
+            [
+                ustx::quoted(&project_audio_reference(&stem_paths[0])),
+                ustx::quoted(&project_audio_reference(&stem_paths[1])),
+                ustx::quoted(&project_audio_reference(AUDIO_RELATIVE_PATH)),
+            ]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+        );
+        // The muted vocal reference Part, the audible accompaniment Part and the
+        // muted full-score mix, each on the track its own wave part names.
+        assert_eq!(audited.track_mutes, vec![true, false, true]);
+        assert_eq!(
+            audited
+                .wave_parts
+                .iter()
+                .map(|part| part.track_no)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        // The whole file from the start of the score, and a length that is the
+        // rendered WAV's own frame count over its sample rate.
+        let manifest: BundleManifest =
+            serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
+        for (part, asset) in audited.wave_parts.iter().zip(
+            manifest
+                .audio
+                .stems
+                .iter()
+                .map(|stem| &stem.asset)
+                .chain([&manifest.audio.reference_mix.asset]),
+        ) {
+            assert_eq!((part.position, part.skip, part.trim), (0, 0, 0));
+            assert_eq!((part.fadein, part.fadeout), (0, 0));
+            assert_eq!(
+                part.file_duration_ms,
+                ustx::file_duration_ms(asset.frames, asset.sample_rate)
+            );
+        }
+        // An OpenUtau project has no Synthesizer V group, so the manifest states
+        // none rather than inventing one to fill the field.
+        assert!(manifest.audio.reference_mix.svp_group_id.is_empty());
+        assert!(manifest
+            .audio
+            .stems
+            .iter()
+            .all(|stem| stem.svp_group_id.is_empty()));
+        assert!(manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("audio-backed OpenUtau wave parts")));
+        assert!(
+            !manifest
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("SVP tracks")),
+            "an OpenUtau bundle must not describe itself as a Synthesizer V one"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Everything a project states between `voice_parts:` and `wave_parts:` — the
+    /// sung material, which audio must never touch.
+    fn voice_parts_block(project: &str) -> &str {
+        let start = project
+            .find("\nvoice_parts:")
+            .expect("a project states voice parts");
+        let end = project
+            .find("\nwave_parts:")
+            .expect("a project states wave parts");
+        &project[start..end]
+    }
+
+    /// Adding audio adds audio and nothing else: the voice part a bundle commits is
+    /// byte-identical to the one the vocal-only export writes, and the wave parts
+    /// take the track indices after it.
+    #[test]
+    fn an_openutau_bundle_keeps_the_vocal_part_the_vocal_only_export_writes() {
+        let data = smf(&[
+            0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // tempo
+            0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // a real source lyric
+            0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, // one note carrying it
+            0x00, 0xff, 0x2f, 0x00,
+        ]);
+        let midi = crate::engine::midi::parse(&data).unwrap();
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        assert_eq!(outcome.placed, 1);
+        let projected = outcome.svp.as_ref().expect("a projection");
+        let vocal_only = ustx::to_yaml(&ustx::serialize(projected).expect("representable"));
+        assert!(
+            vocal_only.contains("        lyric: \"let\"\n"),
+            "the fixture must project one real word"
+        );
+
+        let root = temp_dir("ustx-vocal-part");
+        let destination = root.join("Song.versebundle");
+        let layout = BundleLayout::new(&destination, "source.mid", ExportTarget::Ustx).unwrap();
+        let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+        let stem_references = stem_plan
+            .stems
+            .iter()
+            .map(|stem| project_audio_reference(&layout.stem_audio_relative_path(stem)))
+            .collect::<Vec<_>>();
+        let renderer = Arc::new(FakeRenderer::with_parts(
+            FakeMode::Success,
+            stem_plan.stems.len(),
+        ));
+        let result = export_bundle(BundleRequest {
+            destination,
+            input: BundleInput {
+                original_name: "source.mid".into(),
+                source_format: "standardMidi".into(),
+                source_bytes: data.clone(),
+                project: BundleProject::Ustx(ustx::serialize(projected).expect("representable")),
+                stem_plan: stem_plan.clone(),
+                ledger: build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan),
+                warnings: vec![],
+            },
+            renderer,
+            render_limits: RenderLimits {
+                timeout: std::time::Duration::from_secs(1),
+                max_output_bytes: 1024 * 1024,
+            },
+        })
+        .expect("a complete OpenUtau bundle");
+
+        let committed = fs::read_to_string(&result.project_path).unwrap();
+        assert_eq!(
+            voice_parts_block(&committed),
+            voice_parts_block(&vocal_only),
+            "the sung material must be exactly what the vocal-only export writes"
+        );
+        let audited = ustx::audit(&committed).expect("the committed project is auditable");
+        // The voice lane keeps track 0 and stays audible; the audio takes the
+        // indices after it, and the full-score reference is last.
+        assert_eq!(audited.track_mutes.len(), stem_plan.stems.len() + 2);
+        assert!(!audited.track_mutes[0]);
+        // This fixture's only Part owns the vocal projection, so its stem is muted
+        // to avoid doubling the singer and no accompaniment is left audible. The
+        // reference therefore starts ACTIVE: it used to be muted unconditionally,
+        // which opened a bundle that plays nothing at all and made the promise of
+        // an audible reference mix false for every source whose every Part sings.
+        assert!(!*audited.track_mutes.last().unwrap());
+        assert!(
+            audited.track_mutes.iter().any(|muted| !muted),
+            "a bundle must never open with every track muted"
+        );
+        assert_eq!(
+            audited
+                .wave_parts
+                .iter()
+                .map(|part| part.track_no)
+                .collect::<Vec<_>>(),
+            (1..=stem_plan.stems.len() as i32 + 1).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            audited
+                .wave_parts
+                .iter()
+                .map(|part| part.relative_path_scalar.clone())
+                .collect::<Vec<_>>(),
+            stem_references
+                .iter()
+                .map(|reference| ustx::quoted(reference))
+                .chain([ustx::quoted(&project_audio_reference(AUDIO_RELATIVE_PATH))])
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A note left out of the vocal project is still a source note.
+    ///
+    /// It is exactly the case the ledger exists for: not written into the project,
+    /// preserved byte-exact in the source and audible in the stem rendered from
+    /// it. The ledger is keyed by source item id and the stem plan comes from the
+    /// source Part topology, so neither may shrink because the projection wrote
+    /// one note fewer.
+    #[test]
+    fn a_lane_that_leaves_untexted_notes_out_still_inventories_them() {
+        let data = smf(&[
+            0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, // tempo
+            0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // a real source lyric
+            0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, // the note carrying it
+            0x00, 0x90, 62, 100, 0x83, 0x60, 0x80, 62, 0, // a note it never texts
+            0x00, 0xff, 0x2f, 0x00,
+        ]);
+        let midi = crate::engine::midi::parse(&data).unwrap();
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let projected = outcome.svp.as_ref().expect("a projection");
+        assert_eq!(
+            projected
+                .tracks
+                .iter()
+                .map(|lane| (lane.muted, lane.notes.len()))
+                .collect::<Vec<_>>(),
+            vec![(false, 1)],
+            "the untexted note is not written into the project"
+        );
+
+        let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+        assert_eq!(
+            stem_plan.stems.len(),
+            1,
+            "one source Part means one stem, whatever the projection does with it"
+        );
+
+        let root = temp_dir("ustx-untexted-companion");
+        let destination = root.join("Song.versebundle");
+        let layout = BundleLayout::new(&destination, "source.mid", ExportTarget::Ustx).unwrap();
+        let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
+        assert_eq!(
+            ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.item_kind == SourceItemKind::Note)
+                .count(),
+            2,
+            "two source notes, two note entries: leaving one out of the project \
+             must not leave it out of the ledger"
+        );
+        let ids = ledger
+            .entries
+            .iter()
+            .map(|entry| entry.source_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<BTreeSet<_>>().len(),
+            "one primary disposition per source id"
+        );
+
+        let stem_count = stem_plan.stems.len();
+        let renderer = Arc::new(FakeRenderer::with_parts(FakeMode::Success, stem_count));
+        let result = export_bundle(BundleRequest {
+            destination,
+            input: BundleInput {
+                original_name: "source.mid".into(),
+                source_format: "standardMidi".into(),
+                source_bytes: data.clone(),
+                project: BundleProject::Ustx(ustx::serialize(projected).expect("representable")),
+                stem_plan: stem_plan.clone(),
+                ledger,
+                warnings: vec![],
+            },
+            renderer,
+            render_limits: RenderLimits {
+                timeout: std::time::Duration::from_secs(1),
+                max_output_bytes: 1024 * 1024,
+            },
+        })
+        .expect("a bundle with a companion lane passes every verification");
+
+        let committed = fs::read_to_string(&result.project_path).unwrap();
+        let audited = ustx::audit(&committed).expect("the committed project is auditable");
+        // The sung lane, one stem, and the full-score reference.
+        assert_eq!(audited.track_mutes.len(), stem_count + 2);
+        assert!(!audited.track_mutes[0], "the sung lane stays audible");
+        assert!(
+            audited.track_mutes.iter().any(|muted| !muted),
+            "a bundle must never open with every track muted"
+        );
+        assert_eq!(
+            audited
+                .wave_parts
+                .iter()
+                .map(|part| part.track_no)
+                .collect::<Vec<_>>(),
+            (1..=stem_count as i32 + 1).collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The stems are the bundle's, not the project's: both targets reference the
+    /// same WAVs by the same relative paths, and only the file that references them
+    /// differs.
+    #[test]
+    fn both_targets_reference_the_same_stems_by_the_same_relative_paths() {
+        let mut references: Vec<Vec<String>> = Vec::new();
+        let mut hashes: Vec<Vec<String>> = Vec::new();
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let root = temp_dir(&format!("same-stems-{}", target.extension()));
+            let result = export_bundle(two_stem_request(&root, FakeMode::Success, target))
+                .expect("both targets bundle this source");
+            let manifest: BundleManifest =
+                serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
+            let assets = manifest
+                .audio
+                .stems
+                .iter()
+                .map(|stem| &stem.asset)
+                .chain([&manifest.audio.reference_mix.asset])
+                .collect::<Vec<_>>();
+            references.push(
+                assets
+                    .iter()
+                    .map(|asset| project_audio_reference(&asset.artifact.path))
+                    .collect(),
+            );
+            hashes.push(
+                assets
+                    .iter()
+                    .map(|asset| asset.artifact.sha256.clone())
+                    .collect(),
+            );
+
+            // Whatever the project is, every reference it holds must be the one the
+            // manifest recorded — which is what its own verification proved.
+            let project = fs::read_to_string(&result.project_path).unwrap();
+            for reference in references.last().unwrap() {
+                let stated = match target {
+                    ExportTarget::Svp => project.contains(&format!("\"filename\":\"{reference}\"")),
+                    ExportTarget::Ustx => project
+                        .contains(&format!("    relative_path: {}\n", ustx::quoted(reference))),
+                };
+                assert!(stated, "{target:?} does not reference {reference}");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+        assert_eq!(references[0], references[1]);
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the same source must render byte-identical stems under either target"
+        );
+    }
+
+    /// The Synthesizer V bundle is release 0.4.9's, unchanged by the second target:
+    /// the same project filename, the same audio-track shape, the same group UUIDs
+    /// and the same manifest sentence.
+    #[test]
+    fn the_synthesizer_v_bundle_is_unchanged_by_the_openutau_target() {
+        let root = temp_dir("svp-unchanged");
+        let result = export_bundle(request(&root, FakeMode::Success)).unwrap();
+        assert!(
+            result.project_path.ends_with("project/Song.svp"),
+            "{:?}",
+            result.project_path
+        );
+        let project: serde_json::Value =
+            serde_json::from_slice(&fs::read(&result.project_path).unwrap()).unwrap();
+        assert_eq!(project["version"], 113);
+        let tracks = project["tracks"].as_array().unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(
+            tracks[0]["mainRef"]["audio"]["filename"],
+            "../audio/stems/part-001-test-music.wav"
+        );
+        // 441 frames at 44 100 Hz: the fake renderer's WAV, unchanged since 0.4.9.
+        assert_eq!(tracks[0]["mainRef"]["audio"]["duration"], 0.01);
+        assert_eq!(tracks[0]["mainRef"]["blickOffset"], 0);
+        assert_eq!(
+            tracks[0]["mainRef"]["groupID"],
+            "00000000-0000-4000-8000-000000000000"
+        );
+        assert_eq!(
+            tracks[1]["mainRef"]["audio"]["filename"],
+            "../audio/full-score.wav"
+        );
+        assert_eq!(
+            tracks[1]["mainRef"]["groupID"],
+            "00000001-0000-4000-8000-000000000000"
+        );
+
+        let manifest: BundleManifest =
+            serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.schema_version, 2);
+        assert_eq!(
+            manifest.audio.stems[0].svp_group_id,
+            "00000000-0000-4000-8000-000000000000"
+        );
+        assert_eq!(
+            manifest.audio.reference_mix.svp_group_id,
+            "00000001-0000-4000-8000-000000000000"
+        );
+        assert_eq!(manifest.alignment.svp_blick_offset, 0);
+        assert!(manifest.warnings.iter().any(|warning| warning
+            == "The full-score reference mix is retained muted; source Parts are rendered as separate audio-backed SVP tracks."));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A stem the project no longer references cannot be committed, whichever way
+    /// the reference stopped being there.
+    #[test]
+    fn a_wave_part_that_does_not_reference_its_stem_is_blocking_and_transactional() {
+        let root = temp_dir("ustx-missing-wave-part");
+        let destination = root.join("Song.versebundle");
+        let hook = mutate_staged_project(
+            &root,
+            "    relative_path: \"../audio/stems/part-001-test-music.wav\"\n",
+            "    relative_path: \"../audio/full-score.wav\"\n",
+        );
+        let error = export_bundle_with_hook(
+            request_for(&root, FakeMode::Success, ExportTarget::Ustx),
+            &hook,
+        )
+        .expect_err("a stem with no wave part is not a complete bundle");
+        assert!(
+            matches!(&error, BundleError::Integrity(message) if message.contains("wave part")),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The full-score reference is a muted reference mix, not an accompaniment. In
+    /// OpenUtau the mute lives on the track, so that is where it is verified.
+    #[test]
+    fn an_unmuted_full_score_reference_is_blocking_in_an_openutau_bundle() {
+        let root = temp_dir("ustx-unmuted-reference");
+        let destination = root.join("Song.versebundle");
+        let hook = mutate_staged_project(&root, "    mute: true\n", "    mute: false\n");
+        let error = export_bundle_with_hook(
+            request_for(&root, FakeMode::Success, ExportTarget::Ustx),
+            &hook,
+        )
+        .expect_err("the reference mix must stay muted");
+        assert!(
+            matches!(&error, BundleError::Integrity(message) if message.contains("mute state")),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A wave part must play the whole file from the start of the score, and must
+    /// sit on a track the project actually holds: `UProject.AfterLoad` dereferences
+    /// `tracks[part.trackNo]` unguarded, so a missing track makes the project
+    /// unopenable rather than merely wrong.
+    #[test]
+    fn an_offset_or_homeless_wave_part_is_blocking_and_transactional() {
+        for (index, (from, to, expected)) in [
+            (
+                "    skip: 0\n",
+                "    skip: 480\n",
+                "offset, trimmed or faded",
+            ),
+            (
+                "    trim: 0\n",
+                "    trim: 480\n",
+                "offset, trimmed or faded",
+            ),
+            (
+                "    fadein: 0\n",
+                "    fadein: 10\n",
+                "offset, trimmed or faded",
+            ),
+            (
+                "    track_no: 0\n",
+                "    track_no: 7\n",
+                "which the project does not hold",
+            ),
+            (
+                "    file_duration_ms: 10\n",
+                "    file_duration_ms: 11\n",
+                "a duration the WAV does not",
+            ),
         ]
         .into_iter()
         .enumerate()
         {
+            let root = temp_dir(&format!("ustx-wave-part-{index}"));
+            let destination = root.join("Song.versebundle");
+            let error = export_bundle_with_hook(
+                request_for(&root, FakeMode::Success, ExportTarget::Ustx),
+                &mutate_staged_project(&root, from, to),
+            )
+            .expect_err("a wave part that states an edit the source never asked for");
+            assert!(
+                matches!(&error, BundleError::Integrity(message) if message.contains(expected)),
+                "{from:?}: {error}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// An OpenUtau bundle whose manifest claims a Synthesizer V group is claiming an
+    /// identity no file in it holds.
+    #[test]
+    fn a_manifest_claiming_a_synthesizer_v_group_in_an_openutau_bundle_is_blocking() {
+        let root = temp_dir("ustx-invented-group");
+        let destination = root.join("Song.versebundle");
+        let hook = MutateStagedFile {
+            parent: root.clone(),
+            // The manifest's own bytes are not hashed by anything, so mutating it
+            // after it is written reaches verification directly.
+            at: FaultPoint::AfterManifest,
+            relative_path: MANIFEST_RELATIVE_PATH.into(),
+            from: "\"svpGroupId\": \"\"",
+            to: "\"svpGroupId\": \"00000000-0000-4000-8000-000000000000\"",
+        };
+        let error = export_bundle_with_hook(
+            request_for(&root, FakeMode::Success, ExportTarget::Ustx),
+            &hook,
+        )
+        .expect_err("an OpenUtau bundle holds no Synthesizer V group");
+        assert!(
+            matches!(&error, BundleError::Integrity(message) if message.contains("Synthesizer V group")),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The shared canonicalisation both targets use: a reference is resolved against
+    /// the project file's own directory, and it must land on the validated artifact
+    /// inside the bundle. Neither a file outside the bundle nor another file inside
+    /// it is that artifact.
+    #[test]
+    fn a_project_audio_reference_must_resolve_onto_the_validated_artifact() {
+        let root = temp_dir("audio-reference");
+        let bundle = root.join("Song.versebundle");
+        fs::create_dir(&bundle).unwrap();
+        for directory in ["project", "audio"] {
+            fs::create_dir(bundle.join(directory)).unwrap();
+        }
+        let project_path = bundle.join("project").join("Song.svp");
+        fs::write(&project_path, b"{}").unwrap();
+        fs::write(bundle.join(AUDIO_RELATIVE_PATH), b"RIFF").unwrap();
+        fs::write(bundle.join("manifest.json"), b"{}").unwrap();
+        fs::write(root.join("outside.wav"), b"RIFF").unwrap();
+        let canonical_root = fs::canonicalize(&bundle).unwrap();
+        let resolve = |reference: &str| {
+            verify_project_audio_reference(
+                &bundle,
+                &canonical_root,
+                &project_path,
+                reference,
+                AUDIO_RELATIVE_PATH,
+                "SVP",
+            )
+        };
+
+        assert!(resolve(&project_audio_reference(AUDIO_RELATIVE_PATH)).is_ok());
+        // A real file outside the bundle, reached by climbing out of it.
+        let escape = resolve("../../outside.wav").expect_err("the reference escapes the bundle");
+        assert!(
+            matches!(&escape, BundleError::Integrity(message) if message.contains("escapes or mismatches")),
+            "{escape}"
+        );
+        // A real file inside the bundle that is not the validated artifact.
+        let other = resolve("../manifest.json").expect_err("the reference is not the artifact");
+        assert!(
+            matches!(&other, BundleError::Integrity(message) if message.contains("escapes or mismatches")),
+            "{other}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn every_transaction_phase_rolls_back() {
+        for (index, (target, point)) in [ExportTarget::Svp, ExportTarget::Ustx]
+            .into_iter()
+            .flat_map(|target| {
+                [
+                    FaultPoint::AfterSource,
+                    FaultPoint::AfterAudio,
+                    FaultPoint::AfterProject,
+                    FaultPoint::AfterPreservation,
+                    FaultPoint::AfterManifest,
+                    FaultPoint::BeforeCommit,
+                    FaultPoint::AfterRename,
+                ]
+                .into_iter()
+                .map(move |point| (target, point))
+            })
+            .enumerate()
+        {
             let root = temp_dir(&format!("phase-{index}"));
             let destination = root.join("Song.versebundle");
-            assert!(
-                export_bundle_with_hook(request(&root, FakeMode::Success), &FailAt(point)).is_err()
-            );
-            assert!(!destination.exists(), "failed at {point:?}");
+            assert!(export_bundle_with_hook(
+                request_for(&root, FakeMode::Success, target),
+                &FailAt(point)
+            )
+            .is_err());
+            assert!(!destination.exists(), "{target:?} failed at {point:?}");
             assert_eq!(
                 fs::read_dir(&root).unwrap().count(),
                 0,
-                "failed at {point:?}"
+                "{target:?} failed at {point:?}"
             );
             fs::remove_dir_all(root).unwrap();
         }
@@ -2884,7 +3954,12 @@ mod tests {
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert_eq!(outcome.placed, 1);
         let root = temp_dir("evidence-ledger");
-        let layout = BundleLayout::new(&root.join("Song.versebundle"), "source.mid").unwrap();
+        let layout = BundleLayout::new(
+            &root.join("Song.versebundle"),
+            "source.mid",
+            ExportTarget::Svp,
+        )
+        .unwrap();
         let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
         let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
         let lyric_entries: Vec<_> = ledger
@@ -2941,7 +4016,12 @@ mod tests {
         };
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         let root = temp_dir("metadata-ledger");
-        let layout = BundleLayout::new(&root.join("Song.versebundle"), "source.mid").unwrap();
+        let layout = BundleLayout::new(
+            &root.join("Song.versebundle"),
+            "source.mid",
+            ExportTarget::Svp,
+        )
+        .unwrap();
         let stem_plan = StemPlan { stems: Vec::new() };
         let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
 
@@ -3028,7 +4108,12 @@ mod tests {
         let outcome = crate::engine::convert::convert_midi(&midi, "english");
         assert_eq!(outcome.placed, 2);
         let root = temp_dir("kar-text-ledger");
-        let layout = BundleLayout::new(&root.join("Song.versebundle"), "source.kar").unwrap();
+        let layout = BundleLayout::new(
+            &root.join("Song.versebundle"),
+            "source.kar",
+            ExportTarget::Svp,
+        )
+        .unwrap();
         let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
         let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
         let projected_lyrics = ledger
@@ -3044,7 +4129,8 @@ mod tests {
             .entries
             .iter()
             .all(|entry| !entry.source_id.contains("la")));
-        let project = outcome.svp.unwrap();
+        let project = crate::engine::target::svp::serialize(&outcome.svp.unwrap())
+            .expect("exactly representable");
         assert_eq!(
             project.tracks[0]
                 .main_group
@@ -3112,7 +4198,8 @@ mod tests {
                 .and_then(|value| value.to_str())
                 .expect("Unicode fixture name")
                 .to_string();
-            let layout = BundleLayout::new(&destination, &original_name).unwrap();
+            let layout =
+                BundleLayout::new(&destination, &original_name, ExportTarget::Svp).unwrap();
             let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
             let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
             assert!(
@@ -3125,7 +4212,12 @@ mod tests {
                     original_name,
                     source_format: source_format.into(),
                     source_bytes: source_bytes.clone(),
-                    project: outcome.svp.expect("SVP projection"),
+                    project: BundleProject::Svp(
+                        crate::engine::target::svp::serialize(
+                            &outcome.svp.expect("SVP projection"),
+                        )
+                        .expect("exactly representable"),
+                    ),
                     stem_plan: stem_plan.clone(),
                     ledger,
                     warnings: vec![],
@@ -3161,7 +4253,10 @@ mod tests {
         assert!(outcome.ok);
         let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
         let expected_stems = stem_plan.stems.len();
-        let vocal_tracks = outcome.svp.as_ref().unwrap().tracks.len();
+        let vocal_tracks = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
+            .expect("exactly representable")
+            .tracks
+            .len();
         let root = temp_dir("real-bundle-gate");
         let destination = root.join("Real.versebundle");
         let original_name = source_path
@@ -3169,7 +4264,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let layout = BundleLayout::new(&destination, &original_name).unwrap();
+        let layout = BundleLayout::new(&destination, &original_name, ExportTarget::Svp).unwrap();
         let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
         let renderer = MuseScoreRenderer::probe(Path::new(&executable)).unwrap();
         let result = export_bundle(BundleRequest {
@@ -3178,7 +4273,10 @@ mod tests {
                 original_name,
                 source_format: "museScore".into(),
                 source_bytes,
-                project: outcome.svp.unwrap(),
+                project: BundleProject::Svp(
+                    crate::engine::target::svp::serialize(&outcome.svp.unwrap())
+                        .expect("exactly representable"),
+                ),
                 stem_plan,
                 ledger,
                 warnings: vec![],

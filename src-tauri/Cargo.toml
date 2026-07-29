@@ -2,7 +2,7 @@
 name = "verse"
 version = "0.4.9"
 default-run = "verse"
-description = "Convert karaoke, MIDI and score files into Synthesizer V projects with real lyrics"
+description = "Convert karaoke, MIDI and score files into Synthesizer V or OpenUtau projects with real lyrics"
 authors = ["JoPadOfficiel"]
 license = "MIT"
 edition = "2021"

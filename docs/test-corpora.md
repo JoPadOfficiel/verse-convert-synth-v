@@ -45,10 +45,12 @@ The final gate for the pinned commit currently records:
   expected source Parts extracted and rendered as stems.
 
 An evidence-ineligible file is not counted as a passing projection. It is a
-narrowly classified source whose exact semantics cannot fit the current SVP
-contract: irregular/pickup measure boundaries, a truly intra-measure meter
-change, conflicting global measure durations, or invalid/ambiguous repeat
-navigation. Unknown parse/projection errors always remain
+narrowly classified source whose exact semantics cannot fit the current
+projection contract: irregular/pickup measure boundaries, a truly intra-measure
+meter change, conflicting global measure durations, or invalid/ambiguous repeat
+navigation. The corpus runner measures the Synthesizer V target; a source it
+projects exactly is not necessarily exportable to `.ustx`, whose 480-tick grid
+accepts a strict subset. Unknown parse/projection errors always remain
 `unexpectedError` and fail the runner. MuseScore 2 implicit voices, tuplets
 and local `stretchN/stretchD` meters are parsed rather than allowlisted.
 

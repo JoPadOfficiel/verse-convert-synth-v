@@ -10,6 +10,26 @@ IPC.
 Rust DTOs use camelCase serialization and are mirrored explicitly in
 TypeScript. Any shape change must update both sides and tests together.
 
+## `exportTarget`
+
+`exportTarget` names the project format an export writes:
+
+```text
+"svp"   // Synthesizer V, project version 113
+"ustx"  // OpenUtau, ustx_version 0.6
+```
+
+These serde values are a protocol contract with the webview. It is optional
+everywhere and defaults to `"svp"`, so a caller that names no target keeps
+0.4.9's behaviour exactly. An unknown value is a deserialization error, not a
+silent fallback.
+
+`language` is a vestigial parameter. It is still accepted for compatibility and
+still defaults to `"english"`, but no serializer reads it: the Synthesizer V
+target writes an empty `database.language` and the OpenUtau target writes no
+language at all. The frontend passes the constant `"english"`; there is no
+language selector, and nothing about lyric text depends on it.
+
 ## Commands
 
 ### `convert_files`
@@ -19,8 +39,9 @@ request:
   paths: string[]
   write: boolean
   outDir?: string
-  language?: "english" | "french"
+  language?: "english" | "french"     // vestigial; see above
   overrides?: Record<sourcePath, Record<trackIdString, boolean>>
+  exportTarget?: "svp" | "ustx"
 
 response:
   FileResult[]
@@ -29,20 +50,38 @@ response:
 The current UI always passes `write=false`; direct output is handled by the
 dedicated export commands. Analysis is synchronous in Rust.
 
+Analysis is target-dependent: the exactness gate runs the selected target's own
+arithmetic, so `ok`, `msg`, and the diagnostics can differ between targets for
+the same source. Changing the export target in the UI therefore re-analyses every
+file rather than updating state locally.
+
 ### `export_svp`
 
 ```text
 request:
   path: string
   target: string
-  language?: "english" | "french"
+  language?: "english" | "french"     // vestigial; see above
   overrides?: Record<trackIdString, boolean>
+  exportTarget?: "svp" | "ustx"
 
 response:
   string  // committed target path
 ```
 
-The target must be new and must not be the source.
+The command name is historical: it writes whichever format `exportTarget` names.
+`target` is the **output file path**, not a format — the two parameters are
+independent and must not be confused.
+
+The output path must be new and must not be the source, and its extension must
+match `exportTarget` (`.svp` or `.ustx`). A mismatch returns `INVALID_OUTPUT`:
+the save dialog's filter is advisory, and writing OpenUtau YAML into a `.svp`
+would produce a file neither application opens.
+
+The default filename is `<source stem>_LYRICS.<target extension>`. The `_LYRICS`
+stem is unchanged from 0.4.9; only the extension follows the target.
+`vocal_out_path` in Rust and `defaultVocalPath` in `src/lib/file-utils.ts` must
+stay in agreement.
 
 ### `export_bundle`
 
@@ -50,13 +89,24 @@ The target must be new and must not be the source.
 request:
   path: string
   target: string
-  language?: "english" | "french"
+  language?: "english" | "french"     // vestigial; see above
   overrides?: Record<trackIdString, boolean>
   rendererPath?: string
+  exportTarget?: "svp" | "ustx"
+  onProgress: Channel<BundleProgressEvent>
 
 response:
   BundleResult
 ```
+
+`exportTarget` selects the project format written into `project/`. Both variants
+reference the same stems, by the same relative paths, with the same hashes. As
+with `export_svp`, `target` is the destination path, not a format.
+
+The manifest schema is unchanged at version 2, with every key's name intact.
+`svpGroupId` holds the Synthesizer V group UUID for a `.svp` and must be the
+empty string for a `.ustx`, which verification enforces so no invented identity
+can slip in. `alignment.svpBlickOffset` stays `0` under its existing key.
 
 The command uses Tauri's blocking worker pool for parsing, rendering, and
 publication. It returns only after the bundle is committed and verified.
@@ -90,7 +140,8 @@ Important fields:
 | `parts` | Part-level UI summaries |
 | `tracks` | Detailed source/projection lane reports |
 | `audioStatus` | Initially `notRendered`; UI enriches after bundle export |
-| `requiresVoiceAssignment` | At least one vocal track needs a Synthesizer V voice |
+| `requiresVoiceAssignment` | At least one vocal track needs a Synthesizer V voice database or an OpenUtau singer |
+| `bundleReady` | Whether a complete bundle can be written. Now **equals `ok`**: a bundle carries the selected target's own project, so a source that target refuses has no bundle either. Retained for protocol stability, not because the two can differ |
 | `warnings` | Aggregated diagnostics |
 | `out` | Last successful output path in the UI session |
 
@@ -179,7 +230,8 @@ must not be treated as public API.
 
 - `busyRef` plus `busy` permits only one UI operation at a time.
 - Batch complete-project exports run sequentially.
-- Changing target language reanalyzes all files.
+- Changing the export target reanalyzes all files, because the exactness gate is
+  target-dependent.
 - A failed override reanalysis restores the previous frontend override map.
 - Renderer path and theme are stored in localStorage; output folder remains
   session-only.
