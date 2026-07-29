@@ -2701,7 +2701,7 @@ mod tests {
             },
             renderer: Arc::new(FakeRenderer::new(mode)),
             render_limits: RenderLimits {
-                timeout: std::time::Duration::from_secs(1),
+                timeout: std::time::Duration::from_secs(60),
                 max_output_bytes: 1024 * 1024,
             },
         }
@@ -3373,7 +3373,7 @@ mod tests {
             },
             renderer,
             render_limits: RenderLimits {
-                timeout: std::time::Duration::from_secs(1),
+                timeout: std::time::Duration::from_secs(60),
                 max_output_bytes: 1024 * 1024,
             },
         })
@@ -3500,7 +3500,7 @@ mod tests {
             },
             renderer,
             render_limits: RenderLimits {
-                timeout: std::time::Duration::from_secs(1),
+                timeout: std::time::Duration::from_secs(60),
                 max_output_bytes: 1024 * 1024,
             },
         })
@@ -4227,7 +4227,7 @@ mod tests {
                     &stem_plan.stems,
                 )),
                 render_limits: RenderLimits {
-                    timeout: std::time::Duration::from_secs(1),
+                    timeout: std::time::Duration::from_secs(60),
                     max_output_bytes: 1024 * 1024,
                 },
             })

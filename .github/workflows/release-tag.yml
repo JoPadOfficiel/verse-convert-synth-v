@@ -1,15 +1,27 @@
 name: Release pushed tag
 
+# Release Please creates the tag with the default GITHUB_TOKEN, and GitHub never
+# starts a workflow from an event that token produced — an anti-recursion rule
+# with no opt-in. So the push trigger below fires for a tag pushed by a person
+# and stays silent for the one that actually ships a release. `workflow_dispatch`
+# is the way back in: same jobs, same immutable-SHA resolution, tag named
+# explicitly instead of read from the ref.
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Strict release tag to build (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-tag-${{ github.ref_name }}
+  group: release-tag-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -21,10 +33,10 @@ jobs:
       commit-sha: ${{ steps.resolve.outputs.commit-sha }}
 
     steps:
-      - name: Check out the pushed tag
+      - name: Check out the release tag
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -32,9 +44,15 @@ jobs:
         id: resolve
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          # A dispatched tag name is user input, so it is held to exactly the
+          # shape the push trigger's filter would have allowed.
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must be vMAJOR.MINOR.PATCH, got ${RELEASE_TAG}"
+            exit 1
+          fi
           commit_sha="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
           if [[ ! "$commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Tag did not resolve to a full commit SHA"
@@ -43,14 +61,14 @@ jobs:
           echo "commit-sha=${commit_sha}" >> "$GITHUB_OUTPUT"
 
   build-release:
-    name: Build and publish pushed tag
+    name: Build and publish the release tag
     needs:
       - resolve
     permissions:
       contents: write
     uses: ./.github/workflows/build.yml
     with:
-      tag: ${{ github.ref_name }}
+      tag: ${{ inputs.tag || github.ref_name }}
       commit_sha: ${{ needs.resolve.outputs.commit-sha }}
       publish_release: true
     secrets: inherit
