@@ -11,7 +11,6 @@ entries are maintained by Release Please from Conventional Commits.
 ### Features
 
 * **engine:** move untexted notes to a muted companion lane ([0124b50](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/0124b50d8e2425891162d9305f9b7c9c0cc3bd80))
-* OpenUtau target, and a vocal project that matches the score ([6434774](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/6434774835036315a8814e7ea9c688fac2262a0e))
 * OpenUtau target, and a vocal project that matches the score ([#22](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/22)) ([6434774](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/6434774835036315a8814e7ea9c688fac2262a0e))
 * put the MuseScore stems inside the OpenUtau project ([2c30426](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/2c30426ccffa82f021bc8168cd3e9e097ec24db0))
 * write OpenUtau .ustx projects beside Synthesizer V ones ([b80862a](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/b80862aa101250f96be743708ffda0fde50ee8f7))
