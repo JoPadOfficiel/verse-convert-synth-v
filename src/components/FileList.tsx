@@ -232,11 +232,17 @@ function Row({
     ? exportProgressPercent(exportProgress)
     : 0;
   // Counted after grouping, so one sentence repeated over 300 notes reads as one
-  // warning rather than 300 — the same collapse the expanded rows show.
-  const warningCount = item.parts.reduce(
-    (total, part) => total + groupDiagnostics(part.warnings).length,
-    0,
-  );
+  // entry rather than 300 — the same collapse the expanded rows show.
+  //
+  // Severity is counted separately because it decides what the summary may call
+  // them. Every diagnostic used to be summarised as a warning, so a conversion
+  // whose notes were all informational — where each note went, which reading a
+  // chord took — announced itself as "9 warnings" and read as broken.
+  const grouped = item.parts.flatMap((part) => groupDiagnostics(part.warnings));
+  const warningCount = grouped.filter(
+    (entry) => entry.severity === "warning",
+  ).length;
+  const noteCount = grouped.length - warningCount;
 
   return (
     <div className="rounded-lg border bg-card">
@@ -268,11 +274,26 @@ function Row({
                 warning about a lyric the target reinterprets went unseen unless the
                 row happened to be opened. Surfaced here as a count, with the
                 detail still one click away. */}
-            {item.ok && warningCount > 0 && (
-              <div className="flex items-center gap-1 truncate text-xs text-warning">
-                <ExclamationTriangleIcon className="size-3 shrink-0" />
-                {warningCount} warning{warningCount === 1 ? "" : "s"} · expand
-                for detail
+            {item.ok && (warningCount > 0 || noteCount > 0) && (
+              <div
+                className={`flex items-center gap-1 truncate text-xs ${
+                  warningCount > 0 ? "text-warning" : "text-muted-foreground"
+                }`}
+              >
+                {warningCount > 0 && (
+                  <ExclamationTriangleIcon className="size-3 shrink-0" />
+                )}
+                {[
+                  warningCount > 0
+                    ? `${warningCount} warning${warningCount === 1 ? "" : "s"}`
+                    : null,
+                  noteCount > 0
+                    ? `${noteCount} note${noteCount === 1 ? "" : "s"}`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(", ")}{" "}
+                · expand for detail
               </div>
             )}
             {item.ok && (
