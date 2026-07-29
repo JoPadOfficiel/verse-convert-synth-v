@@ -5,6 +5,30 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.5.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.9...v0.5.0) (2026-07-29)
+
+
+### Features
+
+* **engine:** move untexted notes to a muted companion lane ([0124b50](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/0124b50d8e2425891162d9305f9b7c9c0cc3bd80))
+* OpenUtau target, and a vocal project that matches the score ([6434774](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/6434774835036315a8814e7ea9c688fac2262a0e))
+* OpenUtau target, and a vocal project that matches the score ([#22](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/22)) ([6434774](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/6434774835036315a8814e7ea9c688fac2262a0e))
+* put the MuseScore stems inside the OpenUtau project ([2c30426](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/2c30426ccffa82f021bc8168cd3e9e097ec24db0))
+* write OpenUtau .ustx projects beside Synthesizer V ones ([b80862a](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/b80862aa101250f96be743708ffda0fde50ee8f7))
+
+
+### Bug Fixes
+
+* give every macOS MuseScore 4 the score-load cooldown ([579b7e2](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/579b7e280566ffd0e10b2d1b62bb5db398579009))
+* inventory a chord's lyric once, not once per lane ([a25b268](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/a25b2684737d4ecee905668b160b1f2c5487bc79))
+* keep the bundle reachable under the OpenUtau target ([ea1ae20](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/ea1ae20e719e2cbe96afd854fe4f788b4806870d))
+* **musescore:** one sung lane per written line, and a syllable sung once ([d587219](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/d587219fb745063b7f0e069963c274075b059c68))
+* never open a bundle with every track muted ([1c79f6c](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/1c79f6cf61086eff0c2c10a8760e34c9341a1e52))
+* never write a note with no word into a vocal project ([c5d90e8](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/c5d90e814ba6b0da3c2ba4f2fff2887b9f577657))
+* show a warning count without expanding a row ([bea4a47](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/bea4a47170eda1a44e2b952cee7af3d0af2d2b7f))
+* stop claiming a voice-database language ([09b95bc](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/09b95bc9c44e4d61c4acb7e471d95a0ad9fd927a))
+* **ui:** count informational diagnostics apart from warnings ([1a1ff69](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/1a1ff69edc6190b4007f187db30f540b4a71169a))
+
 ## [0.4.9](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.8...v0.4.9) (2026-07-27)
 
 
