@@ -729,12 +729,15 @@ fn the_same_score_projects_identically_from_mscz_and_mxl() {
     };
     let mscz = voices(&from_mscz);
     let mxl = voices(&from_mxl);
+    // 214/210/235 held while every note was written, texted or not. The untexted
+    // rule left 56 of them out — measured: `UNTEXTED_NOTES_LEFT_OUT` totals 56 on
+    // this score and 659 - 603 is 56, so every note that left is one the source
+    // never texted. A drop below these means a note the source DOES text stopped
+    // being projected; the word-set assertions below are what prove which.
     assert_eq!(
         mscz.iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![214, 210, 235],
-        "each staff must sustain its ties and unroll the repeat; the counts \
-         predate the untexted rule, so a change here means notes the source \
-         texts stopped being projected"
+        vec![197, 194, 212],
+        "each staff must sustain its ties and unroll the repeat"
     );
     assert_eq!(
         mscz, mxl,

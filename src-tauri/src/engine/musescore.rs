@@ -1190,16 +1190,24 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .attribute("id")
             .map(|value| format!("musescore-part-{value}"))
             .unwrap_or_else(|| format!("musescore-part-{part_index}"));
-        // MuseScore's `--score-parts` contract identifies Parts by
-        // `trackName`. Use the same source-owned identity for topology and
-        // stem alignment; `Instrument/longName` is only a display fallback.
-        let name = child(part, "trackName")
-            .map(|n| collapse_ws(&deep_text(n)))
+        // `longName` is the name the score shows and the one MuseScore exports as
+        // MusicXML's `<part-name>`, so reading it is what makes the same score
+        // name its lanes identically whichever way the user exported it. On the
+        // reported score the three sung parts are all `<trackName>Piano</trackName>`
+        // — the template's instrument, never renamed — while `longName` carries
+        // the names the author actually gave them.
+        //
+        // `trackName` was preferred here for `--score-parts` stem alignment, but
+        // that alignment is by ordinal: MuseScore rewrites both names and opaque
+        // IDs even for a native `.mscz`, so a name was never a usable key.
+        let name = part
+            .children()
+            .find(|c| c.has_tag_name("Instrument"))
+            .and_then(|i| child(i, "longName").map(|n| collapse_ws(&deep_text(n))))
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                part.children()
-                    .find(|c| c.has_tag_name("Instrument"))
-                    .and_then(|i| child(i, "longName").map(|n| collapse_ws(&deep_text(n))))
+                child(part, "trackName")
+                    .map(|n| collapse_ws(&deep_text(n)))
                     .filter(|s| !s.is_empty())
             })
             .unwrap_or_default();

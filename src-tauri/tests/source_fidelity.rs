@@ -251,41 +251,52 @@ fn supplied_musescore_gate_when_configured() {
 
     let outcome = convert_auto(&data, "english");
     assert!(outcome.ok, "{:?}", outcome.msg);
-    let projected = outcome.svp.expect("valid SVP");
+    let projected = outcome.svp.clone().expect("valid SVP");
     let svp = target::svp::serialize(&projected).expect("valid SVP");
-    let soprano = |companion: bool| {
-        projected
-            .tracks
-            .iter()
-            .find(|lane| {
-                lane.name.contains("Soprano")
-                    && lane.name.ends_with(" — untexted notes") == companion
-            })
-            .expect("the soprano lane")
-    };
-    // The score opens on an untexted F4. It is not sung, so it no longer opens
-    // the sung lane — and it is not invented away either: it opens the muted
-    // companion instead, still an F4 and still untexted.
-    let sung = soprano(false);
+    let soprano = projected
+        .tracks
+        .iter()
+        .find(|lane| lane.name.contains("Soprano"))
+        .expect("the soprano lane");
+    // The score opens on an untexted F4. A note with no word is not something a
+    // singer can be asked to sing, so it is left out of the vocal project and
+    // counted — it is not invented away, and it is not moved to a muted
+    // companion lane either: that doubled the track count and filled the project
+    // with notes OpenUtau marks `error`.
     assert!(
-        sung.notes.iter().all(|note| note.lyric.is_sung()),
+        soprano.notes.iter().all(|note| note.lyric.is_sung()),
         "the sung lane holds only notes the source asks to be sung"
     );
-    assert!(!sung.muted);
-    let untexted = soprano(true);
-    assert!(untexted.muted, "the companion opens silent");
-    assert!(untexted.notes.iter().all(|note| !note.lyric.is_sung()));
-    assert_eq!(untexted.notes[0].pitch, 65);
-    // The companion directly follows the lane it belongs to, which is what lets
-    // a reader pair them by position rather than by parsing names.
-    let position = |lane: &verse_lib::engine::projection::ProjectedTrack| {
+    assert!(!soprano.muted, "a sung lane never opens silent");
+    assert!(
         projected
             .tracks
             .iter()
-            .position(|candidate| std::ptr::eq(candidate, lane))
-            .expect("the lane is in the projection")
-    };
-    assert_eq!(position(untexted), position(sung) + 1);
+            .all(|lane| !lane.name.ends_with(" — untexted notes")),
+        "the muted companion lane is superseded and must not come back"
+    );
+    let left_out: usize = outcome
+        .tracks
+        .iter()
+        .flat_map(|track| track.warnings.iter())
+        .filter(|warning| warning.code == "UNTEXTED_NOTES_LEFT_OUT")
+        .filter_map(|warning| {
+            warning
+                .message
+                .split_whitespace()
+                .next()
+                .and_then(|count| count.parse::<usize>().ok())
+        })
+        .sum();
+    assert_eq!(
+        left_out, 3,
+        "the notes the source never texted are reported rather than dropped in silence"
+    );
+    assert_eq!(
+        soprano.notes.len() + left_out,
+        174,
+        "every source note is either sung or accounted for"
+    );
     let vocal = svp
         .tracks
         .iter()
