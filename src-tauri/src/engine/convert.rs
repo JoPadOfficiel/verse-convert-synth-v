@@ -404,13 +404,30 @@ fn read_tempo(midi: &Midi) -> (Vec<ProjectedTempo>, BTreeSet<String>) {
             BTreeSet::new(),
         );
     }
-    let evidence = seen.values().map(|(_, id, _, _)| id.clone()).collect();
+    // A source whose first tempo event is after the start plays at 120 until it
+    // states otherwise — the same default this function already applies to a
+    // source stating no tempo at all, so nothing new is claimed. Stating it is
+    // not optional: `TimeAxis.BuildSegments` throws "First tempo must be at tick
+    // 0." and OpenUtau then refuses to open the file, while Synthesizer V leaves
+    // the opening bars at its own default. Discovered last so every stated event
+    // keeps the place a refusal names it by; tick 0 is exact in both targets and
+    // can never be the event that refuses.
+    if let std::collections::btree_map::Entry::Vacant(slot) = seen.entry(0) {
+        slot.insert((120.0, String::new(), String::new(), discovered));
+    }
+    let evidence = seen
+        .values()
+        .filter(|(_, id, _, _)| !id.is_empty())
+        .map(|(_, id, _, _)| id.clone())
+        .collect();
     let tempo = seen
         .into_iter()
         .map(|(tick, (bpm, _, source, discovery_index))| ProjectedTempo {
             tick,
             bpm,
-            source: Some(source),
+            // `None` states that the source named no event here, which is what
+            // the implied opening tempo is.
+            source: (!source.is_empty()).then_some(source),
             discovery_index,
         })
         .collect();
@@ -2178,6 +2195,68 @@ mod tests {
             .iter()
             .map(|note| (note.onset_ticks, note.pitch))
             .collect()
+    }
+
+    /// A score whose first tempo mark sits after the start plays at 120 until it
+    /// states otherwise, and both targets need that said out loud: OpenUtau's
+    /// `TimeAxis.BuildSegments` throws "First tempo must be at tick 0." and
+    /// refuses to open the file at all, while Synthesizer V leaves the opening
+    /// bars at its own default. 25 of the 2645 projected corpus scores do this.
+    #[test]
+    fn a_score_stating_its_first_tempo_late_still_opens_at_the_start() {
+        let mut track = pitched_track("melody", &[(0, 480, 60, 64)]);
+        track.events.push(midi::Event::new(
+            960,
+            track.events.len() as u32,
+            Kind::Tempo(500_000),
+        ));
+        let midi = midi_with(vec![track]);
+        let outcome = convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let projected = outcome.svp.as_ref().expect("a projection");
+        let opening = projected
+            .tempos
+            .iter()
+            .min_by_key(|tempo| tempo.tick)
+            .expect("a tempo");
+        assert_eq!(opening.tick, 0);
+        assert_eq!(opening.bpm, 120.0);
+        assert_eq!(
+            opening.source, None,
+            "the source named no event here, and saying so is what `None` means"
+        );
+        assert!(
+            projected.tempos.iter().any(|tempo| tempo.tick == 960),
+            "the tempo the source does state is still carried"
+        );
+        for target in [
+            crate::engine::target::ExportTarget::Svp,
+            crate::engine::target::ExportTarget::Ustx,
+        ] {
+            crate::engine::target::validate_for(target, projected)
+                .unwrap_or_else(|error| panic!("{target:?} must accept this: {error}"));
+        }
+    }
+
+    /// A source that does state a tempo at the start keeps it, evidence and all.
+    #[test]
+    fn an_opening_tempo_the_source_states_is_not_replaced() {
+        let mut track = pitched_track("melody", &[(0, 480, 60, 64)]);
+        track.events.push(midi::Event::new(
+            0,
+            track.events.len() as u32,
+            Kind::Tempo(500_000),
+        ));
+        let midi = midi_with(vec![track]);
+        let outcome = convert_midi(&midi, "english");
+        let projected = outcome.svp.as_ref().expect("a projection");
+        let opening = projected
+            .tempos
+            .iter()
+            .min_by_key(|tempo| tempo.tick)
+            .expect("a tempo");
+        assert_eq!((opening.tick, opening.bpm), (0, 120.0));
+        assert!(opening.source.is_some(), "the source named this event");
     }
 
     /// A vocal lane is monophonic in both targets, so a lane that sounds two

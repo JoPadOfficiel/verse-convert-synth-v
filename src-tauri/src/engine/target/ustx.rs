@@ -542,6 +542,32 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
         );
     }
     let time_signatures: Vec<UstxTimeSignature> = by_bar.into_values().collect();
+    // Asked after every position has been validated, so a tempo this target
+    // cannot state still refuses first and names its own event.
+    //
+    // `TimeAxis.BuildSegments` throws "First tempo must be at tick 0." and
+    // "First time signature must be at bar 0.", and OpenUtau then refuses to
+    // open the file at all rather than reporting anything about it. `read_tempo`
+    // states the implied opening tempo, so this is unreachable from
+    // `convert_midi_with_target` — but `serialize` is public, and a file nothing
+    // can open is the worst thing this target could write.
+    if tempos.first().is_none_or(|tempo| tempo.position != 0) {
+        return Err(
+            "the first tempo is not at MIDI tick 0; OpenUtau refuses to open a project whose \
+             tempo map does not open at the start"
+                .into(),
+        );
+    }
+    if time_signatures
+        .first()
+        .is_none_or(|meter| meter.bar_position != 0)
+    {
+        return Err(
+            "the first time signature is not at bar 0; OpenUtau refuses to open a project whose \
+             meter map does not open at the first bar"
+                .into(),
+        );
+    }
     // The obsolete scalars restate the opening of the emitted lists. When a list
     // is empty there is nothing to restate, so the value OpenUtau's own
     // `UProject` fields already hold is written: it makes no claim about a score
