@@ -20,6 +20,28 @@ Neither `.svp` nor `.ustx` is a lossless notation container. “Source-faithful�
 means exact source preservation, evidence-backed projection, an auditable
 disposition ledger, and fail-closed handling of unrepresentable semantics.
 
+## Which source carries the most
+
+Every supported format is parsed with the same care and none is second class.
+They do not state the same things, though, and Verse never guesses what a source
+leaves unsaid — so the completeness of a conversion is decided by the source,
+not by the converter.
+
+| Evidence | MuseScore / MusicXML | `.kar` | `.mid` / `.midi` |
+| --- | --- | --- | --- |
+| Which note owns a syllable | stated on the note | resolved conservatively | none |
+| Verse lanes and numbering | stated | one text stream | none |
+| Held syllable (melisma) | `<extend>` or extension length | only when karaoke evidence qualifies | none |
+| Part identity for the chord reading | `<instrumentId>` / `<instrument-sound>` | GM program | GM program |
+| Measures, for the per-measure verse reading | stated | none | none |
+| Repeats, voltas, D.S./Coda | stated and unrolled | none | none |
+| Exact rational durations | stated | PPQ ticks | PPQ ticks |
+
+None of this makes a MIDI conversion wrong. It makes it smaller: the same song
+yields fewer bound syllables, no melisma, and the conservative verse reading.
+Where a score is available, it is the better source, and MuseScore exports
+`.mxl` for every other program.
+
 ## Export targets
 
 Verse writes two project formats. The **Export target** selector chooses one;

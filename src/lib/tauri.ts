@@ -10,6 +10,8 @@ import {
 
 export {
   SUPPORTED_EXTENSIONS,
+  SCORE_EXTENSIONS,
+  MIDI_EXTENSIONS,
   batchBundlePaths,
   commandError,
   commandErrorMessage,

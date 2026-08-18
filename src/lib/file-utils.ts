@@ -9,6 +9,21 @@ export const SUPPORTED_EXTENSIONS = [
   "mscx",
 ] as const;
 
+// A notated score states what a MIDI file can only imply: which note owns a
+// syllable, which verse it belongs to, where a word is held, and what the part
+// is. Verse never guesses the difference, so the same song converts more
+// completely from a score. Ordered best first; the two lists together must
+// cover SUPPORTED_EXTENSIONS.
+export const SCORE_EXTENSIONS = [
+  "mxl",
+  "musicxml",
+  "xml",
+  "mscz",
+  "mscx",
+] as const;
+
+export const MIDI_EXTENSIONS = ["kar", "mid", "midi"] as const;
+
 export type StructuredCommandError = {
   code: string;
   message: string;
