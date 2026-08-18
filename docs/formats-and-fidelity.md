@@ -202,9 +202,19 @@ otherwise be undefined.
 
 ### Structural defaults that assert nothing
 
-A `.ustx` note carries `pitch.data` with two `y: 0` points and a true
-`snap_first`, because `UNote.Validate` dereferences `pitch.data[0]` with no
-guard. `vibrato.length: 0` disables vibrato and every other vibrato field is the
+A `.ustx` note carries `pitch.data` with two `y: 0` points at `x: -40` and
+`x: 40`, shape `io`, and a true `snap_first`. Those are the values
+`UProject.CreateNote` gives every note a user draws, from
+`NotePresets.Default.DefaultPortamento = ("Standard", 80, -40)`, so a projected
+note behaves under the pointer exactly like a hand-drawn one. The list may not
+be empty: `UNote.Validate` dereferences `pitch.data[0]` with no guard whenever
+`snap_first` is set.
+
+Narrower points are a different claim, not a smaller one. `±1` is OpenUtau's own
+`Snap` preset, which deliberately removes portamento; measured against a built
+0.1.568, the rendered f0 steps in a single sample where the default glides over
+about 83 ms, beginning 40 ms before the note. That f0 is the tensor DiffSinger
+sings from, so the difference is heard rather than seen. `vibrato.length: 0` disables vibrato and every other vibrato field is the
 value OpenUtau's own `UVibrato` initializes. A track names
 `OpenUtau.Core.DefaultPhonemizer` because a track must carry one.
 
