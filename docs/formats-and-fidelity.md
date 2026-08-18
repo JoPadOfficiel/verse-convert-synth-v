@@ -20,6 +20,28 @@ Neither `.svp` nor `.ustx` is a lossless notation container. “Source-faithful�
 means exact source preservation, evidence-backed projection, an auditable
 disposition ledger, and fail-closed handling of unrepresentable semantics.
 
+## Which source carries the most
+
+Every supported format is parsed with the same care and none is second class.
+They do not state the same things, though, and Verse never guesses what a source
+leaves unsaid — so the completeness of a conversion is decided by the source,
+not by the converter.
+
+| Evidence | MuseScore / MusicXML | `.kar` | `.mid` / `.midi` |
+| --- | --- | --- | --- |
+| Which note owns a syllable | stated on the note | resolved conservatively | none |
+| Verse lanes and numbering | stated | one text stream | none |
+| Held syllable (melisma) | `<extend>` or extension length | only when karaoke evidence qualifies | none |
+| Part identity for the chord reading | `<instrumentId>` / `<instrument-sound>` | GM program | GM program |
+| Measures, for the per-measure verse reading | stated | none | none |
+| Repeats, voltas, D.S./Coda | stated and unrolled | none | none |
+| Exact rational durations | stated | PPQ ticks | PPQ ticks |
+
+None of this makes a MIDI conversion wrong. It makes it smaller: the same song
+yields fewer bound syllables, no melisma, and the conservative verse reading.
+Where a score is available, it is the better source, and MuseScore exports
+`.mxl` for every other program.
+
 ## Export targets
 
 Verse writes two project formats. The **Export target** selector chooses one;
@@ -145,12 +167,30 @@ Both targets refuse a position or duration that does not divide exactly into
 their own grid, and report the offending MIDI tick and PPQ. Verse leaves the
 source untouched and never rounds.
 
+Before either target is asked, the projection refuses a lane holding two notes
+that sound at once. A vocal lane is monophonic in both, and every adapter
+decomposes simultaneity into lanes precisely so this cannot reach a target, so a
+lane that still overlaps means an adapter stopped doing that — not that one
+format is stricter than the other. The refusal names the lane and both ticks
+rather than blaming timing.
+
+A project whose tempo map does not open at tick 0, or whose meter map does not
+open at bar 0, is refused before it can be written. OpenUtau's
+`TimeAxis.BuildSegments` throws `First tempo must be at tick 0.` and refuses to
+open such a file at all, saying nothing about why. No converted source reaches
+that state: a score whose first tempo mark sits after the start plays at 120
+until it states otherwise, and the projection now says so — the same default it
+has always applied to a source stating no tempo at all. Measured: 25 of the 2645
+projected corpus scores wrote a tempo map that would not open.
+
 OpenUtau additionally refuses:
 
 - a note whose duration falls under the 10-tick floor. `UNote.Validate` does
   `duration = Math.Max(10, duration)` and would silently lengthen it.
 - two overlapping notes in one voice part. One `voice_part` is monophonic and
-  OpenUtau sets `OverlapError` on the later note instead of singing it.
+  OpenUtau sets `OverlapError` on the later note instead of singing it. The
+  projection refuses this first, so the check stands for a project built through
+  the public API rather than for a converted source.
 - a held syllable or syllable split on a note that does not begin exactly where
   its predecessor ends, including such a marker on the first note of a lane.
 - a position or a position-plus-duration beyond the C# `int` range every USTX
@@ -162,9 +202,19 @@ otherwise be undefined.
 
 ### Structural defaults that assert nothing
 
-A `.ustx` note carries `pitch.data` with two `y: 0` points and a true
-`snap_first`, because `UNote.Validate` dereferences `pitch.data[0]` with no
-guard. `vibrato.length: 0` disables vibrato and every other vibrato field is the
+A `.ustx` note carries `pitch.data` with two `y: 0` points at `x: -40` and
+`x: 40`, shape `io`, and a true `snap_first`. Those are the values
+`UProject.CreateNote` gives every note a user draws, from
+`NotePresets.Default.DefaultPortamento = ("Standard", 80, -40)`, so a projected
+note behaves under the pointer exactly like a hand-drawn one. The list may not
+be empty: `UNote.Validate` dereferences `pitch.data[0]` with no guard whenever
+`snap_first` is set.
+
+Narrower points are a different claim, not a smaller one. `±1` is OpenUtau's own
+`Snap` preset, which deliberately removes portamento; measured against a built
+0.1.568, the rendered f0 steps in a single sample where the default glides over
+about 83 ms, beginning 40 ms before the note. That f0 is the tensor DiffSinger
+sings from, so the difference is heard rather than seen. `vibrato.length: 0` disables vibrato and every other vibrato field is the
 value OpenUtau's own `UVibrato` initializes. A track names
 `OpenUtau.Core.DefaultPhonemizer` because a track must carry one.
 
@@ -222,6 +272,17 @@ export—use the same extension-aware snapshot parser.
 - Generic Text meta events (`0x01`) as metadata.
 - UTF-8 text with Windows-1252 fallback while retaining raw bytes.
 
+### Two encodings on one track
+
+A Soft Karaoke exporter may write the same words twice: once as MIDI lyric
+events, and once as the Text stream the format is built around. The lyric events
+are the ones sung — that is the event MIDI defines for words, while Text is
+generic and a track qualifies as karaoke on a line control plus two payloads,
+which a pair of section markers satisfies on its own. The other stream stays in
+the preserved source. The words are counted once, so a file no longer reports
+twice the words it holds, and the choice is reported under
+`TWO_LYRIC_ENCODINGS` rather than made in silence.
+
 ### Soft Karaoke qualification
 
 Text events become karaoke lyrics only when their own physical source track
@@ -254,7 +315,26 @@ A Synthesizer V vocal track is monophonic, and so is one OpenUtau `voice_part`,
 so a source track that sounds two notes at once is split into one lane per
 simultaneous voice — the same decomposition score importers apply to a chord.
 Splitting is driven by sounding overlap alone: a track that never overlaps is
-projected unchanged.
+projected unchanged, byte for byte.
+
+The split runs on the projected lane, not on the source track: only a lane that
+is actually sung has to be monophonic. Splitting every source track instead
+added lanes to 449 corpus scores, 418 of which gained no sung note at all — a
+piano part decomposed into voices nobody will sing.
+
+A score adapter buckets by staff, voice and chord member, none of which stops one
+bucket from stacking two notes: a MusicXML `<backup>` written without `<voice>`,
+a MuseScore `<location>` that rewinds inside a voice, and a tie whose merged head
+passes the following onset all produce one.
+
+A continuation marker follows the note it leans on into whatever lane that note
+took, because both targets need the two to touch. Where that lane is already
+sounding, the source has stacked a marker on its own predecessor; the marker
+takes a free lane and the target reports it rather than the whole projection
+being refused.
+
+Each split lane is reported under `SIMULTANEOUS_VOICES_SPLIT`. A note moves lane
+and changes in no other way — same pitch, instant, length and word.
 
 This matters beyond tidiness. A karaoke syllable landing on a stack of notes has
 no single note to own, and used to be dropped as ambiguous. Split into voices,
@@ -302,8 +382,18 @@ it has; a stem running past the end of the whole score is still refused.
 - Multiple lyric lanes/verses, syllabic state, elisions, `time-only`, and
   extension state.
 - Chords represented as technical monophonic lanes under one source voice.
+- Lyric extensions stated as a tick count, as an exact fraction of a whole note,
+  or as both. A fraction alone is derived on the relationship every score
+  stating both units agrees on, and refused rather than rounded where the
+  division cannot state it exactly.
 - Grace-note and unpitched evidence preserved without fallback pitch.
-- MusicXML start/stop tie chains merged into the editable projection.
+- MusicXML start/stop tie chains merged into the editable projection, and only
+  where the head ends exactly where the tail begins. A `<tie>` reopened across a
+  rest or a repeat jump states no sustain, so the two stay separate notes rather
+  than the head being stretched over the silence between them — the same
+  contiguity evidence the MuseScore adapter requires. A `<tie type="stop">` whose
+  start never arrived keeps its own pitch: nothing sustains it, so it is a note
+  of its own.
 - Repeats, voltas, and supported D.S./D.C./Coda/Fine playback expansion.
 - Exact common PPQ derived from local `<divisions>` values when it fits the
   supported range.

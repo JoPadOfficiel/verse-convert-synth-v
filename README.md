@@ -57,10 +57,38 @@ Verse uses only evidence present in the source:
 
 | Format | Extensions | Notes |
 | --- | --- | --- |
+| MuseScore | `.mscz`, `.mscx` | Native MuseScore score parsing |
+| MusicXML | `.mxl`, `.xml`, `.musicxml` | Parts, voices, lyric lanes and unpitched percussion are inventoried |
 | Karaoke MIDI | `.kar` | Qualified Soft Karaoke text and MIDI lyric events |
 | Standard MIDI | `.mid`, `.midi` | Lyric-free MIDI is valid |
-| MusicXML | `.mxl`, `.xml`, `.musicxml` | Parts, voices, lyric lanes and unpitched percussion are inventoried |
-| MuseScore | `.mscz`, `.mscx` | Native MuseScore score parsing |
+
+### Bring a score if you have one
+
+All four are supported and all four are converted with the same care. They do
+not carry the same evidence, and because Verse never guesses what a source does
+not state, the same song converts more completely from a score.
+
+A notated score states, and a MIDI file cannot:
+
+- **which note owns a syllable.** A score attaches the word to the note. A
+  `.kar` states words and notes separately, so ownership is resolved
+  conservatively and an ambiguous word stays source-only rather than being
+  guessed onto a note.
+- **which verse a word belongs to.** Scores stack verses under one line and
+  number them, so a repeat can sing verse 2 on the second pass. MIDI has one
+  stream of text.
+- **where a word is held.** A melisma is a source claim: a MusicXML `<extend>`
+  or a MuseScore extension length. Standard MIDI states no continuation, so a
+  wordless note after a syllable is read as untexted, not as a hold.
+- **what the part is.** `<instrumentId>` and `<instrument-sound>` decide whether
+  a word under a chord is a choir harmony or a piano reduction — opposite
+  readings. MIDI offers only the GM program.
+- **where the bars are.** A verse's silence is read per measure, which is how a
+  refrain notated once survives a repeat. MIDI has no measures, so that reading
+  falls back to the conservative one.
+
+MuseScore exports `.mxl` for every other program, so authoring there and
+exporting a score costs nothing and keeps all of the above.
 
 ## Export targets
 

@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE score-partwise  PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
+<score-partwise version="4.0">
+  <movement-title>Music21 Fragment</movement-title>
+  <identification>
+    <creator type="composer">Music21</creator>
+    <encoding>
+      <encoding-date>2026-08-18</encoding-date>
+      <software>music21 v.10.5.0</software>
+      <supports element="beam" type="yes" />
+      <supports element="stem" type="yes" />
+      <supports element="accidental" type="yes" />
+    </encoding>
+  </identification>
+  <defaults>
+    <scaling>
+      <millimeters>7</millimeters>
+      <tenths>40</tenths>
+    </scaling>
+  </defaults>
+  <part-list>
+    <score-part id="P153da51cf10c5987a04482f0d46a1a64">
+      <part-name />
+    </score-part>
+  </part-list>
+  <!--=========================== Part 1 ===========================-->
+  <part id="P153da51cf10c5987a04482f0d46a1a64">
+    <!--========================= Measure 1 ==========================-->
+    <measure implicit="no" number="1">
+      <attributes>
+        <divisions>10080</divisions>
+        <time>
+          <beats>2</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <direction>
+        <direction-type>
+          <metronome parentheses="no">
+            <beat-unit>quarter</beat-unit>
+            <per-minute>60</per-minute>
+          </metronome>
+        </direction-type>
+        <sound tempo="60" />
+      </direction>
+      <note>
+        <pitch>
+          <step>C</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">begin</beam>
+        <beam number="2">begin</beam>
+        <notations>
+          <tuplet bracket="yes" number="1" placement="above" type="start">
+            <tuplet-actual>
+              <tuplet-number>11</tuplet-number>
+              <tuplet-type>16th</tuplet-type>
+            </tuplet-actual>
+            <tuplet-normal>
+              <tuplet-number>8</tuplet-number>
+              <tuplet-type>16th</tuplet-type>
+            </tuplet-normal>
+          </tuplet>
+        </notations>
+        <lyric name="1" number="1">
+          <syllabic>begin</syllabic>
+          <text>Glo</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>D</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">continue</beam>
+        <beam number="2">continue</beam>
+        <lyric name="1" number="1">
+          <syllabic>middle</syllabic>
+          <text>ri</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>E</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">continue</beam>
+        <beam number="2">end</beam>
+        <lyric name="1" number="1">
+          <syllabic>end</syllabic>
+          <text>a</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>F</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">continue</beam>
+        <beam number="2">begin</beam>
+        <lyric name="1" number="1">
+          <syllabic>single</syllabic>
+          <text>in</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>G</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">continue</beam>
+        <beam number="2">continue</beam>
+        <lyric name="1" number="1">
+          <syllabic>begin</syllabic>
+          <text>ex</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>A</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">end</beam>
+        <beam number="2">end</beam>
+        <lyric name="1" number="1">
+          <syllabic>middle</syllabic>
+          <text>cel</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>B</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">begin</beam>
+        <beam number="2">begin</beam>
+        <lyric name="1" number="1">
+          <syllabic>end</syllabic>
+          <text>sis</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>C</step>
+          <octave>5</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">continue</beam>
+        <beam number="2">continue</beam>
+        <lyric name="1" number="1">
+          <syllabic>begin</syllabic>
+          <text>De</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>B</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">continue</beam>
+        <beam number="2">end</beam>
+        <lyric name="1" number="1">
+          <syllabic>end</syllabic>
+          <text>o</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>A</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">continue</beam>
+        <beam number="2">begin</beam>
+        <lyric name="1" number="1">
+          <syllabic>begin</syllabic>
+          <text>hal</text>
+        </lyric>
+      </note>
+      <note>
+        <pitch>
+          <step>G</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>1833</duration>
+        <type>16th</type>
+        <time-modification>
+          <actual-notes>11</actual-notes>
+          <normal-notes>8</normal-notes>
+          <normal-type>16th</normal-type>
+        </time-modification>
+        <beam number="1">end</beam>
+        <beam number="2">end</beam>
+        <notations>
+          <tuplet number="1" type="stop" />
+        </notations>
+        <lyric name="1" number="1">
+          <syllabic>middle</syllabic>
+          <text>le</text>
+        </lyric>
+      </note>
+    </measure>
+  </part>
+</score-partwise>

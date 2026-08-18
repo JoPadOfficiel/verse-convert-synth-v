@@ -185,6 +185,11 @@ monophonic in both targets — a Synthesizer V vocal track and an OpenUtau
 `voice_part` alike. They do not become fake source Parts or voices. Chord-member
 lanes stay grouped inside their original source voice and Part.
 
+Every adapter splits a voice that sounds two notes at once into one lane each,
+before this topology is derived, so `projection_track_ids` counts the lanes that
+exist. `ProjectedProject::monophony_violation` then proves the result at the
+analysis gate, ahead of either target.
+
 ## Authority separation
 
 Three concepts must never be conflated:

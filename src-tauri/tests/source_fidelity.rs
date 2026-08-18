@@ -251,41 +251,52 @@ fn supplied_musescore_gate_when_configured() {
 
     let outcome = convert_auto(&data, "english");
     assert!(outcome.ok, "{:?}", outcome.msg);
-    let projected = outcome.svp.expect("valid SVP");
+    let projected = outcome.svp.clone().expect("valid SVP");
     let svp = target::svp::serialize(&projected).expect("valid SVP");
-    let soprano = |companion: bool| {
-        projected
-            .tracks
-            .iter()
-            .find(|lane| {
-                lane.name.contains("Soprano")
-                    && lane.name.ends_with(" — untexted notes") == companion
-            })
-            .expect("the soprano lane")
-    };
-    // The score opens on an untexted F4. It is not sung, so it no longer opens
-    // the sung lane — and it is not invented away either: it opens the muted
-    // companion instead, still an F4 and still untexted.
-    let sung = soprano(false);
+    let soprano = projected
+        .tracks
+        .iter()
+        .find(|lane| lane.name.contains("Soprano"))
+        .expect("the soprano lane");
+    // The score opens on an untexted F4. A note with no word is not something a
+    // singer can be asked to sing, so it is left out of the vocal project and
+    // counted — it is not invented away, and it is not moved to a muted
+    // companion lane either: that doubled the track count and filled the project
+    // with notes OpenUtau marks `error`.
     assert!(
-        sung.notes.iter().all(|note| note.lyric.is_sung()),
+        soprano.notes.iter().all(|note| note.lyric.is_sung()),
         "the sung lane holds only notes the source asks to be sung"
     );
-    assert!(!sung.muted);
-    let untexted = soprano(true);
-    assert!(untexted.muted, "the companion opens silent");
-    assert!(untexted.notes.iter().all(|note| !note.lyric.is_sung()));
-    assert_eq!(untexted.notes[0].pitch, 65);
-    // The companion directly follows the lane it belongs to, which is what lets
-    // a reader pair them by position rather than by parsing names.
-    let position = |lane: &verse_lib::engine::projection::ProjectedTrack| {
+    assert!(!soprano.muted, "a sung lane never opens silent");
+    assert!(
         projected
             .tracks
             .iter()
-            .position(|candidate| std::ptr::eq(candidate, lane))
-            .expect("the lane is in the projection")
-    };
-    assert_eq!(position(untexted), position(sung) + 1);
+            .all(|lane| !lane.name.ends_with(" — untexted notes")),
+        "the muted companion lane is superseded and must not come back"
+    );
+    let left_out: usize = outcome
+        .tracks
+        .iter()
+        .flat_map(|track| track.warnings.iter())
+        .filter(|warning| warning.code == "UNTEXTED_NOTES_LEFT_OUT")
+        .filter_map(|warning| {
+            warning
+                .message
+                .split_whitespace()
+                .next()
+                .and_then(|count| count.parse::<usize>().ok())
+        })
+        .sum();
+    assert_eq!(
+        left_out, 3,
+        "the notes the source never texted are reported rather than dropped in silence"
+    );
+    assert_eq!(
+        soprano.notes.len() + left_out,
+        174,
+        "every source note is either sung or accounted for"
+    );
     let vocal = svp
         .tracks
         .iter()
@@ -355,4 +366,126 @@ fn supplied_musicxml_percussion_gate_when_configured() {
                 && instrument.channel == Some(9)
                 && instrument.midi_unpitched.is_some()
         }));
+}
+
+/// A track qualifies as karaoke on a line control plus two payloads, which two
+/// section markers satisfy on their own. Reading the Text stream there sang the
+/// marker `Chorus` and left seven of the eight words the source states out of
+/// the project, because those words were in the Lyric meta events the marker
+/// displaced. The words are what the file is for.
+#[test]
+fn section_markers_never_displace_the_words_a_track_states() {
+    fn meta(kind: u8, text: &str) -> Vec<u8> {
+        let mut out = vec![0x00, 0xff, kind, text.len() as u8];
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+    let words = ["Right", "this", "way", "your", "ta", "bles", "wai", "ting"];
+    let mut track = Vec::new();
+    // A line control and one more payload: enough to look like karaoke.
+    track.extend(meta(0x01, "/Chorus"));
+    track.extend(meta(0x01, "Intro"));
+    for (index, word) in words.iter().enumerate() {
+        track.extend(meta(0x05, word));
+        track.extend([0x00, 0x90, 60 + index as u8, 100]);
+        track.extend([0x83, 0x60, 0x80, 60 + index as u8, 0]);
+    }
+    track.extend([0x00, 0xff, 0x2f, 0x00]);
+
+    let outcome = convert_auto(&smf(&track), "english");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    assert_eq!(
+        outcome.placed,
+        words.len(),
+        "every word the source states is sung"
+    );
+    let sung: Vec<String> = outcome
+        .svp
+        .as_ref()
+        .expect("a projection")
+        .tracks
+        .iter()
+        .flat_map(|lane| &lane.notes)
+        .filter_map(|note| match &note.lyric {
+            verse_lib::engine::projection::ProjectedLyric::Source(lyric) => match &lyric.state {
+                LyricState::Text(text) => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sung, words.map(str::to_string).to_vec());
+}
+
+/// A Soft Karaoke exporter may write the same words twice, once as MIDI lyric
+/// events and once as the Text stream the format is built around. Counting both
+/// made the file report twice the words it has, so a project singing every one
+/// of them still read as having dropped half. Where the two disagree the loser
+/// used to vanish with nothing said.
+#[test]
+fn a_track_writing_its_words_in_both_encodings_states_them_once() {
+    fn meta(kind: u8, text: &str) -> Vec<u8> {
+        let mut out = vec![0x00, 0xff, kind, text.len() as u8];
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    for (karaoke, duplicate) in [("Hel", "Hel"), ("Hel", "WRONG")] {
+        let mut track = Vec::new();
+        track.extend(meta(0x01, "@KMIDI"));
+        track.extend(meta(0x01, &format!("\\{karaoke}")));
+        track.extend(meta(0x05, duplicate));
+        track.extend([0x00, 0x90, 60, 64]);
+        track.extend([0x83, 0x60, 0x80, 60, 0]);
+        track.extend(meta(0x01, "lo"));
+        track.extend(meta(0x05, "lo"));
+        track.extend([0x00, 0x90, 62, 64]);
+        track.extend([0x83, 0x60, 0x80, 62, 0]);
+        track.extend([0x00, 0xff, 0x2f, 0x00]);
+
+        let outcome = convert_auto(&smf(&track), "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let stated: usize = outcome
+            .tracks
+            .iter()
+            .map(|report| report.lyric_status.source_text_count)
+            .sum();
+        assert_eq!(
+            (stated, outcome.placed),
+            (2, 2),
+            "two words written twice are two words, and both are sung"
+        );
+
+        let project = outcome.svp.as_ref().expect("a projection");
+        let sung: Vec<String> = project
+            .tracks
+            .iter()
+            .flat_map(|lane| &lane.notes)
+            .map(|note| match &note.lyric {
+                verse_lib::engine::projection::ProjectedLyric::Source(lyric) => {
+                    match &lyric.state {
+                        LyricState::Text(text) => text.clone(),
+                        other => format!("{other:?}"),
+                    }
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            sung,
+            vec![duplicate.to_string(), "lo".to_string()],
+            "the Lyric meta event is the event MIDI defines for words"
+        );
+
+        let codes: Vec<&str> = outcome
+            .tracks
+            .iter()
+            .flat_map(|report| report.warnings.iter())
+            .map(|warning| warning.code.as_str())
+            .collect();
+        assert!(
+            codes.contains(&"TWO_LYRIC_ENCODINGS"),
+            "choosing between two encodings is never silent: {codes:?}"
+        );
+    }
 }

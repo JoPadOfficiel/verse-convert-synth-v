@@ -79,8 +79,14 @@ The Rust suites exercise:
   refusing a septuplet, the 10-tick duration floor, the `+~`/`+` marker
   vocabulary, `lyric: ""` for an untexted note, monophonic overlap refusal, and a
   marker refused across a gap;
+- the projection seam: that a lane sounding two notes at once is reported with
+  both ticks, that notes which merely touch are not, and that the order a
+  projection was built in cannot hide a stack;
+- cross-format parity: that a MusicXML and a MuseScore voice each sounding two
+  notes at one instant become two monophonic lanes both targets accept;
 - target dispatch: that the analysis gate refuses exactly what the write boundary
-  refuses, that `ExportTarget`'s serde values are the stable `"svp"`/`"ustx"`
+  refuses, that the two marker vocabularies agree on `+` for a split and never on
+  the hold, that `ExportTarget`'s serde values are the stable `"svp"`/`"ustx"`
   protocol strings with Synthesizer V as the default, and that a refusal stays
   distinguishable from an encoder fault;
 - that lyric text of any language reaches the output byte-exactly with nothing

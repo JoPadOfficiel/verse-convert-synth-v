@@ -1,5 +1,8 @@
 import { UploadIcon } from "@radix-ui/react-icons";
-import { SUPPORTED_EXTENSIONS } from "@/lib/tauri";
+import { MIDI_EXTENSIONS, SCORE_EXTENSIONS } from "@/lib/tauri";
+
+const dotted = (extensions: readonly string[]) =>
+  extensions.map((extension) => `.${extension}`).join(" · ");
 
 export function Dropzone({
   onAdd,
@@ -26,9 +29,20 @@ export function Dropzone({
     >
       <UploadIcon className="size-6 text-muted-foreground" />
       <div className="font-medium">Drop your files, or click to choose</div>
-      <div className="text-sm text-muted-foreground">
-        {SUPPORTED_EXTENSIONS.map((extension) => `.${extension}`).join(" · ")}
-        {" — multiple at once"}
+      {/* Split rather than listed flat: a score states which note owns a
+          syllable and a MIDI file does not, and Verse never guesses the
+          difference. The user chooses the source here, so this is where the
+          difference is worth knowing. */}
+      <div className="flex flex-col gap-1 text-sm text-muted-foreground">
+        <div>
+          <span className="text-foreground">Scores</span>{" "}
+          {dotted(SCORE_EXTENSIONS)}
+        </div>
+        <div>
+          <span className="text-foreground">MIDI</span> {dotted(MIDI_EXTENSIONS)}
+          {" — no verses, no held syllables, no part names"}
+        </div>
+        <div>Multiple at once. Prefer a score when you have one.</div>
       </div>
     </button>
   );

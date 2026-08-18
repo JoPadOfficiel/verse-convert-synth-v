@@ -292,6 +292,47 @@ pub(crate) fn karaoke_text_lyric(
     Some(lyric)
 }
 
+/// The one encoding a track's own words are read from, when it states two.
+///
+/// A Soft Karaoke exporter may add a Lyric meta event carrying the same words a
+/// track already states as Text, so one track can hold both and every syllable
+/// would be counted twice — a file reporting twice the words it holds, and a
+/// project singing all of them still reading as having dropped half.
+///
+/// The Lyric meta event is the one read. It is the event the MIDI standard
+/// defines for words, while Text is generic and a track qualifies as karaoke on
+/// a line control and two payloads — which a pair of section markers satisfies.
+/// Preferring Text there sang `Chorus` and left seven of eight real words out.
+/// Where both carry the song, they carry it identically and the choice costs
+/// nothing. Reported under [`TWO_LYRIC_ENCODINGS`].
+fn own_lyric_tokens(tokens: &[TimedLyric]) -> Vec<&TimedLyric> {
+    let karaoke_text = tokens
+        .iter()
+        .any(|token| token.origin == TimedLyricOrigin::KaraokeText);
+    let midi_lyric = tokens
+        .iter()
+        .any(|token| token.origin == TimedLyricOrigin::MidiLyric);
+    tokens
+        .iter()
+        .filter(|token| {
+            !(karaoke_text && midi_lyric) || token.origin == TimedLyricOrigin::MidiLyric
+        })
+        .collect()
+}
+
+/// Whether a track states its own words twice, once in each MIDI encoding.
+fn states_two_lyric_encodings(tokens: &[TimedLyric]) -> bool {
+    tokens
+        .iter()
+        .any(|token| token.origin == TimedLyricOrigin::KaraokeText)
+        && tokens
+            .iter()
+            .any(|token| token.origin == TimedLyricOrigin::MidiLyric)
+}
+
+/// Reported when one track writes its words in both MIDI lyric encodings.
+pub const TWO_LYRIC_ENCODINGS: &str = "TWO_LYRIC_ENCODINGS";
+
 /// Generic MIDI Text is metadata. It is considered lyric material only under
 /// evidence carried by this exact track.
 fn track_tokens(track: &Track) -> Vec<TimedLyric> {
@@ -367,13 +408,30 @@ fn read_tempo(midi: &Midi) -> (Vec<ProjectedTempo>, BTreeSet<String>) {
             BTreeSet::new(),
         );
     }
-    let evidence = seen.values().map(|(_, id, _, _)| id.clone()).collect();
+    // A source whose first tempo event is after the start plays at 120 until it
+    // states otherwise — the same default this function already applies to a
+    // source stating no tempo at all, so nothing new is claimed. Stating it is
+    // not optional: `TimeAxis.BuildSegments` throws "First tempo must be at tick
+    // 0." and OpenUtau then refuses to open the file, while Synthesizer V leaves
+    // the opening bars at its own default. Discovered last so every stated event
+    // keeps the place a refusal names it by; tick 0 is exact in both targets and
+    // can never be the event that refuses.
+    if let std::collections::btree_map::Entry::Vacant(slot) = seen.entry(0) {
+        slot.insert((120.0, String::new(), String::new(), discovered));
+    }
+    let evidence = seen
+        .values()
+        .filter(|(_, id, _, _)| !id.is_empty())
+        .map(|(_, id, _, _)| id.clone())
+        .collect();
     let tempo = seen
         .into_iter()
         .map(|(tick, (bpm, _, source, discovery_index))| ProjectedTempo {
             tick,
             bpm,
-            source: Some(source),
+            // `None` states that the source named no event here, which is what
+            // the implied opening tempo is.
+            source: (!source.is_empty()).then_some(source),
             discovery_index,
         })
         .collect();
@@ -680,6 +738,84 @@ fn project_track(
     }
 }
 
+/// Splits one projected lane into monophonic lanes, one per simultaneous voice.
+///
+/// A vocal lane is monophonic in both targets: Synthesizer V sings one note of a
+/// stack and OpenUtau marks the later note `OverlapError` and sings neither. The
+/// source states staff, voice and chord member, none of which stops one of them
+/// from sounding two notes at once — a `<backup>` written without a `<voice>`, a
+/// `<location>` that rewinds inside a voice, a tie whose merged head passes the
+/// following onset.
+///
+/// Done on the projected lane rather than on the source track because only a
+/// lane that is actually sung has to be monophonic. Splitting every source track
+/// instead added lanes to 449 corpus scores, 418 of which gained no sung note at
+/// all: a piano part decomposed into voices nobody will sing.
+///
+/// A note moves lane and changes in no other way — same pitch, instant, length
+/// and word.
+fn split_simultaneous_voices(track: ProjectedTrack) -> Vec<ProjectedTrack> {
+    let mut lanes: Vec<Vec<ProjectedNote>> = Vec::new();
+    let mut previous_lane: Option<usize> = None;
+    for note in track.notes {
+        // Widened because a lane's last note may end past the tick range.
+        let onset = u64::from(note.onset_ticks);
+        // A continuation marker carries the previous note's syllable, and every
+        // target needs the two to touch — OpenUtau refuses the export outright
+        // and Synthesizer V would rebind the hold to whatever note was left in
+        // front of it. So the marker follows the note it leans on into whatever
+        // lane that note took, rather than the first lane that happens to be
+        // free. A source that stacks the marker on top of its own predecessor
+        // is contradictory, and the target says so.
+        let held = note.lyric.continues_previous_note();
+        let fits = |lane: &Vec<ProjectedNote>| {
+            lane.last().is_none_or(|last| {
+                u64::from(last.onset_ticks) + u64::from(last.duration_ticks) <= onset
+            })
+        };
+        // Where that lane is already sounding, the source has stacked a marker
+        // on its own predecessor. Forcing it there would leave the lane holding
+        // two notes at once, which is the one thing this function exists to
+        // prevent, so it takes a free lane and the target reports the marker.
+        let free = previous_lane
+            .filter(|lane| held && lanes.get(*lane).is_some_and(fits))
+            .or_else(|| lanes.iter().position(fits));
+        previous_lane = Some(match free {
+            Some(lane) => {
+                lanes[lane].push(note);
+                lane
+            }
+            None => {
+                lanes.push(vec![note]);
+                lanes.len() - 1
+            }
+        });
+    }
+    if lanes.len() <= 1 {
+        return vec![ProjectedTrack {
+            notes: lanes.pop().unwrap_or_default(),
+            ..track
+        }];
+    }
+    lanes
+        .into_iter()
+        .enumerate()
+        .map(|(index, notes)| ProjectedTrack {
+            name: if index == 0 {
+                track.name.clone()
+            } else {
+                format!("{} — voice {}", track.name, index + 1)
+            },
+            source_track_id: track.source_track_id.clone(),
+            muted: track.muted,
+            notes,
+        })
+        .collect()
+}
+
+/// Reported when a projected lane sounded two notes at once and was decomposed.
+pub const SIMULTANEOUS_VOICES_SPLIT: &str = "SIMULTANEOUS_VOICES_SPLIT";
+
 /// The suffix that names a lane's untexted companion, in the same shape as the
 /// verse-lane suffix `project_track`'s caller builds.
 /// Reported when a lane left notes out of the project because the source never
@@ -926,7 +1062,11 @@ pub fn convert_midi_with_target(
     for (index, track) in midi.tracks.iter().enumerate() {
         let notes = &notes_by_track[index];
         let source_note_count = source_note_count(track);
-        let own_tokens = &tokens_by_track[index];
+        let all_tokens = &tokens_by_track[index];
+        let two_encodings = states_two_lyric_encodings(all_tokens);
+        let own_tokens: Vec<TimedLyric> =
+            own_lyric_tokens(all_tokens).into_iter().cloned().collect();
+        let own_tokens = &own_tokens;
         let source_binding = external.binding_for_source(index);
         let source_binding_active = source_binding.filter(|binding| {
             overrides.and_then(|map| map.get(&binding.target_track).copied()) != Some(false)
@@ -1005,6 +1145,7 @@ pub fn convert_midi_with_target(
         let sing = explicit_override.unwrap_or(source_vocal);
         let mut placed = 0usize;
         let mut untexted_left_out = 0usize;
+        let mut simultaneous_voices = 0usize;
         let mut lyric_diagnostics: Vec<Diagnostic> = Vec::new();
         if sing {
             let no_assignment = HashMap::new();
@@ -1049,7 +1190,9 @@ pub fn convert_midi_with_target(
                 let (sung_track, left_out) = drop_untexted(projected_track);
                 untexted_left_out += left_out;
                 if !sung_track.notes.is_empty() {
-                    projected_tracks.push(sung_track);
+                    let voices = split_simultaneous_voices(sung_track);
+                    simultaneous_voices = simultaneous_voices.max(voices.len());
+                    projected_tracks.extend(voices);
                 }
             }
         }
@@ -1127,6 +1270,28 @@ pub fn convert_midi_with_target(
                      first, so both words claim verse 1 and only the first is sung; the other \
                      stays in the source. Number the second verse in the score to sing it."
                 ),
+                &track.id,
+            ));
+        }
+        if simultaneous_voices > 1 {
+            warnings.push(report_warning(
+                SIMULTANEOUS_VOICES_SPLIT,
+                DiagnosticSeverity::Info,
+                format!(
+                    "This line sounds up to {simultaneous_voices} notes at once, so it is sung as \
+                     {simultaneous_voices} lanes of one voice each. A vocal track sings one note \
+                     at a time in both targets: Synthesizer V would sing one note of the stack \
+                     and OpenUtau would mark the others as overlapping and sing none. Every note \
+                     keeps its own pitch, instant, length and word."
+                ),
+                &track.id,
+            ));
+        }
+        if two_encodings {
+            warnings.push(report_warning(
+                TWO_LYRIC_ENCODINGS,
+                DiagnosticSeverity::Info,
+                "This track writes its words twice, once as Soft Karaoke text and once as MIDI                  lyric events. The karaoke stream is the one this file is built around and the                  one carrying its line controls, so it is the one sung; the duplicate stays in                  the preserved source. Where the two disagree, the karaoke text is what you                  will hear.",
                 &track.id,
             ));
         }
@@ -1265,6 +1430,14 @@ pub fn convert_midi_with_target(
     // bundle could only hold a `.svp`; keeping that would offer a bundle button for
     // a source the bundle then refuses, which is the failure this whole block
     // exists to prevent.
+    // Asked before any target, and with its own wording, because a lane that
+    // sounds two notes at once is neither target's doing: both are monophonic,
+    // and the adapters decompose simultaneity into lanes so this cannot reach
+    // them. Only Synthesizer V would accept it, and it would sing one note of
+    // the stack.
+    if let Some(violation) = projected.monophony_violation() {
+        return fail(format!("a projection lane is not monophonic: {violation}"));
+    }
     if let Err(error) = crate::engine::target::validate_for(target, &projected) {
         // Synthesizer V keeps 0.4.9's wording verbatim, because every refusal it
         // can raise really is a timing refusal. OpenUtau also refuses a syllable
@@ -1687,6 +1860,9 @@ fn source_note_count(track: &Track) -> usize {
 }
 
 fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
+    // Counted once even when the track writes its words twice, or the file
+    // would report source words the project then appears to have dropped.
+    let duplicated_encoding = states_two_lyric_encodings(&track_tokens(track));
     let mut source_text_count = 0usize;
     let mut explicit_empty_count = 0usize;
     let mut continuation_count = 0usize;
@@ -1711,6 +1887,10 @@ fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
             Kind::Text(_) if track.text_profile == MidiTextProfile::Generic => {
                 generic_text_count += 1
             }
+            // Counted once even when the track writes its words twice; the Lyric
+            // meta event is the one read, so it is the one counted.
+            Kind::Text(_)
+                if duplicated_encoding && track.text_profile == MidiTextProfile::KaraokeLyrics => {}
             Kind::Text(_) if track.text_profile == MidiTextProfile::KaraokeLyrics => {
                 if let Some(lyric) = match &event.kind {
                     Kind::Text(text) => {
@@ -1721,6 +1901,7 @@ fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
                     count(&lyric);
                 }
             }
+
             _ => {}
         }
     }
@@ -2021,6 +2202,131 @@ mod tests {
             .iter()
             .map(|note| (note.onset_ticks, note.pitch))
             .collect()
+    }
+
+    /// A score whose first tempo mark sits after the start plays at 120 until it
+    /// states otherwise, and both targets need that said out loud: OpenUtau's
+    /// `TimeAxis.BuildSegments` throws "First tempo must be at tick 0." and
+    /// refuses to open the file at all, while Synthesizer V leaves the opening
+    /// bars at its own default. 25 of the 2645 projected corpus scores do this.
+    #[test]
+    fn a_score_stating_its_first_tempo_late_still_opens_at_the_start() {
+        let mut track = pitched_track("melody", &[(0, 480, 60, 64)]);
+        track.events.push(midi::Event::new(
+            960,
+            track.events.len() as u32,
+            Kind::Tempo(500_000),
+        ));
+        let midi = midi_with(vec![track]);
+        let outcome = convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let projected = outcome.svp.as_ref().expect("a projection");
+        let opening = projected
+            .tempos
+            .iter()
+            .min_by_key(|tempo| tempo.tick)
+            .expect("a tempo");
+        assert_eq!(opening.tick, 0);
+        assert_eq!(opening.bpm, 120.0);
+        assert_eq!(
+            opening.source, None,
+            "the source named no event here, and saying so is what `None` means"
+        );
+        assert!(
+            projected.tempos.iter().any(|tempo| tempo.tick == 960),
+            "the tempo the source does state is still carried"
+        );
+        for target in [
+            crate::engine::target::ExportTarget::Svp,
+            crate::engine::target::ExportTarget::Ustx,
+        ] {
+            crate::engine::target::validate_for(target, projected)
+                .unwrap_or_else(|error| panic!("{target:?} must accept this: {error}"));
+        }
+    }
+
+    /// A source that does state a tempo at the start keeps it, evidence and all.
+    #[test]
+    fn an_opening_tempo_the_source_states_is_not_replaced() {
+        let mut track = pitched_track("melody", &[(0, 480, 60, 64)]);
+        track.events.push(midi::Event::new(
+            0,
+            track.events.len() as u32,
+            Kind::Tempo(500_000),
+        ));
+        let midi = midi_with(vec![track]);
+        let outcome = convert_midi(&midi, "english");
+        let projected = outcome.svp.as_ref().expect("a projection");
+        let opening = projected
+            .tempos
+            .iter()
+            .min_by_key(|tempo| tempo.tick)
+            .expect("a tempo");
+        assert_eq!((opening.tick, opening.bpm), (0, 120.0));
+        assert!(opening.source.is_some(), "the source named this event");
+    }
+
+    /// A vocal lane is monophonic in both targets, so a lane that sounds two
+    /// notes at once is decomposed into one lane per voice. Nothing about a note
+    /// changes: it moves lane, keeping its pitch, instant, length and word.
+    #[test]
+    fn a_lane_sounding_two_notes_at_once_is_decomposed_into_one_lane_per_voice() {
+        let stacked = ProjectedTrack {
+            name: "Voice".into(),
+            source_track_id: "voice".into(),
+            muted: false,
+            notes: vec![
+                ProjectedNote {
+                    onset_ticks: 0,
+                    duration_ticks: 480,
+                    pitch: 60,
+                    lyric: word(),
+                },
+                ProjectedNote {
+                    onset_ticks: 0,
+                    duration_ticks: 480,
+                    pitch: 64,
+                    lyric: word(),
+                },
+                ProjectedNote {
+                    onset_ticks: 480,
+                    duration_ticks: 480,
+                    pitch: 67,
+                    lyric: word(),
+                },
+            ],
+        };
+        let lanes = split_simultaneous_voices(stacked);
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].name, "Voice");
+        assert_eq!(lanes[1].name, "Voice — voice 2");
+        assert_eq!(placement(&lanes[0]), vec![(0, 60), (480, 67)]);
+        assert_eq!(placement(&lanes[1]), vec![(0, 64)]);
+        for lane in &lanes {
+            assert_eq!(lane.source_track_id, "voice", "provenance is unchanged");
+            assert!(lane.notes.iter().all(|note| note.lyric == word()));
+        }
+    }
+
+    /// Touching is not overlapping. A sung line is a chain of notes that end
+    /// where the next begins, and every continuation marker needs exactly that,
+    /// so splitting there would break the hold the source states.
+    #[test]
+    fn notes_that_touch_stay_in_one_lane() {
+        let line = lane(&[(0, 480, word()), (480, 480, word()), (960, 480, word())]);
+        let lanes = split_simultaneous_voices(line);
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].notes.len(), 3);
+    }
+
+    /// Three notes at one instant need three lanes, and the third must not be
+    /// folded back onto a lane that is still sounding.
+    #[test]
+    fn a_three_note_stack_becomes_three_lanes() {
+        let chord = lane(&[(0, 480, word()), (0, 480, word()), (0, 480, word())]);
+        let lanes = split_simultaneous_voices(chord);
+        assert_eq!(lanes.len(), 3);
+        assert!(lanes.iter().all(|lane| lane.notes.len() == 1));
     }
 
     #[test]

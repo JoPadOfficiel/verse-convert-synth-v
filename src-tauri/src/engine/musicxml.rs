@@ -1414,6 +1414,14 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                             } else {
                                 None
                             };
+                            // Merged only where the head ends exactly where this
+                            // note begins, the same evidence `musescore.rs`
+                            // requires. A `<tie>` reopened after a rest, after a
+                            // repeat jump, or written across a gap would otherwise
+                            // stretch the head over everything between: a note the
+                            // score never sustains, and the one shape that leaves a
+                            // lane sounding two notes at once.
+                            let mut merged = false;
                             if let Some(source_id) = &continued_source {
                                 let previous_off = events.iter_mut().rev().find(|event| {
                                     matches!(
@@ -1427,14 +1435,20 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                         "MusicXML tie target {source_id:?} has no matching note-off"
                                     )
                                 })?;
-                                previous_off.tick = off;
+                                if previous_off.tick == on {
+                                    previous_off.tick = off;
+                                    merged = true;
+                                }
                             }
                             // A tie continuation is retained as a source-only
                             // note while the first note's playback duration is
                             // extended across the chain. This preserves every
                             // source occurrence without projecting a repeated
                             // Synthesizer V attack.
-                            let playback_pitch = if tie_merges { None } else { pitch };
+                            // An unmerged tail keeps its pitch: nothing sustained
+                            // it, so it is a note of its own and staying silent
+                            // would drop it.
+                            let playback_pitch = if merged { None } else { pitch };
                             push_event(
                                 events,
                                 on,
@@ -2218,6 +2232,92 @@ mod tests {
                 .iter()
                 .all(|part| *part == vec![0, 480, 960, 1440, 1920, 2400]),
             "the al Coda jump reaches its target: {played:?}"
+        );
+    }
+
+    /// A `<tie>` reopened across a gap — after a rest, or after a repeat jump —
+    /// is not evidence that the score sustains the first note through it.
+    /// Stretching the head there invented a note the score never wrote, and it
+    /// is the shape that left a lane sounding two notes at once. `musescore.rs`
+    /// has required the same contiguity since ties landed there.
+    #[test]
+    fn a_tie_across_a_gap_does_not_stretch_the_note_before_it() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <tie type="start"/>
+        <lyric><text>hold</text></lyric>
+      </note>
+      <note><rest/><duration>480</duration></note>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <tie type="stop"/>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        let played: Vec<_> = midi.tracks[0]
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                Kind::NoteOn(note) => Some(("on", event.tick, note.key)),
+                Kind::NoteOff(note) => Some(("off", event.tick, note.key)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            played,
+            vec![
+                ("on", 0, Some(60)),
+                ("off", 480, Some(60)),
+                ("on", 960, Some(60)),
+                ("off", 1440, Some(60)),
+            ],
+            "the rest between them is silence the score wrote"
+        );
+    }
+
+    /// A `<tie type="stop">` whose start never arrived used to silence its note.
+    /// `tie_merges` alone decided the playback pitch, so a tail with nothing to
+    /// merge into still lost its pitch and left the score while nothing
+    /// sustained it in its place. `musescore.rs` keeps such a note audible.
+    #[test]
+    fn a_dangling_tie_stop_keeps_its_note_audible() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions></attributes>
+      <note>
+        <pitch><step>D</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <lyric><text>sing</text></lyric>
+      </note>
+      <note>
+        <pitch><step>E</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <tie type="stop"/>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        let pitched = midi.tracks[0]
+            .events
+            .iter()
+            .any(|event| matches!(&event.kind, Kind::NoteOn(note) if note.key == Some(64)));
+        assert!(
+            pitched,
+            "nothing sustained this note, so it is a note of its own"
         );
     }
 

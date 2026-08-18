@@ -120,3 +120,22 @@ test("only renderer/audio failures mark audio unavailable", () => {
   assert.equal(utils.isAudioUnavailableErrorCode("DESTINATION_EXISTS"), false);
   assert.equal(utils.isAudioUnavailableErrorCode("BUNDLE_COMMIT_FAILED"), false);
 });
+
+// The two fidelity tiers shown in the drop target must together be exactly the
+// extensions the file dialog accepts, or a supported format becomes invisible.
+test("the fidelity tiers cover every supported extension exactly once", () => {
+  const tiered = [...utils.SCORE_EXTENSIONS, ...utils.MIDI_EXTENSIONS];
+  assert.equal(
+    new Set(tiered).size,
+    tiered.length,
+    "no extension may appear in both tiers",
+  );
+  assert.deepEqual([...tiered].sort(), [...utils.SUPPORTED_EXTENSIONS].sort());
+});
+
+// A score states which note owns a syllable; a MIDI file does not. Listing a
+// MIDI extension as a score would tell the user the opposite.
+test("the score tier holds the notated formats and the MIDI tier the rest", () => {
+  assert.deepEqual([...utils.SCORE_EXTENSIONS], ["mxl", "musicxml", "xml", "mscz", "mscx"]);
+  assert.deepEqual([...utils.MIDI_EXTENSIONS], ["kar", "mid", "midi"]);
+});

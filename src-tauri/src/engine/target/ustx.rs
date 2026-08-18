@@ -130,9 +130,20 @@ pub struct UstxNote {
     pub vibrato: UstxVibrato,
 }
 
-/// `UNote.Validate` dereferences `pitch.data[0]` with no guard, so `data` must
-/// carry at least one point. The two `y: 0` points below are that structural
-/// requirement, not musical invention.
+/// The portamento `UProject.CreateNote` gives every note a user draws:
+/// `NotePresets.Default.DefaultPortamento` is `("Standard", 80, -40)`, so the two
+/// points sit at `-40` and `-40 + 80`, shape `io`.
+///
+/// Writing them is not a musical claim — it is the claim OpenUtau itself makes
+/// for every note, and matching it is what makes a projected note behave like a
+/// hand-drawn one under the pointer. Anything narrower is a different claim:
+/// `±1` is OpenUtau's own `Snap` preset, which deliberately removes portamento,
+/// and it was measured against a built 0.1.568 to step the rendered f0 in one
+/// sample where the default glides over ~83 ms. That f0 is the tensor DiffSinger
+/// sings from, so the difference is audible rather than cosmetic.
+///
+/// `data` may not be empty: `UNote.Validate` dereferences `pitch.data[0]` with no
+/// guard whenever `snap_first` is set, and an empty list fails the load outright.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UstxPitch {
     pub data: Vec<UstxPitchPoint>,
@@ -144,12 +155,12 @@ impl Default for UstxPitch {
         UstxPitch {
             data: vec![
                 UstxPitchPoint {
-                    x: -1.0,
+                    x: -40.0,
                     y: 0.0,
                     shape: PitchShape::Io,
                 },
                 UstxPitchPoint {
-                    x: 1.0,
+                    x: 40.0,
                     y: 0.0,
                     shape: PitchShape::Io,
                 },
@@ -542,6 +553,32 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
         );
     }
     let time_signatures: Vec<UstxTimeSignature> = by_bar.into_values().collect();
+    // Asked after every position has been validated, so a tempo this target
+    // cannot state still refuses first and names its own event.
+    //
+    // `TimeAxis.BuildSegments` throws "First tempo must be at tick 0." and
+    // "First time signature must be at bar 0.", and OpenUtau then refuses to
+    // open the file at all rather than reporting anything about it. `read_tempo`
+    // states the implied opening tempo, so this is unreachable from
+    // `convert_midi_with_target` — but `serialize` is public, and a file nothing
+    // can open is the worst thing this target could write.
+    if tempos.first().is_none_or(|tempo| tempo.position != 0) {
+        return Err(
+            "the first tempo is not at MIDI tick 0; OpenUtau refuses to open a project whose \
+             tempo map does not open at the start"
+                .into(),
+        );
+    }
+    if time_signatures
+        .first()
+        .is_none_or(|meter| meter.bar_position != 0)
+    {
+        return Err(
+            "the first time signature is not at bar 0; OpenUtau refuses to open a project whose \
+             meter map does not open at the first bar"
+                .into(),
+        );
+    }
     // The obsolete scalars restate the opening of the emitted lists. When a list
     // is empty there is nothing to restate, so the value OpenUtau's own
     // `UProject` fields already hold is written: it makes no claim about a score
@@ -1238,7 +1275,7 @@ mod tests {
                 "        duration: 480\n",
                 "        tone: 60\n",
                 "        lyric: \"sing\"\n",
-                "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+                "        pitch: {data: [{x: -40, y: 0, shape: io}, {x: 40, y: 0, shape: io}], snap_first: true}\n",
                 "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
                 "        phoneme_expressions: []\n",
                 "        phoneme_overrides: []\n",
@@ -1246,7 +1283,7 @@ mod tests {
                 "        duration: 240\n",
                 "        tone: 62\n",
                 "        lyric: \"+~\"\n",
-                "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+                "        pitch: {data: [{x: -40, y: 0, shape: io}, {x: 40, y: 0, shape: io}], snap_first: true}\n",
                 "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
                 "        phoneme_expressions: []\n",
                 "        phoneme_overrides: []\n",
@@ -1254,7 +1291,7 @@ mod tests {
                 "        duration: 240\n",
                 "        tone: 64\n",
                 "        lyric: \"syl\"\n",
-                "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+                "        pitch: {data: [{x: -40, y: 0, shape: io}, {x: 40, y: 0, shape: io}], snap_first: true}\n",
                 "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
                 "        phoneme_expressions: []\n",
                 "        phoneme_overrides: []\n",
@@ -1262,7 +1299,7 @@ mod tests {
                 "        duration: 480\n",
                 "        tone: 65\n",
                 "        lyric: \"+~\"\n",
-                "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+                "        pitch: {data: [{x: -40, y: 0, shape: io}, {x: 40, y: 0, shape: io}], snap_first: true}\n",
                 "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
                 "        phoneme_expressions: []\n",
                 "        phoneme_overrides: []\n",
@@ -1270,7 +1307,7 @@ mod tests {
                 "        duration: 480\n",
                 "        tone: 67\n",
                 "        lyric: \"\"\n",
-                "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+                "        pitch: {data: [{x: -40, y: 0, shape: io}, {x: 40, y: 0, shape: io}], snap_first: true}\n",
                 "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
                 "        phoneme_expressions: []\n",
                 "        phoneme_overrides: []\n",
@@ -1278,7 +1315,7 @@ mod tests {
                 "        duration: 480\n",
                 "        tone: 69\n",
                 "        lyric: \"\"\n",
-                "        pitch: {data: [{x: -1, y: 0, shape: io}, {x: 1, y: 0, shape: io}], snap_first: true}\n",
+                "        pitch: {data: [{x: -40, y: 0, shape: io}, {x: 40, y: 0, shape: io}], snap_first: true}\n",
                 "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
                 "        phoneme_expressions: []\n",
                 "        phoneme_overrides: []\n",
