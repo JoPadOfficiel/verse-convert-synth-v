@@ -1325,11 +1325,11 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
     })
 }
 
-/// Splits one MIDI track into monophonic lanes, one per simultaneous voice.
+/// Splits one source track into monophonic lanes, one per simultaneous voice.
 ///
-/// A Synthesizer V vocal track is monophonic, and score importers have always
-/// decomposed a chord into one lane per member. MIDI never did: a track that
-/// harmonises its melody, or that carries an accompaniment beside it, stayed a
+/// A vocal lane is monophonic in both targets, and score importers have always
+/// decomposed a chord into one lane per member. A track that harmonises its
+/// melody, or that carries an accompaniment beside it, would otherwise stay a
 /// single lane with its notes stacked on top of each other. A syllable landing
 /// on such a stack has no single note to own, so it was dropped as ambiguous —
 /// which is how `Right this way your tables waiting` vanished from a score
@@ -1342,51 +1342,73 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
 /// Lane 0 keeps the source track's identity and every non-note event, because
 /// tempo, controls and lyrics belong to the track rather than to one of its
 /// voices. A track that is already monophonic is returned untouched.
-fn split_polyphonic_voices(track: Track) -> Result<Vec<Track>, String> {
+pub(crate) fn split_polyphonic_voices(track: Track) -> Result<Vec<Track>, String> {
     // A note-on whose note-off never arrives keeps its lane busy forever, so a
     // hostile or truncated file could open a new lane on every event and clone
     // the track that many times. Sixteen MIDI channels of dense chord writing
     // stay far below this bound.
     const MAX_SIMULTANEOUS_VOICES: usize = 128;
-    type VoiceKey = (Option<u8>, Option<u8>);
     let mut lanes: Vec<Vec<Event>> = vec![Vec::new()];
-    // What each lane is currently sounding, and the lanes a key was started on
-    // so an off closes the lane its on opened.
-    let mut sounding: Vec<Option<VoiceKey>> = vec![None];
-    let mut open: std::collections::HashMap<VoiceKey, Vec<usize>> =
+    // Which lane each sounding note occupies, found by the note's own source
+    // identity, plus the `(channel, key)` queue a source stating no identity
+    // closes through instead. `extract_notes` pairs on the same two indexes, so
+    // a note-off reaches the same note here and there.
+    let mut busy: Vec<bool> = vec![false];
+    let mut lane_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut queued: std::collections::HashMap<(Option<u8>, Option<u8>), Vec<String>> =
         std::collections::HashMap::new();
 
     for event in &track.events {
         match &event.kind {
+            // A note stating no playback pitch sounds nothing: an XML adapter
+            // emits one to keep a tie tail's source identity, and `convert.rs`
+            // projects no note for it. Giving it a voice would split a lane in
+            // two over a note nobody can hear.
+            Kind::NoteOn(note) if note.velocity != Some(0) && note.key.is_none() => {
+                lanes[0].push(event.clone());
+            }
             Kind::NoteOn(note) if note.velocity != Some(0) => {
-                let key: VoiceKey = (note.channel, note.key);
-                let lane = match sounding.iter().position(Option::is_none) {
+                let lane = match busy.iter().position(|occupied| !occupied) {
                     Some(free) => free,
                     None => {
                         if lanes.len() >= MAX_SIMULTANEOUS_VOICES {
                             return Err(format!(
-                                "MIDI track {} sounds more than {MAX_SIMULTANEOUS_VOICES} \
+                                "source track {} sounds more than {MAX_SIMULTANEOUS_VOICES} \
                                  simultaneous voices; the file is malformed or hostile",
                                 track.source.source_track
                             ));
                         }
                         lanes.push(Vec::new());
-                        sounding.push(None);
+                        busy.push(false);
                         lanes.len() - 1
                     }
                 };
-                sounding[lane] = Some(key);
-                open.entry(key).or_default().push(lane);
+                busy[lane] = true;
+                lane_of.insert(note.source.id.clone(), lane);
+                queued
+                    .entry((note.channel, note.key))
+                    .or_default()
+                    .push(note.source.id.clone());
                 lanes[lane].push(event.clone());
             }
             Kind::NoteOn(note) => {
-                let key: VoiceKey = (note.channel, note.key);
-                let lane = close_voice_lane(&mut open, &mut sounding, key);
+                let lane = close_voice_lane(
+                    &mut lane_of,
+                    &mut queued,
+                    &mut busy,
+                    None,
+                    (note.channel, note.key),
+                );
                 lanes[lane].push(event.clone());
             }
             Kind::NoteOff(note) => {
-                let key: VoiceKey = (note.channel, note.key);
-                let lane = close_voice_lane(&mut open, &mut sounding, key);
+                let lane = close_voice_lane(
+                    &mut lane_of,
+                    &mut queued,
+                    &mut busy,
+                    note.source_id.as_deref(),
+                    (note.channel, note.key),
+                );
                 lanes[lane].push(event.clone());
             }
             _ => lanes[0].push(event.clone()),
@@ -1415,8 +1437,24 @@ fn split_polyphonic_voices(track: Track) -> Result<Vec<Track>, String> {
         .collect())
 }
 
-/// Frees the lane a note-off closes, following the same `(channel, key)` FIFO
-/// the note extractor uses.
+/// Splits every track of a source into monophonic lanes.
+///
+/// Score adapters bucket by staff, voice and chord member, which the source
+/// states; nothing there stops one bucket from sounding two notes at once, and
+/// a bucket that does breaks the monophony `ProjectedTrack` claims. Running the
+/// split here rather than per adapter is what keeps the four source families
+/// from each learning `close_voice_lane`'s orphan rule separately.
+pub(crate) fn split_polyphonic_tracks(tracks: Vec<Track>) -> Result<Vec<Track>, String> {
+    let mut lanes = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        lanes.extend(split_polyphonic_voices(track)?);
+    }
+    Ok(lanes)
+}
+
+/// Frees the lane a note-off closes, by the exact source identity the off names
+/// or, when it names none, through the same `(channel, key)` FIFO the note
+/// extractor uses.
 ///
 /// An off with no matching on — orphaned or duplicated, which real files do
 /// contain — is filed on lane 0 without freeing anything. Clearing lane 0 there
@@ -1424,19 +1462,35 @@ fn split_polyphonic_voices(track: Track) -> Result<Vec<Track>, String> {
 /// reuse the lane while its occupant is still playing, interleaving two voices
 /// in one lane and breaking the monophonic invariant everything else relies on.
 fn close_voice_lane(
-    open: &mut std::collections::HashMap<(Option<u8>, Option<u8>), Vec<usize>>,
-    sounding: &mut [Option<(Option<u8>, Option<u8>)>],
+    lane_of: &mut std::collections::HashMap<String, usize>,
+    queued: &mut std::collections::HashMap<(Option<u8>, Option<u8>), Vec<String>>,
+    busy: &mut [bool],
+    source_id: Option<&str>,
     key: (Option<u8>, Option<u8>),
 ) -> usize {
-    let Some(lane) = open
-        .get_mut(&key)
-        .filter(|lanes| !lanes.is_empty())
-        .map(|lanes| lanes.remove(0))
-    else {
+    let sounding = match source_id {
+        Some(named) => named.to_string(),
+        None => {
+            let Some(oldest) = queued
+                .get_mut(&key)
+                .filter(|open| !open.is_empty())
+                .map(|open| open.remove(0))
+            else {
+                return 0;
+            };
+            oldest
+        }
+    };
+    let Some(lane) = lane_of.remove(&sounding) else {
         return 0;
     };
-    if let Some(slot) = sounding.get_mut(lane) {
-        *slot = None;
+    if source_id.is_some() {
+        if let Some(open) = queued.get_mut(&key) {
+            open.retain(|other| other != &sounding);
+        }
+    }
+    if let Some(slot) = busy.get_mut(lane) {
+        *slot = false;
     }
     lane
 }

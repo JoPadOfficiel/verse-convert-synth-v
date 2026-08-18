@@ -1080,3 +1080,115 @@ fn no_karaoke_syllable_is_lost_on_the_way_to_the_project() {
         assert_no_syllable_is_lost(fixture);
     }
 }
+
+/// One MusicXML voice sounding two notes at once, written with `<backup>` and
+/// no `<voice>` so both notes land in the same staff/voice/chord-member bucket.
+/// A score exported by a tool that omits `<voice>` writes exactly this.
+const MUSICXML_SIMULTANEITY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>480</divisions><time><beats>2</beats><beat-type>4</beat-type></time></attributes>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <lyric><text>sing</text></lyric>
+      </note>
+      <backup><duration>480</duration></backup>
+      <note>
+        <pitch><step>E</step><octave>4</octave></pitch>
+        <duration>480</duration>
+        <lyric><text>sing</text></lyric>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+
+/// The same simultaneity in native MuseScore: a negative `<location>` rewinds
+/// the voice cursor and a second `<Chord>` is written over the first.
+const MUSESCORE_SIMULTANEITY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part>
+      <trackName>Voice</trackName>
+      <Staff id="1"/>
+    </Part>
+    <Staff id="1">
+      <Measure>
+        <voice>
+          <Chord>
+            <durationType>quarter</durationType>
+            <Lyrics><text>sing</text></Lyrics>
+            <Note><pitch>60</pitch></Note>
+          </Chord>
+          <location><fractions>-1/4</fractions></location>
+          <Chord>
+            <durationType>quarter</durationType>
+            <Lyrics><text>sing</text></Lyrics>
+            <Note><pitch>64</pitch></Note>
+          </Chord>
+        </voice>
+      </Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+
+/// Every note of every projected lane, as `(onset, duration, pitch)`.
+fn lane_notes(outcome: &ConvertOutcome) -> Vec<Vec<(u32, u32, u8)>> {
+    outcome
+        .svp
+        .as_ref()
+        .expect("a projection")
+        .tracks
+        .iter()
+        .map(|track| {
+            track
+                .notes
+                .iter()
+                .map(|note| (note.onset_ticks, note.duration_ticks, note.pitch))
+                .collect()
+        })
+        .collect()
+}
+
+/// A vocal lane is monophonic in both targets, so a source voice that sounds
+/// two notes at once is decomposed into one lane per voice — the rule the MIDI
+/// parser has always applied. A score adapter buckets by staff, voice and chord
+/// member, none of which stops one bucket from stacking two notes: measured on
+/// the pinned OpenScore corpus, 21 lanes in 17 scores did. Synthesizer V wrote
+/// them into one monophonic group unchecked and OpenUtau refused the export, so
+/// the same score reached the user broken or not at all depending on the target.
+#[test]
+fn a_score_voice_sounding_two_notes_at_once_becomes_two_monophonic_lanes() {
+    for (format, source) in [
+        ("MusicXML", MUSICXML_SIMULTANEITY),
+        ("MuseScore", MUSESCORE_SIMULTANEITY),
+    ] {
+        let outcome = convert_auto(source.as_bytes(), "english");
+        assert!(outcome.ok, "{format}: {:?}", outcome.msg);
+        let lanes = lane_notes(&outcome);
+        assert_eq!(
+            lanes,
+            vec![vec![(0, 480, 60)], vec![(0, 480, 64)]],
+            "{format} must project one monophonic lane per simultaneous voice"
+        );
+        let projected = outcome.svp.as_ref().expect("a projection");
+        for lane in &projected.tracks {
+            for pair in lane.notes.windows(2) {
+                assert!(
+                    u64::from(pair[0].onset_ticks) + u64::from(pair[0].duration_ticks)
+                        <= u64::from(pair[1].onset_ticks),
+                    "{format} left an overlap inside lane {}",
+                    lane.name
+                );
+            }
+        }
+        for export in [target::ExportTarget::Svp, target::ExportTarget::Ustx] {
+            target::validate_for(export, projected).unwrap_or_else(|error| {
+                panic!("{format} must be representable in {export:?}: {error}")
+            });
+        }
+    }
+}

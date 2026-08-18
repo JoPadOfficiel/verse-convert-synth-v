@@ -4,10 +4,10 @@
 //! Staff/Measure/voice, TimeSig, Tempo, Chord (dots, tuplets, graces),
 //! Rest (including full measures), location, and all source lyric lanes.
 use crate::engine::midi::{
-    merge_measure_marks, unroll, ChordReading, Event, InstrumentInfo, Jump, Kind, Lyric,
-    LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource,
-    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track,
-    TrackRoleHint, TrackSource,
+    merge_measure_marks, split_polyphonic_tracks, unroll, ChordReading, Event, InstrumentInfo,
+    Jump, Kind, Lyric, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff,
+    NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice,
+    Syllabic, TimeBase, Track, TrackRoleHint, TrackSource,
 };
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -1984,6 +1984,11 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     if tracks.is_empty() {
         return Err("no usable staff in the MuseScore file".into());
     }
+    // Every projection lane must be monophonic, and the source states staff,
+    // voice and chord member but not that a bucket sounds one note at a time.
+    // Splitting before the topology is derived is what makes the extra lanes
+    // counted rather than hidden.
+    let tracks = split_polyphonic_tracks(tracks)?;
     let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
     Ok(Midi {
         ticks_per_beat: tpb,
