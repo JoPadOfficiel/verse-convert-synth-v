@@ -274,12 +274,14 @@ export—use the same extension-aware snapshot parser.
 
 ### Two encodings on one track
 
-A Soft Karaoke exporter may write the same words twice: once as the Text stream
-the format is built around, and once as MIDI lyric events. The karaoke stream is
-the one sung — it is what the file is built around and what carries its line
-controls — and the duplicate stays in the preserved source. The words are
-counted once, so a file no longer reports twice the words it holds, and the
-choice is reported under `TWO_LYRIC_ENCODINGS` rather than made in silence.
+A Soft Karaoke exporter may write the same words twice: once as MIDI lyric
+events, and once as the Text stream the format is built around. The lyric events
+are the ones sung — that is the event MIDI defines for words, while Text is
+generic and a track qualifies as karaoke on a line control plus two payloads,
+which a pair of section markers satisfies on its own. The other stream stays in
+the preserved source. The words are counted once, so a file no longer reports
+twice the words it holds, and the choice is reported under
+`TWO_LYRIC_ENCODINGS` rather than made in silence.
 
 ### Soft Karaoke qualification
 

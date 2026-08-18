@@ -294,13 +294,17 @@ pub(crate) fn karaoke_text_lyric(
 
 /// The one encoding a track's own words are read from, when it states two.
 ///
-/// A Soft Karaoke file writes its words as Text and some exporters add a Lyric
-/// meta event carrying the same words again, so a track can hold both. The
-/// karaoke stream is the one the file is built around and the one that carries
-/// its line controls, so it wins; the duplicate would otherwise be counted as
-/// extra source words the project then appears to have dropped, and where the
-/// two disagree the loser vanished with nothing said. Reported under
-/// [`TWO_LYRIC_ENCODINGS`].
+/// A Soft Karaoke exporter may add a Lyric meta event carrying the same words a
+/// track already states as Text, so one track can hold both and every syllable
+/// would be counted twice — a file reporting twice the words it holds, and a
+/// project singing all of them still reading as having dropped half.
+///
+/// The Lyric meta event is the one read. It is the event the MIDI standard
+/// defines for words, while Text is generic and a track qualifies as karaoke on
+/// a line control and two payloads — which a pair of section markers satisfies.
+/// Preferring Text there sang `Chorus` and left seven of eight real words out.
+/// Where both carry the song, they carry it identically and the choice costs
+/// nothing. Reported under [`TWO_LYRIC_ENCODINGS`].
 fn own_lyric_tokens(tokens: &[TimedLyric]) -> Vec<&TimedLyric> {
     let karaoke_text = tokens
         .iter()
@@ -311,7 +315,7 @@ fn own_lyric_tokens(tokens: &[TimedLyric]) -> Vec<&TimedLyric> {
     tokens
         .iter()
         .filter(|token| {
-            !(karaoke_text && midi_lyric) || token.origin == TimedLyricOrigin::KaraokeText
+            !(karaoke_text && midi_lyric) || token.origin == TimedLyricOrigin::MidiLyric
         })
         .collect()
 }
@@ -1879,11 +1883,14 @@ fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
                     count(lyric);
                 }
             }
-            Kind::Lyrics(_) if duplicated_encoding => {}
             Kind::Lyrics(lyric) if !midi::is_midi_lyric_line_break(&lyric.raw) => count(lyric),
             Kind::Text(_) if track.text_profile == MidiTextProfile::Generic => {
                 generic_text_count += 1
             }
+            // Counted once even when the track writes its words twice; the Lyric
+            // meta event is the one read, so it is the one counted.
+            Kind::Text(_)
+                if duplicated_encoding && track.text_profile == MidiTextProfile::KaraokeLyrics => {}
             Kind::Text(_) if track.text_profile == MidiTextProfile::KaraokeLyrics => {
                 if let Some(lyric) = match &event.kind {
                     Kind::Text(text) => {
