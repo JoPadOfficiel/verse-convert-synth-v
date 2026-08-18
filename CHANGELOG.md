@@ -5,6 +5,77 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.6.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.5.0...v0.6.0) (2026-08-18)
+
+
+Regenerating a project from this release does not reproduce the previous file:
+note portamento and MuseScore part names both change. All of it landed in
+[#25](https://github.com/JoPadOfficiel/verse-convert-synth-v/pull/25), squashed
+into one commit
+([7741de7](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/7741de79de2c4ad44a2c287283602582edab0f5c)).
+
+### Bug Fixes
+
+* **openutau:** state the opening tempo, so the file opens at all.
+  `TimeAxis.BuildSegments` throws `First tempo must be at tick 0.` and abandons
+  the load without saying why. 25 of 2645 corpus scores state their first tempo
+  mark after the start and wrote exactly that map.
+* **openutau:** give a note the portamento OpenUtau gives every note. The two
+  pitch points were `±1 ms`, which is OpenUtau's own `Snap` preset — deliberately
+  no portamento — while `UProject.CreateNote` uses `±40 ms`. Measured against a
+  built 0.1.568, the rendered f0 stepped in one sample where the default glides
+  over ~83 ms. That f0 is the tensor DiffSinger sings from.
+* **engine:** split a voice that sounds two notes at once into one lane each. A
+  vocal lane is monophonic in both targets; 21 lanes across 17 corpus scores were
+  not. Synthesizer V sang one note of the stack and OpenUtau refused the export.
+  The split runs on the lane that is sung, so an instrumental part is untouched.
+* **engine:** prove the monophonic lane at the analysis gate rather than trust
+  it, with its own wording — a lane sounding two notes at once is not a timing
+  fault.
+* **musescore:** keep the part names the author wrote. Names came from
+  `trackName`, the template's instrument, so a score whose three sung parts were
+  left as `Piano` produced three identical lanes while the author's names sat in
+  `longName`.
+* **musescore:** read a lyric extension written only as `ticks_f`. The unit was
+  measured, not assumed: all 10968 corpus lyrics stating both agree on
+  `ticks = ticks_f × 4 × Division`.
+* **musicxml:** merge a tie only where the head ends exactly where the tail
+  begins, the contiguity `musescore.rs` already required. A tie reopened across a
+  rest sustained a note the score never sustains. A tail with nothing to merge
+  into keeps its own pitch instead of leaving the score.
+* **midi:** read a track's words once when it writes them in both encodings, and
+  let the lyric event win over generic karaoke text. A track qualifies as karaoke
+  on a line control plus two payloads, which two section markers satisfy: reading
+  the text stream there sang `Chorus` and left seven of eight real words out.
+
+
+### Features
+
+* **ui:** say which source carries the most, where the source is chosen. The drop
+  target separates scores from MIDI and names the evidence that differs — which
+  note owns a syllable, which verse it belongs to, where a word is held.
+
+
+### Tests
+
+* add a generated MusicXML rhythm corpus and its invariants: four scores written
+  by music21 covering 3-, 5-, 7-, 9- and 11-tuplets, a meter change per bar and
+  ties across every barline. The generator runs out of CI and its output is the
+  fixture, so CI stays offline and Python-free.
+* all nine private parity tests pass, a first. Two were recorded as unfixable
+  fixture mismatches; the `.mxl` of the same file projects the names the `.mscz`
+  was dropping, which refutes that reading.
+
+
+### Verified
+
+Every projected note of 2645 corpus scores was compared against the file
+written for it: 518138 Synthesizer V notes and 507521 OpenUtau notes, with no
+divergence in pitch, onset, duration or lyric. Synthesizer V accepts all 2645;
+OpenUtau accepts 2613, refusing 30 for a held syllable across a gap and 2 for a
+rhythm its fixed 480-tick grid cannot state. Files OpenUtau would refuse to
+open: 0, previously 25. Lanes sounding two notes at once: 0, previously 21.
+
 ## [0.5.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.9...v0.5.0) (2026-07-29)
 
 
