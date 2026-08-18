@@ -281,7 +281,7 @@ The OpenUtau target also refuses, for reasons that are not about timing:
 | Refusal | Why |
 |---|---|
 | A note under 10 OpenUtau ticks | `UNote.Validate` does `duration = Math.Max(10, duration)` and would silently lengthen it |
-| Two overlapping notes in one lane | One `voice_part` is monophonic; OpenUtau sets `OverlapError` on the later note instead of singing it |
+| Two overlapping notes in one lane | One `voice_part` is monophonic; OpenUtau sets `OverlapError` on the later note instead of singing it. A converted source never reaches this: the projection splits simultaneity into lanes and refuses what it cannot |
 | A held syllable or split on a note that does not touch its predecessor | `UVoicePart.Validate` wires a continuation only when `Prev.End == position`; otherwise the marker reaches the phonemizer and is sung as a word |
 | A position beyond the 32-bit tick range | Every USTX tick field is a C# `int` |
 

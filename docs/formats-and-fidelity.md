@@ -145,12 +145,21 @@ Both targets refuse a position or duration that does not divide exactly into
 their own grid, and report the offending MIDI tick and PPQ. Verse leaves the
 source untouched and never rounds.
 
+Before either target is asked, the projection refuses a lane holding two notes
+that sound at once. A vocal lane is monophonic in both, and every adapter
+decomposes simultaneity into lanes precisely so this cannot reach a target, so a
+lane that still overlaps means an adapter stopped doing that — not that one
+format is stricter than the other. The refusal names the lane and both ticks
+rather than blaming timing.
+
 OpenUtau additionally refuses:
 
 - a note whose duration falls under the 10-tick floor. `UNote.Validate` does
   `duration = Math.Max(10, duration)` and would silently lengthen it.
 - two overlapping notes in one voice part. One `voice_part` is monophonic and
-  OpenUtau sets `OverlapError` on the later note instead of singing it.
+  OpenUtau sets `OverlapError` on the later note instead of singing it. The
+  projection refuses this first, so the check stands for a project built through
+  the public API rather than for a converted source.
 - a held syllable or syllable split on a note that does not begin exactly where
   its predecessor ends, including such a marker on the first note of a lane.
 - a position or a position-plus-duration beyond the C# `int` range every USTX
@@ -254,7 +263,16 @@ A Synthesizer V vocal track is monophonic, and so is one OpenUtau `voice_part`,
 so a source track that sounds two notes at once is split into one lane per
 simultaneous voice — the same decomposition score importers apply to a chord.
 Splitting is driven by sounding overlap alone: a track that never overlaps is
-projected unchanged.
+projected unchanged, byte for byte.
+
+Every source family runs the same split, and runs it before the source topology
+is derived so the extra lanes are counted rather than hidden. A score adapter
+buckets by staff, voice and chord member, none of which stops one bucket from
+stacking two notes: a MusicXML `<backup>` written without `<voice>`, a MuseScore
+`<location>` that rewinds inside a voice, and a tie whose merged head passes the
+following onset all produce one. A note stating no playback pitch sounds nothing
+and occupies no voice, so a tie tail kept only for its source identity never
+splits a lane.
 
 This matters beyond tidiness. A karaoke syllable landing on a stack of notes has
 no single note to own, and used to be dropped as ambiguous. Split into voices,
