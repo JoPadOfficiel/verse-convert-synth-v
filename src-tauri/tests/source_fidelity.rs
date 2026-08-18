@@ -356,3 +356,76 @@ fn supplied_musicxml_percussion_gate_when_configured() {
                 && instrument.midi_unpitched.is_some()
         }));
 }
+
+/// A Soft Karaoke exporter may write the same words twice, once as the Text
+/// stream the format is built around and once as MIDI lyric events. Counting
+/// both made the file report twice the words it has, so a project singing every
+/// one of them still read as having dropped half. Where the two disagree the
+/// loser used to vanish with nothing said.
+#[test]
+fn a_track_writing_its_words_in_both_encodings_states_them_once() {
+    fn meta(kind: u8, text: &str) -> Vec<u8> {
+        let mut out = vec![0x00, 0xff, kind, text.len() as u8];
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    for (karaoke, duplicate) in [("Hel", "Hel"), ("Hel", "WRONG")] {
+        let mut track = Vec::new();
+        track.extend(meta(0x01, "@KMIDI"));
+        track.extend(meta(0x01, &format!("\\{karaoke}")));
+        track.extend(meta(0x05, duplicate));
+        track.extend([0x00, 0x90, 60, 64]);
+        track.extend([0x83, 0x60, 0x80, 60, 0]);
+        track.extend(meta(0x01, "lo"));
+        track.extend(meta(0x05, "lo"));
+        track.extend([0x00, 0x90, 62, 64]);
+        track.extend([0x83, 0x60, 0x80, 62, 0]);
+        track.extend([0x00, 0xff, 0x2f, 0x00]);
+
+        let outcome = convert_auto(&smf(&track), "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let stated: usize = outcome
+            .tracks
+            .iter()
+            .map(|report| report.lyric_status.source_text_count)
+            .sum();
+        assert_eq!(
+            (stated, outcome.placed),
+            (2, 2),
+            "two words written twice are two words, and both are sung"
+        );
+
+        let project = outcome.svp.as_ref().expect("a projection");
+        let sung: Vec<String> = project
+            .tracks
+            .iter()
+            .flat_map(|lane| &lane.notes)
+            .map(|note| match &note.lyric {
+                verse_lib::engine::projection::ProjectedLyric::Source(lyric) => {
+                    match &lyric.state {
+                        LyricState::Text(text) => text.clone(),
+                        other => format!("{other:?}"),
+                    }
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            sung,
+            vec![karaoke.to_string(), "lo".to_string()],
+            "the karaoke stream is the one this file is built around"
+        );
+
+        let codes: Vec<&str> = outcome
+            .tracks
+            .iter()
+            .flat_map(|report| report.warnings.iter())
+            .map(|warning| warning.code.as_str())
+            .collect();
+        assert!(
+            codes.contains(&"TWO_LYRIC_ENCODINGS"),
+            "choosing between two encodings is never silent: {codes:?}"
+        );
+    }
+}

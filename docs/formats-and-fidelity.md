@@ -253,6 +253,15 @@ export—use the same extension-aware snapshot parser.
 - Generic Text meta events (`0x01`) as metadata.
 - UTF-8 text with Windows-1252 fallback while retaining raw bytes.
 
+### Two encodings on one track
+
+A Soft Karaoke exporter may write the same words twice: once as the Text stream
+the format is built around, and once as MIDI lyric events. The karaoke stream is
+the one sung — it is what the file is built around and what carries its line
+controls — and the duplicate stays in the preserved source. The words are
+counted once, so a file no longer reports twice the words it holds, and the
+choice is reported under `TWO_LYRIC_ENCODINGS` rather than made in silence.
+
 ### Soft Karaoke qualification
 
 Text events become karaoke lyrics only when their own physical source track

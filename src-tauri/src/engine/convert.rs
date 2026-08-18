@@ -292,6 +292,43 @@ pub(crate) fn karaoke_text_lyric(
     Some(lyric)
 }
 
+/// The one encoding a track's own words are read from, when it states two.
+///
+/// A Soft Karaoke file writes its words as Text and some exporters add a Lyric
+/// meta event carrying the same words again, so a track can hold both. The
+/// karaoke stream is the one the file is built around and the one that carries
+/// its line controls, so it wins; the duplicate would otherwise be counted as
+/// extra source words the project then appears to have dropped, and where the
+/// two disagree the loser vanished with nothing said. Reported under
+/// [`TWO_LYRIC_ENCODINGS`].
+fn own_lyric_tokens(tokens: &[TimedLyric]) -> Vec<&TimedLyric> {
+    let karaoke_text = tokens
+        .iter()
+        .any(|token| token.origin == TimedLyricOrigin::KaraokeText);
+    let midi_lyric = tokens
+        .iter()
+        .any(|token| token.origin == TimedLyricOrigin::MidiLyric);
+    tokens
+        .iter()
+        .filter(|token| {
+            !(karaoke_text && midi_lyric) || token.origin == TimedLyricOrigin::KaraokeText
+        })
+        .collect()
+}
+
+/// Whether a track states its own words twice, once in each MIDI encoding.
+fn states_two_lyric_encodings(tokens: &[TimedLyric]) -> bool {
+    tokens
+        .iter()
+        .any(|token| token.origin == TimedLyricOrigin::KaraokeText)
+        && tokens
+            .iter()
+            .any(|token| token.origin == TimedLyricOrigin::MidiLyric)
+}
+
+/// Reported when one track writes its words in both MIDI lyric encodings.
+pub const TWO_LYRIC_ENCODINGS: &str = "TWO_LYRIC_ENCODINGS";
+
 /// Generic MIDI Text is metadata. It is considered lyric material only under
 /// evidence carried by this exact track.
 fn track_tokens(track: &Track) -> Vec<TimedLyric> {
@@ -926,7 +963,11 @@ pub fn convert_midi_with_target(
     for (index, track) in midi.tracks.iter().enumerate() {
         let notes = &notes_by_track[index];
         let source_note_count = source_note_count(track);
-        let own_tokens = &tokens_by_track[index];
+        let all_tokens = &tokens_by_track[index];
+        let two_encodings = states_two_lyric_encodings(all_tokens);
+        let own_tokens: Vec<TimedLyric> =
+            own_lyric_tokens(all_tokens).into_iter().cloned().collect();
+        let own_tokens = &own_tokens;
         let source_binding = external.binding_for_source(index);
         let source_binding_active = source_binding.filter(|binding| {
             overrides.and_then(|map| map.get(&binding.target_track).copied()) != Some(false)
@@ -1127,6 +1168,14 @@ pub fn convert_midi_with_target(
                      first, so both words claim verse 1 and only the first is sung; the other \
                      stays in the source. Number the second verse in the score to sing it."
                 ),
+                &track.id,
+            ));
+        }
+        if two_encodings {
+            warnings.push(report_warning(
+                TWO_LYRIC_ENCODINGS,
+                DiagnosticSeverity::Info,
+                "This track writes its words twice, once as Soft Karaoke text and once as MIDI                  lyric events. The karaoke stream is the one this file is built around and the                  one carrying its line controls, so it is the one sung; the duplicate stays in                  the preserved source. Where the two disagree, the karaoke text is what you                  will hear.",
                 &track.id,
             ));
         }
@@ -1695,6 +1744,9 @@ fn source_note_count(track: &Track) -> usize {
 }
 
 fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
+    // Counted once even when the track writes its words twice, or the file
+    // would report source words the project then appears to have dropped.
+    let duplicated_encoding = states_two_lyric_encodings(&track_tokens(track));
     let mut source_text_count = 0usize;
     let mut explicit_empty_count = 0usize;
     let mut continuation_count = 0usize;
@@ -1715,6 +1767,7 @@ fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
                     count(lyric);
                 }
             }
+            Kind::Lyrics(_) if duplicated_encoding => {}
             Kind::Lyrics(lyric) if !midi::is_midi_lyric_line_break(&lyric.raw) => count(lyric),
             Kind::Text(_) if track.text_profile == MidiTextProfile::Generic => {
                 generic_text_count += 1
@@ -1729,6 +1782,7 @@ fn lyric_status(track: &Track, projected_text_count: usize) -> LyricStatus {
                     count(&lyric);
                 }
             }
+
             _ => {}
         }
     }
