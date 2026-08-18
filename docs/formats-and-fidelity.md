@@ -352,7 +352,13 @@ it has; a stem running past the end of the whole score is still refused.
   extension state.
 - Chords represented as technical monophonic lanes under one source voice.
 - Grace-note and unpitched evidence preserved without fallback pitch.
-- MusicXML start/stop tie chains merged into the editable projection.
+- MusicXML start/stop tie chains merged into the editable projection, and only
+  where the head ends exactly where the tail begins. A `<tie>` reopened across a
+  rest or a repeat jump states no sustain, so the two stay separate notes rather
+  than the head being stretched over the silence between them — the same
+  contiguity evidence the MuseScore adapter requires. A `<tie type="stop">` whose
+  start never arrived keeps its own pitch: nothing sustains it, so it is a note
+  of its own.
 - Repeats, voltas, and supported D.S./D.C./Coda/Fine playback expansion.
 - Exact common PPQ derived from local `<divisions>` values when it fits the
   supported range.
