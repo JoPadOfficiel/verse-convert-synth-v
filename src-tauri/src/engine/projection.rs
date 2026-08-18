@@ -38,6 +38,41 @@ impl ProjectedProject {
         ordered.sort_by_key(|tempo| tempo.discovery_index);
         ordered
     }
+
+    /// The first lane holding two notes at once, described by source track and
+    /// both ticks, or `None` when every lane is monophonic.
+    ///
+    /// [`ProjectedTrack`] claims monophony and every producer establishes it, so
+    /// this proves the claim rather than repairing it: a lane that still overlaps
+    /// here means an adapter stopped decomposing simultaneity, and no target can
+    /// make that right. One Synthesizer V group and one OpenUtau voice part are
+    /// each monophonic, and only one of the two says so — OpenUtau refuses the
+    /// export while Synthesizer V writes the stack and sings one note of it.
+    pub fn monophony_violation(&self) -> Option<String> {
+        for track in &self.tracks {
+            // Sorted because this is asked of any projection, including one a
+            // caller built by hand; a producer's own order is not the contract.
+            let mut spans: Vec<(u32, u32)> = track
+                .notes
+                .iter()
+                .map(|note| (note.onset_ticks, note.duration_ticks))
+                .collect();
+            spans.sort_by_key(|(onset, _)| *onset);
+            for pair in spans.windows(2) {
+                // Widened because a lane's last note may legitimately end past
+                // the tick range, and an overflow here would abort on analysis.
+                let end = u64::from(pair[0].0) + u64::from(pair[0].1);
+                if end > u64::from(pair[1].0) {
+                    return Some(format!(
+                        "the note at MIDI tick {} on source track {} still sounds at tick {}, \
+                         where the next note of the same lane begins",
+                        pair[0].0, track.source_track_id, pair[1].0
+                    ));
+                }
+            }
+        }
+        None
+    }
 }
 
 /// A meter change, carried as a bar index because that is what the source
@@ -149,5 +184,72 @@ impl ProjectedLyric {
             ProjectedLyric::Source(source) => !matches!(source.state, LyricState::ExplicitEmpty),
             ProjectedLyric::Absent => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(onset_ticks: u32, duration_ticks: u32, pitch: u8) -> ProjectedNote {
+        ProjectedNote {
+            onset_ticks,
+            duration_ticks,
+            pitch,
+            lyric: ProjectedLyric::Absent,
+        }
+    }
+
+    fn lane(notes: Vec<ProjectedNote>) -> ProjectedProject {
+        ProjectedProject {
+            ticks_per_beat: 480,
+            tracks: vec![ProjectedTrack {
+                name: "Voice".into(),
+                source_track_id: "voice".into(),
+                muted: false,
+                notes,
+            }],
+            ..ProjectedProject::default()
+        }
+    }
+
+    /// Two notes sounding at once in one lane is what a score adapter used to
+    /// hand over before it decomposed simultaneity. Synthesizer V accepts the
+    /// stack and sings one note of it, so nothing downstream reports the loss.
+    #[test]
+    fn a_lane_sounding_two_notes_at_once_is_reported_with_both_ticks() {
+        let project = lane(vec![note(0, 480, 60), note(240, 480, 64)]);
+        assert_eq!(
+            project.monophony_violation().as_deref(),
+            Some(
+                "the note at MIDI tick 0 on source track voice still sounds at tick 240, where \
+                 the next note of the same lane begins"
+            )
+        );
+    }
+
+    /// A note ending exactly where the next begins is the ordinary shape of a
+    /// sung line, and of every continuation marker: both targets require the
+    /// two to touch, so touching must never read as an overlap.
+    #[test]
+    fn notes_that_touch_are_not_sounding_at_once() {
+        let project = lane(vec![note(0, 480, 60), note(480, 480, 64)]);
+        assert_eq!(project.monophony_violation(), None);
+    }
+
+    /// Asked of any projection, including one built by hand through the public
+    /// API, so the producer's own ordering cannot hide a stack.
+    #[test]
+    fn an_overlap_is_found_whatever_order_the_projection_held() {
+        let project = lane(vec![note(240, 480, 64), note(0, 480, 60)]);
+        assert!(project.monophony_violation().is_some());
+    }
+
+    /// A lane's last note may legitimately end past the tick range; computing
+    /// its end in the same width would abort the process during analysis.
+    #[test]
+    fn a_note_ending_past_the_tick_range_is_measured_without_overflowing() {
+        let project = lane(vec![note(u32::MAX - 1, 480, 60)]);
+        assert_eq!(project.monophony_violation(), None);
     }
 }

@@ -136,7 +136,7 @@ pub fn serialize_to(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::midi::Lyric;
+    use crate::engine::midi::{Lyric, LyricState};
     use crate::engine::projection::{
         ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedTempo, ProjectedTrack,
     };
@@ -168,6 +168,30 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn note(
+        onset_ticks: u32,
+        duration_ticks: u32,
+        pitch: u8,
+        lyric: ProjectedLyric,
+    ) -> ProjectedNote {
+        ProjectedNote {
+            onset_ticks,
+            duration_ticks,
+            pitch,
+            lyric,
+        }
+    }
+
+    fn source(id: &str, text: &str) -> ProjectedLyric {
+        ProjectedLyric::Source(Box::new(Lyric::text(id, text.into())))
+    }
+
+    fn stated(id: &str, text: &str, state: LyricState) -> ProjectedLyric {
+        let mut lyric = Lyric::text(id, text.into());
+        lyric.state = state;
+        ProjectedLyric::Source(Box::new(lyric))
     }
 
     /// The serde values are a protocol contract with the webview: renaming one
@@ -271,6 +295,66 @@ mod tests {
         assert_eq!(
             LYRIC_REINTERPRETED_BY_TARGET, "LYRIC_REINTERPRETED_BY_TARGET",
             "the code is a machine-stable protocol value"
+        );
+    }
+
+    /// The one place both marker vocabularies are visible at once.
+    ///
+    /// Synthesizer V spells a held syllable `-` and a syllable split `+`;
+    /// OpenUtau spells the hold `+~` and the split `+`. So `+` means the split
+    /// in both while `-` and `+~` each mean the hold in one, and a target that
+    /// carried rendered text instead of `LyricState` would turn every hold into
+    /// a split in the other. Each target's own module pins its own strings;
+    /// nothing but this test can see that the two are not swapped.
+    #[test]
+    fn the_two_marker_vocabularies_agree_on_the_split_and_never_on_the_hold() {
+        let mut project = projected();
+        project.tracks[0].notes = vec![
+            note(0, 480, 60, source("word", "sing")),
+            note(
+                480,
+                480,
+                62,
+                stated("held", "sing", LyricState::Continuation),
+            ),
+            note(
+                960,
+                480,
+                64,
+                stated("split", "ing", LyricState::SyllableSplit),
+            ),
+        ];
+
+        let svp = String::from_utf8(serialize_to(ExportTarget::Svp, &project).expect("writes"))
+            .expect("Synthesizer V is UTF-8");
+        let ustx = String::from_utf8(serialize_to(ExportTarget::Ustx, &project).expect("writes"))
+            .expect("OpenUtau is UTF-8");
+
+        assert!(
+            svp.contains(r#""lyrics":"-""#),
+            "the hold is `-` here: {svp}"
+        );
+        assert!(
+            ustx.contains(r#"lyric: "+~""#),
+            "the hold is `+~` here: {ustx}"
+        );
+        assert!(
+            svp.contains(r#""lyrics":"+""#),
+            "the split is `+` here: {svp}"
+        );
+        assert!(
+            ustx.contains(r#"lyric: "+""#),
+            "the split is `+` here: {ustx}"
+        );
+
+        // The swap that would corrupt one target while leaving the other clean.
+        assert!(
+            !svp.contains(r#""lyrics":"+~""#),
+            "`+~` is OpenUtau's marker and asserts a hold Synthesizer V never reads: {svp}"
+        );
+        assert!(
+            !ustx.contains(r#"lyric: "-""#),
+            "`-` is Synthesizer V's marker and would be sung as a word here: {ustx}"
         );
     }
 }

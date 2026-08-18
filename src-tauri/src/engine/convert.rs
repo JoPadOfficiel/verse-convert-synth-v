@@ -1265,6 +1265,14 @@ pub fn convert_midi_with_target(
     // bundle could only hold a `.svp`; keeping that would offer a bundle button for
     // a source the bundle then refuses, which is the failure this whole block
     // exists to prevent.
+    // Asked before any target, and with its own wording, because a lane that
+    // sounds two notes at once is neither target's doing: both are monophonic,
+    // and the adapters decompose simultaneity into lanes so this cannot reach
+    // them. Only Synthesizer V would accept it, and it would sing one note of
+    // the stack.
+    if let Some(violation) = projected.monophony_violation() {
+        return fail(format!("a projection lane is not monophonic: {violation}"));
+    }
     if let Err(error) = crate::engine::target::validate_for(target, &projected) {
         // Synthesizer V keeps 0.4.9's wording verbatim, because every refusal it
         // can raise really is a timing refusal. OpenUtau also refuses a syllable
