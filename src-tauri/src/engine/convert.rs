@@ -717,6 +717,84 @@ fn project_track(
     }
 }
 
+/// Splits one projected lane into monophonic lanes, one per simultaneous voice.
+///
+/// A vocal lane is monophonic in both targets: Synthesizer V sings one note of a
+/// stack and OpenUtau marks the later note `OverlapError` and sings neither. The
+/// source states staff, voice and chord member, none of which stops one of them
+/// from sounding two notes at once — a `<backup>` written without a `<voice>`, a
+/// `<location>` that rewinds inside a voice, a tie whose merged head passes the
+/// following onset.
+///
+/// Done on the projected lane rather than on the source track because only a
+/// lane that is actually sung has to be monophonic. Splitting every source track
+/// instead added lanes to 449 corpus scores, 418 of which gained no sung note at
+/// all: a piano part decomposed into voices nobody will sing.
+///
+/// A note moves lane and changes in no other way — same pitch, instant, length
+/// and word.
+fn split_simultaneous_voices(track: ProjectedTrack) -> Vec<ProjectedTrack> {
+    let mut lanes: Vec<Vec<ProjectedNote>> = Vec::new();
+    let mut previous_lane: Option<usize> = None;
+    for note in track.notes {
+        // Widened because a lane's last note may end past the tick range.
+        let onset = u64::from(note.onset_ticks);
+        // A continuation marker carries the previous note's syllable, and every
+        // target needs the two to touch — OpenUtau refuses the export outright
+        // and Synthesizer V would rebind the hold to whatever note was left in
+        // front of it. So the marker follows the note it leans on into whatever
+        // lane that note took, rather than the first lane that happens to be
+        // free. A source that stacks the marker on top of its own predecessor
+        // is contradictory, and the target says so.
+        let held = note.lyric.continues_previous_note();
+        let fits = |lane: &Vec<ProjectedNote>| {
+            lane.last().is_none_or(|last| {
+                u64::from(last.onset_ticks) + u64::from(last.duration_ticks) <= onset
+            })
+        };
+        // Where that lane is already sounding, the source has stacked a marker
+        // on its own predecessor. Forcing it there would leave the lane holding
+        // two notes at once, which is the one thing this function exists to
+        // prevent, so it takes a free lane and the target reports the marker.
+        let free = previous_lane
+            .filter(|lane| held && lanes.get(*lane).is_some_and(fits))
+            .or_else(|| lanes.iter().position(fits));
+        previous_lane = Some(match free {
+            Some(lane) => {
+                lanes[lane].push(note);
+                lane
+            }
+            None => {
+                lanes.push(vec![note]);
+                lanes.len() - 1
+            }
+        });
+    }
+    if lanes.len() <= 1 {
+        return vec![ProjectedTrack {
+            notes: lanes.pop().unwrap_or_default(),
+            ..track
+        }];
+    }
+    lanes
+        .into_iter()
+        .enumerate()
+        .map(|(index, notes)| ProjectedTrack {
+            name: if index == 0 {
+                track.name.clone()
+            } else {
+                format!("{} — voice {}", track.name, index + 1)
+            },
+            source_track_id: track.source_track_id.clone(),
+            muted: track.muted,
+            notes,
+        })
+        .collect()
+}
+
+/// Reported when a projected lane sounded two notes at once and was decomposed.
+pub const SIMULTANEOUS_VOICES_SPLIT: &str = "SIMULTANEOUS_VOICES_SPLIT";
+
 /// The suffix that names a lane's untexted companion, in the same shape as the
 /// verse-lane suffix `project_track`'s caller builds.
 /// Reported when a lane left notes out of the project because the source never
@@ -1046,6 +1124,7 @@ pub fn convert_midi_with_target(
         let sing = explicit_override.unwrap_or(source_vocal);
         let mut placed = 0usize;
         let mut untexted_left_out = 0usize;
+        let mut simultaneous_voices = 0usize;
         let mut lyric_diagnostics: Vec<Diagnostic> = Vec::new();
         if sing {
             let no_assignment = HashMap::new();
@@ -1090,7 +1169,9 @@ pub fn convert_midi_with_target(
                 let (sung_track, left_out) = drop_untexted(projected_track);
                 untexted_left_out += left_out;
                 if !sung_track.notes.is_empty() {
-                    projected_tracks.push(sung_track);
+                    let voices = split_simultaneous_voices(sung_track);
+                    simultaneous_voices = simultaneous_voices.max(voices.len());
+                    projected_tracks.extend(voices);
                 }
             }
         }
@@ -1167,6 +1248,20 @@ pub fn convert_midi_with_target(
                      The source numbers a verse with its own field and omits it only for the \
                      first, so both words claim verse 1 and only the first is sung; the other \
                      stays in the source. Number the second verse in the score to sing it."
+                ),
+                &track.id,
+            ));
+        }
+        if simultaneous_voices > 1 {
+            warnings.push(report_warning(
+                SIMULTANEOUS_VOICES_SPLIT,
+                DiagnosticSeverity::Info,
+                format!(
+                    "This line sounds up to {simultaneous_voices} notes at once, so it is sung as \
+                     {simultaneous_voices} lanes of one voice each. A vocal track sings one note \
+                     at a time in both targets: Synthesizer V would sing one note of the stack \
+                     and OpenUtau would mark the others as overlapping and sing none. Every note \
+                     keeps its own pitch, instant, length and word."
                 ),
                 &track.id,
             ));
@@ -2083,6 +2178,69 @@ mod tests {
             .iter()
             .map(|note| (note.onset_ticks, note.pitch))
             .collect()
+    }
+
+    /// A vocal lane is monophonic in both targets, so a lane that sounds two
+    /// notes at once is decomposed into one lane per voice. Nothing about a note
+    /// changes: it moves lane, keeping its pitch, instant, length and word.
+    #[test]
+    fn a_lane_sounding_two_notes_at_once_is_decomposed_into_one_lane_per_voice() {
+        let stacked = ProjectedTrack {
+            name: "Voice".into(),
+            source_track_id: "voice".into(),
+            muted: false,
+            notes: vec![
+                ProjectedNote {
+                    onset_ticks: 0,
+                    duration_ticks: 480,
+                    pitch: 60,
+                    lyric: word(),
+                },
+                ProjectedNote {
+                    onset_ticks: 0,
+                    duration_ticks: 480,
+                    pitch: 64,
+                    lyric: word(),
+                },
+                ProjectedNote {
+                    onset_ticks: 480,
+                    duration_ticks: 480,
+                    pitch: 67,
+                    lyric: word(),
+                },
+            ],
+        };
+        let lanes = split_simultaneous_voices(stacked);
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].name, "Voice");
+        assert_eq!(lanes[1].name, "Voice — voice 2");
+        assert_eq!(placement(&lanes[0]), vec![(0, 60), (480, 67)]);
+        assert_eq!(placement(&lanes[1]), vec![(0, 64)]);
+        for lane in &lanes {
+            assert_eq!(lane.source_track_id, "voice", "provenance is unchanged");
+            assert!(lane.notes.iter().all(|note| note.lyric == word()));
+        }
+    }
+
+    /// Touching is not overlapping. A sung line is a chain of notes that end
+    /// where the next begins, and every continuation marker needs exactly that,
+    /// so splitting there would break the hold the source states.
+    #[test]
+    fn notes_that_touch_stay_in_one_lane() {
+        let line = lane(&[(0, 480, word()), (480, 480, word()), (960, 480, word())]);
+        let lanes = split_simultaneous_voices(line);
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].notes.len(), 3);
+    }
+
+    /// Three notes at one instant need three lanes, and the third must not be
+    /// folded back onto a lane that is still sounding.
+    #[test]
+    fn a_three_note_stack_becomes_three_lanes() {
+        let chord = lane(&[(0, 480, word()), (0, 480, word()), (0, 480, word())]);
+        let lanes = split_simultaneous_voices(chord);
+        assert_eq!(lanes.len(), 3);
+        assert!(lanes.iter().all(|lane| lane.notes.len() == 1));
     }
 
     #[test]

@@ -2,10 +2,10 @@
 //! Produces the same intermediate `Midi` structure as the MIDI parser, so the
 //! whole multi-track conversion logic can be reused.
 use crate::engine::midi::{
-    merge_measure_marks, split_polyphonic_tracks, unroll, Event, InstrumentInfo, Jump, Kind, Lyric,
-    LyricExtension, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff,
-    NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice,
-    Syllabic, TimeBase, Track, TrackRoleHint, TrackSource, UnpitchedInfo,
+    merge_measure_marks, unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricExtension,
+    LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource,
+    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track,
+    TrackRoleHint, TrackSource, UnpitchedInfo,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -1634,11 +1634,6 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
             staves: Vec::new(),
         });
     }
-    // Every projection lane must be monophonic, and the source states staff,
-    // voice and chord member but not that a bucket sounds one note at a time.
-    // Splitting before the topology is derived is what makes the extra lanes
-    // counted rather than hidden.
-    let tracks = split_polyphonic_tracks(tracks)?;
     let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
     Ok(Midi {
         ticks_per_beat: tpb,
