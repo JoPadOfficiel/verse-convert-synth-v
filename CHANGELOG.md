@@ -5,6 +5,18 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.6.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.5.0...v0.6.0) (2026-08-18)
+
+
+### Bug Fixes
+
+* one monophonic lane per voice, and an OpenUtau file that opens and sings ([#25](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/25)) ([7741de7](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/7741de79de2c4ad44a2c287283602582edab0f5c))
+
+
+### Miscellaneous Chores
+
+* release 0.6.0 ([a4f2136](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/a4f2136918d661a26ef232ea06536ca0df95bc66))
+
 ## [0.5.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.4.9...v0.5.0) (2026-07-29)
 
 
