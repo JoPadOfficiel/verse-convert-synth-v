@@ -351,6 +351,10 @@ it has; a stem running past the end of the whole score is still refused.
 - Multiple lyric lanes/verses, syllabic state, elisions, `time-only`, and
   extension state.
 - Chords represented as technical monophonic lanes under one source voice.
+- Lyric extensions stated as a tick count, as an exact fraction of a whole note,
+  or as both. A fraction alone is derived on the relationship every score
+  stating both units agrees on, and refused rather than rounded where the
+  division cannot state it exactly.
 - Grace-note and unpitched evidence preserved without fallback pitch.
 - MusicXML start/stop tie chains merged into the editable projection, and only
   where the head ends exactly where the tail begins. A `<tie>` reopened across a

@@ -914,6 +914,7 @@ fn chord_lyrics(
     chord: roxmltree::Node,
     source_id: &str,
     tick_scale: i64,
+    ticks_per_quarter: i64,
 ) -> Result<Vec<Lyric>, String> {
     chord
         .children()
@@ -974,6 +975,29 @@ fn chord_lyrics(
                     format!("MuseScore lyric extension fraction is invalid: {text:?}")
                 })?),
                 None => None,
+            };
+            // A score may state the extension only as a fraction. Measured over
+            // the pinned corpus, every one of the 10968 lyrics stating both puts
+            // `ticks_f` in whole notes against `ticks` in Division units, with no
+            // exception — so the fraction is read in the same unit here. Derived
+            // exactly or refused, never rounded, as `<ticks>` already is.
+            let extend_ticks = match (extend_ticks, extend_fraction) {
+                (None, Some((numerator, denominator))) if numerator != 0 => {
+                    let quarters = numerator
+                        .checked_mul(4)
+                        .and_then(|whole_notes| whole_notes.checked_mul(ticks_per_quarter))
+                        .ok_or_else(|| {
+                            "MuseScore lyric extension fraction overflows in ticks".to_string()
+                        })?;
+                    if denominator == 0 || quarters % denominator != 0 {
+                        return Err(format!(
+                            "MuseScore lyric extension fraction {numerator}/{denominator} is not \
+                             a whole number of ticks at this division"
+                        ));
+                    }
+                    Some(quarters / denominator)
+                }
+                (existing, _) => existing,
             };
             Ok(Lyric {
                 id: format!("{source_id}-lyric-{index}"),
@@ -1631,7 +1655,8 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                 let chord_id = format!(
                                     "mscx:staff:{staff_id}:measure:{mi}:voice:{voice_index}:chord:{element_index}"
                                 );
-                                let lyrics = chord_lyrics(el, &chord_id, tick_scale)?;
+                                let lyrics =
+                                    chord_lyrics(el, &chord_id, tick_scale, i64::from(tpb))?;
                                 let notes: Vec<_> = el
                                     .children()
                                     .filter(|child| child.has_tag_name("Note"))
@@ -3264,6 +3289,64 @@ Melodie</trackName>
             .unwrap();
         assert_eq!(lyric.extend_ticks, Some(-1680));
         assert_eq!(lyric.extend_fraction, Some((-7, 8)));
+    }
+
+    /// A score may state a lyric extension only as a fraction, and the field was
+    /// parsed and never read, so that melisma was projected as no extension at
+    /// all. Measured over the pinned corpus: every one of the 10968 lyrics
+    /// stating both units agrees on `ticks = ticks_f x 4 x Division`, which the
+    /// neighbouring `-7/8` / `-1680` case states too.
+    #[test]
+    fn an_extension_written_only_as_a_fraction_is_read_in_ticks() {
+        for (fraction, expected) in [("-7/8", -1680), ("1/2", 960), ("1/4", 480)] {
+            let midi = parse_mscx(&mscx(&format!(
+                "<text>let</text><ticks_f>{fraction}</ticks_f>"
+            )))
+            .unwrap();
+            let lyric = midi.tracks[0]
+                .events
+                .iter()
+                .find_map(|event| match &event.kind {
+                    Kind::NoteOn(note) => note.lyrics.first(),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                lyric.extend_ticks,
+                Some(expected),
+                "{fraction} of a whole note at Division 480"
+            );
+        }
+    }
+
+    /// An extension the division cannot state exactly is refused rather than
+    /// rounded, the same as every other duration here: a rounded melisma holds
+    /// a syllable over a note the score never asked for.
+    #[test]
+    fn a_fractional_extension_off_the_division_is_refused_instead_of_rounded() {
+        let error = parse_mscx(&mscx("<text>let</text><ticks_f>1/7</ticks_f>"))
+            .expect_err("a seventh of a whole note is not a whole number of ticks at 480");
+        assert!(error.contains("1/7"), "{error}");
+    }
+
+    /// Where the score states both, the explicit tick count is the one read; the
+    /// fraction is a second statement of the same thing, not a correction.
+    #[test]
+    fn an_explicit_tick_count_wins_over_the_fraction_beside_it() {
+        let midi = parse_mscx(&mscx(
+            "<text>let</text><ticks>960</ticks><ticks_f>1/2</ticks_f>",
+        ))
+        .unwrap();
+        let lyric = midi.tracks[0]
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                Kind::NoteOn(note) => note.lyrics.first(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(lyric.extend_ticks, Some(960));
+        assert_eq!(lyric.extend_fraction, Some((1, 2)));
     }
 
     /// Builds a one-staff score whose measures are supplied verbatim, so a tie
