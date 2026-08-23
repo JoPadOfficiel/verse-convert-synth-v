@@ -31,7 +31,7 @@ not by the converter.
 | --- | --- | --- | --- |
 | Which note owns a syllable | stated on the note | resolved conservatively | none |
 | Verse lanes and numbering | stated | one text stream | none |
-| Held syllable (melisma) | `<extend>` or extension length | only when karaoke evidence qualifies | none |
+| Held syllable (melisma) | `<extend>`, extension length, or a note bracketed inside one word | only when karaoke evidence qualifies | none |
 | Part identity for the chord reading | `<instrumentId>` / `<instrument-sound>` | GM program | GM program |
 | Measures, for the per-measure verse reading | stated | none | none |
 | Repeats, voltas, D.S./Coda | stated and unrolled | none | none |
@@ -126,9 +126,11 @@ Two rules bound what counts as untexted.
 - A note is sung whenever the source asks for it to be. That includes a `humming`
   or `laughing` vocalization no target can spell — a sound the score asks for —
   and every note of a melisma the source states: a MusicXML `<extend>`, a
-  MuseScore extension length, a note the source brackets *inside* one word
-  (between the syllable that opens it and the one that closes it, with no word of
-  its own — the notes MuseScore draws its continuation dash over), or a qualified
+  MuseScore extension length, a note the source brackets *inside* one word with
+  `<syllabic>` (between the syllable that opens it and the one that closes it,
+  with no word of its own — the notes MuseScore draws its continuation dash
+  over; a hyphen inside free text states that a syllable runs on, never where
+  its word ends, so it never brackets one), or a qualified
   Soft Karaoke phrase. Those notes carry a continuation, and leaving them out
   would shorten a word the score sustains. A wordless note is bracketed only by a
   word that actually closes and whose notes all touch, so a lane's instrumental

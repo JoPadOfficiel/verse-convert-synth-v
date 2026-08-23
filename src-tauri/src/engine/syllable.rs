@@ -65,6 +65,10 @@ enum Part {
     Syllable {
         joins_previous: bool,
         joins_next: bool,
+        /// Whether `<syllabic>` states this note's place in its word. A hyphen
+        /// inside free text says a syllable runs on; it does not say where the
+        /// word ends, so it cannot bracket a wordless note.
+        stated: bool,
         core: String,
     },
     /// A note the source already states as held: a melisma inside the word. It
@@ -106,6 +110,7 @@ fn classify(note: &ProjectedNote) -> Part {
                 Part::Syllable {
                     joins_previous,
                     joins_next,
+                    stated: source.syllabic.is_some(),
                     core: core.to_string(),
                 }
             }
@@ -150,12 +155,30 @@ fn word_run(
         let Some(reach) = next_syllable(notes, parts, last) else {
             return (members, sustained, None);
         };
-        let (Part::Syllable { joins_next, .. }, Part::Syllable { joins_previous, .. }) =
-            (&parts[last], &parts[reach.syllable])
+        let (
+            Part::Syllable {
+                joins_next,
+                stated: opens_stated,
+                ..
+            },
+            Part::Syllable {
+                joins_previous,
+                stated: closes_stated,
+                ..
+            },
+        ) = (&parts[last], &parts[reach.syllable])
         else {
             return (members, sustained, None);
         };
         if !joins_next && !joins_previous {
+            return (members, sustained, None);
+        }
+        // A wordless note is inside the word only where `<syllabic>` brackets
+        // it. A hyphen in free text — all a MIDI exporter can write — states
+        // that a syllable runs on, never where the word ends, and reading a
+        // hold out of it would invent the melisma the source never claimed.
+        let brackets_the_word = *opens_stated && *closes_stated;
+        if !reach.untexted.is_empty() && !brackets_the_word {
             return (members, sustained, None);
         }
         // Neither target can carry a syllable-split marker across silence:
@@ -471,6 +494,22 @@ mod tests {
         assert_eq!(words.joined, vec!["rêves,"]);
         assert_eq!(words.sustained, 2);
         assert_eq!(sung(&notes), vec!["rêves,", "<ext>", "<ext>", "<split>"]);
+    }
+
+    /// A hyphen states that a syllable runs on, never where its word ends, so
+    /// it cannot bracket a wordless note. Reading a hold out of it would invent
+    /// the melisma a Standard MIDI file never claimed.
+    #[test]
+    fn a_hyphen_alone_never_brackets_a_wordless_note() {
+        let mut notes = vec![
+            note(0, 240, word("mi-", None)),
+            note(240, 240, ProjectedLyric::Absent),
+            note(480, 240, word("te", None)),
+        ];
+        let words = join_words(&mut notes);
+        assert!(words.joined.is_empty());
+        assert_eq!(words.sustained, 0);
+        assert_eq!(sung(&notes), vec!["mi-", "<none>", "te"]);
     }
 
     /// Only a word that closes reaches past an untexted note. A syllable whose

@@ -8,7 +8,7 @@
 //! phonemizer looks the lyric up in a pronunciation dictionary: `"mê"` and
 //! `"me"` are not the word `"même"` under any reading.
 
-use verse_lib::engine::convert::convert_midi_with_target;
+use verse_lib::engine::convert::{convert_auto_with, convert_midi_with_target};
 use verse_lib::engine::target::ExportTarget;
 use verse_lib::engine::{musescore, musicxml, target};
 
@@ -53,6 +53,37 @@ fn export(source: &str, target: ExportTarget) -> String {
     assert!(outcome.ok, "conversion refused: {:?}", outcome.msg);
     let projection = outcome.svp.as_ref().expect("a projection");
     let bytes = target::serialize_to(target, projection).expect("the target writes it");
+    String::from_utf8(bytes).expect("valid UTF-8")
+}
+
+/// One MIDI Lyric meta event.
+fn lyric(text: &[u8]) -> Vec<u8> {
+    let mut event = vec![0x00, 0xff, 0x05, text.len() as u8];
+    event.extend_from_slice(text);
+    event
+}
+
+/// One quarter note at 480 ticks per quarter, ending where the next begins.
+fn quarter(pitch: u8) -> Vec<u8> {
+    vec![0x00, 0x90, pitch, 100, 0x83, 0x60, 0x80, pitch, 0x00]
+}
+
+/// One single-track SMF at 480 ticks per quarter, closed by end-of-track.
+fn smf(events: &[Vec<u8>]) -> Vec<u8> {
+    let mut track: Vec<u8> = events.concat();
+    track.extend_from_slice(&[0x00, 0xff, 0x2f, 0x00]);
+    let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
+    data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+    data.extend_from_slice(&track);
+    data
+}
+
+/// Any supported container, detected the way the application detects it.
+fn ustx_of(data: &[u8]) -> String {
+    let outcome = convert_auto_with(data, "french", None);
+    assert!(outcome.ok, "conversion refused: {:?}", outcome.msg);
+    let bytes = target::serialize_to(ExportTarget::Ustx, outcome.svp.as_ref().unwrap())
+        .expect("the target writes it");
     String::from_utf8(bytes).expect("valid UTF-8")
 }
 
@@ -262,4 +293,105 @@ fn a_musescore_score_binds_its_syllables_the_same_way() {
     let bytes = target::serialize_to(ExportTarget::Ustx, outcome.svp.as_ref().unwrap()).unwrap();
     let file = String::from_utf8(bytes).unwrap();
     assert_eq!(ustx_lyrics(&file), vec!["minute", "+", "+"]);
+}
+
+/// A Standard MIDI file states no `<syllabic>` — a hyphen inside the lyric text
+/// is the only binding a MIDI exporter can write, and it is read the same way.
+#[test]
+fn a_standard_midi_file_binds_its_syllables_by_the_hyphen_it_writes() {
+    let file = ustx_of(&smf(&[
+        lyric(b"mi-"),
+        quarter(60),
+        lyric(b"nu-"),
+        quarter(62),
+        lyric(b"te"),
+        quarter(64),
+    ]));
+    assert_eq!(ustx_lyrics(&file), vec!["minute", "+", "+"]);
+}
+
+/// The same file without hyphens states nothing to bind, and nothing is guessed
+/// from the words themselves.
+#[test]
+fn a_standard_midi_file_without_hyphens_is_left_word_per_note() {
+    let file = ustx_of(&smf(&[
+        lyric(b"mi"),
+        quarter(60),
+        lyric(b"nu"),
+        quarter(62),
+        lyric(b"te"),
+        quarter(64),
+    ]));
+    assert_eq!(ustx_lyrics(&file), vec!["mi", "nu", "te"]);
+}
+
+/// A MIDI melisma is not stated, so the wordless note stays untexted and the
+/// word does not reach past it. `.mid` gains nothing it did not write.
+#[test]
+fn a_midi_wordless_note_never_binds_two_syllables() {
+    let file = ustx_of(&smf(&[
+        lyric(b"mi-"),
+        quarter(60),
+        quarter(62),
+        lyric(b"te"),
+        quarter(64),
+    ]));
+    assert_eq!(ustx_lyrics(&file), vec!["mi-", "te"]);
+}
+
+/// A compressed MusicXML container carries the same `<syllabic>` as the raw
+/// file, and the words it binds must survive the archive.
+#[test]
+fn a_compressed_mxl_container_binds_its_syllables() {
+    let data = std::fs::read("tests/fixtures/help.mxl").expect("the fixture is there");
+    let file = ustx_of(&data);
+    assert!(
+        file.contains("lyric: \"somebody\""),
+        "no joined word in {file:.0}"
+    );
+    assert!(file.contains("lyric: \"+\""));
+}
+
+/// Synthesizer V has to receive every shape OpenUtau does, in its own
+/// vocabulary: the word whole, `+` for each following syllable, and `-` — never
+/// `+~` — for the note the score sustains inside the word.
+#[test]
+fn synthesizer_v_receives_every_shape_in_its_own_vocabulary() {
+    let file = export(
+        &format!(
+            "{}{}{}{}{}",
+            note("C", Some("begin"), "rê"),
+            untexted("D"),
+            note("E", Some("end"), "ves"),
+            note("F", None, "au-"),
+            note("G", None, "tour")
+        ),
+        ExportTarget::Svp,
+    );
+    assert!(file.contains(r#""lyrics":"rêves""#), "{file}");
+    assert!(file.contains(r#""lyrics":"autour""#), "{file}");
+    assert_eq!(file.matches(r#""lyrics":"-""#).count(), 1, "{file}");
+    assert_eq!(file.matches(r#""lyrics":"+""#).count(), 2, "{file}");
+    assert!(!file.contains(r#""lyrics":"+~""#), "OpenUtau's hold leaked");
+}
+
+/// A rest inside the word is refused by both targets alike: Synthesizer V
+/// checks nothing and would rebind the marker to whatever note precedes it.
+#[test]
+fn synthesizer_v_leaves_a_word_a_rest_separates_as_written() {
+    let file = export(
+        &format!(
+            "{}{}{}",
+            note("C", Some("begin"), "rê"),
+            rest(),
+            note("E", Some("end"), "ves")
+        ),
+        ExportTarget::Svp,
+    );
+    assert!(file.contains(r#""lyrics":"rê""#), "{file}");
+    assert!(file.contains(r#""lyrics":"ves""#), "{file}");
+    assert!(
+        !file.contains(r#""lyrics":"+""#),
+        "a marker crossed the rest"
+    );
 }
