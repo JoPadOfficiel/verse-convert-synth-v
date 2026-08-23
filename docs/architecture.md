@@ -48,6 +48,7 @@ files, build manifests, launch processes, or commit output.
 | Projection policy | `engine/convert.rs` | Classification, lyric ownership, vocal projection, diagnostics |
 | Input adapters | `engine/midi.rs`, `musicxml.rs`, `musescore.rs` | Format-specific parsing into the shared model |
 | Projection seam | `engine/projection.rs` | Target-neutral projection in source-exact IR ticks |
+| Word reassembly | `engine/syllable.rs` | One word per run of syllables, target-neutral |
 | Target dispatch | `engine/target/mod.rs` | `ExportTarget`, the analysis gate `validate_for`, and the single write boundary `serialize_to` |
 | Target adapter | `engine/target/svp.rs` | Raw Synthesizer V project v113 serialization; blicks |
 | Target adapter | `engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 serialization; 480 ticks per quarter, and its own deterministic YAML emitter |

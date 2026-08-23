@@ -619,6 +619,7 @@ fn project_track(
     projection: TrackProjection<'_>,
 ) -> ProjectedTrack {
     let mut projected_notes = Vec::with_capacity(notes.len());
+    let mut note_ids: Vec<String> = Vec::with_capacity(notes.len());
     let replayed = replayed_note_ids(notes);
     let lane_words = lane_words_by_measure(notes);
     let mut explicit_extension_end = None;
@@ -693,24 +694,7 @@ fn project_track(
             &source_note.source,
             source_note.source_order,
         );
-        // The file will state this word exactly; the application that opens it may
-        // still read it as something else, and staying quiet about that would be
-        // silent loss. Only `LyricState::Text` is asked, so a marker Verse
-        // rendered itself is never diagnosed as a source word.
-        if let ProjectedLyric::Source(carried) = &lyric {
-            if let midi::LyricState::Text(text) = &carried.state {
-                if let Some(message) =
-                    crate::engine::target::lyric_reinterpretation(projection.target, text)
-                {
-                    projection.diagnostics.push(report_warning(
-                        crate::engine::target::LYRIC_REINTERPRETED_BY_TARGET,
-                        DiagnosticSeverity::Warning,
-                        message,
-                        &note_id,
-                    ));
-                }
-            }
-        }
+        note_ids.push(note_id.clone());
         projection.evidence.source_ids.insert(note_id);
         projection.evidence.source_ids.insert(format!(
             "event:{}:{}",
@@ -726,6 +710,81 @@ fn project_track(
             pitch,
             lyric,
         });
+    }
+    // Before anything is diagnosed: the syllables a score spreads over several
+    // notes are the word it writes, and it is that word the file will state.
+    let words = crate::engine::syllable::join_words(&mut projected_notes);
+    if !words.joined.is_empty() {
+        projection.diagnostics.push(report_warning(
+            crate::engine::syllable::SYLLABLES_JOINED_INTO_WORDS,
+            DiagnosticSeverity::Info,
+            format!(
+                "{} word{} this lane spells one syllable per note {} written whole on the first \
+                 note of the word, with a syllable-split marker on every note that follows — the \
+                 shape a phonemizer looks up. For example: {}.{}",
+                words.joined.len(),
+                if words.joined.len() == 1 { "" } else { "s" },
+                if words.joined.len() == 1 { "is" } else { "are" },
+                examples(&words.joined),
+                match words.sustained {
+                    0 => String::new(),
+                    count => format!(
+                        " {count} note{} the score writes inside one of those words with no word \
+                         of {} own {} held on the syllable in front of {}, rather than left out \
+                         of the lane.",
+                        if count == 1 { "" } else { "s" },
+                        if count == 1 { "its" } else { "their" },
+                        if count == 1 { "is" } else { "are" },
+                        if count == 1 { "it" } else { "them" },
+                    ),
+                }
+            ),
+            projection.source_track_id,
+        ));
+    }
+    if !words.separated.is_empty() {
+        projection.diagnostics.push(report_warning(
+            crate::engine::syllable::WORD_NOT_JOINED_ACROSS_A_GAP,
+            DiagnosticSeverity::Warning,
+            format!(
+                "{} word{} of this lane {} syllables the score binds but a rest separates. No \
+                 target can carry a syllable-split marker across silence, so each syllable is \
+                 written as a word of its own and will be pronounced on its own. Close the rest \
+                 in the score to have them sung as one word. For example: {}.",
+                words.separated.len(),
+                if words.separated.len() == 1 { "" } else { "s" },
+                if words.separated.len() == 1 {
+                    "holds"
+                } else {
+                    "hold"
+                },
+                examples(&words.separated)
+            ),
+            projection.source_track_id,
+        ));
+    }
+    // The file will state this word exactly; the application that opens it may
+    // still read it as something else, and staying quiet about that would be
+    // silent loss. Only `LyricState::Text` is asked, so a marker Verse rendered
+    // itself is never diagnosed as a source word, and asking after the join
+    // means the text diagnosed is the text written.
+    for (note, note_id) in projected_notes.iter().zip(&note_ids) {
+        let ProjectedLyric::Source(carried) = &note.lyric else {
+            continue;
+        };
+        let midi::LyricState::Text(text) = &carried.state else {
+            continue;
+        };
+        if let Some(message) =
+            crate::engine::target::lyric_reinterpretation(projection.target, text)
+        {
+            projection.diagnostics.push(report_warning(
+                crate::engine::target::LYRIC_REINTERPRETED_BY_TARGET,
+                DiagnosticSeverity::Warning,
+                message,
+                note_id,
+            ));
+        }
     }
     ProjectedTrack {
         name: name.to_string(),
@@ -1954,6 +2013,17 @@ fn source_role(
         TrackRoleHint::Ambiguous if has_source_vocal_evidence => SourceRole::Vocal,
         TrackRoleHint::Ambiguous => SourceRole::Ambiguous,
     }
+}
+
+/// The first few of a list, quoted, so a message names what it counted without
+/// growing with the score.
+fn examples(words: &[String]) -> String {
+    words
+        .iter()
+        .take(3)
+        .map(|word| format!("\"{word}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn report_warning(

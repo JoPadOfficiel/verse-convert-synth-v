@@ -64,6 +64,46 @@ rendered marker. A target owns its own grid, marker vocabulary, cosmetics and
 schema version, and cannot reach back into the conversion engine or change what
 the other target writes.
 
+### One word, one syllable per note
+
+A vocal score writes one syllable under each note and states which syllables
+spell one word. `engine/syllable.rs` reads that statement and writes the word
+whole on the first note of its run, with a syllable-split marker on every note
+that follows — the shape OpenUtau's own MusicXML importer produces
+(`Format/MusicXML.cs:147-149` appends each following syllable to the note that
+opened the word and writes `+` on the note itself). It matters because a
+phonemizer looks the lyric up in a pronunciation dictionary: `mê` and `me` sung
+as two words are not the word `même` under any reading, and a dictionary that
+holds neither leaves the notes unphonemized.
+
+Three notations state the binding, and all three are read:
+
+| Notation | Example | Written by |
+| --- | --- | --- |
+| `<syllabic>` begin/middle/end | `mê` + `me` | MuseScore, MusicXML |
+| A hyphen that runs on | `mi-` `nu-` `te` | MIDI exporters, hand-typed lyrics |
+| A hyphen that continues | `mi` `-nu` `-te` | the mirror convention |
+
+One side is enough: `<syllabic>` states both, while each hyphen convention marks
+only one of the two syllables. Eleven dash characters count as that hyphen,
+including the en dash and the non-breaking hyphen a word processor substitutes
+for the ASCII one. A dash that binds is a marker and never reaches the file; a
+token that is nothing but dashes, or that spells no letter at all, states
+nothing and is left exactly as written.
+
+`<syllabic>single</syllabic>` is the source saying this note carries a whole
+word, and it is believed over a stray dash inside the same text. Nothing else is
+guessed: a lane whose words already sit one per note is written unchanged, and
+mixing both notations in one phrase changes neither.
+
+Reported per lane as `SYLLABLES_JOINED_INTO_WORDS`.
+
+A word whose syllables a rest separates is **not** joined. Neither target can
+state a marker across silence — OpenUtau wires an extension only where the
+previous note ends exactly where this one begins, and would otherwise sing the
+marker as a word — so both syllables stay words of their own and the lane
+reports `WORD_NOT_JOINED_ACROSS_A_GAP`, naming the word the score spells.
+
 ### Notes the source never texts
 
 A lane the source texts usually also carries notes it never texts: an
@@ -86,9 +126,13 @@ Two rules bound what counts as untexted.
 - A note is sung whenever the source asks for it to be. That includes a `humming`
   or `laughing` vocalization no target can spell — a sound the score asks for —
   and every note of a melisma the source states: a MusicXML `<extend>`, a
-  MuseScore extension length, or a qualified Soft Karaoke phrase. Those notes
-  carry a continuation, and leaving them out would shorten a word the score
-  sustains.
+  MuseScore extension length, a note the source brackets *inside* one word
+  (between the syllable that opens it and the one that closes it, with no word of
+  its own — the notes MuseScore draws its continuation dash over), or a qualified
+  Soft Karaoke phrase. Those notes carry a continuation, and leaving them out
+  would shorten a word the score sustains. A wordless note is bracketed only by a
+  word that actually closes and whose notes all touch, so a lane's instrumental
+  tail is never absorbed into the syllable in front of it.
 - A note also stays when it is the note a continuation marker leans on: the note
   immediately before that marker in time, whether or not the two touch. A marker
   carries the *previous* note's syllable, so which note precedes it decides which
@@ -105,7 +149,9 @@ the only thing the override asked for.
 A melisma is a source claim, not a guess. Where a source states no continuation —
 most Standard MIDI files, and any `.kar` whose karaoke evidence does not qualify —
 Verse has never read a wordless note following a syllable as a held one, and does
-not invent a hold now.
+not invent a hold now. A note *inside* a word is not that case: the syllables
+either side of it are the source stating that the word runs over it, which is why
+MuseScore draws its continuation dash there and why the note is held.
 
 ### The 480-tick grid, and why a septuplet splits the two targets
 
@@ -147,7 +193,9 @@ spells the hold `+~` and the split `+`:
 So `+` means the split in both targets, while `-` and `+~` mean the hold in one
 each. A naive string substitution would turn every hold into a split. Verse
 avoids that by never carrying rendered marker text through the projection: the
-neutral projection carries `LyricState`, and each target renders it.
+neutral projection carries `LyricState`, and each target renders it. The split is
+what a multi-syllable word projects to — see “One word, one syllable per note” —
+and the hold is what a stated melisma projects to; nothing else produces either.
 
 `UVoicePart.Validate` sets `Extends` on any lyric starting with `"+"`, which
 covers both OpenUtau markers, and wires it only when `Prev.End == position`. A
@@ -379,7 +427,9 @@ it has; a stem running past the end of the whole score is still refused.
 - UTF-8/ASCII, UTF-16 LE/BE, ISO-8859-1, and Windows-1252.
 - Declared Parts, staves, voices, instruments, channels/programs, and
   percussion mapping.
-- Multiple lyric lanes/verses, syllabic state, elisions, `time-only`, and
+- Multiple lyric lanes/verses, syllabic state (read *and* projected — the
+  syllables of one word are written as one word, see “One word, one syllable per
+  note”), elisions, `time-only`, and
   extension state.
 - Chords represented as technical monophonic lanes under one source voice.
 - Lyric extensions stated as a tick count, as an exact fraction of a whole note,

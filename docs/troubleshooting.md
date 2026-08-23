@@ -115,6 +115,40 @@ OpenUtau becomes `a`**.
 If you see `a` on notes the source never texted, you opened the source in
 OpenUtau instead of opening Verse's `.ustx`.
 
+## `error` appears under the notes in OpenUtau
+
+`error` is not text Verse wrote. It is the phoneme OpenUtau substitutes when its
+phonemizer throws, and it says nothing about the lyric on the note above it.
+
+Two different failures produce it, and which one you have is decided by *how
+many* notes show it:
+
+- **Every note of the track.** The phonemizer failed to set up, once, and every
+  note group short-circuits to the same phoneme:
+  `Api/PhonemizerRunner.cs:102-117` catches whatever `SetSinger` or `SetUp`
+  throws into `SetUpException`, and `:122-131` writes
+  `phoneme = "error"` for each note group without ever calling `Process`. The
+  usual cause is a DiffSinger phonemizer pointed at a voicebank that does not
+  hold its dictionary: `DiffSingerG2pPhonemizer.LoadG2p` throws
+  `FileNotFoundException` — “No dictionary file found. Tried: …” — when neither
+  `dsdict-<lang>.yaml` nor `dsdict.yaml` is in the singer folder
+  (`DiffSinger/Phonemizers/DiffSingerG2pPhonemizer.cs:81-82`). Check OpenUtau's
+  log, then check that the phonemizer selected on the track is the one that
+  voicebank ships with. **The same `.ustx` failing on one machine and working on
+  another is this**: the file is byte-identical, the installed voicebank is not.
+- **Some notes only.** `Process` threw for those note groups
+  (`Api/PhonemizerRunner.cs:161-171`), which is about those words. Read the
+  lyric Verse wrote on the first note of the group.
+
+Verse writes `phonemizer: OpenUtau.Core.DefaultPhonemizer` and names no singer,
+because it has never seen your voicebank. OpenUtau resolves both from what you
+assign in the track header, so the phonemizer that ran is the one you chose, not
+one the file imposed.
+
+What Verse *can* get wrong here is the word: a phonemizer looks the lyric up in
+a pronunciation dictionary, and a lyric that is half a word is not in any. That
+is what “One word, one syllable per note” in `formats-and-fidelity.md` fixes.
+
 ## `la` appears where the source note is blank
 
 Current Verse does not use `la` as a fallback lyric. Synthesizer V does: it
