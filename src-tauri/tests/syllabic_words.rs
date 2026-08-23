@@ -339,17 +339,41 @@ fn a_midi_wordless_note_never_binds_two_syllables() {
     assert_eq!(ustx_lyrics(&file), vec!["mi-", "te"]);
 }
 
+/// One `.mxl`: the score inside a container, named by `META-INF/container.xml`.
+fn mxl(body: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    writer
+        .start_file("META-INF/container.xml", options)
+        .expect("container entry");
+    writer
+        .write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?><container><rootfiles>
+               <rootfile full-path="score.musicxml"/></rootfiles></container>"#,
+        )
+        .expect("container written");
+    writer
+        .start_file("score.musicxml", options)
+        .expect("score entry");
+    writer
+        .write_all(score(body).as_bytes())
+        .expect("score written");
+    writer.finish().expect("archive closed").into_inner()
+}
+
 /// A compressed MusicXML container carries the same `<syllabic>` as the raw
 /// file, and the words it binds must survive the archive.
 #[test]
 fn a_compressed_mxl_container_binds_its_syllables() {
-    let data = std::fs::read("tests/fixtures/help.mxl").expect("the fixture is there");
-    let file = ustx_of(&data);
-    assert!(
-        file.contains("lyric: \"somebody\""),
-        "no joined word in {file:.0}"
-    );
-    assert!(file.contains("lyric: \"+\""));
+    let file = ustx_of(&mxl(&format!(
+        "{}{}{}",
+        note("C", Some("begin"), "mi"),
+        note("D", Some("middle"), "nu"),
+        note("E", Some("end"), "te")
+    )));
+    assert_eq!(ustx_lyrics(&file), vec!["minute", "+", "+"]);
 }
 
 /// Synthesizer V has to receive every shape OpenUtau does, in its own
