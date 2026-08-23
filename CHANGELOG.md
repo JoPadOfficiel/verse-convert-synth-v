@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.6.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.0...v0.6.1) (2026-08-23)
+
+
+### Bug Fixes
+
+* sing the word a score spells across several notes ([#27](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/27)) ([c4674e5](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/c4674e519a7ed4c2192f5a7d99c57f339e4c4ae1))
+
 ## [0.6.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.5.0...v0.6.0) (2026-08-18)
 
 
