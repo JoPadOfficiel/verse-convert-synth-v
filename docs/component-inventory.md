@@ -124,6 +124,7 @@ resources and Tauri IPC; it does not authorize arbitrary web connections.
 | `src-tauri/src/engine/musescore.rs` | Native MSCX/MSCZ decoding into the shared model |
 | `src-tauri/src/engine/convert.rs` | Source classification, lyric ownership, diagnostics, overrides, and evidence-backed vocal projection |
 | `src-tauri/src/engine/projection.rs` | Target-neutral projection consumed by every export target, in source-exact IR ticks |
+| `src-tauri/src/engine/syllable.rs` | Reassembles the syllables a score spreads over several notes into the word they spell |
 | `src-tauri/src/engine/target/mod.rs` | `ExportTarget`, `SerializeError`, the analysis gate `validate_for`, the write boundary `serialize_to`, and the `LYRIC_REINTERPRETED_BY_TARGET` audit |
 | `src-tauri/src/engine/target/svp.rs` | Synthesizer V project v113 data model and serialization; blicks |
 | `src-tauri/src/engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 data model, the 480-tick exactness gate, the OpenUtau marker vocabulary, and a deterministic always-double-quote YAML emitter |

@@ -74,12 +74,20 @@ A notated score states, and a MIDI file cannot:
   `.kar` states words and notes separately, so ownership is resolved
   conservatively and an ambiguous word stays source-only rather than being
   guessed onto a note.
+- **which syllables spell one word.** `mê-me`, `mi-nu-te`, `j'i-rai`: a score
+  binds them with `<syllabic>`, and files a MIDI exporter writes bind them with a
+  hyphen inside the lyric. Verse reads both and writes the word whole on the
+  first note of its run, with the syllable-split marker on the notes that follow
+  — the shape a phonemizer can look up in a pronunciation dictionary. A lane
+  whose words already sit one per note is written unchanged, and the two
+  notations mix freely inside one phrase.
 - **which verse a word belongs to.** Scores stack verses under one line and
   number them, so a repeat can sing verse 2 on the second pass. MIDI has one
   stream of text.
-- **where a word is held.** A melisma is a source claim: a MusicXML `<extend>`
-  or a MuseScore extension length. Standard MIDI states no continuation, so a
-  wordless note after a syllable is read as untexted, not as a hold.
+- **where a word is held.** A melisma is a source claim: a MusicXML `<extend>`,
+  a MuseScore extension length, or a note the score writes *inside* one word with
+  no word of its own. Standard MIDI states no continuation, so a wordless note
+  after a syllable is read as untexted, not as a hold.
 - **what the part is.** `<instrumentId>` and `<instrument-sound>` decide whether
   a word under a chord is a choir harmony or a piano reduction — opposite
   readings. MIDI offers only the GM program.
@@ -234,7 +242,10 @@ instrumental audio; use the complete bundle when those parts must be audible.
   and the complete lyric stream has one unique, injective, monotonic melody
   mapping. Ambiguous or partial mappings remain source-only.
 - Generic MIDI Text is preserved as metadata.
-- Continuation markers are emitted only from source lyric-extension evidence.
+- Continuation and syllable-split markers are emitted only from source
+  evidence: a stated lyric extension, or the syllables a source binds into one
+  word. A word whose syllables a rest separates is left as written and
+  reported, because no target can state a marker across silence.
 - Unpitched percussion and data no target can represent remain in the source,
   ledger and Part/full-score audio.
 - UTF-8, UTF-16, ISO-8859-1 and Windows-1252 score XML are decoded from their

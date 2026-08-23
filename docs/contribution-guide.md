@@ -183,6 +183,7 @@ Add tests at the boundary that owns the behavior:
 | Cross-format semantic parity | `src-tauri/tests/parity.rs` |
 | Source and no-invention contract | `src-tauri/tests/source_fidelity.rs` |
 | Target-neutral projection | unit tests in `engine/projection.rs` |
+| Syllable-to-word reassembly | unit tests in `engine/syllable.rs`, end to end in `tests/syllabic_words.rs` |
 | SVP shape, blicks, or v113 compatibility | unit tests in `engine/target/svp.rs` |
 | USTX shape, 480-tick gate, markers, or YAML bytes | unit tests in `engine/target/ustx.rs` |
 | Target dispatch, gate/write agreement, protocol values | unit tests in `engine/target/mod.rs` |

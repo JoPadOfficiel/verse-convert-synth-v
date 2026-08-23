@@ -49,6 +49,7 @@ control, filesystem transactions, and persisted artifacts.
 │   │   │   ├── musescore.rs
 │   │   │   ├── musicxml.rs
 │   │   │   ├── projection.rs
+│   │   │   ├── syllable.rs
 │   │   │   └── target/
 │   │   │       ├── mod.rs
 │   │   │       ├── svp.rs

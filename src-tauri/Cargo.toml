@@ -33,5 +33,10 @@ libc = "0.2"
 base64 = "0.22"
 
 
+[dev-dependencies]
+# Already a runtime dependency; declared again so integration tests can build a
+# `.mxl` container instead of reading a fixture git never carries.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 [profile.release]
 overflow-checks = true
