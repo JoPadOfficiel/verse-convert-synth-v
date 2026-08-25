@@ -670,7 +670,11 @@ fn project_track(
             ));
             ProjectedLyric::Source(Box::new(standalone.lyric.clone()))
         } else if musicxml_extension_open
-            || explicit_extension_end.is_some_and(|end| source_note.onset < end)
+            // MuseScore measures a melisma from its syllable to the *onset* of
+            // the last note the melisma line covers, so that note lies exactly
+            // at `end` and belongs to the melisma. Reading the bound as
+            // exclusive dropped the final note of every melisma in the score.
+            || explicit_extension_end.is_some_and(|end| source_note.onset <= end)
         {
             // Continuation is emitted only from a source lyric extension.
             ProjectedLyric::Extension
@@ -3188,6 +3192,37 @@ mod tests {
   </Score>
 </museScore>"#;
         assert_eq!(sung_lyrics(xml), vec!["one", "bam", "two", "bam"]);
+    }
+
+    #[test]
+    fn a_melisma_holds_the_last_note_its_line_reaches() {
+        // MuseScore states a melisma as the distance from its syllable to the
+        // *onset* of the last note the line covers: `<ticks>960</ticks>` on a
+        // quarter-note syllable reaches the note two quarters later, and that
+        // note is the one the line ends on. Read as an exclusive bound it was
+        // left wordless and dropped from the sung lane, which is one note of
+        // every melisma in a score lost.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Voice</trackName><Staff id="1"/></Part>
+    <Staff id="1">
+      <Measure><voice>
+        <Chord><durationType>quarter</durationType>
+          <Lyrics><text>court</text><ticks>960</ticks></Lyrics>
+          <Note><pitch>60</pitch></Note>
+        </Chord>
+        <Chord><durationType>quarter</durationType><Note><pitch>62</pitch></Note></Chord>
+        <Chord><durationType>quarter</durationType><Note><pitch>64</pitch></Note></Chord>
+        <Chord><durationType>quarter</durationType><Note><pitch>65</pitch></Note></Chord>
+      </voice></Measure>
+    </Staff>
+  </Score>
+</museScore>"#;
+        // Three notes sung: the syllable and the two the melisma line reaches.
+        // The fourth begins past the line and stays wordless.
+        assert_eq!(sung_lyrics(xml), vec!["court", "-", "-"]);
     }
 
     #[test]
