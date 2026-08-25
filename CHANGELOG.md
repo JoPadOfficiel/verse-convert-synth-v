@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.6.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.1...v0.6.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* three shapes a score writes that the conversion read wrong ([#29](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/29)) ([7d4d0e8](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/7d4d0e8c10f55123e986e008411bb6bd6b7b69a1))
+
 ## [0.6.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.0...v0.6.1) (2026-08-23)
 
 
