@@ -38,6 +38,41 @@ pub fn parse(data: &[u8]) -> Result<Midi, String> {
     parse_mscx(&xml)
 }
 
+/// The Parts a MuseScore container holds, in score order, each named by the
+/// `id` MuseScore writes on it.
+///
+/// `--score-parts` answers with every part the score can be cut into *and*
+/// every excerpt already saved in the file, so a score whose author saved a
+/// two-instrument part comes back with more containers than the source has
+/// Parts. Reading what a container actually holds is what tells a
+/// one-Part excerpt apart from a saved multi-instrument one.
+///
+/// `None` for bytes that are not a readable score; a `None` entry for a Part
+/// written without an id, as MuseScore 3 writes them.
+pub fn container_part_ids(data: &[u8]) -> Option<Vec<Option<String>>> {
+    let xml = if data.len() >= 2 && &data[0..2] == b"PK" {
+        extract_mscz(data).ok()?
+    } else {
+        crate::engine::musicxml::decode_xml_bytes(data).ok()?
+    };
+    crate::engine::musicxml::check_nesting(&xml).ok()?;
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: false,
+        nodes_limit: 5_000_000,
+    };
+    let document = roxmltree::Document::parse_with_options(&xml, options).ok()?;
+    let score = document
+        .descendants()
+        .find(|node| node.has_tag_name("Score"))?;
+    Some(
+        score
+            .children()
+            .filter(|node| node.has_tag_name("Part"))
+            .map(|part| part.attribute("id").map(str::to_string))
+            .collect(),
+    )
+}
+
 fn is_mscx_path(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -2166,6 +2201,33 @@ mod tests {
             writer.write_all(bytes).unwrap();
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_container_names_the_source_parts_it_holds() {
+        let two = zipped_score(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="4.70"><Score><Division>480</Division>
+<Part id="2"><trackName>Bass</trackName></Part>
+<Part id="3"><trackName>Drums</trackName></Part>
+</Score></museScore>"#,
+        );
+        assert_eq!(
+            container_part_ids(&two),
+            Some(vec![Some("2".into()), Some("3".into())])
+        );
+
+        // MuseScore 3 writes Parts without an id, so a container written that
+        // way names nothing and cannot place itself on the source.
+        let unnamed = zipped_score(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02"><Score><Division>480</Division>
+<Part><trackName>Bass</trackName></Part>
+</Score></museScore>"#,
+        );
+        assert_eq!(container_part_ids(&unnamed), Some(vec![None]));
+
+        assert_eq!(container_part_ids(b"not a score"), None);
     }
 
     fn container(paths: &[&str]) -> String {

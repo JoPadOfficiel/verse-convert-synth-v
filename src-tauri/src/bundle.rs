@@ -1293,18 +1293,43 @@ fn midi_source_parts(
         .collect()
 }
 
+/// Where each source Part sits in `parts`, in source Part order, or `None`
+/// when the containers do not say which Part they hold.
+///
+/// `--score-parts` returns the excerpts already saved in the score alongside
+/// the one-per-instrument parts it can cut, so a score whose author saved a
+/// two-instrument part comes back with a container that is not any single
+/// source Part and must never be rendered as one. MuseScore stamps each Part it
+/// writes with the id that Part has in the score, which both says which Part a
+/// container holds and orders the containers the way the score does.
+fn single_source_part_container_order(parts: &[ExtractedScorePart]) -> Option<Vec<usize>> {
+    let mut kept: Vec<(u64, usize)> = Vec::with_capacity(parts.len());
+    let mut seen = BTreeSet::new();
+    for (index, part) in parts.iter().enumerate() {
+        let ids = crate::engine::musescore::container_part_ids(&part.mscz)?;
+        match ids.as_slice() {
+            [Some(id)] => {
+                let order = id.parse::<u64>().ok()?;
+                if seen.insert(order) {
+                    kept.push((order, index));
+                }
+            }
+            // A Part written without an id names nothing, so no container can
+            // be placed and the whole answer is unusable.
+            [None] => return None,
+            // Zero Parts, or several: not one source Part.
+            _ => {}
+        }
+    }
+    kept.sort_by_key(|(order, _)| *order);
+    Some(kept.into_iter().map(|(_, index)| index).collect())
+}
+
 fn align_extracted_parts(
     _source_format: &str,
     stems: &[StemDescriptor],
     parts: Vec<ExtractedScorePart>,
 ) -> Result<Vec<ExtractedScorePart>, BundleError> {
-    if parts.len() != stems.len() {
-        return Err(BundleError::Integrity(format!(
-            "MuseScore extracted {} Parts but the source topology requires {}",
-            parts.len(),
-            stems.len()
-        )));
-    }
     let mut available = vec![None; parts.len()];
     for part in parts {
         let ordinal = part.ordinal;
@@ -1314,8 +1339,7 @@ fn align_extracted_parts(
             ));
         }
     }
-
-    available
+    let ordered = available
         .into_iter()
         .enumerate()
         .map(|(ordinal, part)| {
@@ -1325,7 +1349,42 @@ fn align_extracted_parts(
                 ))
             })
         })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let selection = single_source_part_container_order(&ordered);
+    let mut slots: Vec<Option<ExtractedScorePart>> = ordered.into_iter().map(Some).collect();
+    let Some(selection) = selection else {
+        // Containers that do not name their Part: the count is the only evidence
+        // left that each one is the Part at its own source ordinal.
+        if slots.len() != stems.len() {
+            return Err(topology_count_mismatch(slots.len(), stems.len()));
+        }
+        return Ok(slots.into_iter().flatten().collect());
+    };
+    if selection.len() < stems.len() {
+        return Err(topology_count_mismatch(selection.len(), stems.len()));
+    }
+    stems
+        .iter()
+        .map(|stem| {
+            selection
+                .get(stem.source_part_index)
+                .and_then(|index| slots[*index].take())
+                .ok_or_else(|| {
+                    BundleError::Integrity(format!(
+                        "MuseScore extracted no Part for source Part {} of stem {}",
+                        stem.source_part_index + 1,
+                        stem.stem_id
+                    ))
+                })
+        })
         .collect()
+}
+
+fn topology_count_mismatch(extracted: usize, required: usize) -> BundleError {
+    BundleError::Integrity(format!(
+        "MuseScore extracted {extracted} Parts but the source topology requires {required}"
+    ))
 }
 
 fn remaining_render_limits(
@@ -2665,6 +2724,7 @@ mod tests {
         let stem_plan = StemPlan {
             stems: vec![StemDescriptor {
                 stem_id: "part-001-test".into(),
+                source_part_index: 0,
                 source_part_id: "midi:track:0".into(),
                 display_name: "Music".into(),
                 source_track_ids: vec!["midi-track-0".into()],
@@ -2827,6 +2887,7 @@ mod tests {
         request.input.stem_plan.stems[0].active_by_default = false;
         let second = StemDescriptor {
             stem_id: "part-002-test".into(),
+            source_part_index: 1,
             source_part_id: "midi:track:1".into(),
             display_name: "Piano".into(),
             source_track_ids: vec!["piano".into()],
@@ -2894,11 +2955,123 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A `.mscz` holding exactly the Parts named, as MuseScore writes a part it
+    /// cut from a score.
+    fn part_container(part_ids: &[&str]) -> Vec<u8> {
+        let parts = part_ids
+            .iter()
+            .map(|id| format!("<Part id=\"{id}\"><trackName>Part {id}</trackName></Part>"))
+            .collect::<String>();
+        let mscx = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <museScore version=\"4.20\"><Score><Division>480</Division>{parts}</Score></museScore>"
+        );
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        writer
+            .start_file("score.mscx", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(mscx.as_bytes()).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn part_descriptor(stem_id: &str, source_part_index: usize) -> StemDescriptor {
+        StemDescriptor {
+            stem_id: stem_id.into(),
+            source_part_id: format!("musescore-part-{source_part_index}"),
+            source_part_index,
+            display_name: stem_id.into(),
+            source_track_ids: vec![stem_id.into()],
+            source_note_count: 1,
+            role: StemRole::Accompaniment,
+            active_by_default: true,
+        }
+    }
+
+    fn extracted(ordinal: usize, part_ids: &[&str]) -> ExtractedScorePart {
+        ExtractedScorePart {
+            ordinal,
+            name: part_ids.join("+"),
+            metadata: serde_json::Value::Null,
+            mscz: part_container(part_ids),
+        }
+    }
+
+    #[test]
+    fn a_part_the_author_saved_over_several_instruments_is_not_a_source_part() {
+        // `--score-parts` answers with the excerpts already in the file as well
+        // as the parts it can cut, so a score whose author saved a combined
+        // part comes back with one container more than the source has Parts.
+        let descriptors = vec![
+            part_descriptor("melodie", 0),
+            part_descriptor("basse", 1),
+            part_descriptor("batterie", 2),
+        ];
+        let parts = vec![
+            extracted(0, &["1"]),
+            extracted(1, &["2"]),
+            extracted(2, &["3"]),
+            extracted(3, &["2", "3"]),
+        ];
+
+        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
+
+        assert_eq!(aligned.len(), 3);
+        assert_eq!(aligned[0].mscz, part_container(&["1"]));
+        assert_eq!(aligned[1].mscz, part_container(&["2"]));
+        assert_eq!(aligned[2].mscz, part_container(&["3"]));
+    }
+
+    #[test]
+    fn saved_parts_are_placed_on_the_source_whatever_order_musescore_lists_them() {
+        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
+        let parts = vec![extracted(0, &["2"]), extracted(1, &["1"])];
+
+        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
+
+        assert_eq!(aligned[0].mscz, part_container(&["1"]));
+        assert_eq!(aligned[1].mscz, part_container(&["2"]));
+    }
+
+    #[test]
+    fn a_source_part_that_carries_no_note_keeps_the_others_on_their_own_parts() {
+        // A note-free Part has no stem, so the stems are a subsequence of the
+        // Parts MuseScore cuts and position alone no longer places them.
+        let descriptors = vec![part_descriptor("first", 0), part_descriptor("third", 2)];
+        let parts = vec![
+            extracted(0, &["1"]),
+            extracted(1, &["2"]),
+            extracted(2, &["3"]),
+        ];
+
+        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
+
+        assert_eq!(aligned[0].mscz, part_container(&["1"]));
+        assert_eq!(aligned[1].mscz, part_container(&["3"]));
+    }
+
+    #[test]
+    fn a_source_part_musescore_never_cut_is_still_refused() {
+        let descriptors = vec![
+            part_descriptor("first", 0),
+            part_descriptor("second", 1),
+            part_descriptor("third", 2),
+        ];
+        let parts = vec![extracted(0, &["1"]), extracted(1, &["2", "3"])];
+
+        let error = align_extracted_parts("museScore", &descriptors, parts).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BundleError::Integrity(message) if message.contains("source topology")
+        ));
+    }
+
     #[test]
     fn native_scores_align_parts_by_verified_source_order() {
         let descriptors = vec![
             StemDescriptor {
                 stem_id: "first".into(),
+                source_part_index: 0,
                 source_part_id: "musescore-part-native-b".into(),
                 display_name: "Same".into(),
                 source_track_ids: vec!["b".into()],
@@ -2908,6 +3081,7 @@ mod tests {
             },
             StemDescriptor {
                 stem_id: "second".into(),
+                source_part_index: 1,
                 source_part_id: "musescore-part-native-a".into(),
                 display_name: "Same".into(),
                 source_track_ids: vec!["a".into()],
@@ -2940,6 +3114,7 @@ mod tests {
         let descriptors = vec![
             StemDescriptor {
                 stem_id: "banjo".into(),
+                source_part_index: 0,
                 source_part_id: "midi:track:3".into(),
                 display_name: "BANJO MELODY".into(),
                 source_track_ids: vec!["midi:track:3".into()],
@@ -2949,6 +3124,7 @@ mod tests {
             },
             StemDescriptor {
                 stem_id: "strings".into(),
+                source_part_index: 1,
                 source_part_id: "midi:track:5".into(),
                 display_name: "STRINGS".into(),
                 source_track_ids: vec!["midi:track:5".into()],
@@ -2981,6 +3157,7 @@ mod tests {
     fn native_scores_tolerate_musescore_rewritten_part_identity() {
         let descriptors = vec![StemDescriptor {
             stem_id: "voice".into(),
+            source_part_index: 0,
             source_part_id: "musescore-part-voice".into(),
             display_name: "Voice".into(),
             source_track_ids: vec!["voice".into()],

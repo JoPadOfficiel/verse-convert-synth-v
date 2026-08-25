@@ -24,6 +24,10 @@ pub struct StemDescriptor {
     /// Bundle-owned, filename-safe identifier. Source names are never paths.
     pub stem_id: String,
     pub source_part_id: String,
+    /// Position of this Part in the source topology. Stems skip note-free
+    /// Parts, so this is not the stem's own index, and it is the key that maps
+    /// a stem onto the Part MuseScore cut for it.
+    pub source_part_index: usize,
     pub display_name: String,
     pub source_track_ids: Vec<String>,
     pub source_note_count: usize,
@@ -128,6 +132,7 @@ impl StemPlan {
             stems.push(StemDescriptor {
                 stem_id: stable_stem_id(part_index, &part.id),
                 source_part_id: part.id.clone(),
+                source_part_index: part_index,
                 display_name: nonempty_display_name(&part.name, part_index),
                 source_track_ids,
                 source_note_count,
