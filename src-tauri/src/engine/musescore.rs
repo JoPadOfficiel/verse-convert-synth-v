@@ -9,7 +9,7 @@ use crate::engine::midi::{
     SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track,
     TrackRoleHint, TrackSource,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
 pub fn is_musescore_xml(data: &[u8]) -> bool {
@@ -1215,6 +1215,11 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         .collect();
     let mut staff_cursor = 0usize;
     let mut staff_info: BTreeMap<String, StaffInfo> = BTreeMap::new();
+    // A staff MuseScore declares `<linkedTo>` another is a second *view* of it —
+    // a tablature beside the notation, a transposed part — and the score body
+    // carries a full copy of the same measures under it. Read as a staff of its
+    // own it doubles every note the instrument plays.
+    let mut linked_staff_ids: BTreeSet<String> = BTreeSet::new();
     let mut declared_parts = Vec::new();
     for (part_index, part) in score
         .children()
@@ -1344,6 +1349,10 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 })
                 .unwrap_or_else(|| format!("{}-{}", part_index + 1, staff_index + 1));
             staff_cursor += 1;
+            if staff.children().any(|node| node.has_tag_name("linkedTo")) {
+                linked_staff_ids.insert(staff_id);
+                continue;
+            }
             declared_staves.push(SourceStaff {
                 id: staff_id.clone(),
                 voices: Vec::new(),
@@ -1414,6 +1423,10 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     let score_staves: Vec<_> = score
         .children()
         .filter(|n| n.has_tag_name("Staff"))
+        .filter(|n| {
+            !n.attribute("id")
+                .is_some_and(|id| linked_staff_ids.contains(id))
+        })
         .collect();
     let staff_measures: Vec<Vec<_>> = score_staves
         .iter()
@@ -2201,6 +2214,39 @@ mod tests {
             writer.write_all(bytes).unwrap();
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_linked_staff_is_a_view_of_its_staff_and_never_a_second_one() {
+        // A tablature beside the notation is the same instrument playing the
+        // same notes, and the score body writes a full copy of the measures
+        // under it. Read as a staff of its own it doubled every note.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02"><Score><Division>480</Division>
+<Part><trackName>Guitare</trackName>
+  <Staff id="1"><StaffType group="pitched"><name>stdNormal</name></StaffType></Staff>
+  <Staff id="2"><linkedTo>1</linkedTo><StaffType group="tab"><name>tab6StrCommon</name></StaffType></Staff>
+</Part>
+<Staff id="1"><Measure><voice>
+  <Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>
+</voice></Measure></Staff>
+<Staff id="2"><Measure><voice>
+  <Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>
+</voice></Measure></Staff>
+</Score></museScore>"#;
+        let midi = parse_mscx(xml).unwrap();
+        assert_eq!(midi.topology.parts.len(), 1);
+        assert_eq!(midi.topology.parts[0].staves.len(), 1);
+        let sounded = midi
+            .tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .filter(|event| matches!(&event.kind, Kind::NoteOn(note) if note.velocity != Some(0)))
+            .count();
+        assert_eq!(
+            sounded, 1,
+            "the tablature is the same note, not a second one"
+        );
     }
 
     #[test]
