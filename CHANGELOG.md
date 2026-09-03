@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.6.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.2...v0.6.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* read lyric rows that never share an instant as one sung line ([#31](https://github.com/JoPadOfficiel/verse-convert-synth-v/issues/31)) ([3e86ef8](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/3e86ef8c2a33a874ac4e50a1aac55b826f3b3542))
+
 ## [0.6.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.1...v0.6.2) (2026-08-25)
 
 
