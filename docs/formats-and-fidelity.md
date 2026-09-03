@@ -566,6 +566,16 @@ When there are more verses than passes there is nowhere to put the extra ones,
 so each keeps a track of its own at the same instants and a
 `LYRIC_VERSES_EXCEED_REPEAT_PASSES` diagnostic says so.
 
+A row count is only evidence of stacked verses when the rows compete for a
+moment of the music. On a score played once whose rows never do — no note
+carries two of them, and no two notes sounding together carry different ones —
+the rows are one sung line written in several places, not verses, and they are
+projected as a single track under the staff's own name; a
+`LYRIC_LANES_READ_AS_ONE_LINE` diagnostic records the reading. Only words count
+here: an empty or placeholder entry spells nothing and claims no moment. A score
+that is replayed keeps the pass-per-verse reading above, which cannot be
+second-guessed from where the words happen to be written.
+
 A score stacks verses only under the passage whose words differ. The refrain
 that follows is normally written on a single lyric line meant for every pass.
 Verse therefore reads a verse's silence per measure: where the pass's own verse

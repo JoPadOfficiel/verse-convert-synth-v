@@ -537,15 +537,19 @@ fn lane_words_by_measure(notes: &[SourceNote]) -> BTreeSet<(u32, &str)> {
     notes
         .iter()
         .filter_map(|note| Some((note.source.measure?, note)))
-        .flat_map(|(measure, note)| {
-            note.lyrics
-                .iter()
-                .filter(|lyric| {
-                    matches!(&lyric.state, midi::LyricState::Text(text) if !text.trim().is_empty())
-                })
-                .map(move |lyric| (measure, lyric.lane.as_str()))
-        })
+        .flat_map(|(measure, note)| word_lanes(note).map(move |lane| (measure, lane)))
         .collect()
+}
+
+/// The lanes writing an actual word on this note. An empty or placeholder entry
+/// spells nothing, so it claims no instant and competes for none.
+fn word_lanes(note: &SourceNote) -> impl Iterator<Item = &str> {
+    note.lyrics
+        .iter()
+        .filter(
+            |lyric| matches!(&lyric.state, midi::LyricState::Text(text) if !text.trim().is_empty()),
+        )
+        .map(|lyric| lyric.lane.as_str())
 }
 
 fn selected_attached_lyric<'a>(
@@ -1188,6 +1192,7 @@ pub fn convert_midi_with_target(
         let lanes = ordered_lanes(&attached_lanes(notes));
         let attached = !lanes.is_empty();
         let mut unplaced_verses = 0usize;
+        let mut merged_lanes = 0usize;
         let target_binding = external.binding_for_target(index).filter(|binding| {
             overrides.and_then(|map| map.get(&binding.target_track).copied()) != Some(false)
         });
@@ -1215,11 +1220,20 @@ pub fn convert_midi_with_target(
             // Stacked verses under one melody are alternatives, not simultaneous
             // voices: the score plays the music again and sings the next verse.
             // When the repeat provides a pass per verse, project one track that
-            // follows that reading. Otherwise there is no place to put the extra
-            // verses, so keep a track each and say so.
+            // follows that reading. On a score played once, rows that never
+            // want the same instant are not stacked at all -- one line written
+            // in several rows -- so they also belong together. Otherwise there
+            // is no place to put the extra verses, so keep a track each and say
+            // so.
             let groups: Vec<Vec<String>> = if lanes.is_empty() {
                 vec![Vec::new()]
             } else if lanes.len() > 1 && repeat_passes(notes) >= lanes.len() {
+                vec![lanes.clone()]
+            } else if lanes.len() > 1
+                && repeat_passes(notes) == 1
+                && !lanes_compete_for_an_instant(notes)
+            {
+                merged_lanes = lanes.len();
                 vec![lanes.clone()]
             } else {
                 lanes.iter().map(|lane| vec![lane.clone()]).collect()
@@ -1388,6 +1402,19 @@ pub fn convert_midi_with_target(
                 CHORD_READING,
                 DiagnosticSeverity::Info,
                 message,
+                &track.id,
+            ));
+        }
+        if merged_lanes > 1 {
+            warnings.push(report_warning(
+                "LYRIC_LANES_READ_AS_ONE_LINE",
+                DiagnosticSeverity::Info,
+                format!(
+                    "The words of this melody are written across {merged_lanes} lyric rows, but \
+                     no note carries more than one of them and no two of them are ever sung at \
+                     the same instant. They are one sung line written in several rows, not \
+                     stacked verses, so they are projected as a single track."
+                ),
                 &track.id,
             ));
         }
@@ -2220,6 +2247,44 @@ fn ordered_lanes(lanes: &BTreeSet<String>) -> Vec<String> {
         key(a).cmp(&key(b)).then_with(|| a.cmp(b))
     });
     ordered
+}
+
+/// Whether two lanes ever want the same instant: one note carrying words from
+/// two lanes, or two notes sounding together under different lanes -- a chord
+/// or a second voice in the staff puts rival verses on one moment without ever
+/// sharing a note. Only then do the rows read as stacked verses; rows that
+/// never meet are a single sung line written across two of them.
+fn lanes_compete_for_an_instant(notes: &[SourceNote]) -> bool {
+    let mut edges: Vec<(u32, bool, &str)> = Vec::with_capacity(notes.len() * 2);
+    for note in notes {
+        let mut lanes = word_lanes(note);
+        let Some(lane) = lanes.next() else { continue };
+        if lanes.any(|other| other != lane) {
+            return true;
+        }
+        // A grace note lasts no ticks yet sounds with the note it leans on, so
+        // give every word at least one tick of presence.
+        edges.push((note.onset, true, lane));
+        edges.push((note.onset.saturating_add(note.duration.max(1)), false, lane));
+    }
+    // Ends before starts at the same tick: notes that merely touch do not sound
+    // together.
+    edges.sort_unstable_by_key(|(tick, start, _)| (*tick, *start));
+    let mut sounding: HashMap<&str, usize> = HashMap::new();
+    for (_, start, lane) in edges {
+        if start {
+            *sounding.entry(lane).or_insert(0) += 1;
+            if sounding.len() > 1 {
+                return true;
+            }
+        } else if let Some(count) = sounding.get_mut(lane) {
+            *count -= 1;
+            if *count == 0 {
+                sounding.remove(lane);
+            }
+        }
+    }
+    false
 }
 
 /// How many times the source is played back, counting repeat unrolling. A score
@@ -3116,6 +3181,216 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.code == "LYRIC_VERSES_EXCEED_REPEAT_PASSES")));
+    }
+
+    /// One note per entry, placed and measured explicitly, so lanes can be
+    /// written side by side, stacked in a chord, or replayed on a second pass.
+    struct PlacedNote {
+        onset: u32,
+        pitch: u8,
+        measure: u32,
+        occurrence: u32,
+        lyrics: Vec<Lyric>,
+    }
+
+    impl PlacedNote {
+        fn new(onset: u32, measure: u32, lyrics: Vec<Lyric>) -> Self {
+            Self {
+                onset,
+                pitch: 60,
+                measure,
+                occurrence: 0,
+                lyrics,
+            }
+        }
+
+        fn pitch(mut self, pitch: u8) -> Self {
+            self.pitch = pitch;
+            self
+        }
+
+        fn occurrence(mut self, occurrence: u32) -> Self {
+            self.occurrence = occurrence;
+            self
+        }
+    }
+
+    fn placed_note_events(track_id: &str, notes: Vec<PlacedNote>) -> Vec<midi::Event> {
+        let mut events = Vec::new();
+        for note in notes {
+            // Stable across passes, distinct within a chord: the replay reading
+            // asks whether this very source note is played again.
+            let source_id = format!("{track_id}-m{}-p{}", note.measure, note.pitch);
+            events.push(midi::Event::new(
+                note.onset,
+                events.len() as u32,
+                Kind::NoteOn(NoteOn {
+                    channel: Some(0),
+                    key: Some(note.pitch),
+                    velocity: Some(90),
+                    source: midi::NoteSource {
+                        id: source_id.clone(),
+                        measure: Some(note.measure),
+                        occurrence: note.occurrence,
+                        ..midi::NoteSource::default()
+                    },
+                    lyrics: note.lyrics,
+                }),
+            ));
+            events.push(midi::Event::new(
+                note.onset + 480,
+                events.len() as u32,
+                Kind::NoteOff(midi::NoteOff {
+                    channel: Some(0),
+                    key: Some(note.pitch),
+                    velocity: Some(0),
+                    source_id: Some(source_id),
+                }),
+            ));
+        }
+        events
+    }
+
+    fn raises(outcome: &ConvertOutcome, code: &str) -> bool {
+        outcome
+            .tracks
+            .iter()
+            .any(|report| report.warnings.iter().any(|warning| warning.code == code))
+    }
+
+    #[test]
+    fn rows_that_never_share_an_instant_are_one_sung_lane() {
+        // Row 2 takes over where row 1 stops writing: that is one vocal line
+        // typed across two rows, not two singers.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        track.events = placed_note_events(
+            "voice",
+            vec![
+                PlacedNote::new(0, 1, vec![verse("lane-1a", "one", "1")]),
+                PlacedNote::new(480, 2, vec![verse("lane-2a", "two", "2")]),
+                PlacedNote::new(960, 3, vec![verse("lane-1b", "three", "1")]),
+            ],
+        );
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = svp(&outcome);
+        assert_eq!(project.tracks.len(), 1);
+        assert_eq!(project.tracks[0].name, "Voice");
+        let sung: Vec<_> = project.tracks[0]
+            .main_group
+            .notes
+            .iter()
+            .map(|note| note.lyrics.as_str())
+            .collect();
+        assert_eq!(sung, vec!["one", "two", "three"]);
+        assert!(raises(&outcome, "LYRIC_LANES_READ_AS_ONE_LINE"));
+        assert!(!raises(&outcome, "LYRIC_VERSES_EXCEED_REPEAT_PASSES"));
+    }
+
+    #[test]
+    fn rows_sharing_one_note_still_split_without_a_repeat() {
+        // The same two rows, but now competing for a note: nothing says which
+        // pass sings which, so the old split and its diagnostic stand.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        track.events = placed_note_events(
+            "voice",
+            vec![
+                PlacedNote::new(0, 1, vec![verse("lane-1a", "one", "1")]),
+                PlacedNote::new(
+                    480,
+                    2,
+                    vec![verse("lane-1b", "two", "1"), verse("lane-2a", "deux", "2")],
+                ),
+            ],
+        );
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = svp(&outcome);
+        assert_eq!(project.tracks.len(), 2);
+        assert!(project.tracks[0].name.contains("lyric lane"));
+        assert!(raises(&outcome, "LYRIC_VERSES_EXCEED_REPEAT_PASSES"));
+        assert!(!raises(&outcome, "LYRIC_LANES_READ_AS_ONE_LINE"));
+    }
+
+    #[test]
+    fn rows_on_two_notes_of_one_chord_still_split_without_a_repeat() {
+        // No note carries both rows, yet both sound at the same instant: the
+        // rows are rivals for that moment, so they stay apart.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        track.events = placed_note_events(
+            "voice",
+            vec![
+                PlacedNote::new(0, 1, vec![verse("lane-1a", "one", "1")]),
+                PlacedNote::new(0, 1, vec![verse("lane-2a", "deux", "2")]).pitch(64),
+            ],
+        );
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        assert!(raises(&outcome, "LYRIC_VERSES_EXCEED_REPEAT_PASSES"));
+        assert!(!raises(&outcome, "LYRIC_LANES_READ_AS_ONE_LINE"));
+        let project = svp(&outcome);
+        assert!(project
+            .tracks
+            .iter()
+            .all(|projected| projected.name.contains("lyric lane")));
+    }
+
+    #[test]
+    fn three_rows_over_a_two_pass_repeat_keep_a_track_each() {
+        // Two passes cannot carry three verses even when the rows never meet:
+        // the pass-indexed reading has nowhere to sing the third, so the split
+        // and its diagnostic stand.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        let mut notes = Vec::new();
+        for pass in 0..2u32 {
+            for measure in 1..=3u32 {
+                notes.push(
+                    PlacedNote::new(
+                        pass * 1440 + (measure - 1) * 480,
+                        measure,
+                        vec![verse(
+                            &format!("lane-{measure}"),
+                            &format!("w{measure}"),
+                            &measure.to_string(),
+                        )],
+                    )
+                    .occurrence(pass),
+                );
+            }
+        }
+        track.events = placed_note_events("voice", notes);
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = svp(&outcome);
+        assert_eq!(project.tracks.len(), 3);
+        assert!(raises(&outcome, "LYRIC_VERSES_EXCEED_REPEAT_PASSES"));
+        assert!(!raises(&outcome, "LYRIC_LANES_READ_AS_ONE_LINE"));
+    }
+
+    #[test]
+    fn a_blank_second_row_under_every_note_does_not_block_the_merge() {
+        // An exporter that writes an empty entry on every note of a second row
+        // claims no word there, so the rows still read as one line.
+        let mut track = Track::new("voice", 0);
+        track.name = "Voice".into();
+        let mut blank = verse("lane-2a", "", "2");
+        blank.state = midi::LyricState::ExplicitEmpty;
+        track.events = placed_note_events(
+            "voice",
+            vec![
+                PlacedNote::new(0, 1, vec![verse("lane-1a", "one", "1"), blank]),
+                PlacedNote::new(480, 2, vec![verse("lane-2b", "two", "2")]),
+            ],
+        );
+
+        let outcome = convert_midi(&midi_with(vec![track]), "english");
+        let project = svp(&outcome);
+        assert_eq!(project.tracks.len(), 1);
+        assert!(raises(&outcome, "LYRIC_LANES_READ_AS_ONE_LINE"));
     }
 
     #[test]
