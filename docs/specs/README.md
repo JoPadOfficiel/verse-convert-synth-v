@@ -10,6 +10,7 @@ in the public repository.
 | --- | --- | --- |
 | [FR-001](fr-001-sung-pronunciation.md) | French sung syllables, silent endings, liaison, source ownership | Implemented and reviewed; listening pending |
 | [FR-002](fr-002-community-lexicon.md) | Broad, reproducible French dictionary coverage | Implemented; corpus and allocation validated; listening pending |
+| [FR-003](fr-003-syllable-hyphen-cleanup.md) | French USTX edge syllable separators, independent of lexical coverage | Implemented; 100 focused tests, format and Clippy passed; consolidated gate remains with parent |
 | [EN-001](en-001-diffsinger-pronunciation.md) | Explicit English DiffSinger pronunciation | Implemented; source-fragment guards and integration tests validated |
 | [EN-002](en-002-karaoke-word-articulation.md) | Karaoke word articulation across performed gaps | Specified; fragments protected by EN-001 |
 | [EXP-001](exp-001-expression-fidelity.md) | Pitch, interpolation, vibrato and volume provenance | Source/history audit complete; broader import remains separate |

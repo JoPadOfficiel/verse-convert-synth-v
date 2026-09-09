@@ -101,7 +101,10 @@ fn assert_lanes(midi: &Midi, expected: &[&str]) {
         .collect();
     for track in &corrected.svp.as_ref().unwrap().tracks {
         for note in &track.notes {
-            if let ProjectedLyric::Pronounced { source, .. } = &note.lyric {
+            if let ProjectedLyric::Source(source)
+            | ProjectedLyric::Pronounced { source, .. }
+            | ProjectedLyric::PronouncedSplit { source } = &note.lyric
+            {
                 assert!(
                     source_lyrics.iter().any(|original| **original == **source),
                     "every original field survives"
@@ -584,7 +587,7 @@ fn punctuation_parentheses_do_not_hide_words_or_erase_literal_variants() {
 
 #[test]
 fn dangling_dashes_protect_fragments_and_a_split_marker_is_not_a_hold() {
-    assert_lanes(&sab(&["chan-", "ter"], false, false), &["chan-", "ter"]);
+    assert_lanes(&sab(&["chan-", "ter"], false, false), &["chan", "ter"]);
     // The marker consumes a syllable; it cannot be skipped to find the curated
     // two-syllable rê/ves layout and leave a native + without a vowel.
     let midi = sab(&["rê", "+", "ves"], false, false);
@@ -666,6 +669,155 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
             broken[2].lyric,
             ProjectedLyric::PronouncedSplit { .. }
         ));
+    }
+}
+
+#[test]
+fn edge_separators_keep_known_attacks_with_and_without_syllabic_metadata() {
+    use verse_lib::engine::midi::Syllabic;
+    let expected = [
+        "chan[fr/sh fr/en]",
+        "ger[fr/j fr/eh]",
+        "pres[fr/p fr/r fr/ae]",
+        "se[fr/s fr/ee]",
+        "mê[fr/m fr/ae]",
+        "me[fr/m fr/ee]",
+        "rê[fr/r fr/ae]",
+        "ves[fr/v fr/ee]",
+    ];
+    for native in [false, true] {
+        assert_lanes(
+            &sab(
+                &["chan-", "ger", "pres–", "se", "mê—", "me", "rê-", "ves"],
+                native,
+                false,
+            ),
+            &expected,
+        );
+        let mut midi = sab(
+            &["chan", "ger", "pres", "se", "mê", "me", "rê", "ves"],
+            native,
+            false,
+        );
+        for track in &mut midi.tracks {
+            for (i, note) in track
+                .events
+                .iter_mut()
+                .filter_map(|event| match &mut event.kind {
+                    Kind::NoteOn(note) => Some(note),
+                    _ => None,
+                })
+                .enumerate()
+            {
+                for lyric in &mut note.lyrics {
+                    lyric.syllabic = Some(if i % 2 == 0 {
+                        Syllabic::Begin
+                    } else {
+                        Syllabic::End
+                    });
+                }
+            }
+        }
+        assert_lanes(&midi, &expected);
+    }
+}
+
+#[test]
+fn unknown_edge_separators_are_spelling_only_in_direct_and_bundle_exports() {
+    use verse_lib::bundle::BundleProject;
+    for native in [false, true] {
+        for dash in ['-', '‐', '‑', '‒', '–', '—', '―', '−', '﹘', '﹣', '－'] {
+            let left = format!("zyx{dash}");
+            let right = format!("{dash}qwv");
+            let midi = sab(&[&left, &right], native, true);
+            assert_lanes(&midi, &["zyx", "qwv", "zyx", "qwv"]);
+            let outcome = convert(&midi);
+            for track in outcome.tracks.iter().filter(|track| track.placed > 0) {
+                assert_eq!(
+                    track
+                        .warnings
+                        .iter()
+                        .filter(|w| w.code == french::UNSUPPORTED)
+                        .count(),
+                    4
+                );
+            }
+            let projected = outcome.svp.as_ref().unwrap();
+            let before = projected.clone();
+            assert!(projected
+                .tracks
+                .iter()
+                .flat_map(|t| &t.notes)
+                .all(|n| matches!(n.lyric, ProjectedLyric::Source(_))));
+            let direct = target::serialize_to(ExportTarget::Ustx, projected).unwrap();
+            let BundleProject::Ustx(bundle) =
+                BundleProject::from_projection(ExportTarget::Ustx, projected).unwrap()
+            else {
+                panic!("expected USTX");
+            };
+            assert_eq!(direct, ustx::to_yaml(&bundle).into_bytes());
+            assert_eq!(
+                target::serialize_to(ExportTarget::Ustx, projected).unwrap(),
+                direct
+            );
+            assert_eq!(projected, &before);
+
+            // Existing Default/SVP word joining remains exactly as before.
+            let default = convert_midi_with_target(&midi, "english", None, ExportTarget::Ustx);
+            for part in model(&default).voice_parts {
+                assert_eq!(
+                    part.notes
+                        .iter()
+                        .map(|n| n.lyric.as_str())
+                        .collect::<Vec<_>>(),
+                    ["zyxqwv", "+", "zyxqwv", "+"]
+                );
+            }
+            let svp = convert_midi_with_target(&midi, "english", None, ExportTarget::Svp);
+            let selected = convert_midi_with_profile(&midi, "english", None, ExportTarget::Svp, FR);
+            assert_eq!(svp.svp, selected.svp);
+            assert_eq!(
+                target::serialize_to(ExportTarget::Svp, svp.svp.as_ref().unwrap()),
+                target::serialize_to(ExportTarget::Svp, selected.svp.as_ref().unwrap())
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_punctuation_internal_hyphens_and_manual_controls_survive_conversion() {
+    let words = [
+        " «Zyx-,» ",
+        " (-Qwv!) ",
+        "arc-en-ciel",
+        "zyx-qwv",
+        "-",
+        "+",
+        "+~",
+        "?alias-",
+        "mot-[phones]",
+        "mot[phones]-",
+    ];
+    let expected = [
+        " «Zyx,» ",
+        " (Qwv!) ",
+        "arc-en-ciel[fr/ah fr/r fr/k fr/en fr/s fr/y fr/ae fr/l]",
+        "zyx-qwv",
+        "-",
+        "+",
+        "+~",
+        "?alias-",
+        "mot-[phones]",
+        "mot[phones]-",
+    ];
+    for native in [false, true] {
+        // MuseScore already trims outer whitespace while parsing; the target
+        // must preserve the spelling that actually reaches the source IR.
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|text| if native { text.trim() } else { *text })
+            .collect();
+        assert_lanes(&sab(&words, native, false), &expected);
     }
 }
 

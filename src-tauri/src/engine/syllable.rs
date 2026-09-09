@@ -20,7 +20,7 @@ use crate::engine::projection::{ProjectedLyric, ProjectedNote};
 /// Every dash a score uses where a syllable hyphen is meant, including the ones
 /// a word processor substitutes for the ASCII one. Kept as a set rather than a
 /// `char::is_dash_punctuation` test so a source cannot widen it silently.
-const SYLLABLE_HYPHENS: [char; 11] = [
+pub(crate) const SYLLABLE_HYPHENS: [char; 11] = [
     '\u{002D}', // HYPHEN-MINUS
     '\u{2010}', // HYPHEN
     '\u{2011}', // NON-BREAKING HYPHEN

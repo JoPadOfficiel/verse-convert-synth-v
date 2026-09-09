@@ -32,6 +32,22 @@ Les indications manuelles entre crochets sont conservées. Un mot absent du
 lexique ou un découpage ambigu est signalé ; un dictionnaire plus grand ne
 résout pas à lui seul les homographes, les liaisons ou les choix de « e » chanté.
 
+Le profil français retire les tirets typographiques de séparation placés aux
+extrémités des syllabes dans l'export USTX, même sans lecture connue :
+`zyx- / -qwv` devient `zyx / qwv`, avec le diagnostic de prononciation non
+résolue. Sans lecture lexicale, la casse, les espaces et la ponctuation restent
+intacts. Les tirets internes (`arc-en-ciel`), les marqueurs isolés (`-`, `+`,
+`+~`), les alias forcés (`?alias-`) et les indications manuelles entre crochets
+restent inchangés.
+
+Les découpages reconnus, comme `chan- / ger`, `pres– / se`, `mê— / me` et
+`rê- / ves`, conservent une attaque et une indication vérifiée sur chaque note.
+Ce nettoyage d'écriture préserve les paroles sources et leurs métadonnées,
+les notes, le tempo, le pitch et le vibrato. Il s'applique aux exports directs
+et aux projets des bundles ; les chemins Default et SVP gardent leur
+comportement existant. [FR-003](specs/fr-003-syllable-hyphen-cleanup.md) ne
+prétend pas résoudre les fragments inconnus ni valider leur rendu à l'écoute.
+
 Sources : [OpenUtau — phonémiseurs](https://github.com/openutau/OpenUtau/wiki/Phonemizers),
 [Millefeuille](https://github.com/imsupposedto/Millefeuille-DiffSinger-French),
 [pack UFR](https://utaufrance.com/telechargement-du-pack-diffsinger-ufr/).
