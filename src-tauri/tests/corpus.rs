@@ -49,16 +49,16 @@ fn audited_kar_corpus_keeps_only_proven_lyric_bindings() {
             .expect("VERSE_CORPUS_DIR must point to the audited private corpus"),
     );
     let fixtures = [
-        ("Beatles - All you need is love.kar", 207usize),
-        ("Beatles - HELP.kar", 314),
-        ("Dirty_Dancing_._She_s_like_the_wind.kar", 218),
-        ("Elvis_Presley_._Heartbreak_hotel.kar", 276),
-        ("Elvis_Presley_._Hound_dog.kar", 244),
-        ("Liza_Minelli_._Cabaret.kar", 162),
-        ("Queen_._Crazy_little_thing_called_love.kar", 0),
+        ("Beatles - All you need is love.kar", 207usize, 207usize),
+        ("Beatles - HELP.kar", 314, 314),
+        ("Dirty_Dancing_._She_s_like_the_wind.kar", 218, 218),
+        ("Elvis_Presley_._Heartbreak_hotel.kar", 276, 276),
+        ("Elvis_Presley_._Hound_dog.kar", 244, 244),
+        ("Liza_Minelli_._Cabaret.kar", 178, 170),
+        ("Queen_._Crazy_little_thing_called_love.kar", 0, 0),
     ];
 
-    for (name, expected_placed) in fixtures {
+    for (name, expected_placed, expected_source_lyrics) in fixtures {
         let path = required_fixture(&root, name);
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|error| panic!("required fixture {}: {error}", path.display()));
@@ -78,9 +78,92 @@ fn audited_kar_corpus_keeps_only_proven_lyric_bindings() {
                 .iter()
                 .filter(|source_id| source_id.starts_with("lyric:"))
                 .count(),
-            expected_placed,
-            "{name}: every emitted lyric must have one source evidence ID"
+            expected_source_lyrics,
+            "{name}: distinct source lyrics must remain identifiable across harmony copies"
         );
+
+        if name.contains("Cabaret") {
+            // 4383c9f intentionally restored the eight harmony words that the
+            // old 162/ambiguity oracle demanded we drop. Count source words
+            // separately from their 178 instances across two singing voices.
+            use std::collections::BTreeMap;
+            let source_events: BTreeMap<_, _> = midi
+                .tracks
+                .iter()
+                .filter(|track| track.text_profile == midi::MidiTextProfile::KaraokeLyrics)
+                .flat_map(|track| {
+                    track
+                        .events
+                        .iter()
+                        .filter_map(move |event| match &event.kind {
+                            midi::Kind::Text(text)
+                                if !midi::is_soft_karaoke_text_control(&text.text) =>
+                            {
+                                Some((format!("event:{}:{}", track.id, event.order), text))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect();
+            assert_eq!(source_events.len(), 170);
+            let neutral = outcome.svp.as_ref().expect("successful project");
+            assert_eq!(neutral.tracks.len(), 2);
+            let mut copies = BTreeMap::<String, Vec<_>>::new();
+            for (lane, track) in neutral.tracks.iter().enumerate() {
+                for note in &track.notes {
+                    let evidence = note
+                        .source_evidence
+                        .as_ref()
+                        .expect("retained note identity");
+                    let event_id = evidence
+                        .lyric_event_id
+                        .as_ref()
+                        .expect("original lyric event");
+                    let original = source_events
+                        .get(event_id)
+                        .expect("lyric belongs to this source");
+                    let verse_lib::engine::projection::ProjectedLyric::Source(lyric) = &note.lyric
+                    else {
+                        panic!("Cabaret's audited words must remain source lyrics");
+                    };
+                    assert_eq!(lyric.raw, original.text);
+                    assert_eq!(lyric.raw_bytes, original.raw);
+                    copies.entry(event_id.clone()).or_default().push((
+                        lane,
+                        note.onset_ticks,
+                        note.pitch,
+                        evidence.note_id.as_str(),
+                    ));
+                }
+            }
+            assert_eq!(
+                copies.keys().collect::<Vec<_>>(),
+                source_events.keys().collect::<Vec<_>>()
+            );
+            let mut shared_onsets = Vec::new();
+            for group in copies.values() {
+                assert!(matches!(group.len(), 1 | 2));
+                if let [left, right] = group.as_slice() {
+                    assert_ne!(left.0, right.0, "a word belongs to distinct harmony lanes");
+                    assert_eq!(left.1, right.1);
+                    assert_ne!(left.2, right.2);
+                    assert_ne!(
+                        left.3, right.3,
+                        "two original notes, not duplicated evidence"
+                    );
+                    shared_onsets.push(left.1);
+                }
+            }
+            shared_onsets.sort_unstable();
+            assert_eq!(
+                shared_onsets,
+                [33024, 33216, 33408, 33600, 33792, 33984, 34176, 34368]
+            );
+            assert!(!outcome.tracks.iter().any(|track| track
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "KARAOKE_CHORD_PITCH_AMBIGUOUS")));
+        }
 
         let project =
             target::svp::serialize(&outcome.svp.expect("successful conversion has a project"))
@@ -105,14 +188,6 @@ fn audited_kar_corpus_keeps_only_proven_lyric_bindings() {
             );
         }
 
-        if name.contains("Cabaret") {
-            assert!(outcome.tracks.iter().any(|track| {
-                track.warnings.iter().any(|warning| {
-                    warning.code == "KARAOKE_CHORD_PITCH_AMBIGUOUS"
-                        && warning.message.starts_with('8')
-                })
-            }));
-        }
         if name.starts_with("Queen") {
             assert!(project.tracks.is_empty());
         }
