@@ -2,7 +2,7 @@
 title: Remove score syllable hyphens independently of lexical coverage
 type: bugfix
 created: 2026-09-09
-status: in-review
+status: done
 baseline_commit: 425dab11208c3a8663b41aaa41defe601bac13aa
 review_loop_iteration: 0
 context:
@@ -120,7 +120,11 @@ Passed on 2026-09-09, with Cargo builds run sequentially:
 - `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings`.
 - `git diff --check`.
 
-The parent still owns the consolidated gate. Bundle coverage exercises its real
+The parent consolidated gate passed after review patches: 459 Rust tests,
+14 optional ignored; 45 frontend tests, one skipped; version check, build,
+format, all-target Clippy and diff check passed. Review guards preserve numeric
+minus signs and punctuation-wrapped control aliases, and recognize additional
+quote punctuation. Bundle coverage exercises its real
 project serialization boundary; no acoustic rendering was performed. Existing
 MuseScore parsing trims outer spaces before projection; this fix preserves all
 spacing present in projected text. Internal lexical hyphens remain intact even
@@ -129,3 +133,10 @@ when an existing verified reading adds hints, as for `arc-en-ciel`.
 Unresolved pronunciation, perceived pitch, tempo investigation and broader
 expression import remain separate. No acoustic claim is implied by separator
 or allocation tests.
+
+## Suggested Review Order
+
+- Inspect the French-only spelling boundary and its control guards.
+  [ustx.rs:412](../../src-tauri/src/engine/target/ustx.rs#L412)
+- Check separator coverage and unchanged musical/source fields.
+  [ustx.rs:1290](../../src-tauri/src/engine/target/ustx.rs#L1290)

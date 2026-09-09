@@ -414,11 +414,19 @@ fn french_syllable_text(text: &str) -> String {
         return text.into();
     }
     let edge = |c: char| {
-        c.is_whitespace() || ",.;:!?…\"«»“”„'‘’(){}".contains(c) || SYLLABLE_HYPHENS.contains(&c)
+        c.is_whitespace() || ",.;:!?…\"«»‹›“”„‚'‘’(){}".contains(c) || SYLLABLE_HYPHENS.contains(&c)
     };
+    // A separator can surround an existing force/control prefix. Never turn
+    // that text into a newly active alias by stripping its protective edge.
+    if text
+        .trim_start_matches(|c| c != '?' && c != '+' && edge(c))
+        .starts_with(['?', '+'])
+    {
+        return text.into();
+    }
     let core = text.trim_matches(edge);
     // A standalone dash or punctuation does not prove a syllable.
-    if !core.chars().any(char::is_alphanumeric) || core.starts_with(['+', '?']) {
+    if !core.chars().any(char::is_alphabetic) || core.starts_with(['+', '?']) {
         return text.into();
     }
     let start = text.len() - text.trim_start_matches(edge).len();
@@ -1318,6 +1326,8 @@ mod tests {
                 assert!(!expected.is_empty());
             }
         }
+        assert_eq!(french_syllable_text("‹zyx-›"), "‹zyx›");
+        assert_eq!(french_syllable_text("zyx-‚"), "zyx‚");
         for text in [
             "arc-en-ciel",
             "-",
@@ -1329,6 +1339,11 @@ mod tests {
             "  ",
             "l'",
             "d'un",
+            "-12",
+            "−12",
+            "-?alias-",
+            "(?alias-)",
+            "-+alias-",
         ] {
             assert_eq!(french_syllable_text(text), text);
         }
