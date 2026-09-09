@@ -86,7 +86,8 @@ notes. An isolated `end` never invents `mesrê` or `levent`.
 An explicit `end` or phrase-ending punctuation before the last attack blocks
 a layout, including punctuation followed by a closing quote. Whole-word
 dictionary readings are also withheld from bilaterally connected fragments
-of an unrecognized word, such as `des(begin)`/`tin(end)`.
+of an unrecognized word. A recognized `des(begin)`/`tin(end)` uses the
+complete `destin` reading; `des` is never interpreted as a separate determiner.
 
 The bounded layouts include `m'ar`/`rê`/`te`, `m'ar`/`rête`,
 `mu`/`u`/`ur(s)` and `ju`/`ure`. Repeated `u` attacks keep their vowel;
@@ -98,19 +99,26 @@ An isolated `rê` receives only `fr/r fr/ae`, without inventing a missing
 
 Known word readings remove verified silent endings without a general
 consonant-deletion rule. Lookup normalizes case, whitespace and edge
-punctuation while preserving accents and internal elisions. Closing
+punctuation and canonical Unicode while preserving accents and internal elisions. Closing
 apostrophes in `rêves',` or `rêves’,` are punctuation; the internal
 apostrophe in `d'un` is retained. `un` receives `[fr/in]`; `d'un` includes
 `[fr/d fr/in]`. The raw word `in` is never substituted.
 Supported touching pairs include `tout au/à`, `est un`, selected plural
-determiners before `ami(s)`, `amours`, `enfant(s)`, and `un/mon/ton/son` before
+determiners before `ami(s)`, `amours`, `enfant(s)`, `homme(s)`, and `un/mon/ton/son` before
 `ami` or `enfant`. Liaison is placed on the next attack, never across a rest,
 hold, source row, voice or repeat boundary. Existing spelling `tau` and manual
 hints do not receive a second consonant. Ambiguous h and unknown vocabulary or
-layouts retain the original text with a source-linked diagnostic. This is a
-bounded correction lexicon, not general French G2P. Selecting it does not
-mean every French lyric is corrected: fragments such as `la`, `rai`, `J'i`
-and `ure` outside a validated layout remain unsupported by this policy.
+layouts retain the original text with a source-linked diagnostic. The profile
+includes 104,943 community dictionary keys, indexed once and imported from a
+pinned revision with original-symbol provenance and its redistribution license.
+The original 59 curated readings and source-aware sung layouts take priority.
+Literal numbered variants remain distinct; their numbers do not define grammar.
+New entries cannot reinterpret orphan syllabic fragments. Complete bilateral
+source words can use a whole-word hint followed by native `+` syllable markers
+when their vowel count matches the source attacks; holds do not consume a vowel.
+No variant is selected merely to manufacture enough vowels for the score.
+Bare elisions, ambiguous base homographs and audited fragments such as `rai`,
+`J'i` and `ure` remain unforced outside a recognized word or layout.
 OpenUtau still processes those retained lyrics through its own phonemizer.
 Liaison uses recognized word boundaries: `mes`/`a`/`mours` adds z on `a`,
 while the `tes` syllable in `tem`/`pê`/`tes` cannot act as a determiner.
@@ -717,11 +725,36 @@ French, Spanish, English, Portuguese, German, Polish and Turkish, deliberately
 passing an unrelated legacy language argument to show that it has no effect.
 
 Verse does not fill `database.language` in a `.svp`, and the OpenUtau target
-does not write a language field. The optional French Millefeuille profile
-selects the pronunciation convention and supplies the bounded spelling and
-phoneme hints documented above. It does not select a singer or modify the
-source text, role or ownership. Neither profile translates or transliterates
-lyrics.
+does not write a language field. The optional French Millefeuille and English
+ARPAbet profiles select a pronunciation convention and supply dictionary hints.
+They do not select a singer or modify source text, role or ownership. No profile
+translates lyrics.
+
+The English profile uses `OpenUtau.Core.DiffSinger.DiffSingerEnglishPhonemizer`
+(DIFFS EN) and `en/` CMU ARPAbet symbols. Its pinned corpus has 135,166 keys,
+including 9,114 numbered variants and 126,052 base words. Stress digits remain
+in provenance but are removed from acoustic aliases. Eight consonant-only
+readings stay in the corpus for provenance and are excluded from sung hints.
+Case, edge punctuation, canonical Unicode and curly apostrophes normalize for
+lookup, fixing dictionary misses such as `She’s` and `Debt,`. English plural and
+past-tense consonants are retained. Common semantic homographs such as `read`
+and `wound` receive a warning unless a literal dictionary variant is specified.
+Explicit words spanning multiple notes use the same source-boundary and vowel
+allocation checks as French; unknown fragments keep their text and diagnostics.
+Karaoke text with encoded line controls and whitespace word boundaries receives
+an additional fragment guard, including when performed notes are separated by
+gaps. Such gaps are preserved. [EN-002](specs/en-002-karaoke-word-articulation.md)
+tracks articulation across them; an independent dictionary reading of a fragment
+such as `Li` in `Living` is not accepted as a correction.
+
+Both corpora are offline assets. Reproduce them using
+`scripts/import-french-lexicon.py --source SOURCE --check` and
+`scripts/import-english-lexicon.py --source SOURCE --check`; hashes, immutable
+source URLs, accepted/excluded counts and mapping rules are in the corresponding
+`docs/*-lexicon-provenance.json` files. A matching alphabet establishes symbol
+compatibility, not perfect pronunciation or acoustic quality for every bank.
+See [the DiffSinger guide](openutau-diffsinger-guide.fr.md) for bank selection,
+GENC, voice colours and the remaining expression-fidelity scope.
 
 ## User overrides
 

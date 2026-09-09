@@ -27,7 +27,7 @@ const api = await load("../src/lib/tauri.ts", {
 });
 
 test("analysis, direct and bundle adapters carry one explicit pronunciation selection", async () => {
-  for (const profile of ["default", "frenchMillefeuille"]) {
+  for (const profile of ["default", "frenchMillefeuille", "englishArpabet"]) {
     calls.length = 0;
     await api.convertFiles(["/tmp/song.mscz"], false, "english", undefined, undefined, "ustx", profile);
     await api.exportVocalsWithDialog({ path: "/tmp/song.mscz" }, "english", undefined, "ustx", profile);
@@ -73,20 +73,24 @@ function reanalysisHarness(convertFiles) {
   return { state, change: new Function(...Object.keys(scope), `${callbackCode}\nreturn changeTarget;`)(...Object.values(scope)) };
 }
 
-test("same-target pronunciation change waits for reanalysis and adopts returned per-file verdicts", async () => {
+for (const [profile, unsupported] of [
+  ["frenchMillefeuille", "FRENCH_PRONUNCIATION_UNSUPPORTED"],
+  ["englishArpabet", "ENGLISH_PRONUNCIATION_UNSUPPORTED"],
+]) {
+test(`${profile}: same-target pronunciation change waits for reanalysis and adopts returned per-file verdicts`, async () => {
   let resolve;
   const requested = [];
   const { state, change } = reanalysisHarness((...args) => { requested.push(args); return new Promise((done) => { resolve = done; }); });
-  const pending = change("ustx", "frenchMillefeuille");
+  const pending = change("ustx", profile);
   assert.equal(requested.length, 1);
-  assert.deepEqual(requested[0], [["song.mscz"], false, "english", undefined, {}, "ustx", "frenchMillefeuille"]);
+  assert.deepEqual(requested[0], [["song.mscz"], false, "english", undefined, {}, "ustx", profile]);
   assert.equal(state.busy, true);
   assert.equal(state.pronunciationProfile, "default", "no selection change before the command returns");
   const verdicts = [{ path: "song.mscz", ok: false, msg: "target cannot represent this source" },
-    { path: "other.mscz", ok: true, warnings: [{ code: "FRENCH_PRONUNCIATION_UNSUPPORTED" }] }];
+    { path: "other.mscz", ok: true, warnings: [{ code: unsupported }] }];
   resolve(verdicts);
   await pending;
-  assert.equal(state.pronunciationProfile, "frenchMillefeuille");
+  assert.equal(state.pronunciationProfile, profile);
   assert.equal(state.items, verdicts, "not-ok and unsupported diagnostics are valid new-profile verdicts");
   assert.equal(state.selected.size, 0);
   assert.deepEqual(state.exportErrors, {});
@@ -95,10 +99,10 @@ test("same-target pronunciation change waits for reanalysis and adopts returned 
   assert.equal(state.busy, false);
 });
 
-test("rejected reanalysis preserves the old selection and diagnostics", async () => {
+test(`${profile}: rejected reanalysis preserves the old selection and diagnostics`, async () => {
   const { state, change } = reanalysisHarness(async () => { throw new Error("command unavailable"); });
   const original = state.items;
-  await change("ustx", "frenchMillefeuille");
+  await change("ustx", profile);
   assert.equal(state.items, original);
   assert.equal(state.pronunciationProfile, "default");
   assert.equal(state.globalError, "command unavailable");
@@ -106,11 +110,12 @@ test("rejected reanalysis preserves the old selection and diagnostics", async ()
   assert.equal(state.busy, false);
 });
 
-test("unchanged selection or the active busy guard prevents another reanalysis", async () => {
+test(`${profile}: unchanged selection or the active busy guard prevents another reanalysis`, async () => {
   const { state, change } = reanalysisHarness(async () => { assert.fail("unexpected reanalysis"); });
   await change("ustx", "default");
   state.busy = true;
-  await change("ustx", "frenchMillefeuille");
+  await change("ustx", profile);
   assert.equal(state.pronunciationProfile, "default");
   assert.equal(state.busy, true, "another operation still owns the guard");
 });
+}

@@ -5,7 +5,9 @@
 //! reads [`crate::engine::projection::ProjectedProject`] and nothing else, so
 //! adding a target cannot reach back into the conversion engine and cannot
 //! change what another target writes.
+pub mod english;
 pub mod french;
+pub(crate) mod lexical;
 pub mod svp;
 pub mod ustx;
 
@@ -34,6 +36,7 @@ pub enum PronunciationProfile {
     #[default]
     Default,
     FrenchMillefeuille,
+    EnglishArpabet,
 }
 
 impl PronunciationProfile {
@@ -174,11 +177,17 @@ mod tests {
                 PronunciationProfile::FrenchMillefeuille,
                 "\"frenchMillefeuille\"",
             ),
+            (PronunciationProfile::EnglishArpabet, "\"englishArpabet\""),
         ] {
             assert_eq!(serde_json::to_string(&profile).unwrap(), value);
             assert_eq!(
                 serde_json::from_str::<PronunciationProfile>(value).unwrap(),
                 profile
+            );
+            assert_eq!(profile.for_target(ExportTarget::Ustx), profile);
+            assert_eq!(
+                profile.for_target(ExportTarget::Svp),
+                PronunciationProfile::Default
             );
         }
         assert!(serde_json::from_str::<PronunciationProfile>("\"french\"").is_err());

@@ -34,21 +34,38 @@ language selector, and nothing about lyric text depends on it.
 
 All three conversion/export commands accept the optional `pronunciationProfile`.
 It defaults to `"default"`; unknown values fail deserialization. The legacy
-`language` parameter remains ignored. `"frenchMillefeuille"` applies only when
-`exportTarget` is `"ustx"`; SVP always uses the default projection policy.
+`language` parameter remains ignored. `"frenchMillefeuille"` and `"englishArpabet"`
+apply only when `exportTarget` is `"ustx"`; SVP always uses the default projection
+policy.
 
 Settings exposes the choice as **OpenUtau pronunciation**. Changing it reanalyzes
 all loaded files through the same guarded workflow as a target change. The
-selection is installed only after successful reanalysis. Direct, batch and
+selection is installed when the reanalysis command returns its per-file verdicts,
+including `ok=false` results and unsupported-pronunciation warnings. A rejected
+command preserves the previous selection and diagnostics. Direct, batch and
 bundle exports pass the same selection to `convert_midi_with_profile`.
 
-The profile selects a pronunciation convention and the French DiffSinger
-phonemizer, never a singer. No automatic language detection occurs.
+The profile selects a pronunciation convention, never a singer. No automatic
+language detection occurs. French selects
+`OpenUtau.Core.DiffSinger.DiffSingerFrenchMillfeuillePhonemizer`; English selects
+`OpenUtau.Core.DiffSinger.DiffSingerEnglishPhonemizer` (DIFFS EN, stressless CMU39
+phones in the `en/` namespace). Compatible singer assignment remains manual.
+
 Diagnostics include `FRENCH_PRONUNCIATION_APPLIED`, `FRENCH_LIAISON_APPLIED`,
-`FRENCH_PRONUNCIATION_UNSUPPORTED`, and `FRENCH_DUPLICATE_BLANK_RESOLVED`.
+`FRENCH_PRONUNCIATION_UNSUPPORTED`, `FRENCH_DUPLICATE_BLANK_RESOLVED`,
+`FRENCH_DUPLICATE_LYRIC_CONFLICT`, `ENGLISH_PRONUNCIATION_APPLIED`,
+`ENGLISH_PRONUNCIATION_UNSUPPORTED`, `ENGLISH_PRONUNCIATION_AMBIGUOUS`,
+`ENGLISH_PRONUNCIATION_VOWEL_MISMATCH`, `ENGLISH_DUPLICATE_BLANK_RESOLVED`, and
+`ENGLISH_DUPLICATE_LYRIC_CONFLICT`.
 They retain source note IDs; bundle manifests preserve the same codes,
 messages and source IDs. Unsupported vocabulary is a warning, not an export
-refusal. Manual hints remain unchanged.
+refusal. Manual hints remain unchanged. For a recognized complete English source
+word with exactly one dictionary vowel per source syllable attack, its first
+note carries the whole-word hint and later syllables use native `+`; real holds
+use `+~`. Original lyric evidence remains attached to every projected note.
+Unknown fragments, orphan syllabic metadata, mismatches and ambiguous base
+homographs retain source text instead of inventing a reading or choosing a
+numbered variant by vowel count.
 
 ## Commands
 
@@ -62,7 +79,7 @@ request:
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<sourcePath, Record<trackIdString, boolean>>
   exportTarget?: "svp" | "ustx"
-  pronunciationProfile?: "default" | "frenchMillefeuille"
+  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet"
 
 response:
   FileResult[]
@@ -85,7 +102,7 @@ request:
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<trackIdString, boolean>
   exportTarget?: "svp" | "ustx"
-  pronunciationProfile?: "default" | "frenchMillefeuille"
+  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet"
 
 response:
   string  // committed target path
@@ -115,7 +132,7 @@ request:
   overrides?: Record<trackIdString, boolean>
   rendererPath?: string
   exportTarget?: "svp" | "ustx"
-  pronunciationProfile?: "default" | "frenchMillefeuille"
+  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet"
   onProgress: Channel<BundleProgressEvent>
 
 response:

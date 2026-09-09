@@ -8,9 +8,10 @@ in the public repository.
 
 | Specification | Purpose | Current stage |
 | --- | --- | --- |
-| [FR-001](fr-001-sung-pronunciation.md) | French sung syllables, silent endings, liaison, source ownership | Implementation under review |
-| [FR-002](fr-002-community-lexicon.md) | Broad, reproducible French dictionary coverage | Ready for implementation after FR-001 |
-| [EN-001](en-001-diffsinger-pronunciation.md) | Explicit English DiffSinger pronunciation | Compatibility investigation |
+| [FR-001](fr-001-sung-pronunciation.md) | French sung syllables, silent endings, liaison, source ownership | Implemented and reviewed; listening pending |
+| [FR-002](fr-002-community-lexicon.md) | Broad, reproducible French dictionary coverage | Implemented; corpus and allocation validated; listening pending |
+| [EN-001](en-001-diffsinger-pronunciation.md) | Explicit English DiffSinger pronunciation | Implemented; source-fragment guards and integration tests validated |
+| [EN-002](en-002-karaoke-word-articulation.md) | Karaoke word articulation across performed gaps | Specified; fragments protected by EN-001 |
 | [EXP-001](exp-001-expression-fidelity.md) | Pitch, interpolation, vibrato and volume provenance | Source/history audit complete; broader import remains separate |
 
 Each implementation must distinguish automated structural verification from

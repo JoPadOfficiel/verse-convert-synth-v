@@ -1,12 +1,15 @@
-//! Bounded French Millefeuille pronunciation policy. No runtime G2P or guessing.
+//! French Millefeuille pronunciation with indexed, pinned community readings.
 //!
 //! `french-lexicon.tsv` pins the community readings and their original symbols.
 //! Layouts below choose sung variants only from source note evidence. Numbers
 //! in dictionary keys are literal variants, never a general schwa convention.
+use std::{collections::HashMap, sync::OnceLock};
+
+use super::lexical as shared;
 use crate::engine::convert::{Diagnostic, DiagnosticSeverity};
 use crate::engine::midi::{Lyric, LyricState, Syllabic};
 use crate::engine::projection::{ProjectedLyric, ProjectedNote};
-use crate::engine::syllable::{hyphen_markers, preserve_bracketed_melismas, touches};
+use crate::engine::syllable::{preserve_bracketed_melismas, touches};
 
 // The misspelling is the actual installed OpenUtau type name.
 pub const PHONEMIZER: &str = "OpenUtau.Core.DiffSinger.DiffSingerFrenchMillfeuillePhonemizer";
@@ -16,42 +19,95 @@ pub const LIAISON: &str = "FRENCH_LIAISON_APPLIED";
 
 const LEXICON: &str = include_str!("french-lexicon.tsv");
 
-/// Edge punctuation is lookup noise. Internal accents, apostrophes and dashes
-/// remain meaningful; an unknown token is still emitted exactly as received.
+const COMMUNITY: &str = include_str!("french-community.tsv");
+static CURATED_INDEX: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+static COMMUNITY_INDEX: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
+
 fn normalize(text: &str) -> String {
-    let text = text.trim_matches(|c: char| c.is_whitespace() || ",.;:!?…\"«»“”„()".contains(c));
-    // A closing apostrophe followed by punctuation is not an internal elision:
-    // `rêves',` looks up `rêves`, whereas `d'un` keeps its stated d consonant.
-    // Leading apostrophes and unknown elided fragments still retain their text.
-    let text =
-        text.trim_end_matches(|c: char| c.is_whitespace() || ",.;:!?…\"«»“”„()'’".contains(c));
-    hyphen_markers(text)
-        .2
-        .trim()
-        .to_lowercase()
-        .replace('’', "'")
+    shared::normalize(text)
 }
 
-fn lexical(key: &str) -> Option<&'static str> {
-    // Only explicit elisions / spellings validated for this bounded policy.
-    match key {
-        "d'un" => return Some("fr/d fr/in"),
-        "tau" => return Some("fr/t fr/oh"),
-        // A verified source fragment, not a repair to an imagined whole word.
-        // Isolated `rê` receives its vowel but never an invented v or final e.
-        "rê" => return Some("fr/r fr/ae"),
-        // Keep the pronounced s of the noun; the verb homograph is ambiguous.
-        // `bus` intentionally remains untouched and diagnosed below.
+/// These base forms need grammatical context. Numbered source variants remain
+/// explicit choices; their number is never interpreted as a general rule.
+fn ambiguous(key: &str) -> bool {
+    matches!(
+        key,
+        "bus" | "fils" | "as" | "tous" | "os" | "plus" | "couvent"
+        | "content" | "portions" | "président" | "résident" | "sens" | "est"
+        // These audited isolated fragments also collide with rare dictionary
+        // lexemes; only a complete word/layout can disambiguate their use.
+        | "rai" | "ur" | "urs" | "ure" | "ures"
+    )
+}
+
+fn lexical(key: &str) -> Option<String> {
+    let special = match key {
+        "d'un" => Some("fr/d fr/in"),
+        "tau" => Some("fr/t fr/oh"),
+        "rê" => Some("fr/r fr/ae"),
         "laisses" => return lexical("laisse"),
-        _ => {}
+        _ => None,
+    };
+    if let Some(hint) = special {
+        return Some(hint.into());
     }
-    LEXICON
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .find_map(|line| {
-            let mut fields = line.split('\t');
-            (fields.next()? == key).then(|| fields.next()).flatten()
-        })
+    // The original curated grammatical reading of est supports the verified
+    // est/un liaison. Other ambiguous base forms remain unforced.
+    if let Some(hint) = CURATED_INDEX
+        .get_or_init(|| shared::index(LEXICON))
+        .get(key)
+    {
+        return Some((*hint).into());
+    }
+    if ambiguous(key) {
+        return None;
+    }
+    let dictionary = COMMUNITY_INDEX.get_or_init(|| shared::index(COMMUNITY));
+    if let Some(hint) = dictionary.get(key) {
+        return Some((*hint).into());
+    }
+    // An explicit elision contributes its consonant only when its remainder
+    // is itself known. It does not create a liaison at another word boundary.
+    for (prefix, phone) in [
+        ("l'", "fr/l"),
+        ("d'", "fr/d"),
+        ("j'", "fr/j"),
+        ("t'", "fr/t"),
+        ("m'", "fr/m"),
+        ("n'", "fr/n"),
+        ("s'", "fr/s"),
+        ("c'", "fr/s"),
+        ("qu'", "fr/k"),
+    ] {
+        if let Some(remainder) = key.strip_prefix(prefix) {
+            if !remainder.contains('\'')
+                && !ambiguous(remainder)
+                && (remainder.chars().count() > 1 || matches!(remainder, "a" | "y"))
+            {
+                let hint = CURATED_INDEX
+                    .get_or_init(|| shared::index(LEXICON))
+                    .get(remainder)
+                    .or_else(|| dictionary.get(remainder));
+                if let Some(hint) = hint {
+                    return Some(format!("{phone} {hint}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn standalone_allowed(lyric: &ProjectedLyric, key: &str) -> bool {
+    // FR-001 explicitly audited these isolated spellings despite orphan score
+    // metadata. New community entries need a complete word or an independent
+    // source token, not an unfinished Begin/Middle/End fragment.
+    source(lyric).is_some_and(|source| {
+        matches!(source.syllabic, None | Some(Syllabic::Single))
+            || CURATED_INDEX
+                .get_or_init(|| shared::index(LEXICON))
+                .contains_key(key)
+            || matches!(key, "d'un" | "tau" | "rê" | "laisses")
+    })
 }
 
 struct Layout {
@@ -209,7 +265,9 @@ const LAYOUTS: &[Layout] = &[
 
 fn source(lyric: &ProjectedLyric) -> Option<&Lyric> {
     match lyric {
-        ProjectedLyric::Source(source) | ProjectedLyric::Pronounced { source, .. } => Some(source),
+        ProjectedLyric::Source(source)
+        | ProjectedLyric::Pronounced { source, .. }
+        | ProjectedLyric::PronouncedSplit { source } => Some(source),
         _ => None,
     }
 }
@@ -222,15 +280,11 @@ fn text(lyric: &ProjectedLyric) -> Option<&str> {
 }
 
 fn manual(text: &str) -> bool {
-    text.contains('[') || text.contains(']') || text.trim_start().starts_with('+')
+    text.contains('[') || text.contains(']') || text.trim_start().starts_with(['+', '?'])
 }
 
 fn candidate(lyric: &ProjectedLyric) -> Option<String> {
-    if !matches!(lyric, ProjectedLyric::Source(_)) {
-        return None;
-    }
-    let text = text(lyric)?;
-    (!manual(text) && !text.trim().is_empty()).then(|| normalize(text))
+    shared::candidate(lyric)
 }
 
 fn same_lane(left: &ProjectedLyric, right: &ProjectedLyric) -> bool {
@@ -254,52 +308,14 @@ fn next_attack(notes: &[ProjectedNote], head: usize) -> Option<usize> {
         {
             return None;
         }
-        if !notes[index].lyric.continues_previous_note() {
-            return Some(index);
+        match &notes[index].lyric {
+            ProjectedLyric::Extension => {}
+            ProjectedLyric::Source(lyric) if lyric.state == LyricState::Continuation => {}
+            _ => return Some(index),
         }
         index += 1;
     }
     None
-}
-
-fn syllable_binding(lyric: &ProjectedLyric) -> Option<(bool, bool)> {
-    let source = source(lyric)?;
-    let LyricState::Text(text) = &source.state else {
-        return None;
-    };
-    Some(match source.syllabic {
-        Some(Syllabic::Begin) => (false, true),
-        Some(Syllabic::Middle) => (true, true),
-        Some(Syllabic::End) => (true, false),
-        Some(Syllabic::Single) => (false, false),
-        None => {
-            let (previous, next, _) = hyphen_markers(text);
-            (previous, next)
-        }
-    })
-}
-
-/// Bilateral source binding identifies fragments even when the word is unknown.
-/// An orphan end alone cannot turn the preceding independent word into one.
-fn connected_fragments(notes: &[ProjectedNote]) -> Vec<bool> {
-    let mut fragments = vec![false; notes.len()];
-    for head in 0..notes.len() {
-        if !syllable_binding(&notes[head].lyric).is_some_and(|(_, next)| next)
-            || text(&notes[head].lyric).is_none_or(ends_phrase)
-        {
-            continue;
-        }
-        let Some(next) = next_attack(notes, head) else {
-            continue;
-        };
-        if same_lane(&notes[head].lyric, &notes[next].lyric)
-            && syllable_binding(&notes[next].lyric).is_some_and(|(previous, _)| previous)
-        {
-            fragments[head] = true;
-            fragments[next] = true;
-        }
-    }
-    fragments
 }
 
 fn layout_members(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Option<Vec<usize>> {
@@ -366,7 +382,7 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
     preserve_bracketed_melismas(notes);
     let mut diagnostics = Vec::new();
     let mut changed = vec![false; notes.len()];
-    let fragments = connected_fragments(notes);
+    let fragments = shared::fragments(notes);
     // Word boundaries are independent of the surface syllable under a note.
     // In particular, the `tes` tail of tempêtes is never a determiner.
     let mut words: Vec<(usize, usize, String)> = Vec::new();
@@ -383,13 +399,28 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
             break;
         }
     }
+    // Curated sung layouts take priority. Other complete source words use the
+    // native phonemizer's syllable allocation only when every attack has a vowel.
+    for members in shared::words(notes) {
+        let key = shared::joined_key(notes, &members);
+        if let Some(hint) = lexical(&key) {
+            if shared::vowel_count(&hint) == members.len() {
+                shared::pronounce_word(notes, &members, &key, &hint);
+                words.push((members[0], *members.last().unwrap(), key));
+                for member in members {
+                    changed[member] = true;
+                }
+            }
+        }
+    }
     for index in 0..notes.len() {
         if let Some(key) = candidate(&notes[index].lyric) {
-            // A literal variant is unsupported input, not an invitation to pick
-            // a sung layout by its number.
-            if !key.contains(['(', ')']) && (!fragments[index] || key == "rê") {
+            // A variant is looked up literally, never selected from a guessed
+            // grammatical or sung-schwa rule.
+            if (!fragments[index] || key == "rê") && standalone_allowed(&notes[index].lyric, &key)
+            {
                 if let Some(hint) = lexical(&key) {
-                    pronounce(&mut notes[index], hint);
+                    pronounce(&mut notes[index], &hint);
                     changed[index] = true;
                     if key != "rê" {
                         words.push((index, index, key));
@@ -398,7 +429,7 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
                 }
             }
             diagnostics.push(diagnose(UNSUPPORTED, format!(
-                "French Millefeuille has no verified reading for source lyric {:?} in this layout; text and attacks were retained.", text(&notes[index].lyric).unwrap_or_default()
+                "French Millefeuille has no unambiguous reading compatible with the source syllable layout for lyric {:?} in this layout; text and attacks were retained.", text(&notes[index].lyric).unwrap_or_default()
             ), &note_ids[index]));
         }
     }
@@ -425,7 +456,7 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
             ("tout", "au" | "à") | ("est", "un") => "fr/t",
             (
                 "mes" | "tes" | "ses" | "les" | "des" | "nos" | "vos",
-                "ami" | "amis" | "amours" | "enfant" | "enfants",
+                "ami" | "amis" | "amours" | "enfant" | "enfants" | "homme" | "hommes",
             ) => "fr/z",
             ("un" | "mon" | "ton" | "son", "ami" | "enfant") => "fr/n",
             _ => continue,
@@ -449,6 +480,11 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
                 phonemes,
             } = &notes[index].lyric
             else {
+                if let ProjectedLyric::PronouncedSplit { source } = &notes[index].lyric {
+                    diagnostics.push(diagnose(APPLIED, format!(
+                        "French Millefeuille: {:?} remains a separate source-owned syllable of the preceding dictionary word; rendered as +.", source.raw
+                    ), &note_ids[index]));
+                }
                 continue;
             };
             diagnostics.push(diagnose(APPLIED, format!(

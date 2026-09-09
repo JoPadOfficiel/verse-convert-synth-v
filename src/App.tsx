@@ -556,7 +556,7 @@ export default function App() {
             </div>
             {exportTarget === "ustx" && (
               <span className="text-xs text-muted-foreground">
-                Pronunciation: {pronunciationProfile === "frenchMillefeuille" ? "French Millefeuille" : "Default"}
+                Pronunciation: {pronunciationProfile === "frenchMillefeuille" ? "French Millefeuille" : pronunciationProfile === "englishArpabet" ? "English ARPAbet" : "Default"}
               </span>
             )}
             <div className="flex-1" />

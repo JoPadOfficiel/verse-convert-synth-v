@@ -47,12 +47,12 @@ fn french_unknown_connected_word_cannot_use_its_fragment_as_a_determiner() {
     let body = format!(
         "{}{}{}",
         note("C", Some("begin"), "des"),
-        note("D", Some("end"), "tin"),
+        note("D", Some("end"), "tinqzx"),
         note("E", None, "amis")
     );
     assert_eq!(
         ustx_lyrics(&french_export(&body)),
-        ["des", "tin", "amis[fr/ah fr/m fr/ih]"]
+        ["des", "tinqzx", "amis[fr/ah fr/m fr/ih]"]
     );
     let midi = musicxml::parse(score(&body).as_bytes()).unwrap();
     let result = verse_lib::engine::convert::convert_midi_with_profile(
@@ -197,13 +197,19 @@ fn french_rests_untexted_notes_and_explicit_words_block_layouts() {
         untexted("D"),
         note("E", None, "me")
     );
-    assert_eq!(ustx_lyrics(&french_export(&unmarked)), ["mê", "me"]);
+    assert_eq!(
+        ustx_lyrics(&french_export(&unmarked)),
+        ["mê", "me[fr/m fr/ee]"]
+    );
     let words = format!(
         "{}{}",
         note("C", Some("single"), "mê"),
         note("D", Some("single"), "me")
     );
-    assert_eq!(ustx_lyrics(&french_export(&words)), ["mê", "me"]);
+    assert_eq!(
+        ustx_lyrics(&french_export(&words)),
+        ["mê", "me[fr/m fr/ee]"]
+    );
     let liaison = format!(
         "{}{}{}",
         note("C", None, "tout"),

@@ -152,6 +152,9 @@ pub enum ProjectedLyric {
         text: String,
         phonemes: String,
     },
+    /// The next source-owned syllable of an explicitly recognized word.
+    /// The target uses its syllable-split marker; the original lyric survives.
+    PronouncedSplit { source: Box<Lyric> },
     /// A source lyric extension carries the previous syllable onto this note.
     /// There is no lyric object of its own; the source stated the extension on
     /// a neighbour, as a MusicXML `<extend>` or a MuseScore extension length.
@@ -178,6 +181,7 @@ impl ProjectedLyric {
             ),
             ProjectedLyric::Absent => false,
             ProjectedLyric::Pronounced { .. } => false,
+            ProjectedLyric::PronouncedSplit { .. } => true,
         }
     }
 
@@ -193,6 +197,7 @@ impl ProjectedLyric {
             ProjectedLyric::Source(source) => !matches!(source.state, LyricState::ExplicitEmpty),
             ProjectedLyric::Absent => false,
             ProjectedLyric::Pronounced { .. } => true,
+            ProjectedLyric::PronouncedSplit { .. } => true,
         }
     }
 }

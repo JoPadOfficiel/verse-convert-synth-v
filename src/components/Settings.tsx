@@ -77,15 +77,22 @@ export function Settings({
         >
           <option value="default">Default</option>
           <option value="frenchMillefeuille">French DiffSinger Millefeuille</option>
+          <option value="englishArpabet">English DiffSinger ARPAbet</option>
         </select>
         <p className="text-xs text-muted-foreground">
-          French Millefeuille preserves sung syllables using a bounded French
-          dictionary and selects DIFFS FR MILLE on every vocal track. Assign a
-          compatible DiffSinger singer in OpenUtau. Unsupported words remain
-          unchanged and appear in diagnostics. Synthesizer V uses Default.
+          {pronunciationProfile === "englishArpabet"
+            ? "English pronunciation for compatible DiffSinger banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
+            : pronunciationProfile === "frenchMillefeuille"
+              ? "French pronunciation for compatible DiffSinger Millefeuille banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
+              : "Default keeps the existing lyric projection and OpenUtau phonemizer convention."}
+          {" "}Assign a compatible singer in OpenUtau. Pronunciation is never
+          detected automatically. Synthesizer V uses Default.
         </p>
         <a className="text-xs underline" href="/licenses/french-community-dictionary.txt" target="_blank" rel="noreferrer">
           French community dictionary license
+        </a>
+        <a className="text-xs underline" href="/licenses/cmudict.txt" target="_blank" rel="noreferrer">
+          CMU English dictionary license
         </a>
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
       </div>

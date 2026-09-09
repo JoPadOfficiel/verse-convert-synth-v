@@ -373,6 +373,7 @@ fn exact_ustx_ticks(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i3
 fn lyric_text(lyric: &ProjectedLyric) -> String {
     match lyric {
         ProjectedLyric::Pronounced { text, phonemes, .. } => format!("{text}[{phonemes}]"),
+        ProjectedLyric::PronouncedSplit { .. } => "+".into(),
         ProjectedLyric::Source(source) => match &source.state {
             LyricState::Text(text) => text.clone(),
             // The source states that the previous syllable is *held* across this
@@ -502,6 +503,7 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
             phonemizer: match project.pronunciation_profile {
                 super::PronunciationProfile::Default => DEFAULT_PHONEMIZER,
                 super::PronunciationProfile::FrenchMillefeuille => super::french::PHONEMIZER,
+                super::PronunciationProfile::EnglishArpabet => super::english::PHONEMIZER,
             }
             .into(),
             track_name: track.name.clone(),

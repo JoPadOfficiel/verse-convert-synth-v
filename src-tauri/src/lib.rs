@@ -1313,13 +1313,57 @@ mod output_tests {
 
     #[test]
     fn french_analysis_batch_and_direct_exports_share_the_bundle_projection() {
+        assert_profile_commands(
+            PronunciationProfile::FrenchMillefeuille,
+            &[
+                ("Tout", None),
+                ("au", None),
+                ("Un,", None),
+                ("d'un", None),
+                ("mê", None),
+                ("me", None),
+                ("zzq-not-a-word", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn english_analysis_batch_and_direct_exports_share_the_bundle_projection() {
+        assert_profile_commands(
+            PronunciationProfile::EnglishArpabet,
+            &[
+                ("She's,", None),
+                ("Debt,", None),
+                ("beau", Some("begin")),
+                ("ti", Some("middle")),
+                ("ful", Some("end")),
+                ("zzq-not-a-word", None),
+            ],
+        );
+    }
+
+    fn assert_profile_commands(profile: PronunciationProfile, words: &[(&str, Option<&str>)]) {
         let root = temp_dir();
-        let source = root.join("french.musicxml");
-        let words = ["Tout", "au", "Un,", "d'un", "mê", "me", "inconnu"];
-        let notes: String = words.iter().map(|word| format!("<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><lyric><text>{word}</text></lyric></note>")).collect();
+        let source = root.join("profile.musicxml");
+        let notes: String = words.iter().map(|(word, state)| {
+            let state = state.map(|value| format!("<syllabic>{value}</syllabic>")).unwrap_or_default();
+            format!("<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><lyric>{state}<text>{word}</text></lyric></note>")
+        }).collect();
         let data = format!("<score-partwise version=\"4.0\"><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes>{notes}</measure></part></score-partwise>");
         std::fs::write(&source, &data).unwrap();
-        let profile = PronunciationProfile::FrenchMillefeuille;
+        let (applied, unsupported, phonemizer) = match profile {
+            PronunciationProfile::FrenchMillefeuille => (
+                engine::target::french::LIAISON,
+                engine::target::french::UNSUPPORTED,
+                engine::target::french::PHONEMIZER,
+            ),
+            PronunciationProfile::EnglishArpabet => (
+                engine::target::english::APPLIED,
+                engine::target::english::UNSUPPORTED,
+                engine::target::english::PHONEMIZER,
+            ),
+            PronunciationProfile::Default => unreachable!(),
+        };
         let path = source.to_str().unwrap();
         let analysis = process_one(
             path,
@@ -1346,14 +1390,8 @@ mod output_tests {
             batch.msg
         );
         assert_eq!(analysis.warnings, batch.warnings);
-        assert!(analysis
-            .warnings
-            .iter()
-            .any(|w| w.code == engine::target::french::LIAISON));
-        assert!(analysis
-            .warnings
-            .iter()
-            .any(|w| w.code == engine::target::french::UNSUPPORTED));
+        assert!(analysis.warnings.iter().any(|w| w.code == applied));
+        assert!(analysis.warnings.iter().any(|w| w.code == unsupported));
         let direct = root.join("direct.ustx");
         export_svp(
             path.into(),
@@ -1393,7 +1431,7 @@ mod output_tests {
         let plan = stems::StemPlan::from_source(&midi, &converted.tracks).unwrap();
         let bundled = export_bundle_blocking(
             path.into(),
-            root.join("french.versebundle")
+            root.join("profile.versebundle")
                 .to_string_lossy()
                 .into_owned(),
             Some("english".into()),
@@ -1416,10 +1454,7 @@ mod output_tests {
                 .unwrap()
         }
         assert_eq!(vocal_section(&emitted), vocal_section(&baseline));
-        assert_eq!(
-            emitted.matches(engine::target::french::PHONEMIZER).count(),
-            project.tracks.len()
-        );
+        assert_eq!(emitted.matches(phonemizer).count(), project.tracks.len());
         assert!(!engine::target::ustx::audit(&emitted)
             .unwrap()
             .wave_parts

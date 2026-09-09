@@ -2,12 +2,12 @@
 title: "FR-002: Broad French community lexicon"
 type: feature
 created: 2026-09-09
-status: ready
+status: implemented
 ---
 
 # FR-002: Broad French community lexicon
 
-Status: ready for implementation after FR-001. Scope authorized 2026-09-09.
+Status: implemented and reviewed; listening remains pending. Scope authorized 2026-09-09.
 
 ## Intent
 
@@ -53,3 +53,24 @@ No change in note identity, timing, pitch/vibrato or default/SVP output.
 - https://github.com/openutau/OpenUtau/wiki/Phonemizers
 - https://github.com/bootphon/phonemizer
 - https://github.com/espeak-ng/espeak-ng
+
+## Implementation evidence
+
+The pinned importer accepts 104,943 keys, excludes 125 source rows, and
+quarantines 27 conflicting/invalid keys. It preserves 40 duplicate source rows
+as provenance rather than overwriting their evidence. Runtime uses lazy indexes,
+NFC normalization and curated readings/layouts first. Numbered variants are
+literal choices. Bare elisions, incomplete word fragments and known ambiguous
+homographs stay unforced. Complete source words use a whole-word hint and native
+syllable markers only when the reading supplies exactly the stated attacks.
+
+No external G2P runtime was added. eSpeak/Phonemizer would require another alias
+adapter and alignment policy; their installation would not by itself improve
+the supported-bank contract. Audible evaluation remains separate.
+
+Validation: 19 French integration tests pass, including the review regressions
+for unilateral dashes and punctuation parentheses. Both private score exports
+retain all matching musical data, with nine separately source-justified recovered
+notes. Installed OpenUtau allocation accepts 2,997 groups / 3,124 notes with all
+3,107 expected attacks present; no rejected or unsupported symbols. The lexical
+policy supplies 2,625 attacks and diagnoses 482 unresolved occurrences.

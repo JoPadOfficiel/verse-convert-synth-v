@@ -85,7 +85,7 @@ enum Part {
 
 fn classify(note: &ProjectedNote) -> Part {
     match &note.lyric {
-        ProjectedLyric::Pronounced { .. } => Part::Break,
+        ProjectedLyric::Pronounced { .. } | ProjectedLyric::PronouncedSplit { .. } => Part::Break,
         ProjectedLyric::Extension => Part::Held,
         ProjectedLyric::Absent => Part::Untexted,
         ProjectedLyric::Source(source) => match &source.state {
@@ -372,7 +372,7 @@ mod tests {
                 },
                 ProjectedLyric::Extension => "<ext>".into(),
                 ProjectedLyric::Absent => "<none>".into(),
-                ProjectedLyric::Pronounced { .. } => {
+                ProjectedLyric::Pronounced { .. } | ProjectedLyric::PronouncedSplit { .. } => {
                     panic!("default joining must not generate pronunciation hints")
                 }
             })

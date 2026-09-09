@@ -134,7 +134,7 @@ fn phrase_boundaries_cannot_relocate_a_word_consonant() {
         for head in ["court.", "court.’", "court!\"", "court,»"] {
             assert_lanes(
                 &sab(&[head, "ou", "ourt"], native, false),
-                &["court[fr/k fr/ou fr/r]", "ou", "ourt"],
+                &["court[fr/k fr/ou fr/r]", "ou[fr/ou]", "ourt"],
             );
         }
     }
@@ -318,7 +318,7 @@ fn closing_apostrophes_are_punctuation_but_internal_elisions_remain() {
                 "rê'ves",
                 "J'i",
                 "rai",
-                "la",
+                "la[fr/l fr/ah]",
             ],
         );
     }
@@ -376,7 +376,10 @@ fn audited_word_layouts_preserve_repeated_vowels_and_only_stated_consonants() {
 #[test]
 fn vowel_fragments_outside_the_audited_layouts_stay_unsupported() {
     let midi = sab(&["u", "ure,", "urs,", "la", "J'i", "rai"], false, false);
-    assert_lanes(&midi, &["u", "ure,", "urs,", "la", "J'i", "rai"]);
+    assert_lanes(
+        &midi,
+        &["u", "ure,", "urs,", "la[fr/l fr/ah]", "J'i", "rai"],
+    );
     for track in convert(&midi)
         .tracks
         .iter()
@@ -388,7 +391,7 @@ fn vowel_fragments_outside_the_audited_layouts_stay_unsupported() {
                 .iter()
                 .filter(|w| w.code == french::UNSUPPORTED)
                 .count(),
-            6
+            5
         );
     }
 }
@@ -413,11 +416,11 @@ fn liaison_is_bounded_and_already_spelled_consonants_are_not_doubled() {
         "est[fr/ae]",
         "un[fr/t fr/in]",
         "les[fr/l fr/eh]",
-        "hommes",
+        "hommes[fr/z fr/oo fr/m]",
         "tout[fr/t fr/ou]",
         "au[fr/oh]",
         "mes[fr/m fr/eh]",
-        "haricots",
+        "haricots[fr/ah fr/r fr/ih fr/k fr/oh]",
     ];
     assert_lanes(&sab(&words, false, false), &expected);
 }
@@ -446,7 +449,7 @@ fn unknowns_pronounced_consonants_and_manual_hints_are_retained() {
             "net[fr/n fr/ae fr/t]",
             "Xylophonie!",
             "un[fr/un]",
-            "rêves(2)",
+            "rêves(2)[fr/r fr/ae fr/v fr/ee]",
         ],
     );
     let outcome = convert(&midi);
@@ -457,7 +460,7 @@ fn unknowns_pronounced_consonants_and_manual_hints_are_retained() {
             .flat_map(|track| &track.warnings)
             .filter(|warning| warning.code == french::UNSUPPORTED)
             .count(),
-        9
+        6
     );
 }
 
@@ -502,5 +505,200 @@ fn selected_french_profile_cannot_change_svp() {
             .iter()
             .map(|t| &t.warnings)
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn broad_dictionary_normalizes_unicode_and_keeps_pronounced_exceptions() {
+    for native in [false, true] {
+        assert_lanes(
+            &sab(
+                &[
+                    "FLEURS!",
+                    "grand",
+                    "chats",
+                    "parfum",
+                    "gagner",
+                    "montagne",
+                    "ABI\u{302}ME",
+                    "d’abîme",
+                    "bus(2)",
+                    "fils(4)",
+                ],
+                native,
+                false,
+            ),
+            &[
+                "fleurs[fr/f fr/l fr/oe fr/r]",
+                "grand[fr/g fr/r fr/en]",
+                "chats[fr/sh fr/ah]",
+                "parfum[fr/p fr/ah fr/r fr/f fr/in]",
+                "gagner[fr/g fr/ah fr/n fr/y fr/eh]",
+                "montagne[fr/m fr/on fr/t fr/ah fr/n fr/y]",
+                "abîme[fr/ah fr/b fr/ih fr/m]",
+                "d'abîme[fr/d fr/ah fr/b fr/ih fr/m]",
+                "bus(2)[fr/b fr/uh fr/s]",
+                "fils(4)[fr/f fr/ih fr/s]",
+            ],
+        );
+    }
+}
+
+#[test]
+fn ambiguous_homographs_and_forced_input_remain_unforced() {
+    let words = [
+        "bus",
+        "fils",
+        "président",
+        "couvent",
+        "plus",
+        "tous",
+        "?vent",
+        "l'",
+        "j’",
+        "SP",
+        "AP",
+        "br",
+        "R",
+    ];
+    assert_lanes(&sab(&words, false, false), &words);
+}
+
+#[test]
+fn punctuation_parentheses_do_not_hide_words_or_erase_literal_variants() {
+    assert_lanes(
+        &sab(
+            &["(le", "vent)", "(rêves.)", "(rêves(2))", "(l')"],
+            false,
+            false,
+        ),
+        &[
+            "le[fr/l fr/ee]",
+            "vent[fr/v fr/en]",
+            "rêves[fr/r fr/ae fr/v]",
+            "rêves(2)[fr/r fr/ae fr/v fr/ee]",
+            "(l')",
+        ],
+    );
+}
+
+#[test]
+fn dangling_dashes_protect_fragments_and_a_split_marker_is_not_a_hold() {
+    assert_lanes(&sab(&["chan-", "ter"], false, false), &["chan-", "ter"]);
+    // The marker consumes a syllable; it cannot be skipped to find the curated
+    // two-syllable rê/ves layout and leave a native + without a vowel.
+    let midi = sab(&["rê", "+", "ves"], false, false);
+    let result = model(&convert(&midi));
+    for part in result.voice_parts {
+        assert_eq!(part.notes[2].lyric, "ves");
+    }
+}
+
+#[test]
+fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidence() {
+    use verse_lib::engine::midi::{Lyric, Syllabic};
+    use verse_lib::engine::projection::ProjectedNote;
+    let mut left = Lyric::text("a", "bon".into());
+    left.syllabic = Some(Syllabic::Begin);
+    let mut right = Lyric::text("b", "jour".into());
+    right.syllabic = Some(Syllabic::End);
+    let mut notes = vec![
+        ProjectedNote {
+            onset_ticks: 0,
+            duration_ticks: 480,
+            pitch: 60,
+            lyric: ProjectedLyric::Source(Box::new(left.clone())),
+        },
+        ProjectedNote {
+            onset_ticks: 480,
+            duration_ticks: 240,
+            pitch: 62,
+            lyric: ProjectedLyric::Absent,
+        },
+        ProjectedNote {
+            onset_ticks: 720,
+            duration_ticks: 480,
+            pitch: 64,
+            lyric: ProjectedLyric::Source(Box::new(right.clone())),
+        },
+    ];
+    french::apply(&mut notes, &["0".into(), "1".into(), "2".into()]);
+    assert_eq!(
+        notes[0].lyric,
+        ProjectedLyric::Pronounced {
+            source: Box::new(left),
+            text: "bonjour".into(),
+            phonemes: "fr/b fr/on fr/j fr/ou fr/r".into()
+        }
+    );
+    assert_eq!(notes[1].lyric, ProjectedLyric::Extension);
+    assert_eq!(
+        notes[2].lyric,
+        ProjectedLyric::PronouncedSplit {
+            source: Box::new(right)
+        }
+    );
+    assert!(notes[2].lyric.continues_previous_note());
+    let once = notes.clone();
+    french::apply(&mut notes, &["0".into(), "1".into(), "2".into()]);
+    assert_eq!(notes, once);
+    // A rest or another lyric row cannot be traversed by the dictionary word.
+    for row in [false, true] {
+        let mut broken = once.clone();
+        for note in &mut broken {
+            note.lyric = match &note.lyric {
+                ProjectedLyric::Pronounced { source, .. }
+                | ProjectedLyric::PronouncedSplit { source } => {
+                    ProjectedLyric::Source(source.clone())
+                }
+                _ => note.lyric.clone(),
+            };
+        }
+        if row {
+            if let ProjectedLyric::Source(source) = &mut broken[2].lyric {
+                source.lane = "other".into();
+            }
+        } else {
+            broken[2].onset_ticks += 1;
+        }
+        french::apply(&mut broken, &["0".into(), "1".into(), "2".into()]);
+        assert!(!matches!(
+            broken[2].lyric,
+            ProjectedLyric::PronouncedSplit { .. }
+        ));
+    }
+}
+
+#[test]
+fn a_dictionary_cannot_invent_a_third_vowel_for_a_three_note_word() {
+    use verse_lib::engine::midi::{Lyric, Syllabic};
+    use verse_lib::engine::projection::ProjectedNote;
+    let mut notes: Vec<_> = [
+        ("mon", Syllabic::Begin),
+        ("ta", Syllabic::Middle),
+        ("gne", Syllabic::End),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (text, syllabic))| {
+        let mut lyric = Lyric::text(i.to_string(), text.into());
+        lyric.syllabic = Some(syllabic);
+        ProjectedNote {
+            onset_ticks: i as u32 * 480,
+            duration_ticks: 480,
+            pitch: 60,
+            lyric: ProjectedLyric::Source(Box::new(lyric)),
+        }
+    })
+    .collect();
+    let before = notes.clone();
+    let diagnostics = french::apply(&mut notes, &["0".into(), "1".into(), "2".into()]);
+    assert_eq!(notes, before);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|d| d.code == french::UNSUPPORTED)
+            .count(),
+        3
     );
 }

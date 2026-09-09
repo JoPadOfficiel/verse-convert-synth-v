@@ -578,11 +578,27 @@ fn eligible_attached_lyrics<'a>(note: &'a SourceNote, lane: &str) -> Vec<&'a Lyr
         .collect()
 }
 
-fn duplicate_lyric_diagnostics(note: &SourceNote, selected: &Lyric, id: &str) -> Vec<Diagnostic> {
+fn duplicate_lyric_diagnostics(
+    note: &SourceNote,
+    selected: &Lyric,
+    id: &str,
+    profile: PronunciationProfile,
+) -> Vec<Diagnostic> {
+    let (blank_code, conflict_code) = match profile {
+        PronunciationProfile::Default => return Vec::new(),
+        PronunciationProfile::FrenchMillefeuille => (
+            "FRENCH_DUPLICATE_BLANK_RESOLVED",
+            "FRENCH_DUPLICATE_LYRIC_CONFLICT",
+        ),
+        PronunciationProfile::EnglishArpabet => (
+            "ENGLISH_DUPLICATE_BLANK_RESOLVED",
+            "ENGLISH_DUPLICATE_LYRIC_CONFLICT",
+        ),
+    };
     let candidates = eligible_attached_lyrics(note, &selected.lane);
     let mut diagnostics = Vec::new();
     if !blank_lyric(selected) && candidates.iter().any(|lyric| blank_lyric(lyric)) {
-        diagnostics.push(report_warning("FRENCH_DUPLICATE_BLANK_RESOLVED", DiagnosticSeverity::Info,
+        diagnostics.push(report_warning(blank_code, DiagnosticSeverity::Info,
             "Selected the first nonblank lyric among same-lane playback-eligible duplicates; all original lyric records remain in the preserved source.", id));
     }
     if candidates.iter().any(|lyric| {
@@ -593,7 +609,7 @@ fn duplicate_lyric_diagnostics(note: &SourceNote, selected: &Lyric, id: &str) ->
                 || lyric.extend_ticks != selected.extend_ticks
                 || lyric.extend_fraction != selected.extend_fraction)
     }) {
-        diagnostics.push(report_warning("FRENCH_DUPLICATE_LYRIC_CONFLICT", DiagnosticSeverity::Warning,
+        diagnostics.push(report_warning(conflict_code, DiagnosticSeverity::Warning,
             "Conflicting nonblank lyrics in the same source row are eligible for this playback; original priority is retained and all records remain in the preserved source.", id));
     }
     diagnostics
@@ -609,7 +625,7 @@ fn selected_attached_lyric<'a>(
     let pick = |lane: &String| {
         let mut eligible = eligible_attached_lyrics(note, lane).into_iter();
         let first = eligible.next()?;
-        if profile == PronunciationProfile::FrenchMillefeuille && blank_lyric(first) {
+        if profile != PronunciationProfile::Default && blank_lyric(first) {
             // Continuations, syllable splits and unsupported meaningful states
             // keep their original priority just as nonempty text does.
             eligible.find(|lyric| !blank_lyric(lyric)).or(Some(first))
@@ -762,12 +778,13 @@ fn project_track(
             source_note.source.voice.clone(),
             source_note.source.occurrence,
         ));
-        if projection.profile == PronunciationProfile::FrenchMillefeuille {
+        if projection.profile != PronunciationProfile::Default {
             if let Some(selected) = attached {
                 projection.diagnostics.extend(duplicate_lyric_diagnostics(
                     source_note,
                     selected,
                     &note_id,
+                    projection.profile,
                 ));
             }
         }
@@ -790,7 +807,7 @@ fn project_track(
     }
     // Before anything is diagnosed: the syllables a score spreads over several
     // notes are the word it writes, and it is that word the file will state.
-    let words = if projection.profile == PronunciationProfile::FrenchMillefeuille {
+    let words = if projection.profile != PronunciationProfile::Default {
         // A source voice or repeat occurrence boundary must not supply lexical
         // context, even when playback makes the two notes touch.
         let mut start = 0;
@@ -799,12 +816,17 @@ fn project_track(
             while end < domains.len() && domains[end] == domains[start] {
                 end += 1;
             }
-            projection
-                .diagnostics
-                .extend(crate::engine::target::french::apply(
-                    &mut projected_notes[start..end],
-                    &note_ids[start..end],
-                ));
+            let notes = &mut projected_notes[start..end];
+            let ids = &note_ids[start..end];
+            projection.diagnostics.extend(match projection.profile {
+                PronunciationProfile::FrenchMillefeuille => {
+                    crate::engine::target::french::apply(notes, ids)
+                }
+                PronunciationProfile::EnglishArpabet => {
+                    crate::engine::target::english::apply(notes, ids)
+                }
+                PronunciationProfile::Default => Vec::new(),
+            });
             start = end;
         }
         crate::engine::syllable::JoinedWords::default()
@@ -3917,128 +3939,138 @@ mod tests {
     }
 
     #[test]
-    fn french_duplicate_selection_retains_meaningful_priority_and_reports_conflicts() {
-        for state in [
-            midi::LyricState::Continuation,
-            midi::LyricState::SyllableSplit,
-            midi::LyricState::Unsupported("opaque".into()),
-            midi::LyricState::Text("vent".into()),
+    fn explicit_profiles_duplicate_selection_retains_meaningful_priority_and_reports_conflicts() {
+        for (profile, prefix) in [
+            (PronunciationProfile::FrenchMillefeuille, "FRENCH"),
+            (PronunciationProfile::EnglishArpabet, "ENGLISH"),
         ] {
-            for blank_first in [false, true] {
-                let mut first = Lyric::text("first-meaningful", "original".into());
-                first.state = state.clone();
-                let mut lyrics = vec![first, Lyric::text("second", "rêves".into())];
-                if blank_first {
-                    lyrics.insert(0, Lyric::text("blank", " ".into()));
-                }
-                let note = SourceNote {
-                    onset: 0,
-                    duration: 480,
-                    pitch: Some(60),
-                    source_order: 0,
-                    end_order: 1,
-                    source: midi::NoteSource::default(),
-                    lyrics,
-                };
-                let before = note.lyrics.clone();
-                let lanes = vec!["1".into()];
-                let selected = selected_attached_lyric(
-                    &note,
-                    &lanes,
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    PronunciationProfile::FrenchMillefeuille,
-                )
-                .unwrap();
-                assert_eq!(selected.id, "first-meaningful");
-                let diagnostics = duplicate_lyric_diagnostics(&note, selected, "note");
-                assert!(diagnostics
-                    .iter()
-                    .any(|w| w.code == "FRENCH_DUPLICATE_LYRIC_CONFLICT"));
-                assert_eq!(
-                    diagnostics
-                        .iter()
-                        .any(|w| w.code == "FRENCH_DUPLICATE_BLANK_RESOLVED"),
-                    blank_first
-                );
-                assert_eq!(note.lyrics, before);
-                let default = selected_attached_lyric(
-                    &note,
-                    &lanes,
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    PronunciationProfile::Default,
-                )
-                .unwrap();
-                assert_eq!(
-                    default.id,
+            for state in [
+                midi::LyricState::Continuation,
+                midi::LyricState::SyllableSplit,
+                midi::LyricState::Unsupported("opaque".into()),
+                midi::LyricState::Text("vent".into()),
+            ] {
+                for blank_first in [false, true] {
+                    let mut first = Lyric::text("first-meaningful", "original".into());
+                    first.state = state.clone();
+                    let mut lyrics = vec![first, Lyric::text("second", "rêves".into())];
                     if blank_first {
-                        "blank"
-                    } else {
-                        "first-meaningful"
+                        lyrics.insert(0, Lyric::text("blank", " ".into()));
                     }
-                );
+                    let note = SourceNote {
+                        onset: 0,
+                        duration: 480,
+                        pitch: Some(60),
+                        source_order: 0,
+                        end_order: 1,
+                        source: midi::NoteSource::default(),
+                        lyrics,
+                    };
+                    let before = note.lyrics.clone();
+                    let lanes = vec!["1".into()];
+                    let selected = selected_attached_lyric(
+                        &note,
+                        &lanes,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                        profile,
+                    )
+                    .unwrap();
+                    assert_eq!(selected.id, "first-meaningful");
+                    let diagnostics = duplicate_lyric_diagnostics(&note, selected, "note", profile);
+                    assert!(diagnostics
+                        .iter()
+                        .any(|w| w.code == format!("{prefix}_DUPLICATE_LYRIC_CONFLICT")));
+                    assert_eq!(
+                        diagnostics
+                            .iter()
+                            .any(|w| w.code == format!("{prefix}_DUPLICATE_BLANK_RESOLVED")),
+                        blank_first
+                    );
+                    assert_eq!(note.lyrics, before);
+                    let default = selected_attached_lyric(
+                        &note,
+                        &lanes,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                        PronunciationProfile::Default,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        default.id,
+                        if blank_first {
+                            "blank"
+                        } else {
+                            "first-meaningful"
+                        }
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn french_duplicate_diagnostics_follow_playback_eligibility_and_specific_priority() {
-        let mut blank = Lyric::text("blank", String::new());
-        blank.time_only = vec![1];
-        let mut text = Lyric::text("specific", "rêves".into());
-        text.time_only = vec![1, 2];
-        let unrestricted = Lyric::text("unrestricted", "vent".into());
-        let mut other_row = Lyric::text("other-row", "court".into());
-        other_row.lane = "2".into();
-        let mut note = SourceNote {
-            onset: 0,
-            duration: 480,
-            pitch: Some(60),
-            source_order: 0,
-            end_order: 1,
-            source: midi::NoteSource::default(),
-            lyrics: vec![unrestricted, blank, text, other_row],
-        };
-        for (occurrence, expected, resolved) in [
-            (0, "specific", true),
-            (1, "specific", false),
-            (2, "unrestricted", false),
+    fn explicit_profiles_duplicate_diagnostics_follow_playback_eligibility_and_specific_priority() {
+        for (profile, prefix) in [
+            (PronunciationProfile::FrenchMillefeuille, "FRENCH"),
+            (PronunciationProfile::EnglishArpabet, "ENGLISH"),
         ] {
-            note.source.occurrence = occurrence;
+            let mut blank = Lyric::text("blank", String::new());
+            blank.time_only = vec![1];
+            let mut text = Lyric::text("specific", "rêves".into());
+            text.time_only = vec![1, 2];
+            let unrestricted = Lyric::text("unrestricted", "vent".into());
+            let mut other_row = Lyric::text("other-row", "court".into());
+            other_row.lane = "2".into();
+            let mut note = SourceNote {
+                onset: 0,
+                duration: 480,
+                pitch: Some(60),
+                source_order: 0,
+                end_order: 1,
+                source: midi::NoteSource::default(),
+                lyrics: vec![unrestricted, blank, text, other_row],
+            };
+            for (occurrence, expected, resolved) in [
+                (0, "specific", true),
+                (1, "specific", false),
+                (2, "unrestricted", false),
+            ] {
+                note.source.occurrence = occurrence;
+                let selected = selected_attached_lyric(
+                    &note,
+                    &["1".into()],
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    profile,
+                )
+                .unwrap();
+                assert_eq!(selected.id, expected);
+                let diagnostics = duplicate_lyric_diagnostics(&note, selected, "note", profile);
+                assert_eq!(diagnostics.len(), usize::from(resolved));
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .any(|w| w.code == format!("{prefix}_DUPLICATE_BLANK_RESOLVED")),
+                    resolved
+                );
+            }
+            note.source.occurrence = 0;
+            note.lyrics.retain(|lyric| lyric.id != "specific");
             let selected = selected_attached_lyric(
                 &note,
                 &["1".into()],
                 &BTreeSet::new(),
                 &BTreeSet::new(),
-                PronunciationProfile::FrenchMillefeuille,
+                profile,
             )
             .unwrap();
-            assert_eq!(selected.id, expected);
-            let diagnostics = duplicate_lyric_diagnostics(&note, selected, "note");
-            assert_eq!(diagnostics.len(), usize::from(resolved));
             assert_eq!(
-                diagnostics
-                    .iter()
-                    .any(|w| w.code == "FRENCH_DUPLICATE_BLANK_RESOLVED"),
-                resolved
+                selected.id, "blank",
+                "unrestricted text cannot replace a playback-specific blank"
             );
+            assert!(duplicate_lyric_diagnostics(&note, selected, "note", profile).is_empty());
         }
-        note.source.occurrence = 0;
-        note.lyrics.retain(|lyric| lyric.id != "specific");
-        let selected = selected_attached_lyric(
-            &note,
-            &["1".into()],
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            PronunciationProfile::FrenchMillefeuille,
-        )
-        .unwrap();
-        assert_eq!(
-            selected.id, "blank",
-            "unrestricted text cannot replace a playback-specific blank"
-        );
-        assert!(duplicate_lyric_diagnostics(&note, selected, "note").is_empty());
     }
 
     #[test]

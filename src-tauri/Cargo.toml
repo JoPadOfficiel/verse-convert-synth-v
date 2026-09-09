@@ -31,6 +31,7 @@ thiserror = "2"
 hound = "3.5"
 libc = "0.2"
 base64 = "0.22"
+unicode-normalization = "0.1.25"
 
 
 [dev-dependencies]

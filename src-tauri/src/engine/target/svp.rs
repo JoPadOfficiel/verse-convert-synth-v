@@ -219,14 +219,14 @@ fn exact_blicks(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i64, S
 /// only place it is safe to decide.
 fn lyric_text(lyric: &ProjectedLyric) -> String {
     match lyric {
-        ProjectedLyric::Source(source) | ProjectedLyric::Pronounced { source, .. } => {
-            match &source.state {
-                LyricState::Text(text) => text.clone(),
-                LyricState::Continuation => "-".into(),
-                LyricState::SyllableSplit => "+".into(),
-                LyricState::ExplicitEmpty | LyricState::Unsupported(_) => String::new(),
-            }
-        }
+        ProjectedLyric::Source(source)
+        | ProjectedLyric::Pronounced { source, .. }
+        | ProjectedLyric::PronouncedSplit { source } => match &source.state {
+            LyricState::Text(text) => text.clone(),
+            LyricState::Continuation => "-".into(),
+            LyricState::SyllableSplit => "+".into(),
+            LyricState::ExplicitEmpty | LyricState::Unsupported(_) => String::new(),
+        },
         ProjectedLyric::Extension => "-".into(),
         ProjectedLyric::Absent => String::new(),
     }
