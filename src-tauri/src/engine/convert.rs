@@ -7,7 +7,8 @@ use crate::engine::midi::{
     TrackRoleHint,
 };
 use crate::engine::projection::{
-    ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedProject, ProjectedTempo, ProjectedTrack,
+    NoteEvidence, ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedProject, ProjectedTempo,
+    ProjectedTrack,
 };
 use crate::engine::target::{ExportTarget, PronunciationProfile};
 use serde::Serialize;
@@ -760,6 +761,7 @@ fn french_source_context(
                     });
                     ProjectedNote {
                         performance: None,
+                        source_evidence: None,
                         onset_ticks: first.onset,
                         duration_ticks: first.duration,
                         pitch: first.pitch.unwrap_or(60),
@@ -832,7 +834,6 @@ struct TrackProjection<'a> {
     performance: &'a crate::engine::performance::PerformanceIndex,
     lanes: &'a [String],
     standalone: &'a HashMap<usize, TimedLyric>,
-    evidence: &'a mut ProjectionEvidence,
     /// The target the caller will export to. Nothing about the projection itself
     /// depends on it; it exists only so the diagnostics below can ask whether
     /// that target's application reads a source word differently.
@@ -927,12 +928,6 @@ fn project_track(
         if source_note.duration == 0 {
             continue;
         }
-        if let Some(source_id) = lyric_source_id {
-            projection.evidence.source_ids.insert(source_id);
-        }
-        if let Some(source_id) = lyric_event_id {
-            projection.evidence.source_ids.insert(source_id);
-        }
         let note_id = note_instance_id(
             projection.source_track_id,
             &source_note.source,
@@ -955,15 +950,6 @@ fn project_track(
             }
         }
         note_ids.push(note_id.clone());
-        projection.evidence.source_ids.insert(note_id.clone());
-        projection.evidence.source_ids.insert(format!(
-            "event:{}:{}",
-            projection.source_track_id, source_note.source_order
-        ));
-        projection.evidence.source_ids.insert(format!(
-            "event:{}:{}",
-            projection.source_track_id, source_note.end_order
-        ));
         projected_notes.push(ProjectedNote {
             performance: projection
                 .performance
@@ -975,7 +961,7 @@ fn project_track(
                 .and_then(|key| {
                     projection.performance.channels.get(key).map(|timeline| {
                         crate::engine::performance::PerformanceNote {
-                            source_id: note_id,
+                            source_id: note_id.clone(),
                             key: *key,
                             timeline: timeline.clone(),
                         }
@@ -985,6 +971,19 @@ fn project_track(
             duration_ticks: source_note.duration,
             pitch,
             lyric,
+            source_evidence: Some(NoteEvidence {
+                note_id,
+                note_on_event_id: format!(
+                    "event:{}:{}",
+                    projection.source_track_id, source_note.source_order
+                ),
+                note_off_event_id: format!(
+                    "event:{}:{}",
+                    projection.source_track_id, source_note.end_order
+                ),
+                lyric_id: lyric_source_id,
+                lyric_event_id,
+            }),
         });
         if let Some(attached) = attached {
             if let Some(hint) = projection.contextual_french.get(&(
@@ -1596,7 +1595,6 @@ pub fn convert_midi_with_profile(
                         performance: &performance,
                         lanes: group,
                         standalone,
-                        evidence: &mut projection,
                         target,
                         profile,
                         contextual_french: &contextual_french,
@@ -1828,6 +1826,17 @@ pub fn convert_midi_with_profile(
         });
     }
 
+    // Only final editable notes establish note/lyric ownership. Union retained
+    // records across every lyric lane; an exclusion in one lane cannot erase a
+    // representation in another. The existing retention predicate is authoritative.
+    projection.source_ids.extend(
+        projected_tracks
+            .iter()
+            .flat_map(|track| &track.notes)
+            .filter_map(|note| note.source_evidence.as_ref())
+            .flat_map(NoteEvidence::source_ids)
+            .map(str::to_owned),
+    );
     let (tempo, tempo_evidence) = read_tempo(midi);
     projection.source_ids.extend(meter_evidence);
     projection.source_ids.extend(tempo_evidence);
@@ -2775,6 +2784,24 @@ fn repeat_passes(notes: &[SourceNote]) -> usize {
 }
 
 #[cfg(test)]
+pub(crate) const RETAINED_SPLIT_FIXTURE: &str = r#"<?xml version="1.0"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <direction><sound tempo="120"/></direction>
+    <note><pitch><step>C</step><octave>4</octave></pitch><duration>960</duration><voice>1</voice>
+      <lyric number="1"><text>one</text></lyric><lyric number="2"><text>un</text></lyric></note>
+    <backup><duration>480</duration></backup>
+    <note><pitch><step>E</step><octave>4</octave></pitch><duration>960</duration><voice>1</voice>
+      <lyric number="1"><text>two</text></lyric><lyric number="2"><text>deux</text></lyric></note>
+    <note><pitch><step>G</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice></note>
+    <note><pitch><step>D</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice>
+      <lyric number="1"><text>end</text></lyric><lyric number="2"><text></text></lyric></note>
+  </measure></part>
+</score-partwise>"#;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2792,6 +2819,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, (onset, duration, lyric))| ProjectedNote {
                     performance: None,
+                    source_evidence: None,
                     onset_ticks: *onset,
                     duration_ticks: *duration,
                     pitch: 60 + index as u8,
@@ -2895,6 +2923,7 @@ mod tests {
             notes: vec![
                 ProjectedNote {
                     performance: None,
+                    source_evidence: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
                     pitch: 60,
@@ -2902,6 +2931,7 @@ mod tests {
                 },
                 ProjectedNote {
                     performance: None,
+                    source_evidence: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
                     pitch: 64,
@@ -2909,6 +2939,7 @@ mod tests {
                 },
                 ProjectedNote {
                     performance: None,
+                    source_evidence: None,
                     onset_ticks: 480,
                     duration_ticks: 480,
                     pitch: 67,
@@ -3257,6 +3288,374 @@ mod tests {
     fn svp(outcome: &ConvertOutcome) -> crate::engine::target::svp::SvpProject {
         crate::engine::target::svp::serialize(outcome.svp.as_ref().expect("conversion succeeds"))
             .expect("the projection is exactly representable")
+    }
+
+    fn evidence_for_note(track: &Track, index: usize) -> [String; 3] {
+        let note = &extract_notes(track)[index];
+        [
+            note_instance_id(&track.id, &note.source, note.source_order),
+            format!("event:{}:{}", track.id, note.source_order),
+            format!("event:{}:{}", track.id, note.end_order),
+        ]
+    }
+
+    fn attach(track: &mut Track, index: usize, lyrics: Vec<Lyric>) {
+        let Kind::NoteOn(note) = &mut track.events[index * 2].kind else {
+            panic!("fixture note-on")
+        };
+        note.lyrics = lyrics;
+    }
+
+    fn assert_note_evidence(outcome: &ConvertOutcome, track: &Track, retained: &[bool]) {
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        for (index, retained) in retained.iter().enumerate() {
+            for id in evidence_for_note(track, index) {
+                assert_eq!(
+                    outcome.projection.source_ids.contains(&id),
+                    *retained,
+                    "{id}"
+                );
+            }
+        }
+        let actual: BTreeSet<_> = outcome
+            .svp
+            .as_ref()
+            .unwrap()
+            .tracks
+            .iter()
+            .flat_map(|lane| &lane.notes)
+            .flat_map(|note| {
+                note.source_evidence
+                    .as_ref()
+                    .expect("source ownership")
+                    .source_ids()
+            })
+            .map(str::to_owned)
+            .collect();
+        let mut domain = BTreeSet::new();
+        for note in extract_notes(track) {
+            domain.extend([
+                note_instance_id(&track.id, &note.source, note.source_order),
+                format!("event:{}:{}", track.id, note.source_order),
+                format!("event:{}:{}", track.id, note.end_order),
+            ]);
+            domain.extend(
+                note.lyrics.iter().map(|lyric| {
+                    attached_lyric_instance_id(lyric, &note.source, note.source_order)
+                }),
+            );
+        }
+        for token in track_tokens(track) {
+            domain.insert(standalone_lyric_instance_id(
+                &token.lyric,
+                &token.track_id,
+                token.order,
+            ));
+            domain.insert(format!("event:{}:{}", token.track_id, token.order));
+        }
+        assert_eq!(
+            outcome
+                .projection
+                .source_ids
+                .intersection(&domain)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            actual
+                .intersection(&domain)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn retained_evidence_excludes_untexted_notes_and_dropped_attached_lyrics() {
+        let mut track = pitched_track(
+            "voice",
+            &[(0, 480, 60, 0), (480, 480, 62, 0), (960, 480, 64, 0)],
+        );
+        attach(&mut track, 0, vec![Lyric::text("sung", "word".into())]);
+        attach(&mut track, 1, vec![Lyric::text("empty", String::new())]);
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let outcome =
+                convert_midi_with_target(&midi_with(vec![track.clone()]), "english", None, target);
+            assert_note_evidence(&outcome, &track, &[true, false, false]);
+            assert!(!outcome
+                .projection
+                .source_ids
+                .contains("lyric:empty:occurrence:0:note-event:2"));
+            assert!(outcome
+                .projection
+                .source_ids
+                .contains("lyric:sung:occurrence:0:note-event:0"));
+            assert_eq!(outcome.svp.as_ref().unwrap().tracks[0].notes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn retained_evidence_keeps_holds_and_their_untexted_predecessors() {
+        for duration in [240, 480] {
+            let mut track = pitched_track(
+                "voice",
+                &[
+                    (0, 480, 60, 0),
+                    (480, duration, 62, 0),
+                    (960, 480, 64, 0),
+                    (1440, 480, 65, 0),
+                ],
+            );
+            attach(&mut track, 0, vec![Lyric::text("sung", "word".into())]);
+            let mut hold = Lyric::text("hold", "-".into());
+            hold.state = midi::LyricState::Continuation;
+            attach(&mut track, 2, vec![hold]);
+            for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+                let outcome = convert_midi_with_target(
+                    &midi_with(vec![track.clone()]),
+                    "english",
+                    None,
+                    target,
+                );
+                if duration == 240 && target == ExportTarget::Ustx {
+                    assert!(!outcome.ok, "existing gap refusal must remain");
+                    assert_eq!(outcome.msg.as_deref(), Some(
+                        "the source cannot be projected safely to OpenUtau: the note at MIDI tick 960 on source track voice carries the marker \"+~\", which continues the previous note, but does not begin where that note ends; OpenUtau only carries a syllable across notes that touch and would sing the marker as a word instead"
+                    ));
+                    continue;
+                }
+                assert_note_evidence(&outcome, &track, &[true, true, true, false]);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_evidence_unions_lyric_lanes_without_geometry_joins() {
+        // Two indistinguishable geometries have different source identities.
+        // Each verse keeps a different one; a third equal note is never sung.
+        let mut track = pitched_track(
+            "voice",
+            &[
+                (0, 480, 60, 0),
+                (0, 480, 60, 0),
+                (0, 480, 60, 0),
+                (480, 480, 62, 0),
+            ],
+        );
+        attach(&mut track, 0, vec![verse("first", "one", "1")]);
+        attach(&mut track, 1, vec![verse("second", "two", "2")]);
+        attach(
+            &mut track,
+            3,
+            vec![verse("shared-1", "end", "1"), verse("shared-2", "fin", "2")],
+        );
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let outcome =
+                convert_midi_with_target(&midi_with(vec![track.clone()]), "english", None, target);
+            assert_note_evidence(&outcome, &track, &[true, true, false, true]);
+            let lanes = &outcome.svp.as_ref().unwrap().tracks;
+            assert_eq!(lanes.len(), 2);
+            for (index, lane) in lanes.iter().enumerate() {
+                assert_eq!(lane.notes.len(), 2);
+                assert_eq!(
+                    lane.notes[0].source_evidence.as_ref().unwrap().note_id,
+                    evidence_for_note(&track, index)[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_evidence_survives_actual_same_verse_splitting_and_metadata() {
+        let midi = crate::engine::musicxml::parse(RETAINED_SPLIT_FIXTURE.as_bytes()).unwrap();
+        let track = midi
+            .tracks
+            .iter()
+            .find(|track| source_note_count(track) > 0)
+            .unwrap();
+        let notes = extract_notes(track);
+        assert_eq!(notes.len(), 4);
+        assert!(notes[0].onset + notes[0].duration > notes[1].onset);
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let outcome = convert_midi_with_target(&midi, "english", None, target);
+            assert_note_evidence(&outcome, track, &[true, true, false, true]);
+            assert!(raises(&outcome, SIMULTANEOUS_VOICES_SPLIT));
+            let lanes = &outcome.svp.as_ref().unwrap().tracks;
+            assert_eq!(
+                lanes.len(),
+                4,
+                "two overlapping voices in each of two verses"
+            );
+            for (lane, expected) in lanes.iter().zip([vec![0, 3], vec![1], vec![0], vec![1]]) {
+                assert_eq!(lane.notes.len(), expected.len());
+                for (note, index) in lane.notes.iter().zip(expected) {
+                    let original = &notes[index];
+                    let evidence = note.source_evidence.as_ref().unwrap();
+                    let ids = evidence_for_note(track, index);
+                    assert_eq!(
+                        [
+                            &evidence.note_id,
+                            &evidence.note_on_event_id,
+                            &evidence.note_off_event_id
+                        ],
+                        [&ids[0], &ids[1], &ids[2]]
+                    );
+                    let ProjectedLyric::Source(lyric) = &note.lyric else {
+                        panic!("untransformed words")
+                    };
+                    assert_eq!(
+                        evidence.lyric_id,
+                        Some(attached_lyric_instance_id(
+                            lyric,
+                            &original.source,
+                            original.source_order
+                        ))
+                    );
+                    assert!(evidence
+                        .source_ids()
+                        .all(|id| outcome.projection.source_ids.contains(id)));
+                }
+            }
+            let metadata: Vec<_> = midi
+                .tracks
+                .iter()
+                .flat_map(|track| {
+                    track
+                        .events
+                        .iter()
+                        .filter(|event| matches!(event.kind, Kind::Tempo(_) | Kind::TimeSig { .. }))
+                        .map(|event| format!("event:{}:{}", track.id, event.order))
+                })
+                .collect();
+            assert_eq!(metadata.len(), 2, "independent tempo and meter evidence");
+            for id in metadata {
+                assert!(outcome.projection.source_ids.contains(&id), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_original_ids_survive_french_and_english_word_allocation() {
+        for (profile, words, whole) in [
+            (
+                PronunciationProfile::FrenchMillefeuille,
+                vec!["bon", "", "jour"],
+                "bonjour",
+            ),
+            (
+                PronunciationProfile::EnglishArpabet,
+                vec!["beau", "", "ti", "ful"],
+                "beautiful",
+            ),
+        ] {
+            let geometry: Vec<_> = (0..words.len())
+                .map(|i| (i as u32 * 480, 480, 60 + i as u8, 0))
+                .collect();
+            let mut track = pitched_track("voice", &geometry);
+            for (index, word) in words
+                .iter()
+                .enumerate()
+                .filter(|(_, word)| !word.is_empty())
+            {
+                let mut lyric = Lyric::text(format!("original-{index}"), (*word).into());
+                lyric.syllabic = Some(if index == 0 {
+                    midi::Syllabic::Begin
+                } else if index + 1 == words.len() {
+                    midi::Syllabic::End
+                } else {
+                    midi::Syllabic::Middle
+                });
+                attach(&mut track, index, vec![lyric]);
+            }
+            let original = extract_notes(&track);
+            let outcome = convert_midi_with_profile(
+                &midi_with(vec![track.clone()]),
+                "english",
+                None,
+                ExportTarget::Ustx,
+                profile,
+            );
+            assert_note_evidence(&outcome, &track, &vec![true; words.len()]);
+            let project = outcome.svp.as_ref().unwrap();
+            let notes = &project.tracks[0].notes;
+            assert!(
+                matches!(&notes[0].lyric, ProjectedLyric::Pronounced { text, phonemes, .. } if text == whole && !phonemes.is_empty())
+            );
+            assert_eq!(notes[1].lyric, ProjectedLyric::Extension);
+            for (index, (note, source)) in notes.iter().zip(&original).enumerate() {
+                let ids = evidence_for_note(&track, index);
+                let expected = NoteEvidence {
+                    note_id: ids[0].clone(),
+                    note_on_event_id: ids[1].clone(),
+                    note_off_event_id: ids[2].clone(),
+                    lyric_id: source.lyrics.first().map(|lyric| {
+                        attached_lyric_instance_id(lyric, &source.source, source.source_order)
+                    }),
+                    lyric_event_id: None,
+                };
+                assert_eq!(note.source_evidence.as_ref(), Some(&expected));
+                assert_eq!(
+                    (note.onset_ticks, note.duration_ticks, note.pitch),
+                    (source.onset, source.duration, source.pitch.unwrap())
+                );
+                if index > 1 {
+                    assert!(matches!(note.lyric, ProjectedLyric::PronouncedSplit { .. }));
+                }
+                if let ProjectedLyric::Pronounced { source: lyric, .. }
+                | ProjectedLyric::PronouncedSplit { source: lyric } = &note.lyric
+                {
+                    assert_eq!(
+                        lyric.as_ref(),
+                        &source.lyrics[0],
+                        "original lyric bytes and identity"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_evidence_tracks_standalone_lyric_and_event_removal() {
+        let mut track = pitched_track("voice", &[(0, 480, 60, 0), (480, 480, 62, 0)]);
+        track.events.push(midi::Event::new(
+            0,
+            4,
+            Kind::Lyrics(Lyric::text("sung", "word".into())),
+        ));
+        track.events.push(midi::Event::new(
+            480,
+            5,
+            Kind::Lyrics(Lyric::text("empty", String::new())),
+        ));
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let outcome =
+                convert_midi_with_target(&midi_with(vec![track.clone()]), "english", None, target);
+            assert_note_evidence(&outcome, &track, &[true, false]);
+            for id in ["lyric:empty:event:voice:5", "event:voice:5"] {
+                assert!(!outcome.projection.source_ids.contains(id), "{id}");
+            }
+            for id in ["lyric:sung:event:voice:4", "event:voice:4"] {
+                assert!(outcome.projection.source_ids.contains(id), "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn retained_evidence_preserves_the_whole_explicit_no_lyrics_override() {
+        let track = pitched_track("voice", &[(0, 480, 60, 0), (480, 480, 62, 0)]);
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let midi = midi_with(vec![track.clone()]);
+            let automatic = convert_midi_with_target(&midi, "english", None, target);
+            assert_note_evidence(&automatic, &track, &[false, false]);
+            let forced = convert_midi_with_target(
+                &midi,
+                "english",
+                Some(&HashMap::from([(0, true)])),
+                target,
+            );
+            assert_note_evidence(&forced, &track, &[true, true]);
+            assert!(forced.svp.as_ref().unwrap().tracks[0]
+                .notes
+                .iter()
+                .all(|note| note.lyric == ProjectedLyric::Absent));
+        }
     }
 
     #[test]

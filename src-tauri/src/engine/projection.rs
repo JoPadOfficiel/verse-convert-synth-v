@@ -136,6 +136,35 @@ pub struct ProjectedNote {
     pub duration_ticks: u32,
     pub pitch: u8,
     pub lyric: ProjectedLyric,
+    /// Original ownership, captured before lyric transforms and moved with the
+    /// note through filtering and lane splitting. Never serialized by a target.
+    /// `None` is reserved for synthetic analysis notes and hand-built fixtures.
+    pub source_evidence: Option<NoteEvidence>,
+}
+
+/// The source items represented by one editable note. Geometry is not identity:
+/// distinct source notes can share pitch, onset and duration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteEvidence {
+    pub note_id: String,
+    pub note_on_event_id: String,
+    pub note_off_event_id: String,
+    pub lyric_id: Option<String>,
+    pub lyric_event_id: Option<String>,
+}
+
+impl NoteEvidence {
+    pub fn source_ids(&self) -> impl Iterator<Item = &str> {
+        [
+            Some(self.note_id.as_str()),
+            Some(self.note_on_event_id.as_str()),
+            Some(self.note_off_event_id.as_str()),
+            self.lyric_id.as_deref(),
+            self.lyric_event_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 /// What the source says this note sings.
@@ -213,6 +242,7 @@ mod tests {
     fn note(onset_ticks: u32, duration_ticks: u32, pitch: u8) -> ProjectedNote {
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks,
             duration_ticks,
             pitch,

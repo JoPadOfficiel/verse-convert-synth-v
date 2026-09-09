@@ -346,6 +346,7 @@ mod tests {
                 lyric.line_break = (i == 0).then_some(LineBreak::Line);
                 ProjectedNote {
                     performance: None,
+                    source_evidence: None,
                     onset_ticks: i as u32 * 480,
                     duration_ticks: 240,
                     pitch: 60,

@@ -347,6 +347,7 @@ mod tests {
     fn note(onset: u32, duration: u32, lyric: ProjectedLyric) -> ProjectedNote {
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: onset,
             duration_ticks: duration,
             pitch: 60,
