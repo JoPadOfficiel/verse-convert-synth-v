@@ -158,7 +158,10 @@ full-score reference.
 
 ## `preservation.json`
 
-The ledger is schema version 2 and contains:
+The ledger remains schema version 2 for exports without performance references.
+Performance evidence uses **ledger schema version 3**; the bundle manifest stays
+at version 2. Version-2 ledgers remain readable and their serialization remains
+unchanged when the new fields are empty. Every ledger contains:
 
 - `expectedSourceIds`
 - one `entries[]` item for every inventoried item in the current rich source
@@ -174,6 +177,7 @@ An entry contains:
 Primary dispositions:
 
 - `projectedExact`
+- `projectedMapped { policy, limitations? }`
 - `renderedStem { stemId }`
 - `sourceOnly { reason }`
 - `metadataOnly`
@@ -182,6 +186,26 @@ Primary dispositions:
 
 There is no normal “dropped” state. Every entry always references the exact
 source; projected/rendered items additionally reference their project or stem.
+
+`projectedMapped` requires schema 3 and identifies supported editable performance
+conversion. `policy` and optional `limitations` give concise first summaries;
+the shared `performanceSpans` table retains every span's full `detail` policy or
+reason. Each event entry's `performanceRefs` indexes that table. A span records
+the target format, zero-based `targetTrack` (the actual USTX track/voice part),
+`sourceTrackId`, `dimension`, source `startTick`/`endTick`, affected `noteIds`,
+and `status` (`mapped`, `unsupported` or `representationLimit`). Editable held
+spans are half-open. Source-level records have no target track or affected notes
+and identify raw events with no eligible editable ownership.
+
+One event may map to one polyphonic sibling and be limited on another; its
+references preserve both outcomes without duplicating a full note list in every
+event entry. Reference indices, required schema capability and bounded evidence
+storage are validated. Mapped rows reference the editable project and exact source.
+An entirely unsupported performance event remains `sourceOnly` with a reason
+(and any available stem), without an editable-project reference. Consumers of
+the ledger must recognize schema 3 and the new disposition instead of treating mapped
+performance as `projectedExact`. This does not change nominal-note evidence or
+establish that notes pruned from projection were retained (separate FID-001).
 
 The ledger inventories constructs represented in Verse's current source model.
 Unknown or opaque source-format constructs remain preserved by the

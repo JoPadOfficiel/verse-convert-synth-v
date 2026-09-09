@@ -144,6 +144,36 @@ fn generic_midi_text_is_not_a_lyric_and_performance_events_survive() {
         .expect("exactly representable")
         .tracks
         .is_empty());
+
+    // Retention alone above proves no editable transfer: include an actual
+    // sung lyric and assert an active USTX curve plus mapped-event evidence.
+    let singing = smf(&[
+        0, 0xff, 5, 3, b'l', b'e', b't', 0, 0xb2, 7, 99, 0, 0xe2, 0, 64, 0, 0x92, 64, 73, 0x81,
+        0x70, 0x82, 64, 12, 0, 0xff, 0x2f, 0,
+    ]);
+    let parsed = midi::parse(&singing).unwrap();
+    let before = parsed.tracks.clone();
+    let outcome = verse_lib::engine::convert::convert_midi_with_target(
+        &parsed,
+        "english",
+        None,
+        target::ExportTarget::Ustx,
+    );
+    assert!(outcome.ok);
+    assert_eq!(outcome.placed, 1);
+    let project = target::ustx::serialize(outcome.svp.as_ref().unwrap()).unwrap();
+    assert_eq!(project.voice_parts[0].notes[0].tone, 64);
+    assert_eq!(project.voice_parts[0].notes[0].lyric, "let");
+    assert_eq!(project.voice_parts[0].curves.len(), 2);
+    assert!(project.voice_parts[0]
+        .curves
+        .iter()
+        .any(|curve| curve.abbr == "dyn" && curve.ys.iter().any(|value| *value < 0)));
+    assert!(outcome
+        .projection
+        .performance_mapped
+        .contains_key("event:midi-track-0:1"));
+    assert_eq!(parsed.tracks, before);
 }
 
 #[test]

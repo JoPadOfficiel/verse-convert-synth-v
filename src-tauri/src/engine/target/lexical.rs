@@ -345,6 +345,7 @@ mod tests {
                 lyric.raw_bytes = raw.as_bytes().to_vec();
                 lyric.line_break = (i == 0).then_some(LineBreak::Line);
                 ProjectedNote {
+                    performance: None,
                     onset_ticks: i as u32 * 480,
                     duration_ticks: 240,
                     pitch: 60,

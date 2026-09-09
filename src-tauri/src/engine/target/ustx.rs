@@ -17,6 +17,7 @@ use crate::engine::projection::{
 };
 use crate::engine::syllable::SYLLABLE_HYPHENS;
 use std::collections::BTreeMap;
+mod performance;
 
 /// One quarter note. `UProject.resolution` is `[YamlIgnore] => 480`, so the
 /// emitted `resolution:` is ignored on load and rescaling is impossible: this
@@ -120,6 +121,31 @@ pub struct UstxVoicePart {
     pub track_no: i32,
     pub position: i32,
     pub notes: Vec<UstxNote>,
+    pub curves: Vec<UstxCurve>,
+}
+
+/// OpenUtau 3f213e8993ca792c3e6f8958c92ab27eae78eac5,
+/// Ustx/UCurve.cs:10-17: serialized integer part-relative samples.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UstxCurve {
+    pub abbr: String,
+    pub xs: Vec<i32>,
+    pub ys: Vec<i32>,
+}
+
+pub fn performance_report(
+    project: &ProjectedProject,
+) -> Result<Vec<crate::engine::performance::PerformanceTransfer>, String> {
+    let mut reports = Vec::new();
+    let mut budget = super::performance::Budget::default();
+    let clock = performance::Clock::new(project, &mut budget)?;
+    for (index, track) in project.tracks.iter().enumerate() {
+        reports.extend(
+            performance::adapt(track, project.ticks_per_beat, &clock, index, &mut budget)?
+                .transfers,
+        );
+    }
+    Ok(reports)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -535,6 +561,8 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
     // always surfaced these two in.
     let mut tracks = Vec::with_capacity(project.tracks.len());
     let mut voice_parts = Vec::with_capacity(project.tracks.len());
+    let mut performance_budget = super::performance::Budget::default();
+    let performance_clock = performance::Clock::new(project, &mut performance_budget)?;
     for (index, track) in project.tracks.iter().enumerate() {
         let track_no = i32::try_from(index)
             .map_err(|_| "projected lane count exceeds the OpenUtau track range".to_string())?;
@@ -557,6 +585,8 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
             track,
             project.ticks_per_beat,
             project.pronunciation_profile,
+            &performance_clock,
+            &mut performance_budget,
         )?);
     }
     // Same shape as the Synthesizer V target: refuse a position while walking
@@ -673,14 +703,29 @@ fn serialize_voice_part(
     track: &ProjectedTrack,
     ticks_per_beat: u16,
     profile: PronunciationProfile,
+    clock: &performance::Clock,
+    budget: &mut super::performance::Budget,
 ) -> Result<UstxVoicePart, String> {
+    let performance = performance::adapt(track, ticks_per_beat, clock, track_no as usize, budget)?;
     let mut notes = Vec::with_capacity(track.notes.len());
-    for note in &track.notes {
-        notes.push((
-            note.onset_ticks,
-            is_rendered_marker(&note.lyric),
-            serialize_note(note, &track.source_track_id, ticks_per_beat, profile)?,
-        ));
+    for (index, note) in track.notes.iter().enumerate() {
+        let mut emitted = serialize_note(note, &track.source_track_id, ticks_per_beat, profile)?;
+        if performance.flat_notes.contains(&index) {
+            // OpenUtau 3f213e8993ca792c3e6f8958c92ab27eae78eac5:
+            // UNote.cs:108-114 rewrites the first Y only when snapFirst=true;
+            // RenderPhrase.cs:315-335 extends this nonempty zero-offset point
+            // to note.End, then :448-454 adds PITD once. Starting at onset
+            // prevents an unauthored negative-time portamento into a neighbour.
+            emitted.pitch = UstxPitch {
+                data: vec![UstxPitchPoint {
+                    x: 0.0,
+                    y: 0.0,
+                    shape: PitchShape::Io,
+                }],
+                snap_first: false,
+            };
+        }
+        notes.push((note.onset_ticks, is_rendered_marker(&note.lyric), emitted));
     }
     // `UNote.CompareTo` falls back to `GetHashCode()` at equal positions, so the
     // order OpenUtau loads a part in is only defined while positions ascend.
@@ -748,6 +793,7 @@ fn serialize_voice_part(
         // position identical to the projection's own timeline.
         position: 0,
         notes: notes.into_iter().map(|(_, _, note)| note).collect(),
+        curves: performance.curves,
     })
 }
 
@@ -872,9 +918,16 @@ pub fn to_yaml(project: &UstxProject) -> String {
                     out.push_str("        phoneme_overrides: []\n");
                 }
             }
-            // No curve is source evidence either: every expression curve in
-            // OpenUtau is an authored performance edit.
-            out.push_str("    curves: []\n");
+            if part.curves.is_empty() {
+                out.push_str("    curves: []\n");
+            } else {
+                out.push_str("    curves:\n");
+                for curve in &part.curves {
+                    out.push_str(&format!("      - abbr: {}\n", quoted(&curve.abbr)));
+                    out.push_str(&format!("        xs: {:?}\n", curve.xs));
+                    out.push_str(&format!("        ys: {:?}\n", curve.ys));
+                }
+            }
         }
     }
     // Audio reaches a project only through a preservation bundle, which owns the
@@ -1227,6 +1280,7 @@ mod tests {
         lyric: ProjectedLyric,
     ) -> ProjectedNote {
         ProjectedNote {
+            performance: None,
             onset_ticks,
             duration_ticks,
             pitch,

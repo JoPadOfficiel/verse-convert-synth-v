@@ -434,6 +434,7 @@ fn source_rows_rests_and_manual_boundaries_block_word_allocation() {
             let mut source = Lyric::text(i.to_string(), text.into());
             source.syllabic = Some(syllabic);
             ProjectedNote {
+                performance: None,
                 onset_ticks: i as u32 * 480,
                 duration_ticks: 480,
                 pitch: 60,
@@ -469,12 +470,14 @@ fn genuine_hold_after_a_whole_word_stays_a_hold() {
     held.state = LyricState::Continuation;
     let mut notes = vec![
         ProjectedNote {
+            performance: None,
             onset_ticks: 0,
             duration_ticks: 480,
             pitch: 60,
             lyric: ProjectedLyric::Source(Box::new(first)),
         },
         ProjectedNote {
+            performance: None,
             onset_ticks: 480,
             duration_ticks: 480,
             pitch: 62,

@@ -2,9 +2,9 @@
 title: Transfer explicit MIDI performance curves to OpenUtau
 type: bugfix
 created: 2026-09-09
-status: ready-for-dev
+status: done
 baseline_commit: e04120ee94cc520aeeec72db246074204eb102f4
-review_loop_iteration: 0
+review_loop_iteration: 1
 context:
   - docs/contribution-guide.md
   - docs/architecture.md
@@ -97,16 +97,16 @@ format-specific implementation comments. Reuse exact target-grid checks.
 
 ## Tasks and Acceptance
 
-- [ ] Implement source-owned performance normalization and active USTX curves.
-- [ ] Test the full matrix with compact synthetic MIDI files containing lyrics,
+- [x] Implement source-owned performance normalization and active USTX curves.
+- [x] Test the full matrix with compact synthetic MIDI files containing lyrics,
   including RPN changes, volume mute/restore, ports/channels, sibling lanes,
   ambiguous cross-track state, sampling limits and target compatibility.
-- [ ] Verify source event disposition and user-visible diagnostics; no source
+- [x] Verify source event disposition and user-visible diagnostics; no source
   snapshot or stem may be mistaken for editable curve preservation.
-- [ ] Validate saved curves through the pinned OpenUtau consumer without an
+- [x] Validate saved curves through the pinned OpenUtau consumer without an
   acoustic model where possible, including base-pitch/snap interaction.
-- [ ] Keep the French/English pronunciation tests and no-expression corpus stable.
-- [ ] Update fidelity documentation and the BMAD specification index with exact
+- [x] Keep the French/English pronunciation tests and no-expression corpus stable.
+- [x] Update fidelity documentation and the BMAD specification index with exact
   supported mappings and remaining notation/SVP limitations.
 
 ## Design Notes
@@ -115,6 +115,15 @@ Choose the narrowest architecture-compatible implementation. Retain unsupported
 raw evidence without promising an unimplemented musical interpretation. The
 completed supported path must create actual curves; warnings alone are not a fix.
 
+Integration coordination: FR-004 review patches currently own `convert.rs`,
+`french.rs`, parser provenance fields and the Cargo slot. Begin by reading the
+contract and implementing the independent performance module and its contained
+tests in a new `src-tauri/src/engine/performance.rs`. Report readiness to the
+parent before editing shared production files or running Cargo; the parent will
+release that integration slot after committing FR-004. Preserve every existing
+working-tree change. Do not commit: the parent owns review, the full gate and
+coherent commits. Use at most two Cargo jobs and two test threads when released.
+
 ## Spec Change Log
 
 - 2026-09-09: Created in configured BMAD implementation_artifacts before code,
@@ -122,4 +131,75 @@ completed supported path must create actual curves; warnings alone are not a fix
 
 ## Verification
 
-Pending. This is not the cause or a claimed correction of the reported high voice.
+Iteration-1 bounded review corrections are implemented without reverting the
+existing work. See [iteration-1 verification](exp-002/iteration-1-verification.md)
+for every triaged finding, exact commands, consumer pin and limits. Final Rust
+gate: 505 passed, zero failed, 14 opt-in/helper tests ignored; Clippy, fmt,
+frontend tests/build, version check and diff check passed. French/English and
+no-expression automated fixtures remain stable. The completed pre-review corpus
+batch is historical evidence; it does not cover these corrections. The parent
+accepted the 505-test/native gate for the bounded EXP commit. The final aggregate
+corpus matrix remains mandatory after FID/EXP-003 integration; no separate
+EXP-only rerun or acoustic render is claimed.
+
+Saved pitch, gain, pulse, tempo/rest and default projects passed the native
+OpenUtau 0.1.569.0 / Core revision `3f213e8993ca792c3e6f8958c92ab27eae78eac5`
+probe, including real `Ustx.Load` and negative empty/missing-curve fixtures.
+Full renderer pitch composition remains source-inspected, not executed by this
+model-free probe. Positive terminal spans under five ticks and overlapping
+millisecond default-template extents are explicit representation limits. An
+event exactly at the exclusive endpoint cannot invalidate the preceding curve.
+Mapped evidence uses ledger schema 3 with bounded shared span references; schema
+2 remains readable and unchanged for no-performance exports. The frozen linear gain law
+is not a universal GM response or identical SoundFont reproduction. Nominal-note
+retention evidence (FID-001), score dynamics/ramps (EXP-003) and SVP expression
+mapping remain separate. No commit was made by this worker.
+
+This is not the cause or a claimed correction of the reported high voice.
+
+## Review clarification, iteration 1
+
+The independent review decisions and complete KEEP contract are in
+[review triage](exp-002/review-triage.md). Apply these bounded corrections without
+reverting the existing implementation, as explicitly required by the user.
+Performance applies to half-open sounding spans: a controller exactly at the
+exclusive endpoint cannot invalidate the preceding curve. Short positive spans
+still obey the consumer limit. Millisecond default pitch extents, including
+short rests and tempo changes, must be considered at ownership boundaries.
+Known later state may recover a specifically resolved conflict; opaque protocol
+hazards remain unsupported. A parameter selection alone is not a parameter write.
+Use bounded indexed traversal and bounded structured target/note/span references
+for partial mapping. New mapped disposition needs an explicit ledger capability
+or schema version, with old schema2 readable and unchanged no-expression output;
+this is a data-format change, not an application release-version bump. Verify
+serialized curves and mixed-success ledger bytes in ordinary tests, and prevent
+empty native fixtures from passing. Native test claims must match the actual
+consumer path exercised. FID and EXP003 ownership remain separate.
+
+Change log2026-09-09: clarified temporal/protocol/capability boundaries after
+review; avoided false mapped claims, unrelated event attribution and unbounded
+report growth. Preserve all working mappings, French/English changes and source
+geometry listed in the triage KEEP contract. No source projects are rewritten.
+
+## Suggested Review Order
+
+- Resolve original ownership before any target adaptation.
+  [performance.rs:380](../../src-tauri/src/engine/performance.rs#L380)
+
+- Carry source identity and shared state with each projected note.
+  [convert.rs:968](../../src-tauri/src/engine/convert.rs#L968)
+
+- Bound traversal and preserve half-open sounding intervals.
+  [performance.rs:69](../../src-tauri/src/engine/target/performance.rs#L69)
+
+- Map held source values into verified PITD and DYN limits.
+  [performance.rs:100](../../src-tauri/src/engine/target/ustx/performance.rs#L100)
+
+- Version structured performance evidence while reading existing ledgers.
+  [bundle.rs:350](../../src-tauri/src/bundle.rs#L350)
+
+- Exercise saved outputs, partial mapping and compatibility.
+  [expression_fidelity.rs:783](../../src-tauri/tests/expression_fidelity.rs#L783)
+
+- Validate the pinned native consumer against positive and negative fixtures.
+  [probe-midi-performance-consumer.py:25](../../scripts/probe-midi-performance-consumer.py#L25)

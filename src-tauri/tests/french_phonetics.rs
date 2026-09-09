@@ -84,6 +84,7 @@ fn direct_notes(words: &[&str]) -> Vec<verse_lib::engine::projection::ProjectedN
         .iter()
         .enumerate()
         .map(|(i, word)| ProjectedNote {
+            performance: None,
             onset_ticks: i as u32 * 480,
             duration_ticks: 480,
             pitch: 60 + i as u8,
@@ -1101,6 +1102,7 @@ fn another_source_row_inside_a_melisma_prevents_blank_absorption() {
     .into_iter()
     .enumerate()
     .map(|(i, lyric)| ProjectedNote {
+        performance: None,
         onset_ticks: i as u32 * 480,
         duration_ticks: 480,
         pitch: 60,
@@ -1511,18 +1513,21 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
     right.syllabic = Some(Syllabic::End);
     let mut notes = vec![
         ProjectedNote {
+            performance: None,
             onset_ticks: 0,
             duration_ticks: 480,
             pitch: 60,
             lyric: ProjectedLyric::Source(Box::new(left.clone())),
         },
         ProjectedNote {
+            performance: None,
             onset_ticks: 480,
             duration_ticks: 240,
             pitch: 62,
             lyric: ProjectedLyric::Absent,
         },
         ProjectedNote {
+            performance: None,
             onset_ticks: 720,
             duration_ticks: 480,
             pitch: 64,
@@ -1740,6 +1745,7 @@ fn a_dictionary_cannot_invent_a_third_vowel_for_a_three_note_word() {
         let mut lyric = Lyric::text(i.to_string(), text.into());
         lyric.syllabic = Some(syllabic);
         ProjectedNote {
+            performance: None,
             onset_ticks: i as u32 * 480,
             duration_ticks: 480,
             pitch: 60,
