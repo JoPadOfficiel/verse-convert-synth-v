@@ -49,12 +49,10 @@ fn latin_languages_survive_byte_exactly() {
                 missing.push(*w);
             }
         }
-        println!(
-            "{tag:6} placed={} byte_exact={} missing={:?} lang_leaked={}",
-            o.placed,
-            missing.is_empty(),
-            missing,
-            text.contains("japanese")
-        );
+        assert_eq!(o.placed, words.len(), "{tag}: every lyric stays placed");
+        assert!(missing.is_empty(), "{tag}: changed lyrics {missing:?}");
+        assert!(!text.contains("japanese"), "legacy language must not leak");
+        assert!(text.contains(target::ustx::DEFAULT_PHONEMIZER));
+        assert!(!text.contains("[fr/"), "default never applies French hints");
     }
 }

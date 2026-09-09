@@ -372,6 +372,7 @@ fn exact_ustx_ticks(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i3
 /// state cannot silently fall into a wrong marker.
 fn lyric_text(lyric: &ProjectedLyric) -> String {
     match lyric {
+        ProjectedLyric::Pronounced { text, phonemes, .. } => format!("{text}[{phonemes}]"),
         ProjectedLyric::Source(source) => match &source.state {
             LyricState::Text(text) => text.clone(),
             // The source states that the previous syllable is *held* across this
@@ -498,7 +499,11 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
         let track_no = i32::try_from(index)
             .map_err(|_| "projected lane count exceeds the OpenUtau track range".to_string())?;
         tracks.push(UstxTrack {
-            phonemizer: DEFAULT_PHONEMIZER.into(),
+            phonemizer: match project.pronunciation_profile {
+                super::PronunciationProfile::Default => DEFAULT_PHONEMIZER,
+                super::PronunciationProfile::FrenchMillefeuille => super::french::PHONEMIZER,
+            }
+            .into(),
             track_name: track.name.clone(),
             // OpenUtau carries mute on the track and nowhere else, so a lane the
             // projection opens silent has to state it here.
@@ -1193,6 +1198,7 @@ mod tests {
     /// a meter. Every refusal has its own projection instead.
     fn projected() -> ProjectedProject {
         ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             language: "japanese".into(),
             meters: vec![ProjectedMeter {
@@ -1840,6 +1846,7 @@ mod tests {
     #[test]
     fn a_zero_ppq_is_refused_even_with_nothing_to_convert() {
         let empty = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 0,
             ..Default::default()
         };
@@ -1885,6 +1892,7 @@ mod tests {
     #[test]
     fn an_unrepresentable_tempo_names_the_event_the_source_revealed_first() {
         let project = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 448,
             meters: vec![ProjectedMeter {
                 bar_index: 0,
@@ -1926,6 +1934,7 @@ mod tests {
     #[test]
     fn the_emitted_tempo_map_is_position_ordered_whatever_the_projection_holds() {
         let project = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             meters: vec![ProjectedMeter {
                 bar_index: 0,

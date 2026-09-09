@@ -12,6 +12,315 @@ use verse_lib::engine::convert::{convert_auto_with, convert_midi_with_target};
 use verse_lib::engine::target::ExportTarget;
 use verse_lib::engine::{musescore, musicxml, target};
 
+fn french_export(body: &str) -> String {
+    let midi = musicxml::parse(score(body).as_bytes()).unwrap();
+    let outcome = verse_lib::engine::convert::convert_midi_with_profile(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        target::PronunciationProfile::FrenchMillefeuille,
+    );
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    String::from_utf8(
+        target::serialize_to(ExportTarget::Ustx, outcome.svp.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn french_explicit_end_cannot_be_reinterpreted_as_a_layout_head() {
+    let body = format!(
+        "{}{}{}",
+        note("C", Some("end"), "rêves"),
+        note("D", Some("begin"), "ê"),
+        note("E", Some("end"), "ves,")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&body)),
+        ["rêves[fr/r fr/ae fr/v]", "ê", "ves,"]
+    );
+}
+
+#[test]
+fn french_unknown_connected_word_cannot_use_its_fragment_as_a_determiner() {
+    let body = format!(
+        "{}{}{}",
+        note("C", Some("begin"), "des"),
+        note("D", Some("end"), "tin"),
+        note("E", None, "amis")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&body)),
+        ["des", "tin", "amis[fr/ah fr/m fr/ih]"]
+    );
+    let midi = musicxml::parse(score(&body).as_bytes()).unwrap();
+    let result = verse_lib::engine::convert::convert_midi_with_profile(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        target::PronunciationProfile::FrenchMillefeuille,
+    );
+    assert_eq!(
+        result.tracks[0]
+            .warnings
+            .iter()
+            .filter(|w| w.code == target::french::UNSUPPORTED)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn french_isolated_ends_never_fuse_unrelated_words() {
+    let body = format!(
+        "{}{}{}{}",
+        note("C", None, "mes"),
+        note("D", Some("end"), "rê"),
+        note("E", None, "le"),
+        note("F", Some("end"), "vent")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&body)),
+        [
+            "mes[fr/m fr/eh]",
+            "rê[fr/r fr/ae]",
+            "le[fr/l fr/ee]",
+            "vent[fr/v fr/en]"
+        ]
+    );
+    // Default behavior remains frozen even for this known bad source metadata.
+    assert_eq!(
+        ustx_lyrics(&export(&body, ExportTarget::Ustx)),
+        ["mesrê", "+", "levent", "+"]
+    );
+}
+
+#[test]
+fn french_preserves_bracketed_melismas_without_losing_the_sung_schwa() {
+    let body = format!(
+        "{}{}{}",
+        note("C", Some("begin"), "rê"),
+        untexted("D"),
+        note("E", Some("end"), "ves,")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&body)),
+        ["rê[fr/r fr/ae]", "+~", "ves[fr/v fr/ee]"]
+    );
+}
+
+#[test]
+fn french_exact_layout_tolerates_repeated_begin_metadata_without_joining() {
+    let full_word_head = format!(
+        "{}{}{}",
+        note("C", None, "rêves"),
+        note("D", Some("begin"), "ê"),
+        note("E", Some("end"), "ves,")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&full_word_head)),
+        ["rêves[fr/r fr/ae]", "ê[fr/ae]", "ves[fr/v fr/ee]"]
+    );
+    let body = format!(
+        "{}{}{}",
+        note("C", Some("begin"), "rê"),
+        note("D", Some("begin"), "ê"),
+        note("E", Some("end"), "ves,")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&body)),
+        ["rê[fr/r fr/ae]", "ê[fr/ae]", "ves[fr/v fr/ee]"]
+    );
+    let murmurs = format!(
+        "{}{}{}{}",
+        note("C", Some("begin"), "mur"),
+        note("D", Some("begin"), "mu"),
+        note("E", Some("middle"), "u"),
+        note("F", Some("end"), "ures,")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&murmurs)),
+        [
+            "mur[fr/m fr/uh fr/r]",
+            "mu[fr/m fr/uh]",
+            "u[fr/uh]",
+            "ures[fr/uh fr/r]"
+        ]
+    );
+}
+
+#[test]
+fn french_added_layouts_never_cross_rests_or_invent_a_final_schwa() {
+    let gap = format!(
+        "{}{}{}",
+        note("C", Some("begin"), "ju"),
+        rest(),
+        note("D", Some("end"), "ure,")
+    );
+    assert_eq!(ustx_lyrics(&french_export(&gap)), ["ju", "ure,"]);
+    let held = format!(
+        "{}{}{}",
+        note("C", Some("begin"), "ju"),
+        untexted("D"),
+        note("E", Some("end"), "ure,")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&held)),
+        ["ju[fr/j fr/uh]", "+~", "ure[fr/uh fr/r]"]
+    );
+}
+
+#[test]
+fn french_rests_untexted_notes_and_explicit_words_block_layouts() {
+    let independent_word = format!(
+        "{}{}{}",
+        note("C", Some("single"), "rêves"),
+        note("D", Some("begin"), "ê"),
+        note("E", Some("end"), "ves,")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&independent_word)),
+        ["rêves[fr/r fr/ae fr/v]", "ê", "ves,"]
+    );
+    let gap = format!(
+        "{}{}{}",
+        note("C", Some("begin"), "mê"),
+        rest(),
+        note("E", Some("end"), "me")
+    );
+    assert_eq!(ustx_lyrics(&french_export(&gap)), ["mê", "me"]);
+    let unmarked = format!(
+        "{}{}{}",
+        note("C", None, "mê"),
+        untexted("D"),
+        note("E", None, "me")
+    );
+    assert_eq!(ustx_lyrics(&french_export(&unmarked)), ["mê", "me"]);
+    let words = format!(
+        "{}{}",
+        note("C", Some("single"), "mê"),
+        note("D", Some("single"), "me")
+    );
+    assert_eq!(ustx_lyrics(&french_export(&words)), ["mê", "me"]);
+    let liaison = format!(
+        "{}{}{}",
+        note("C", None, "tout"),
+        rest(),
+        note("D", None, "au")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&liaison)),
+        ["tout[fr/t fr/ou]", "au[fr/oh]"]
+    );
+}
+
+#[test]
+fn french_does_not_cross_source_lyric_rows_or_override_manual_hints() {
+    let body = format!(
+        "{}{}",
+        note("C", None, "tout"),
+        note("D", None, "au").replace("<lyric>", "<lyric number=\"2\">")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&body)),
+        ["tout[fr/t fr/ou]", "au[fr/oh]"]
+    );
+    let manual = format!(
+        "{}{}",
+        note("C", Some("begin"), "mê[fr/m fr/ae]"),
+        note("D", Some("end"), "me")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&manual)),
+        ["mê[fr/m fr/ae]", "me"]
+    );
+    let manual_liaison = format!(
+        "{}{}",
+        note("C", None, "tout"),
+        note("D", None, "au[fr/t fr/oh]")
+    );
+    assert_eq!(
+        ustx_lyrics(&french_export(&manual_liaison)),
+        ["tout[fr/t fr/ou]", "au[fr/t fr/oh]"]
+    );
+}
+
+#[test]
+fn french_blank_duplicates_keep_the_text_at_its_original_note() {
+    for native in [false, true] {
+        for blank_first in [false, true] {
+            let blank = if native {
+                "<Lyrics><syllabic>begin</syllabic><text></text></Lyrics>"
+            } else {
+                "<lyric><syllabic>begin</syllabic><text></text></lyric>"
+            };
+            let text = if native {
+                "<Lyrics><text>rêves.</text></Lyrics>"
+            } else {
+                "<lyric><text>rêves.</text></lyric>"
+            };
+            let both = if blank_first {
+                format!("{blank}{text}")
+            } else {
+                format!("{text}{blank}")
+            };
+            let midi = if native {
+                musescore::parse(format!("<museScore version=\"4.0\"><Score><Division>480</Division><Part><Staff id=\"1\"/><trackName>Voice</trackName></Part><Staff id=\"1\"><Measure><voice><Chord><durationType>quarter</durationType><Lyrics><text>mes</text></Lyrics><Note><pitch>60</pitch></Note></Chord><Chord><durationType>quarter</durationType>{both}<Note><pitch>62</pitch></Note></Chord></voice></Measure></Staff></Score></museScore>").as_bytes()).unwrap()
+            } else {
+                musicxml::parse(
+                    score(&format!(
+                        "{}{}",
+                        note("C", None, "mes"),
+                        untexted("D").replace("</note>", &format!("{both}</note>"))
+                    ))
+                    .as_bytes(),
+                )
+                .unwrap()
+            };
+            let result = verse_lib::engine::convert::convert_midi_with_profile(
+                &midi,
+                "english",
+                None,
+                ExportTarget::Ustx,
+                target::PronunciationProfile::FrenchMillefeuille,
+            );
+            assert!(result.ok, "{:?}", result.msg);
+            assert_eq!(result.placed, 2);
+            let output = target::ustx::serialize(result.svp.as_ref().unwrap()).unwrap();
+            assert_eq!(output.voice_parts.len(), 1);
+            let notes = &output.voice_parts[0].notes;
+            assert_eq!(notes.len(), 2);
+            assert_eq!(
+                (notes[1].position, notes[1].duration, notes[1].tone),
+                (480, 480, 62)
+            );
+            assert_eq!(notes[1].lyric, "rêves[fr/r fr/ae fr/v]");
+            assert!(result.tracks[0]
+                .warnings
+                .iter()
+                .any(|w| w.code == "FRENCH_DUPLICATE_BLANK_RESOLVED"));
+            let originals: Vec<_> = midi
+                .tracks
+                .iter()
+                .flat_map(|t| &t.events)
+                .filter_map(|e| match &e.kind {
+                    verse_lib::engine::midi::Kind::NoteOn(n) if n.lyrics.len() == 2 => {
+                        Some(&n.lyrics)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                originals.len(),
+                1,
+                "both lyric records survive in source evidence"
+            );
+        }
+    }
+}
+
 /// One `<note>` with one lyric. `syllabic` is written only when stated.
 fn note(step: &str, syllabic: Option<&str>, text: &str) -> String {
     let lyric = match syllabic {

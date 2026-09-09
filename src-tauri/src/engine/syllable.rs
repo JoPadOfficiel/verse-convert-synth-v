@@ -85,6 +85,7 @@ enum Part {
 
 fn classify(note: &ProjectedNote) -> Part {
     match &note.lyric {
+        ProjectedLyric::Pronounced { .. } => Part::Break,
         ProjectedLyric::Extension => Part::Held,
         ProjectedLyric::Absent => Part::Untexted,
         ProjectedLyric::Source(source) => match &source.state {
@@ -120,9 +121,56 @@ fn classify(note: &ProjectedNote) -> Part {
     }
 }
 
-fn touches(previous: &ProjectedNote, next: &ProjectedNote) -> bool {
+pub(crate) fn touches(previous: &ProjectedNote, next: &ProjectedNote) -> bool {
     u64::from(previous.onset_ticks) + u64::from(previous.duration_ticks)
         == u64::from(next.onset_ticks)
+}
+
+/// Preserve only melismas bracketed by bilateral syllabic evidence. French
+/// layouts keep their attacks instead of joining their text; this shares the
+/// default joiner's reach and timing checks without accepting an isolated end.
+pub(crate) fn preserve_bracketed_melismas(notes: &mut [ProjectedNote]) {
+    let parts: Vec<_> = notes.iter().map(classify).collect();
+    for head in 0..notes.len() {
+        let Part::Syllable {
+            joins_next: true,
+            stated: true,
+            ..
+        } = parts[head]
+        else {
+            continue;
+        };
+        let Some(reach) = next_syllable(notes, &parts, head) else {
+            continue;
+        };
+        if !reach.contiguous
+            || !matches!(
+                parts[reach.syllable],
+                Part::Syllable {
+                    joins_previous: true,
+                    stated: true,
+                    ..
+                }
+            )
+        {
+            continue;
+        }
+        let (ProjectedLyric::Source(left), ProjectedLyric::Source(right)) =
+            (&notes[head].lyric, &notes[reach.syllable].lyric)
+        else {
+            continue;
+        };
+        if left.lane != right.lane
+            || notes[head + 1..reach.syllable].iter().any(|note| {
+                matches!(&note.lyric, ProjectedLyric::Source(source) if source.lane != left.lane)
+            })
+        {
+            continue;
+        }
+        for held in reach.untexted {
+            notes[held].lyric = ProjectedLyric::Extension;
+        }
+    }
 }
 
 /// The next syllable on a lane, and what lies between it and the one before.
@@ -324,6 +372,9 @@ mod tests {
                 },
                 ProjectedLyric::Extension => "<ext>".into(),
                 ProjectedLyric::Absent => "<none>".into(),
+                ProjectedLyric::Pronounced { .. } => {
+                    panic!("default joining must not generate pronunciation hints")
+                }
             })
             .collect()
     }

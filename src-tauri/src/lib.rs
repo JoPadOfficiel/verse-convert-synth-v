@@ -8,11 +8,11 @@ use bundle::{
     BundleLayout, BundleProgressEvent, BundleProject, BundleRequest, BundleResult,
 };
 use engine::convert::{
-    convert_midi_with_target, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState,
+    convert_midi_with_profile, Diagnostic, ExportRepresentation, LyricStatus, LyricStatusState,
     SourceRole, TrackReport,
 };
 use engine::midi::{Midi, SourceFormat, SourceTopology};
-use engine::target::{ExportTarget, SerializeError};
+use engine::target::{ExportTarget, PronunciationProfile, SerializeError};
 use renderer::{
     AudioRenderer, MuseScoreConfig, MuseScoreRenderer, RenderLimits, DEFAULT_MAX_WAV_BYTES,
     DEFAULT_RENDER_TIMEOUT,
@@ -331,6 +331,7 @@ fn process_one(
     language: &str,
     overrides: Option<&HashMap<usize, bool>>,
     target: ExportTarget,
+    pronunciation_profile: PronunciationProfile,
 ) -> FileResult {
     let name = Path::new(path)
         .file_name()
@@ -387,7 +388,7 @@ fn process_one(
         Ok(midi) => midi,
         Err(message) => return err(name, "SOURCE_PARSE_FAILED", message),
     };
-    let r = convert_midi_with_target(&midi, language, overrides, target);
+    let r = convert_midi_with_profile(&midi, language, overrides, target, pronunciation_profile);
     let tracks: Vec<_> = r
         .tracks
         .iter()
@@ -509,6 +510,7 @@ fn export_svp(
     language: Option<String>,
     overrides: Option<HashMap<String, bool>>,
     export_target: Option<ExportTarget>,
+    pronunciation_profile: Option<PronunciationProfile>,
 ) -> Result<String, CommandErrorDto> {
     let export_target = export_target.unwrap_or_default();
     let extension = Path::new(&path)
@@ -536,7 +538,13 @@ fn export_svp(
     let lang = language.as_deref().unwrap_or("english");
     let midi = parse_source_snapshot(&data, &extension)
         .map_err(|message| CommandErrorDto::new("SOURCE_PARSE_FAILED", message))?;
-    let r = convert_midi_with_target(&midi, lang, Some(&ov), export_target);
+    let r = convert_midi_with_profile(
+        &midi,
+        lang,
+        Some(&ov),
+        export_target,
+        pronunciation_profile.unwrap_or_default(),
+    );
     if !r.ok {
         return Err(CommandErrorDto::new(
             "CONVERSION_FAILED",
@@ -625,6 +633,7 @@ fn source_format_name(format: SourceFormat) -> &'static str {
 /// shipped, so the project format inside the bundle is `export_target` — optional,
 /// defaulting to Synthesizer V, so a caller that names no format writes 0.4.9's
 /// bundle exactly.
+#[allow(clippy::too_many_arguments)] // Mirrors the optional Tauri command fields.
 fn export_bundle_blocking(
     path: String,
     target: String,
@@ -632,7 +641,9 @@ fn export_bundle_blocking(
     overrides: Option<HashMap<String, bool>>,
     renderer_path: Option<String>,
     export_target: Option<ExportTarget>,
+    pronunciation_profile: Option<PronunciationProfile>,
     progress: &(dyn Fn(BundleProgressEvent) + Sync),
+    #[cfg(test)] test_renderer: Option<Arc<dyn renderer::AudioRenderer>>,
 ) -> Result<BundleResult, CommandErrorDto> {
     let export_target = export_target.unwrap_or_default();
     let source_path = PathBuf::from(&path);
@@ -668,11 +679,12 @@ fn export_bundle_blocking(
     // A bundle carries the chosen target's project, so it gates on that target: a
     // source OpenUtau cannot represent must be refused here, before any staging
     // exists, rather than surfacing after the renderer has run.
-    let outcome = engine::convert::convert_midi_with_target(
+    let outcome = engine::convert::convert_midi_with_profile(
         &midi,
         language.as_deref().unwrap_or("english"),
         Some(&parsed_overrides),
         export_target,
+        pronunciation_profile.unwrap_or_default(),
     );
     if !outcome.ok {
         return Err(CommandErrorDto::new(
@@ -739,8 +751,18 @@ fn export_bundle_blocking(
         timeout: DEFAULT_RENDER_TIMEOUT,
         max_wav_bytes: DEFAULT_MAX_WAV_BYTES,
     };
-    let renderer = MuseScoreRenderer::discover(&config)
-        .map_err(|error| CommandErrorDto::from(bundle::BundleError::Render(error)))?;
+    let discover = || {
+        MuseScoreRenderer::discover(&config)
+            .map(|renderer| Arc::new(renderer) as Arc<dyn renderer::AudioRenderer>)
+            .map_err(|error| CommandErrorDto::from(bundle::BundleError::Render(error)))
+    };
+    #[cfg(test)]
+    let renderer = match test_renderer {
+        Some(renderer) => renderer,
+        None => discover()?,
+    };
+    #[cfg(not(test))]
+    let renderer = discover()?;
     write_bundle(
         BundleRequest {
             destination,
@@ -753,7 +775,7 @@ fn export_bundle_blocking(
                 ledger,
                 warnings: manifest_warnings,
             },
-            renderer: Arc::new(renderer),
+            renderer,
             render_limits: RenderLimits {
                 timeout: config.timeout,
                 max_output_bytes: config.max_wav_bytes,
@@ -765,6 +787,7 @@ fn export_bundle_blocking(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri exposes each optional field separately.
 async fn export_bundle(
     path: String,
     target: String,
@@ -772,6 +795,7 @@ async fn export_bundle(
     overrides: Option<HashMap<String, bool>>,
     renderer_path: Option<String>,
     export_target: Option<ExportTarget>,
+    pronunciation_profile: Option<PronunciationProfile>,
     on_progress: Channel<BundleProgressEvent>,
 ) -> Result<BundleResult, CommandErrorDto> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -782,9 +806,12 @@ async fn export_bundle(
             overrides,
             renderer_path,
             export_target,
+            pronunciation_profile,
             &|event| {
                 let _ = on_progress.send(event);
             },
+            #[cfg(test)]
+            None,
         )
     })
     .await
@@ -867,6 +894,7 @@ fn convert_files(
     language: Option<String>,
     overrides: Option<HashMap<String, HashMap<String, bool>>>,
     export_target: Option<ExportTarget>,
+    pronunciation_profile: Option<PronunciationProfile>,
 ) -> Vec<FileResult> {
     let lang = language.as_deref().unwrap_or("english");
     let export_target = export_target.unwrap_or_default();
@@ -892,6 +920,7 @@ fn convert_files(
                 lang,
                 overrides.get(p.as_str()),
                 export_target,
+                pronunciation_profile.unwrap_or_default(),
             )
         })
         .collect()
@@ -983,6 +1012,7 @@ mod output_tests {
             "english",
             None,
             ExportTarget::Svp,
+            PronunciationProfile::Default,
         );
         assert!(!result.ok, "an unprojectable source is not convertible");
         assert_eq!(
@@ -1218,6 +1248,7 @@ mod output_tests {
             "english",
             None,
             ExportTarget::Svp,
+            PronunciationProfile::Default,
         );
         assert!(analysis.ok, "{:?}", analysis.msg);
         assert_eq!(analysis.placed, 1);
@@ -1235,6 +1266,7 @@ mod output_tests {
             source.to_string_lossy().into_owned(),
             direct_target.to_string_lossy().into_owned(),
             Some("english".into()),
+            None,
             None,
             None,
         )
@@ -1262,6 +1294,7 @@ mod output_tests {
             Some("english".into()),
             None,
             Some(ExportTarget::Ustx),
+            None,
         );
         let error = mismatched.expect_err("a .svp path cannot hold an OpenUtau project");
         assert_eq!(error.code, "INVALID_OUTPUT");
@@ -1275,6 +1308,131 @@ mod output_tests {
             "nothing may be written when the format and the filename disagree"
         );
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn french_analysis_batch_and_direct_exports_share_the_bundle_projection() {
+        let root = temp_dir();
+        let source = root.join("french.musicxml");
+        let words = ["Tout", "au", "Un,", "d'un", "mê", "me", "inconnu"];
+        let notes: String = words.iter().map(|word| format!("<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><lyric><text>{word}</text></lyric></note>")).collect();
+        let data = format!("<score-partwise version=\"4.0\"><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes>{notes}</measure></part></score-partwise>");
+        std::fs::write(&source, &data).unwrap();
+        let profile = PronunciationProfile::FrenchMillefeuille;
+        let path = source.to_str().unwrap();
+        let analysis = process_one(
+            path,
+            false,
+            None,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            profile,
+        );
+        let batch = process_one(
+            path,
+            true,
+            None,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            profile,
+        );
+        assert!(
+            analysis.ok && batch.ok,
+            "{:?} / {:?}",
+            analysis.msg,
+            batch.msg
+        );
+        assert_eq!(analysis.warnings, batch.warnings);
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.code == engine::target::french::LIAISON));
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.code == engine::target::french::UNSUPPORTED));
+        let direct = root.join("direct.ustx");
+        export_svp(
+            path.into(),
+            direct.to_string_lossy().into_owned(),
+            None,
+            None,
+            Some(ExportTarget::Ustx),
+            Some(profile),
+        )
+        .unwrap();
+        let batch_bytes = std::fs::read(batch.out.unwrap()).unwrap();
+        assert_eq!(batch_bytes, std::fs::read(direct).unwrap());
+        let midi = parse_source_snapshot(data.as_bytes(), "musicxml").unwrap();
+        let converted =
+            convert_midi_with_profile(&midi, "english", None, ExportTarget::Ustx, profile);
+        assert_eq!(
+            analysis.warnings,
+            converted
+                .tracks
+                .iter()
+                .flat_map(|t| t.warnings.clone())
+                .collect::<Vec<_>>()
+        );
+        let BundleProject::Ustx(project) =
+            BundleProject::from_projection(ExportTarget::Ustx, converted.svp.as_ref().unwrap())
+                .unwrap()
+        else {
+            panic!("USTX expected")
+        };
+        assert_eq!(
+            batch_bytes,
+            engine::target::ustx::to_yaml(&project).into_bytes()
+        );
+        // Exercise the actual command worker, including profile propagation,
+        // audio references and manifest diagnostics, with the existing fake
+        // renderer. This performs no installed acoustic rendering.
+        let plan = stems::StemPlan::from_source(&midi, &converted.tracks).unwrap();
+        let bundled = export_bundle_blocking(
+            path.into(),
+            root.join("french.versebundle")
+                .to_string_lossy()
+                .into_owned(),
+            Some("english".into()),
+            None,
+            None,
+            Some(ExportTarget::Ustx),
+            Some(profile),
+            &|_| {},
+            Some(bundle::tests::successful_renderer(&plan.stems)),
+        )
+        .unwrap();
+        let emitted = std::fs::read_to_string(&bundled.project_path).unwrap();
+        let baseline = engine::target::ustx::to_yaml(&project);
+        fn vocal_section(yaml: &str) -> &str {
+            yaml.split("voice_parts:\n")
+                .nth(1)
+                .unwrap()
+                .split("wave_parts:")
+                .next()
+                .unwrap()
+        }
+        assert_eq!(vocal_section(&emitted), vocal_section(&baseline));
+        assert_eq!(
+            emitted.matches(engine::target::french::PHONEMIZER).count(),
+            project.tracks.len()
+        );
+        assert!(!engine::target::ustx::audit(&emitted)
+            .unwrap()
+            .wave_parts
+            .is_empty());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&bundled.manifest_path).unwrap()).unwrap();
+        for warning in &analysis.warnings {
+            assert!(bundled
+                .warnings
+                .iter()
+                .any(|text| text.contains(&warning.code) && text.contains(&warning.message)));
+        }
+        assert_eq!(manifest["warnings"], serde_json::json!(bundled.warnings));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1304,6 +1462,7 @@ mod output_tests {
             "english",
             None,
             ExportTarget::Svp,
+            PronunciationProfile::Default,
         );
         assert!(result.ok, "{:?}", result.msg);
         assert_eq!(result.n_parts, 1);

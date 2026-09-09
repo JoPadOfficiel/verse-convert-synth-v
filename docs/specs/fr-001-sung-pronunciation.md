@@ -2,12 +2,12 @@
 title: "FR-001: French sung pronunciation"
 type: bugfix
 created: 2026-09-09
-status: in-review
+status: implemented
 ---
 
 # FR-001: French sung pronunciation
 
-Status: implementation under review. Original baseline:
+Status: implemented and reviewed; acoustic listening remains pending. Original baseline:
 `6558ea9da7d7b4dc60b3dbf18f7ab60c86f2f73c`.
 
 ## Intent

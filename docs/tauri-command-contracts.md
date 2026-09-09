@@ -30,6 +30,26 @@ target writes an empty `database.language` and the OpenUtau target writes no
 language at all. The frontend passes the constant `"english"`; there is no
 language selector, and nothing about lyric text depends on it.
 
+## `pronunciationProfile`
+
+All three conversion/export commands accept the optional `pronunciationProfile`.
+It defaults to `"default"`; unknown values fail deserialization. The legacy
+`language` parameter remains ignored. `"frenchMillefeuille"` applies only when
+`exportTarget` is `"ustx"`; SVP always uses the default projection policy.
+
+Settings exposes the choice as **OpenUtau pronunciation**. Changing it reanalyzes
+all loaded files through the same guarded workflow as a target change. The
+selection is installed only after successful reanalysis. Direct, batch and
+bundle exports pass the same selection to `convert_midi_with_profile`.
+
+The profile selects a pronunciation convention and the French DiffSinger
+phonemizer, never a singer. No automatic language detection occurs.
+Diagnostics include `FRENCH_PRONUNCIATION_APPLIED`, `FRENCH_LIAISON_APPLIED`,
+`FRENCH_PRONUNCIATION_UNSUPPORTED`, and `FRENCH_DUPLICATE_BLANK_RESOLVED`.
+They retain source note IDs; bundle manifests preserve the same codes,
+messages and source IDs. Unsupported vocabulary is a warning, not an export
+refusal. Manual hints remain unchanged.
+
 ## Commands
 
 ### `convert_files`
@@ -42,6 +62,7 @@ request:
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<sourcePath, Record<trackIdString, boolean>>
   exportTarget?: "svp" | "ustx"
+  pronunciationProfile?: "default" | "frenchMillefeuille"
 
 response:
   FileResult[]
@@ -64,6 +85,7 @@ request:
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<trackIdString, boolean>
   exportTarget?: "svp" | "ustx"
+  pronunciationProfile?: "default" | "frenchMillefeuille"
 
 response:
   string  // committed target path
@@ -93,6 +115,7 @@ request:
   overrides?: Record<trackIdString, boolean>
   rendererPath?: string
   exportTarget?: "svp" | "ustx"
+  pronunciationProfile?: "default" | "frenchMillefeuille"
   onProgress: Channel<BundleProgressEvent>
 
 response:
