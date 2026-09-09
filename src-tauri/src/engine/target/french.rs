@@ -43,6 +43,7 @@ fn ambiguous(key: &str) -> bool {
 fn lexical(key: &str) -> Option<String> {
     let special = match key {
         "d'un" => Some("fr/d fr/in"),
+        "ouh" => Some("fr/ou"),
         "tau" => Some("fr/t fr/oh"),
         "rê" => Some("fr/r fr/ae"),
         "laisses" => return lexical("laisse"),
@@ -111,9 +112,12 @@ fn standalone_allowed(lyric: &ProjectedLyric, key: &str) -> bool {
 }
 
 struct Layout {
+    // An empty identity denotes the independent words in `syllables`.
     word: &'static str,
     syllables: &'static [&'static str],
     hints: &'static [&'static str],
+    // Only explicitly audited sung layouts can override a premature End.
+    orphan_end_slots: &'static [usize],
 }
 
 // Longest layouts first. Each slot is an attack, including repeated vowels;
@@ -123,143 +127,403 @@ const LAYOUTS: &[Layout] = &[
         word: "murmures",
         syllables: &["mur", "mu", "u", "ures"],
         hints: &["fr/m fr/uh fr/r", "fr/m fr/uh", "fr/uh", "fr/uh fr/r"],
+        orphan_end_slots: &[1],
     },
     Layout {
         word: "murmure",
         syllables: &["mur", "mu", "u", "ure"],
         hints: &["fr/m fr/uh fr/r", "fr/m fr/uh", "fr/uh", "fr/uh fr/r"],
+        orphan_end_slots: &[1],
+    },
+    Layout {
+        word: "j'effacerai",
+        syllables: &["j'ef", "fa", "ce", "rai"],
+        hints: &["fr/j fr/ae", "fr/f fr/ah", "fr/s fr/ee", "fr/r fr/ae"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "courants",
+        syllables: &["cou", "rant", "an", "an"],
+        hints: &["fr/k fr/ou", "fr/r fr/en", "fr/en", "fr/en"],
+        orphan_end_slots: &[1],
+    },
+    Layout {
+        word: "courants",
+        syllables: &["cou", "rants", "an", "an"],
+        hints: &["fr/k fr/ou", "fr/r fr/en", "fr/en", "fr/en"],
+        orphan_end_slots: &[1],
+    },
+    Layout {
+        word: "partir",
+        syllables: &["par", "ti", "i", "ir"],
+        hints: &["fr/p fr/ah fr/r", "fr/t fr/ih", "fr/ih", "fr/ih fr/r"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "espace",
+        syllables: &["es", "pa", "a", "ace"],
+        hints: &["fr/ae fr/s", "fr/p fr/ah", "fr/ah", "fr/ah fr/s"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "amours",
+        syllables: &["a", "mou", "ou", "ours"],
+        hints: &["fr/ah", "fr/m fr/ou", "fr/ou", "fr/ou fr/r"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "amours",
+        syllables: &["a", "mou", "ou", "our"],
+        hints: &["fr/ah", "fr/m fr/ou", "fr/ou", "fr/ou fr/r"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "m'arrête",
         syllables: &["m'ar", "rê", "te"],
         hints: &["fr/m fr/ah", "fr/r fr/ae", "fr/t fr/ee"],
+        orphan_end_slots: &[1],
     },
     Layout {
         word: "murs",
         syllables: &["mu", "u", "urs"],
         hints: &["fr/m fr/uh", "fr/uh", "fr/uh fr/r"],
+        orphan_end_slots: &[0],
     },
     Layout {
         word: "mur",
         syllables: &["mu", "u", "ur"],
         hints: &["fr/m fr/uh", "fr/uh", "fr/uh fr/r"],
+        orphan_end_slots: &[0],
     },
     Layout {
         word: "rêves",
         syllables: &["rê", "ê", "ves"],
         hints: &["fr/r fr/ae", "fr/ae", "fr/v fr/ee"],
+        orphan_end_slots: &[0],
     },
-    // The audited Bass ending spells the full word on the first note, then
-    // repeats its vowel and sings `ves` separately. Place v only on that tail.
     Layout {
         word: "rêves",
         syllables: &["rêves", "ê", "ves"],
         hints: &["fr/r fr/ae", "fr/ae", "fr/v fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "rêve",
         syllables: &["rê", "ê", "ve"],
         hints: &["fr/r fr/ae", "fr/ae", "fr/v fr/ee"],
+        orphan_end_slots: &[0],
     },
     Layout {
         word: "vent",
         syllables: &["vent", "en", "ent"],
         hints: &["fr/v fr/en", "fr/en", "fr/en"],
+        orphan_end_slots: &[0],
     },
     Layout {
         word: "court",
         syllables: &["court", "ou", "ourt"],
         hints: &["fr/k fr/ou", "fr/ou", "fr/ou fr/r"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "fond",
         syllables: &["fond", "on", "on"],
         hints: &["fr/f fr/on", "fr/on", "fr/on"],
+        orphan_end_slots: &[0, 1],
     },
     Layout {
         word: "tempêtes",
         syllables: &["tem", "pê", "tes"],
         hints: &["fr/t fr/en", "fr/p fr/ae", "fr/t fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "tempête",
         syllables: &["tem", "pê", "te"],
         hints: &["fr/t fr/en", "fr/p fr/ae", "fr/t fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "blessures",
         syllables: &["bles", "su", "res"],
         hints: &["fr/b fr/l fr/ae", "fr/s fr/uh", "fr/r fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "raison s'achève",
+        syllables: &["rai", "sons'a", "chève"],
+        hints: &["fr/r fr/ae", "fr/z fr/on fr/s fr/ah", "fr/sh fr/ae fr/v"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "garderai",
+        syllables: &["gar", "de", "rai"],
+        hints: &["fr/g fr/ah fr/r", "fr/d fr/ee", "fr/r fr/ae"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "trompettes",
+        syllables: &["trom", "pet", "te"],
+        hints: &["fr/t fr/r fr/on", "fr/p fr/ae", "fr/t fr/ee"],
+        orphan_end_slots: &[1],
+    },
+    Layout {
+        word: "trompettes",
+        syllables: &["trom", "pet", "tes"],
+        hints: &["fr/t fr/r fr/on", "fr/p fr/ae", "fr/t fr/ee"],
+        orphan_end_slots: &[1],
+    },
+    Layout {
+        word: "presse",
+        syllables: &["pre", "sse", "e"],
+        hints: &["fr/p fr/r fr/ae", "fr/s fr/ee", "fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "trace",
+        syllables: &["tra", "a", "ce"],
+        hints: &["fr/t fr/r fr/ah", "fr/ah", "fr/s fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "l'exil",
+        syllables: &["l'e", "xi", "il"],
+        hints: &["fr/l fr/ae", "fr/g fr/z fr/ih", "fr/ih fr/l"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "l'empreinte",
+        syllables: &["l'em", "prein", "te"],
+        hints: &["fr/l fr/en", "fr/p fr/r fr/in", "fr/t fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "blessure",
+        syllables: &["bles", "su", "re"],
+        hints: &["fr/b fr/l fr/ae", "fr/s fr/uh", "fr/r fr/ee"],
+        orphan_end_slots: &[1],
+    },
+    Layout {
+        word: "jours",
+        syllables: &["jours", "ou", "our"],
+        hints: &["fr/j fr/ou", "fr/ou", "fr/ou fr/r"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "jours",
+        syllables: &["jours", "ou", "ours"],
+        hints: &["fr/j fr/ou", "fr/ou", "fr/ou fr/r"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "espace",
+        syllables: &["es", "pa", "ace"],
+        hints: &["fr/ae fr/s", "fr/p fr/ah", "fr/ah fr/s"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "",
+        syllables: &["au", "bout", "de"],
+        hints: &["fr/oh", "fr/b fr/ou", "fr/d fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "m'arrête",
         syllables: &["m'ar", "rête"],
         hints: &["fr/m fr/ah", "fr/r fr/ae fr/t"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "jure",
         syllables: &["ju", "ure"],
         hints: &["fr/j fr/uh", "fr/uh fr/r"],
+        orphan_end_slots: &[0],
     },
     Layout {
         word: "changer",
         syllables: &["chan", "ger"],
         hints: &["fr/sh fr/en", "fr/j fr/eh"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "même",
         syllables: &["mê", "me"],
         hints: &["fr/m fr/ae", "fr/m fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "presse",
         syllables: &["pres", "se"],
         hints: &["fr/p fr/r fr/ae", "fr/s fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "rêves",
         syllables: &["rê", "ves"],
         hints: &["fr/r fr/ae", "fr/v fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "rêve",
         syllables: &["rê", "ve"],
         hints: &["fr/r fr/ae", "fr/v fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "blessures",
         syllables: &["bles", "sures"],
         hints: &["fr/b fr/l fr/ae", "fr/s fr/uh fr/r"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "blessure",
         syllables: &["bles", "sure"],
         hints: &["fr/b fr/l fr/ae", "fr/s fr/uh fr/r"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "amours",
         syllables: &["a", "mours"],
         hints: &["fr/ah", "fr/m fr/ou fr/r"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "laisses",
         syllables: &["lais", "ses"],
         hints: &["fr/l fr/ae", "fr/s fr/ee"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "genoux",
         syllables: &["ge", "noux"],
         hints: &["fr/j fr/ee", "fr/n fr/ou"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "ferons",
         syllables: &["fe", "rons"],
         hints: &["fr/f fr/ee", "fr/r fr/on"],
+        orphan_end_slots: &[],
     },
     Layout {
         word: "moments",
         syllables: &["mo", "ments"],
         hints: &["fr/m fr/oo", "fr/m fr/en"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "j'irai",
+        syllables: &["j'i", "rai"],
+        hints: &["fr/j fr/ih", "fr/r fr/ae"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "raison",
+        syllables: &["rai", "son"],
+        hints: &["fr/r fr/ae", "fr/z fr/on"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "s'achève",
+        syllables: &["s'a", "chève"],
+        hints: &["fr/s fr/ah", "fr/sh fr/ae fr/v"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "garde",
+        syllables: &["gar", "de"],
+        hints: &["fr/g fr/ah fr/r", "fr/d fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "force",
+        syllables: &["for", "ce"],
+        hints: &["fr/f fr/oo fr/r", "fr/s fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "tempête",
+        syllables: &["tem", "pête"],
+        hints: &["fr/t fr/en", "fr/p fr/ae fr/t"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "courant",
+        syllables: &["cou", "rant"],
+        hints: &["fr/k fr/ou", "fr/r fr/en"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "plier",
+        syllables: &["pli", "er"],
+        hints: &["fr/p fr/l fr/ih", "fr/y fr/eh"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "années",
+        syllables: &["an", "nées"],
+        hints: &["fr/ah", "fr/n fr/eh"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "laisse",
+        syllables: &["lais", "se"],
+        hints: &["fr/l fr/ae", "fr/s fr/ee"],
+        orphan_end_slots: &[0],
+    },
+    Layout {
+        word: "minutes",
+        syllables: &["mi", "nutes"],
+        hints: &["fr/m fr/ih", "fr/n fr/uh fr/t"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "soufflant",
+        syllables: &["souf", "flant"],
+        hints: &["fr/s fr/ou", "fr/f fr/l fr/en"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "courber",
+        syllables: &["cour", "ber"],
+        hints: &["fr/k fr/ou fr/r", "fr/b fr/eh"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "tête",
+        syllables: &["tê", "te"],
+        hints: &["fr/t fr/ae", "fr/t fr/ee"],
+        orphan_end_slots: &[0],
+    },
+    Layout {
+        word: "teste",
+        syllables: &["tes", "te"],
+        hints: &["fr/t fr/ae fr/s", "fr/t fr/ee"],
+        orphan_end_slots: &[0],
+    },
+    Layout {
+        word: "briser",
+        syllables: &["bri", "ser"],
+        hints: &["fr/b fr/r fr/ih", "fr/z fr/eh"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "chercher",
+        syllables: &["cher", "cher"],
+        hints: &["fr/sh fr/ae fr/r", "fr/sh fr/eh"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "genou",
+        syllables: &["ge", "nou"],
+        hints: &["fr/j fr/ee", "fr/n fr/ou"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "dessus",
+        syllables: &["des", "sus"],
+        hints: &["fr/d fr/ee", "fr/s fr/uh"],
+        orphan_end_slots: &[],
     },
 ];
 
@@ -284,12 +548,21 @@ fn manual(text: &str) -> bool {
 }
 
 fn candidate(lyric: &ProjectedLyric) -> Option<String> {
-    shared::candidate(lyric)
+    let key = shared::candidate(lyric)?;
+    let source = source(lyric)?;
+    // A prefix is notation only when the explicit verse proves its number.
+    // Literal dictionary variants such as word(2) never enter this branch.
+    if let Some((number, remainder)) = key.split_once('.') {
+        if source.verse_from_score && number == source.verse.to_string() && !remainder.is_empty() {
+            return Some(normalize(remainder));
+        }
+    }
+    Some(key)
 }
 
 fn same_lane(left: &ProjectedLyric, right: &ProjectedLyric) -> bool {
     match (source(left), source(right)) {
-        (Some(left), Some(right)) => left.lane == right.lane,
+        (Some(left), Some(right)) => left.lane == right.lane && left.verse == right.verse,
         _ => false,
     }
 }
@@ -318,12 +591,43 @@ fn next_attack(notes: &[ProjectedNote], head: usize) -> Option<usize> {
     None
 }
 
+fn same_lane_or_hold(left: &ProjectedLyric, right: &ProjectedLyric) -> bool {
+    matches!(right, ProjectedLyric::Extension) || same_lane(left, right)
+}
+
+fn ends_word(lyric: &ProjectedLyric) -> bool {
+    source(lyric).is_some_and(|s| !matches!(s.syllabic, Some(Syllabic::Begin | Syllabic::Middle)))
+        && !text(lyric).is_some_and(|s| s.trim_end().ends_with('-'))
+}
+
 fn layout_members(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Option<Vec<usize>> {
     let mut members = Vec::new();
     let mut index = head;
+    let mut crossed_gap = false;
     for (slot, expected) in layout.syllables.iter().enumerate() {
         if slot > 0 {
-            index = next_attack(notes, index)?;
+            loop {
+                let next = index + 1;
+                let note = notes.get(next)?;
+                let end =
+                    u64::from(notes[index].onset_ticks) + u64::from(notes[index].duration_ticks);
+                let onset = u64::from(note.onset_ticks);
+                if end > onset || !same_lane_or_hold(&notes[head].lyric, &note.lyric) {
+                    return None;
+                }
+                let held = matches!(&note.lyric, ProjectedLyric::Extension)
+                    || matches!(&note.lyric, ProjectedLyric::Source(s) if s.state == LyricState::Continuation);
+                // A true hold must touch its predecessor; only the next text
+                // attack may follow a rest inside a completely bound word.
+                if held && end != onset {
+                    return None;
+                }
+                crossed_gap |= end < onset;
+                index = next;
+                if !held {
+                    break;
+                }
+            }
             if !same_lane(&notes[head].lyric, &notes[index].lyric) {
                 return None;
             }
@@ -338,14 +642,83 @@ fn layout_members(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Opti
         // text and metadata, and no words are joined.
         let syllabic = source(&notes[index].lyric)?.syllabic.clone();
         if syllabic == Some(Syllabic::Single)
+            || (slot + 1 == layout.syllables.len() && !ends_word(&notes[index].lyric))
             || (slot + 1 < layout.syllables.len()
-                && (syllabic == Some(Syllabic::End) || ends_phrase(text(&notes[index].lyric)?)))
+                && ((syllabic == Some(Syllabic::End) && !layout.orphan_end_slots.contains(&slot))
+                    || ends_phrase(text(&notes[index].lyric)?)))
         {
             return None;
         }
         members.push(index);
     }
+    // A rest needs a complete written word, not only an exact surface echo.
+    // Emit independent hints below; native + must never bridge the silence.
+    if crossed_gap
+        && (layout.word.is_empty()
+            || layout.word.contains(' ')
+            || members.iter().enumerate().any(|(slot, &member)| {
+                source(&notes[member].lyric).map(|s| &s.syllabic)
+                    != Some(&Some(if slot == 0 {
+                        Syllabic::Begin
+                    } else if slot + 1 == members.len() {
+                        Syllabic::End
+                    } else {
+                        Syllabic::Middle
+                    }))
+            }))
+    {
+        return None;
+    }
     Some(members)
+}
+
+/// Exact independent readings for a caller that has proved source provenance.
+/// Returned groups let it require that a layout actually spans polyphonic members.
+pub(crate) fn contextual_readings(notes: &[ProjectedNote]) -> Vec<Vec<(usize, String)>> {
+    // Evaluate the proven source chronology before extracting hints, retaining
+    // complete word identity for liaison on split polyphonic words.
+    let mut pronounced = notes.to_vec();
+    apply(&mut pronounced, &vec![String::new(); notes.len()]);
+    let mut claimed = vec![false; notes.len()];
+    let mut result = Vec::new();
+    for head in 0..notes.len() {
+        for layout in LAYOUTS {
+            let Some(members) = layout_members(notes, head, layout) else {
+                continue;
+            };
+            if members.iter().any(|&member| claimed[member]) {
+                continue;
+            }
+            for &member in &members {
+                claimed[member] = true;
+            }
+            result.push(
+                members
+                    .into_iter()
+                    .map(|index| {
+                        let ProjectedLyric::Pronounced { phonemes, .. } = &pronounced[index].lyric
+                        else {
+                            unreachable!("matched independent layout")
+                        };
+                        (index, phonemes.clone())
+                    })
+                    .collect(),
+            );
+            break;
+        }
+    }
+    result
+}
+
+pub(crate) fn apply_contextual_reading(
+    note: &mut ProjectedNote,
+    hint: &str,
+    id: &str,
+) -> Diagnostic {
+    pronounce(note, hint);
+    diagnose(APPLIED, format!(
+        "French Millefeuille: matching written lyric provenance across polyphonic members supplies [{hint}]; original lyric ownership and note geometry are preserved."
+    ), id)
 }
 
 fn diagnose(code: &str, message: String, id: &str) -> Diagnostic {
@@ -370,7 +743,7 @@ fn pronounce(note: &mut ProjectedNote, hint: &str) {
     };
     note.lyric = ProjectedLyric::Pronounced {
         source: source.clone(),
-        text: normalize(text),
+        text: candidate(&note.lyric).unwrap_or_else(|| normalize(text)),
         phonemes: hint.into(),
     };
 }
@@ -387,11 +760,39 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
     // In particular, the `tes` tail of tempêtes is never a determiner.
     let mut words: Vec<(usize, usize, String)> = Vec::new();
     for head in 0..notes.len() {
+        if candidate(&notes[head].lyric).as_deref() != Some("laisse")
+            || !text(&notes[head].lyric).is_some_and(ends_phrase)
+        {
+            continue;
+        }
+        let Some(tail) = next_attack(notes, head) else {
+            continue;
+        };
+        if candidate(&notes[tail].lyric).as_deref() == Some("se")
+            && same_lane(&notes[head].lyric, &notes[tail].lyric)
+            && ends_word(&notes[tail].lyric)
+        {
+            // This is an independent written schwa attack after punctuation.
+            // Keep the preceding word's full consonant; never redistribute it.
+            pronounce(&mut notes[tail], "fr/s fr/ee");
+            changed[tail] = true;
+        }
+    }
+    for head in 0..notes.len() {
         for layout in LAYOUTS {
             let Some(members) = layout_members(notes, head, layout) else {
                 continue;
             };
-            words.push((head, *members.last().unwrap(), layout.word.into()));
+            if layout.word.is_empty() {
+                words.extend(
+                    members
+                        .iter()
+                        .zip(layout.syllables)
+                        .map(|(&member, word)| (member, member, (*word).into())),
+                );
+            } else {
+                words.push((head, *members.last().unwrap(), layout.word.into()));
+            }
             for (member, hint) in members.into_iter().zip(layout.hints) {
                 pronounce(&mut notes[member], hint);
                 changed[member] = true;
@@ -402,7 +803,20 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
     // Curated sung layouts take priority. Other complete source words use the
     // native phonemizer's syllable allocation only when every attack has a vowel.
     for members in shared::words(notes) {
-        let key = shared::joined_key(notes, &members);
+        if !members
+            .iter()
+            .all(|&member| same_lane(&notes[members[0]].lyric, &notes[member].lyric))
+        {
+            continue;
+        }
+        let Some(parts) = members
+            .iter()
+            .map(|&i| candidate(&notes[i].lyric))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let key = parts.concat();
         if let Some(hint) = lexical(&key) {
             if shared::vowel_count(&hint) == members.len() {
                 shared::pronounce_word(notes, &members, &key, &hint);

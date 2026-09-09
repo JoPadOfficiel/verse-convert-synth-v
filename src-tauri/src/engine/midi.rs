@@ -727,6 +727,8 @@ pub struct Lyric {
     pub fragments: Vec<LyricFragment>,
     pub lane: String,
     pub verse: u32,
+    /// A score adapter established this verse row; MIDI defaults are not notation evidence.
+    pub verse_from_score: bool,
     pub state: LyricState,
     pub syllabic: Option<Syllabic>,
     pub line_break: Option<LineBreak>,
@@ -757,6 +759,7 @@ impl Lyric {
             })],
             lane: "1".into(),
             verse: 1,
+            verse_from_score: false,
             state,
             syllabic: None,
             line_break: None,

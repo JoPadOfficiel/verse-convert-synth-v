@@ -1041,6 +1041,7 @@ fn chord_lyrics(
                 fragments: vec![LyricFragment::Text(raw)],
                 lane: verse.to_string(),
                 verse,
+                verse_from_score: true,
                 state,
                 syllabic,
                 line_break: None,

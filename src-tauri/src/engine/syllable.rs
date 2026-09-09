@@ -160,9 +160,9 @@ pub(crate) fn preserve_bracketed_melismas(notes: &mut [ProjectedNote]) {
         else {
             continue;
         };
-        if left.lane != right.lane
+        if left.lane != right.lane || left.verse != right.verse
             || notes[head + 1..reach.syllable].iter().any(|note| {
-                matches!(&note.lyric, ProjectedLyric::Source(source) if source.lane != left.lane)
+                matches!(&note.lyric, ProjectedLyric::Source(source) if source.lane != left.lane || source.verse != left.verse)
             })
         {
             continue;

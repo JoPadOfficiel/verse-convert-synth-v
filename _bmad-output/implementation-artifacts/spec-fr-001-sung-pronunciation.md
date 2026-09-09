@@ -29,6 +29,12 @@ produce unwanted final consonants, merged unrelated words and lost notes.
   input. Never strip final s/x/t/d mechanically or substitute raw `un` with `in`.
 - Never join unrelated words from an isolated syllabic end. Never carry context
   across a rest, source lyric lane, explicit word boundary or repeat occurrence.
+  [FR-004](spec-fr-004-contextual-sung-readings.md) extends pronunciation evidence:
+  an exact layout with a complete written word binding may supply independent
+  hints across a rest, without joining notes or using native `+` across silence.
+  Audited premature-End slots and matching original polyphonic provenance also
+  support independent hints; source rows, voices and repeat occurrences remain
+  separate.
 - Resolve eligible blank/text duplicates without replacing meaningful hold
   instructions or borrowing another verse's lyrics.
 

@@ -139,4 +139,4 @@ or allocation tests.
 - Inspect the French-only spelling boundary and its control guards.
   [ustx.rs:412](../../src-tauri/src/engine/target/ustx.rs#L412)
 - Check separator coverage and unchanged musical/source fields.
-  [ustx.rs:1290](../../src-tauri/src/engine/target/ustx.rs#L1290)
+  [ustx.rs:1306](../../src-tauri/src/engine/target/ustx.rs#L1306)

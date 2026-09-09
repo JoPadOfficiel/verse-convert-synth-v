@@ -48,9 +48,50 @@ et aux projets des bundles ; les chemins Default et SVP gardent leur
 comportement existant. [FR-003](../_bmad-output/implementation-artifacts/spec-fr-003-syllable-hyphen-cleanup.md) ne
 prétend pas résoudre les fragments inconnus ni valider leur rendu à l'écoute.
 
+Le contexte écrit permet aussi de corriger les lectures de fragments : `rai`
+dans `j'i / rai`, `son` dans `rai / son`, ou `chan` dans `chan / ger` ne sont
+pas traités comme des mots indépendants. Les découpages reconnus conservent
+les voyelles répétées et les « e » chantés sur leurs notes : `gar / de / rai`,
+`rê / ê / ve` ou `pre / sse / e`. Ce dernier découpage reçoit un schwa sur
+`sse` puis un schwa répété sur `e` ; cette règle précise ne s'étend pas à tous
+les « e » isolés. `Ouh` reçoit la lecture `fr/ou`.
+
+Un `End` prématuré n'est accepté qu'aux positions prévues dans un découpage
+vérifié. Une liaison ne traverse jamais un silence ou une ponctuation.
+Un mot explicitement lié mais séparé par un silence peut recevoir des
+indications indépendantes ; ses durées restent intactes et aucun `+` ne
+traverse le silence. Après `laisse, / se`, la consonne du premier mot reste
+en place et la seconde note reçoit sa propre lecture `fr/s fr/ee`.
+
+Quand un accord a été réparti entre plusieurs pistes, Verse peut retrouver
+le contexte à partir de la partie, de la portée, de la voix écrite, du verset,
+de la répétition et de l'identité des paroles. Les copies doivent appartenir
+au même accord écrit et leur succession doit être sans ambiguïté. Les notes
+et les paroles restent sur leurs pistes. Un numéro devant une parole, comme
+`2.Et`, est omis dans l'indication de prononciation uniquement s'il correspond
+au verset explicite ; le texte source reste intact.
+
+La vérification [FR-004](../_bmad-output/implementation-artifacts/spec-fr-004-contextual-sung-readings.md)
+résout 480 des 482 avertissements de référence et corrige 51 lectures déjà
+appliquées mais incorrectes. Les deux `3.Et` associés au verset 1 restent
+signalés. Les 3 124 notes gardent leurs données musicales ; l'allocateur
+Millefeuille installé conserve les 3 107 attaques attendues sans symbole
+rejeté. Pour une parole contenant deux voyelles sur une note, les deux restent
+dans le même groupe phonétique et une tenue suivante reste une tenue.
+Cette vérification ne valide ni le minutage interne des phonèmes ni le rendu
+à l'écoute.
+
 Sources : [OpenUtau — phonémiseurs](https://github.com/openutau/OpenUtau/wiki/Phonemizers),
 [Millefeuille](https://github.com/imsupposedto/Millefeuille-DiffSinger-French),
 [pack UFR](https://utaufrance.com/telechargement-du-pack-diffsinger-ufr/).
+
+Pour le son « un », Millefeuille distingue une convention fusionnée `fr/in`
+(« vin » et « un ») et le symbole `fr/un` pour /œ̃/ distinct. Le phonémiseur
+installé choisit déjà `fr/in` pour le mot `un`, sans intervention de Verse.
+Le pack UFR testé accepte aussi l'indication manuelle `un[fr/un]` : ses symboles
+et son attaque ont été vérifiés, sans comparaison d'écoute. Cette indication
+permet un essai ponctuel ; elle ne justifie pas de modifier automatiquement le
+dialecte de tout le projet. Voir la [table phonétique Millefeuille](https://github.com/imsupposedto/Millefeuille-DiffSinger-French/blob/main/Millefeuille_Phonemes.md).
 
 ## Hauteur et timbre
 

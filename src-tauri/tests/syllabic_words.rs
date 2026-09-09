@@ -152,14 +152,26 @@ fn french_exact_layout_tolerates_repeated_begin_metadata_without_joining() {
 }
 
 #[test]
-fn french_added_layouts_never_cross_rests_or_invent_a_final_schwa() {
+fn french_complete_layout_across_a_rest_keeps_independent_hints_and_no_final_schwa() {
     let gap = format!(
         "{}{}{}",
         note("C", Some("begin"), "ju"),
         rest(),
         note("D", Some("end"), "ure,")
     );
-    assert_eq!(ustx_lyrics(&french_export(&gap)), ["ju", "ure,"]);
+    // FR-004: a complete written word supports independent per-note hints.
+    // The rest still prevents native joining, duration changes, or a '+' tail.
+    assert_eq!(
+        ustx_lyrics(&french_export(&gap)),
+        ["ju[fr/j fr/uh]", "ure[fr/uh fr/r]"]
+    );
+    let unbound_gap = gap
+        .replace("<syllabic>begin</syllabic>", "")
+        .replace("<syllabic>end</syllabic>", "");
+    assert_eq!(
+        ustx_lyrics(&french_export(&unbound_gap)),
+        ["ju[fr/j fr/uh]", "ure,"]
+    );
     let held = format!(
         "{}{}{}",
         note("C", Some("begin"), "ju"),
@@ -173,7 +185,7 @@ fn french_added_layouts_never_cross_rests_or_invent_a_final_schwa() {
 }
 
 #[test]
-fn french_rests_untexted_notes_and_explicit_words_block_layouts() {
+fn french_rests_require_written_binding_and_untexted_or_explicit_words_block_layouts() {
     let independent_word = format!(
         "{}{}{}",
         note("C", Some("single"), "rêves"),
@@ -190,7 +202,10 @@ fn french_rests_untexted_notes_and_explicit_words_block_layouts() {
         rest(),
         note("E", Some("end"), "me")
     );
-    assert_eq!(ustx_lyrics(&french_export(&gap)), ["mê", "me"]);
+    assert_eq!(
+        ustx_lyrics(&french_export(&gap)),
+        ["mê[fr/m fr/ae]", "me[fr/m fr/ee]"]
+    );
     let unmarked = format!(
         "{}{}{}",
         note("C", None, "mê"),

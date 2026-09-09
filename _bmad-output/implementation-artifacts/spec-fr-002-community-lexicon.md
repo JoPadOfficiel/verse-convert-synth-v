@@ -68,9 +68,16 @@ No external G2P runtime was added. eSpeak/Phonemizer would require another alias
 adapter and alignment policy; their installation would not by itself improve
 the supported-bank contract. Audible evaluation remains separate.
 
-Validation: 19 French integration tests pass, including the review regressions
+Historical FR-002 validation: 19 French integration tests passed, including the review regressions
 for unilateral dashes and punctuation parentheses. Both private score exports
 retain all matching musical data, with nine separately source-justified recovered
 notes. Installed OpenUtau allocation accepts 2,997 groups / 3,124 notes with all
 3,107 expected attacks present; no rejected or unsupported symbols. The lexical
 policy supplies 2,625 attacks and diagnoses 482 unresolved occurrences.
+
+[FR-004](spec-fr-004-contextual-sung-readings.md) adds bounded contextual sung
+layouts and original-source recovery for polyphonic members. Its source-ID audit
+resolves 480 of those warnings and corrects 51 previously applied readings;
+two mismatched verse labels remain diagnosed. Current allocation covers all
+3,107 expected attacks across the same 3,124 notes, with unchanged musical fields.
+This remains symbol/allocation evidence, separate from acoustic validation.
