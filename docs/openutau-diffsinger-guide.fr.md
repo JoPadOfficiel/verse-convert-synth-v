@@ -45,7 +45,7 @@ Les découpages reconnus, comme `chan- / ger`, `pres– / se`, `mê— / me` et
 Ce nettoyage d'écriture préserve les paroles sources et leurs métadonnées,
 les notes, le tempo, le pitch et le vibrato. Il s'applique aux exports directs
 et aux projets des bundles ; les chemins Default et SVP gardent leur
-comportement existant. [FR-003](specs/fr-003-syllable-hyphen-cleanup.md) ne
+comportement existant. [FR-003](../_bmad-output/implementation-artifacts/spec-fr-003-syllable-hyphen-cleanup.md) ne
 prétend pas résoudre les fragments inconnus ni valider leur rendu à l'écoute.
 
 Sources : [OpenUtau — phonémiseurs](https://github.com/openutau/OpenUtau/wiki/Phonemizers),
@@ -83,7 +83,7 @@ Une courbe de hauteur, un vibrato et un fondu de volume sont trois contrôles
 différents. Un silence écrit dans la partition doit rester un silence. Verse
 ne doit pas inventer un fondu ou un vibrato absent du fichier pour prétendre à
 une conversion identique. L'import complet des expressions de chaque format
-reste suivi dans [EXP-001](specs/exp-001-expression-fidelity.md) ; le correctif
+reste suivi dans [EXP-001](../_bmad-output/implementation-artifacts/spec-exp-001-expression-fidelity.md) ; le correctif
 de prononciation ne l'implémente pas.
 
 Conserver un projet retouché dans OpenUtau sous un nom distinct. Une nouvelle

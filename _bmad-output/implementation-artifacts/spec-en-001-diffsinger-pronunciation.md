@@ -54,7 +54,7 @@ The generated asset contains 135,166 distinct keys, including 9,114 explicit
 numbered variants, from CMU commit
 `74790861f652b15e4ac49015a90074ad62a27690`. The original source SHA256 is
 `81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22`.
-[Provenance and reproduction](../english-lexicon-provenance.json) records the
+[Provenance and reproduction](../../docs/english-lexicon-provenance.json) records the
 exact import, mapping, source rows and asset hash. The bundled
 [CMU license](../../public/licenses/cmudict.txt) retains the original notices and
 is linked from Settings. This dictionary describes American English; it does
@@ -81,7 +81,7 @@ unknown split markers prevent unsafe reconstruction.
 Unknown coherent fragments cannot receive independent whole-word readings.
 Encoded karaoke fragments are also protected across performed gaps when the
 source demonstrates line controls and whitespace word boundaries. Reconstructing
-their full articulation across those gaps is tracked in [EN-002](en-002-karaoke-word-articulation.md).
+their full articulation across those gaps is tracked in [EN-002](spec-en-002-karaoke-word-articulation.md).
 Orphan `Begin`, `Middle` or `End` metadata also retains source text and receives
 an unsupported diagnostic. Standalone dictionary lookup requires absent or
 `Single` syllabic metadata. Unknown entries and vowel-count mismatches remain

@@ -743,7 +743,7 @@ Explicit words spanning multiple notes use the same source-boundary and vowel
 allocation checks as French; unknown fragments keep their text and diagnostics.
 Karaoke text with encoded line controls and whitespace word boundaries receives
 an additional fragment guard, including when performed notes are separated by
-gaps. Such gaps are preserved. [EN-002](specs/en-002-karaoke-word-articulation.md)
+gaps. Such gaps are preserved. [EN-002](../_bmad-output/implementation-artifacts/spec-en-002-karaoke-word-articulation.md)
 tracks articulation across them; an independent dictionary reading of a fragment
 such as `Li` in `Living` is not accepted as a correction.
 

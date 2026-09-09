@@ -2,12 +2,12 @@
 title: Remove score syllable hyphens independently of lexical coverage
 type: bugfix
 created: 2026-09-09
-status: implemented
+status: in-review
 baseline_commit: 425dab11208c3a8663b41aaa41defe601bac13aa
 review_loop_iteration: 0
 context:
   - docs/contribution-guide.md
-  - docs/specs/fr-001-sung-pronunciation.md
+  - _bmad-output/implementation-artifacts/spec-fr-001-sung-pronunciation.md
   - src-tauri/src/engine/projection.rs
   - src-tauri/src/engine/target/ustx.rs
   - src-tauri/src/engine/target/lexical.rs
