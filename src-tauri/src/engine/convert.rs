@@ -98,6 +98,8 @@ pub struct ConvertOutcome {
     /// target turns this into its own file shape; the converter never does.
     pub svp: Option<ProjectedProject>,
     pub topology: SourceTopology,
+    /// Source-level diagnostics without an asserted musical-track owner.
+    pub source_warnings: Vec<Diagnostic>,
     pub tracks: Vec<TrackReport>,
     pub n_tracks: usize,
     pub placed: usize,
@@ -1282,6 +1284,7 @@ pub fn convert_auto_with(
         msg: Some(m),
         svp: None,
         topology: SourceTopology::default(),
+        source_warnings: Vec::new(),
         tracks: vec![],
         n_tracks: 0,
         placed: 0,
@@ -1333,6 +1336,7 @@ pub fn convert_bytes(data: &[u8], language: &str) -> ConvertOutcome {
                 msg: Some(format!("unreadable file ({})", e)),
                 svp: None,
                 topology: SourceTopology::default(),
+                source_warnings: Vec::new(),
                 tracks: vec![],
                 n_tracks: 0,
                 placed: 0,
@@ -1403,6 +1407,7 @@ pub fn convert_midi_with_profile(
         // Parsing succeeded, so a projection refusal must not erase the
         // source Part/staff/voice evidence from diagnostics or manifests.
         topology: midi.topology.clone(),
+        source_warnings: staff_link_warnings(midi),
         tracks: vec![],
         n_tracks: 0,
         placed: 0,
@@ -2033,6 +2038,7 @@ pub fn convert_midi_with_profile(
         msg: None,
         svp: Some(projected),
         topology: midi.topology.clone(),
+        source_warnings: staff_link_warnings(midi),
         tracks: report,
         n_tracks,
         placed: total_placed,
@@ -2555,6 +2561,25 @@ fn report_warning(
         message: message.into(),
         source_id: Some(source_id.into()),
     }
+}
+
+fn staff_link_warnings(midi: &Midi) -> Vec<Diagnostic> {
+    midi.staff_links.iter().map(|link| {
+        let (code, severity, message) = match &link.canonical_staff_id {
+            Some(target) => ("MUSESCORE_LINKED_VIEW_COLLAPSED", DiagnosticSeverity::Info,
+                format!("Staff {} is an equivalent local view of retained staff {target} in the same Part. Its raw linkage and notation remain in the preserved source.", link.staff_id)),
+            None => {
+                let preservation = if link.has_body_measures {
+                    "Its source measures and staff identity are retained."
+                } else {
+                    "The declaration remains in the preserved source; no score-body measures were found for this staff."
+                };
+                ("MUSESCORE_STAFF_LINK_UNRESOLVED", DiagnosticSeverity::Warning,
+                    format!("Staff {} declares linkedTo {:?}, but no equivalent retained local target was proven in the same Part. {preservation}", link.staff_id, link.linked_to))
+            }
+        };
+        report_warning(code, severity, message, &format!("mscx:staff:{}", link.staff_id))
+    }).collect()
 }
 
 fn track_warnings(
@@ -3181,6 +3206,7 @@ mod tests {
             }
         }
         Midi {
+            staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
             format: 1,

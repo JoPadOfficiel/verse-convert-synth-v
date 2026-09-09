@@ -683,6 +683,15 @@ pub fn build_preservation_ledger(
             }
         }
     }
+    for link in &midi.staff_links {
+        push_entry(
+            &mut entries,
+            link.id.clone(),
+            SourceItemKind::Event,
+            PrimaryDisposition::MetadataOnly,
+            artifact_paths(false, None, layout),
+        );
+    }
     for entry in &mut entries {
         entry.performance_refs = projection
             .performance_refs
@@ -4584,6 +4593,91 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn linked_staff_metadata_is_source_only_and_diagnostics_keep_original_identity() {
+        use crate::engine::{convert, musescore};
+        let music = "<Measure><voice><Chord><durationType>quarter</durationType><Lyrics><text>word</text></Lyrics><Note><pitch>60</pitch></Note></Chord></voice></Measure>";
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let xml = format!(
+                r#"<museScore><Score><Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo></Staff><Staff id="3"><linkedTo>99</linkedTo></Staff></Part><Part><Staff id="9"><linkedTo>99</linkedTo></Staff></Part><Staff id="1">{music}</Staff><Staff id="2">{music}</Staff><Staff id="3">{music}</Staff></Score></museScore>"#
+            );
+            let midi = musescore::parse_mscx(&xml).unwrap();
+            let outcome = convert::convert_midi_with_target(&midi, "english", None, target);
+            assert!(outcome.ok);
+            let collapsed = outcome
+                .source_warnings
+                .iter()
+                .find(|warning| warning.code == "MUSESCORE_LINKED_VIEW_COLLAPSED")
+                .unwrap();
+            assert_eq!(collapsed.severity, convert::DiagnosticSeverity::Info);
+            assert_eq!(collapsed.source_id.as_deref(), Some("mscx:staff:2"));
+            assert_eq!(outcome.source_warnings.len(), 3);
+            assert_eq!(
+                midi.tracks.len(),
+                2,
+                "unmatched declarations never make pseudo-tracks"
+            );
+            let root = temp_dir("linked-source-metadata");
+            let layout =
+                BundleLayout::new(&root.join("Song.versebundle"), "source.mscx", target).unwrap();
+            let stems = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+            assert!(
+                !stems.stems.is_empty(),
+                "the test must exercise a real stem mapping"
+            );
+            let mut evidence = outcome.projection.clone();
+            evidence
+                .source_ids
+                .extend(midi.staff_links.iter().map(|link| link.id.clone()));
+            let ledger = build_preservation_ledger(&midi, &evidence, &layout, &stems);
+            for link in &midi.staff_links {
+                let entry = ledger
+                    .entries
+                    .iter()
+                    .find(|entry| entry.source_id == link.id)
+                    .unwrap();
+                assert_eq!(entry.disposition, PrimaryDisposition::MetadataOnly);
+                assert_eq!(
+                    entry.artifact_paths,
+                    vec![layout.source_relative_path.clone()]
+                );
+            }
+            // Canonical note/event IDs and chronological order are untouched by
+            // metadata, as are their dispositions and source evidence IDs.
+            let control_xml = xml
+                .replace(r#"<Staff id="2"><linkedTo>1</linkedTo></Staff>"#, "")
+                .replace(&format!(r#"<Staff id="2">{music}</Staff>"#), "")
+                .replace("<linkedTo>99</linkedTo>", "");
+            let control = musescore::parse_mscx(&control_xml).unwrap();
+            assert_eq!(midi.tracks, control.tracks);
+            assert_eq!(midi.topology, control.topology);
+            let control_outcome =
+                convert::convert_midi_with_target(&control, "english", None, target);
+            let control_stems = StemPlan::from_source(&control, &control_outcome.tracks).unwrap();
+            let control_ledger = build_preservation_ledger(
+                &control,
+                &control_outcome.projection,
+                &layout,
+                &control_stems,
+            );
+            assert_eq!(outcome.projection, control_outcome.projection);
+            for entry in control_ledger.entries {
+                assert_eq!(
+                    ledger
+                        .entries
+                        .iter()
+                        .find(|candidate| candidate.source_id == entry.source_id),
+                    Some(&entry)
+                );
+            }
+            assert_eq!(
+                crate::engine::target::serialize_to(target, outcome.svp.as_ref().unwrap()).unwrap(),
+                crate::engine::target::serialize_to(target, control_outcome.svp.as_ref().unwrap())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn ledger_uses_per_item_projection_evidence_not_a_global_lyric_count() {
         let data = smf(&[
             0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // aligned lyric
@@ -4649,6 +4743,7 @@ pub(crate) mod tests {
         ];
         let tracks = vec![metadata];
         let midi = Midi {
+            staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
             format: 1,
@@ -4740,6 +4835,7 @@ pub(crate) mod tests {
         }
         let tracks = vec![words, melody];
         let midi = Midi {
+            staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
             format: 1,

@@ -420,6 +420,7 @@ fn process_one(
     let warnings = tracks
         .iter()
         .flat_map(|track| track.warnings.iter().cloned())
+        .chain(r.source_warnings.iter().cloned())
         .collect();
     let mut out = None;
     let mut ok = r.ok;
@@ -715,6 +716,7 @@ fn export_bundle_blocking(
         .tracks
         .iter()
         .flat_map(|track| track.warnings.iter())
+        .chain(outcome.source_warnings.iter())
         .map(|warning| {
             let severity = match warning.severity {
                 engine::convert::DiagnosticSeverity::Info => "info",
