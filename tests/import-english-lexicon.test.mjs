@@ -7,11 +7,12 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const importer = resolve(dirname(fileURLToPath(import.meta.url)), "../scripts/import-english-lexicon.py");
+const pythonExecutable = process.env.PYTHON ?? "python3";
 
 // Pure transformations use small fixtures. The production CLI has no hash
 // override and still requires the exact upstream file; no fixture can import.
 function python(code, payload, seed = "1") {
-  const result = spawnSync("rtk", ["proxy", "python3", "-B", "-c", [
+  const result = spawnSync(pythonExecutable, ["-B", "-c", [
     "import json, pathlib, runpy, sys",
     "m = runpy.run_path(sys.argv[1])",
     "payload = json.loads(sys.argv[2])",
@@ -153,7 +154,7 @@ test("CLI rejects an unpinned source before generating anything, including in ch
     const source = join(temp, "cmudict.dict");
     writeFileSync(source, "she's SH IY1 Z\n");
     for (const mode of [[], ["--check"]]) {
-      const result = spawnSync("rtk", ["proxy", "python3", "-B", copy, "--source", source, ...mode], {
+      const result = spawnSync(pythonExecutable, ["-B", copy, "--source", source, ...mode], {
         encoding: "utf8", timeout: 10_000,
       });
       assert.ifError(result.error);
