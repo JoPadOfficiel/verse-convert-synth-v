@@ -51,7 +51,8 @@ impl ProjectedProject {
     pub fn continuity_violation(&self) -> Option<String> {
         self.validate_continuity_bounded(
             &mut crate::engine::score_intensity::ProvenanceBudget::default(),
-        ).err()
+        )
+        .err()
     }
 
     fn validate_continuity_bounded(
@@ -59,10 +60,12 @@ impl ProjectedProject {
         intensity_budget: &mut crate::engine::score_intensity::ProvenanceBudget,
     ) -> Result<(), String> {
         for track in &self.tracks {
-            if !track.notes.iter().any(|note| note.source_evidence.as_ref()
-                .and_then(|e| e.origin.as_ref())
-                .is_some_and(|origin| origin.continuation.is_some()))
-            {
+            if !track.notes.iter().any(|note| {
+                note.source_evidence
+                    .as_ref()
+                    .and_then(|e| e.origin.as_ref())
+                    .is_some_and(|origin| origin.continuation.is_some())
+            }) {
                 continue;
             }
             let count = track.notes.len();
@@ -74,21 +77,39 @@ impl ProjectedProject {
                 count.saturating_mul(depth.saturating_add(4)),
             )?;
             for note in &track.notes {
-                let Some(evidence) = &note.source_evidence else { continue };
-                let link = evidence.origin.as_ref().and_then(|o| o.continuation.as_ref());
+                let Some(evidence) = &note.source_evidence else {
+                    continue;
+                };
+                let link = evidence
+                    .origin
+                    .as_ref()
+                    .and_then(|o| o.continuation.as_ref());
                 if note.lyric.sung_owner_identity().is_some() || link.is_some() {
                     intensity_budget.charge(
                         128,
-                        evidence.note_id.len().saturating_add(8).saturating_mul(depth) / 8 + 1,
+                        evidence
+                            .note_id
+                            .len()
+                            .saturating_add(8)
+                            .saturating_mul(depth)
+                            / 8
+                            + 1,
                     )?;
                 }
                 if let Some(link) = link {
-                    let bytes = link.predecessor_id.len()
+                    let bytes = link
+                        .predecessor_id
+                        .len()
                         .saturating_add(link.lyric_owner_id.len())
                         .saturating_add(link.destination_track_id.len())
                         .saturating_add(track.source_track_id.len())
-                        .saturating_add(link.intensity_attack_note_id.as_ref().map_or(0, String::len));
-                    intensity_budget.charge(0, bytes.saturating_add(8).saturating_mul(depth) / 8 + 1)?;
+                        .saturating_add(
+                            link.intensity_attack_note_id
+                                .as_ref()
+                                .map_or(0, String::len),
+                        );
+                    intensity_budget
+                        .charge(0, bytes.saturating_add(8).saturating_mul(depth) / 8 + 1)?;
                 }
             }
             let mut notes: Vec<_> = track.notes.iter().collect();
@@ -125,16 +146,27 @@ impl ProjectedProject {
                         note.onset_ticks, track.source_track_id, link.predecessor_id));
                 }
                 let head = previous.unwrap();
-                let origin = note.source_evidence.as_ref().unwrap().origin.as_ref().unwrap();
-                let source_has_tie = origin.source.continuity.as_ref()
+                let origin = note
+                    .source_evidence
+                    .as_ref()
+                    .unwrap()
+                    .origin
+                    .as_ref()
+                    .unwrap();
+                let source_has_tie = origin
+                    .source
+                    .continuity
+                    .as_ref()
                     .is_some_and(|c| c.incoming_tie.is_some());
                 if source_has_tie != (link.kind == ContinuationKind::Tie) {
-                    return Err("Source-proven tie cannot be reclassified as a syllable extension".into());
+                    return Err(
+                        "Source-proven tie cannot be reclassified as a syllable extension".into(),
+                    );
                 }
                 match link.kind {
                     ContinuationKind::Extension if link.intensity_attack_note_id.is_some() => {
                         return Err(
-                            "A syllable extension cannot claim an inherited tie attack".into(),
+                            "A syllable extension cannot claim an inherited tie attack".into()
                         );
                     }
                     ContinuationKind::Tie => {
@@ -165,13 +197,21 @@ impl ProjectedProject {
                                     match tail.intensity.as_deref().zip(head.intensity.as_deref()) {
                                         Some((tail, head)) if a == b => {
                                             use crate::engine::score_intensity::Time;
-                                            let start = Time::new(i64::from(note.onset_ticks), i64::from(self.ticks_per_beat))?;
-                                            let end = Time::new(
-                                                i64::from(note.onset_ticks) + i64::from(note.duration_ticks),
+                                            let start = Time::new(
+                                                i64::from(note.onset_ticks),
                                                 i64::from(self.ticks_per_beat),
                                             )?;
-                                            tail.start <= start && tail.end >= end
-                                                && tail.is_continuation_of_bounded(head, intensity_budget)?
+                                            let end = Time::new(
+                                                i64::from(note.onset_ticks)
+                                                    + i64::from(note.duration_ticks),
+                                                i64::from(self.ticks_per_beat),
+                                            )?;
+                                            tail.start <= start
+                                                && tail.end >= end
+                                                && tail.is_continuation_of_bounded(
+                                                    head,
+                                                    intensity_budget,
+                                                )?
                                         }
                                         _ => false,
                                     }
@@ -192,7 +232,9 @@ impl ProjectedProject {
                     }
                     ContinuationKind::Extension => {
                         if !link.merged_tie_sources.is_empty() {
-                            return Err("A syllable extension cannot claim merged tie sources".into());
+                            return Err(
+                                "A syllable extension cannot claim merged tie sources".into()
+                            );
                         }
                     }
                 }
@@ -372,22 +414,43 @@ fn valid_source_tie(
     let matches_ref = |source: &NoteSource, reference: &SourceNoteRef| {
         source.id == reference.source_id
             && source.occurrence == reference.occurrence
-            && source.continuity.as_ref().is_some_and(|c| c.playback_segment == reference.playback_segment)
+            && source
+                .continuity
+                .as_ref()
+                .is_some_and(|c| c.playback_segment == reference.playback_segment)
     };
-    let charge = |source: &NoteSource, budget: &mut crate::engine::score_intensity::ProvenanceBudget| {
+    let charge = |source: &NoteSource,
+                  budget: &mut crate::engine::score_intensity::ProvenanceBudget| {
         let mut bytes = source.id.len();
-        for field in [&source.part_id, &source.staff_id, &source.voice].into_iter().flatten() {
+        for field in [&source.part_id, &source.staff_id, &source.voice]
+            .into_iter()
+            .flatten()
+        {
             bytes = bytes.saturating_add(field.len());
         }
-        if let Some(tie) = source.continuity.as_ref().and_then(|c| c.incoming_tie.as_ref()) {
-            bytes = bytes.saturating_add(tie.head.source_id.len()).saturating_add(tie.tail.source_id.len());
+        if let Some(tie) = source
+            .continuity
+            .as_ref()
+            .and_then(|c| c.incoming_tie.as_ref())
+        {
+            bytes = bytes
+                .saturating_add(tie.head.source_id.len())
+                .saturating_add(tie.tail.source_id.len());
         }
         budget.charge(0, bytes / 8 + 16)
     };
-    let Some(head_origin) = head.source_evidence.as_ref().and_then(|e| e.origin.as_ref()) else {
+    let Some(head_origin) = head
+        .source_evidence
+        .as_ref()
+        .and_then(|e| e.origin.as_ref())
+    else {
         return Ok(false);
     };
-    let Some(tail_origin) = tail.source_evidence.as_ref().and_then(|e| e.origin.as_ref()) else {
+    let Some(tail_origin) = tail
+        .source_evidence
+        .as_ref()
+        .and_then(|e| e.origin.as_ref())
+    else {
         return Ok(false);
     };
     let head_source = &head_origin.source;
@@ -395,21 +458,36 @@ fn valid_source_tie(
     charge(head_source, budget)?;
     charge(tail_source, budget)?;
     let same_domain = |source: &NoteSource| {
-        source.part_id.is_some() && source.part_id == head_source.part_id
-            && source.staff_id.is_some() && source.staff_id == head_source.staff_id
-            && source.voice.is_some() && source.voice == head_source.voice
-            && source.continuity.as_ref().zip(head_source.continuity.as_ref())
+        source.part_id.is_some()
+            && source.part_id == head_source.part_id
+            && source.staff_id.is_some()
+            && source.staff_id == head_source.staff_id
+            && source.voice.is_some()
+            && source.voice == head_source.voice
+            && source
+                .continuity
+                .as_ref()
+                .zip(head_source.continuity.as_ref())
                 .is_some_and(|(a, b)| a.playback_segment == b.playback_segment)
     };
-    if head_origin.lyric_conflict || tail_origin.lyric_conflict
-        || !same_domain(tail_source) || head.pitch != tail.pitch
+    if head_origin.lyric_conflict
+        || tail_origin.lyric_conflict
+        || !same_domain(tail_source)
+        || head.pitch != tail.pitch
     {
         return Ok(false);
     }
-    let Some(tie) = tail_source.continuity.as_ref().and_then(|c| c.incoming_tie.as_ref()) else {
+    let Some(tie) = tail_source
+        .continuity
+        .as_ref()
+        .and_then(|c| c.incoming_tie.as_ref())
+    else {
         return Ok(false);
     };
-    if !matches_ref(tail_source, &tie.tail) || tie.contact_tick != tail.onset_ticks || tie.pitch != tail.pitch {
+    if !matches_ref(tail_source, &tie.tail)
+        || tie.contact_tick != tail.onset_ticks
+        || tie.pitch != tail.pitch
+    {
         return Ok(false);
     }
     budget.charge(0, link.merged_tie_sources.len())?;
@@ -417,17 +495,25 @@ fn valid_source_tie(
     let mut contact = tail.onset_ticks;
     for merged in &link.merged_tie_sources {
         charge(&merged.source, budget)?;
-        if !matches_ref(&merged.source, reference) || !same_domain(&merged.source)
-            || merged.onset_ticks <= head.onset_ticks || merged.onset_ticks >= contact
+        if !matches_ref(&merged.source, reference)
+            || !same_domain(&merged.source)
+            || merged.onset_ticks <= head.onset_ticks
+            || merged.onset_ticks >= contact
             || merged.onset_ticks.checked_add(merged.duration_ticks) != Some(contact)
         {
             return Ok(false);
         }
-        let Some(incoming) = merged.source.continuity.as_ref().and_then(|c| c.incoming_tie.as_ref()) else {
+        let Some(incoming) = merged
+            .source
+            .continuity
+            .as_ref()
+            .and_then(|c| c.incoming_tie.as_ref())
+        else {
             return Ok(false);
         };
         if !matches_ref(&merged.source, &incoming.tail)
-            || incoming.contact_tick != merged.onset_ticks || incoming.pitch != tail.pitch
+            || incoming.contact_tick != merged.onset_ticks
+            || incoming.pitch != tail.pitch
         {
             return Ok(false);
         }
@@ -627,10 +713,17 @@ mod tests {
     }
 
     fn origin_mut(note: &mut ProjectedNote) -> &mut NoteOrigin {
-        note.source_evidence.as_mut().unwrap().origin.as_mut().unwrap()
+        note.source_evidence
+            .as_mut()
+            .unwrap()
+            .origin
+            .as_mut()
+            .unwrap()
     }
 
-    fn source_reference(source: &crate::engine::midi::NoteSource) -> crate::engine::midi::SourceNoteRef {
+    fn source_reference(
+        source: &crate::engine::midi::NoteSource,
+    ) -> crate::engine::midi::SourceNoteRef {
         crate::engine::midi::SourceNoteRef {
             source_id: source.id.clone(),
             occurrence: source.occurrence,
@@ -681,7 +774,14 @@ mod tests {
     }
 
     fn incoming(head: &ProjectedNote, tail: &mut ProjectedNote) {
-        let head = &head.source_evidence.as_ref().unwrap().origin.as_ref().unwrap().source;
+        let head = &head
+            .source_evidence
+            .as_ref()
+            .unwrap()
+            .origin
+            .as_ref()
+            .unwrap()
+            .source;
         let at = tail.onset_ticks;
         let pitch = tail.pitch;
         let source = &mut origin_mut(tail).source;
@@ -722,7 +822,9 @@ mod tests {
             match field {
                 0..=2 => {
                     let tie = std::sync::Arc::make_mut(source.continuity.as_mut().unwrap())
-                        .incoming_tie.as_mut().unwrap();
+                        .incoming_tie
+                        .as_mut()
+                        .unwrap();
                     match field {
                         0 => tie.head.source_id = "unrelated-original-note".into(),
                         1 => tie.head.occurrence += 1,
@@ -749,32 +851,49 @@ mod tests {
         let tail = &mut project.tracks[0].notes[1];
         tail.onset_ticks = 1440;
         incoming(&second, tail);
-        origin_mut(tail).continuation.as_mut().unwrap().merged_tie_sources = [second, first]
-            .into_iter().map(|note| MergedTieSource {
+        origin_mut(tail)
+            .continuation
+            .as_mut()
+            .unwrap()
+            .merged_tie_sources = [second, first]
+            .into_iter()
+            .map(|note| MergedTieSource {
                 onset_ticks: note.onset_ticks,
                 duration_ticks: note.duration_ticks,
                 source: note.source_evidence.unwrap().origin.unwrap().source,
-            }).collect();
+            })
+            .collect();
         assert_eq!(project.continuity_violation(), None);
         for mutation in 0..5 {
             let mut changed = project.clone();
             let chain = &mut origin_mut(&mut changed.tracks[0].notes[1])
-                .continuation.as_mut().unwrap().merged_tie_sources;
+                .continuation
+                .as_mut()
+                .unwrap()
+                .merged_tie_sources;
             match mutation {
                 0 => chain.reverse(),
                 1 => chain[0].source.id.push('x'),
                 2 => chain[1].source.voice = Some("other".into()),
                 3 => chain[0].duration_ticks -= 1,
-                _ => { chain.pop(); }
+                _ => {
+                    chain.pop();
+                }
             }
-            assert!(changed.continuity_violation().is_some(), "mutation {mutation}");
+            assert!(
+                changed.continuity_violation().is_some(),
+                "mutation {mutation}"
+            );
         }
     }
 
     #[test]
     fn a_proven_tie_cannot_disable_inheritance_by_claiming_extension() {
         let mut project = tied_project();
-        let link = origin_mut(&mut project.tracks[0].notes[1]).continuation.as_mut().unwrap();
+        let link = origin_mut(&mut project.tracks[0].notes[1])
+            .continuation
+            .as_mut()
+            .unwrap();
         link.kind = ContinuationKind::Extension;
         link.intensity_attack_note_id = None;
         assert!(project.continuity_violation().is_some());
@@ -800,24 +919,48 @@ mod tests {
         use crate::engine::score_intensity::{NoteIntensity, ScoreVoice, Time};
         use std::sync::Arc;
         let mut project = tied_project();
-        let attack = NoteIntensity::midi_attack("original-attack".into(), Time::ZERO,
-            Time::integer(1), 100, 0, 0, "original-velocity".into()).unwrap();
-        let owner = PerformanceOwner::Score { voice: ScoreVoice {
-            part: "P1".into(), staff: "1".into(), voice: "1".into(), instrument: None,
-        }};
+        let attack = NoteIntensity::midi_attack(
+            "original-attack".into(),
+            Time::ZERO,
+            Time::integer(1),
+            100,
+            0,
+            0,
+            "original-velocity".into(),
+        )
+        .unwrap();
+        let owner = PerformanceOwner::Score {
+            voice: ScoreVoice {
+                part: "P1".into(),
+                staff: "1".into(),
+                voice: "1".into(),
+                instrument: None,
+            },
+        };
         project.tracks[0].notes[0].performance = Some(PerformanceNote {
-            source_id: "head".into(), owner: owner.clone(), intensity: Some(Arc::new(attack.clone())),
+            source_id: "head".into(),
+            owner: owner.clone(),
+            intensity: Some(Arc::new(attack.clone())),
         });
         // Construct the expected inherited value directly, without using the
         // production continuation helper as the test oracle.
-        for (end, valid) in [(Time::integer(2), true), (Time::integer(5), true),
-            (Time::new(959, 480).unwrap(), false)] {
+        for (end, valid) in [
+            (Time::integer(2), true),
+            (Time::integer(5), true),
+            (Time::new(959, 480).unwrap(), false),
+        ] {
             let mut inherited = attack.clone();
             inherited.end = end;
             project.tracks[0].notes[1].performance = Some(PerformanceNote {
-                source_id: "tail".into(), owner: owner.clone(), intensity: Some(Arc::new(inherited)),
+                source_id: "tail".into(),
+                owner: owner.clone(),
+                intensity: Some(Arc::new(inherited)),
             });
-            assert_eq!(project.continuity_violation().is_none(), valid, "end {end:?}");
+            assert_eq!(
+                project.continuity_violation().is_none(),
+                valid,
+                "end {end:?}"
+            );
         }
     }
 
@@ -825,12 +968,19 @@ mod tests {
     fn continuation_index_budget_is_cumulative_and_skips_unlinked_tracks() {
         use crate::engine::score_intensity::ProvenanceBudget;
         let plain = lane(vec![note(0, 480, 60); 10_000]);
-        assert!(plain.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(0, 0)).is_ok());
+        assert!(plain
+            .validate_continuity_bounded(&mut ProvenanceBudget::with_limits(0, 0))
+            .is_ok());
         let mut project = tied_project();
-        assert!(project.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(0, usize::MAX)).is_err());
-        assert!(project.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(512, usize::MAX)).is_ok());
+        assert!(project
+            .validate_continuity_bounded(&mut ProvenanceBudget::with_limits(0, usize::MAX))
+            .is_err());
+        assert!(project
+            .validate_continuity_bounded(&mut ProvenanceBudget::with_limits(512, usize::MAX))
+            .is_ok());
         project.tracks.push(project.tracks[0].clone());
-        assert!(project.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(512, usize::MAX))
+        assert!(project
+            .validate_continuity_bounded(&mut ProvenanceBudget::with_limits(512, usize::MAX))
             .is_err_and(|error| error.contains("SCORE_INTENSITY_LIMIT")));
     }
 }

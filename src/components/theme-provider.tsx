@@ -11,10 +11,18 @@ const ThemeProviderContext = createContext<ThemeProviderState>({
 
 const STORAGE_KEY = "verse-theme";
 
+function storedTheme(): Theme {
+  try {
+    const value = localStorage.getItem(STORAGE_KEY);
+    if (value === "dark" || value === "light") return value;
+  } catch {
+    // Storage must not block the application or its pronunciation controls.
+  }
+  return "system";
+}
+
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>(
-    () => (localStorage.getItem(STORAGE_KEY) as Theme) || "system"
-  );
+  const [theme, setThemeState] = useState<Theme>(storedTheme);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -37,7 +45,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [theme]);
 
   const setTheme = (t: Theme) => {
-    localStorage.setItem(STORAGE_KEY, t);
+    try {
+      localStorage.setItem(STORAGE_KEY, t);
+    } catch {
+      // Keep the explicit choice usable for the current session.
+    }
     setThemeState(t);
   };
 

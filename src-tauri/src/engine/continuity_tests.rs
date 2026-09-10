@@ -1518,7 +1518,7 @@ fn selected_merged_tie_captures_intermediates_tail_to_head_without_retained_owne
         .collect();
     owner.duration_ticks = 1440;
     let mut lanes = pending(vec![vec![tail], vec![owner]]);
-    run_with_sources(&mut lanes, &[originals.clone()]);
+    run_with_sources(&mut lanes, std::slice::from_ref(&originals));
     assert_hold(&lanes, "last", "technical:1", "head", "first-verse");
     let captured = &origin(find(&lanes, "last").1)
         .continuation

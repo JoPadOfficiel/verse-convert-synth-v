@@ -389,16 +389,18 @@ fn pair_performed_wedges(
                 }
                 budget.charge(candidates.len().saturating_mul(128), candidates.len())?;
                 let mut selected = Vec::new();
+                let mut prefix = Vec::new();
                 let mut local_passes = BTreeMap::new();
                 for wedge in &candidates {
                     let id = &wedge.event.evidence.source_ids[0];
                     let measure = &input.written_measures
                         [input.original_declarations[id].written_measure.unwrap()];
-                    // Original measure ownership prevents a skipped ending with
-                    // an offset into this route from consuming another start.
-                    if measure.start < runs[first].written_start
-                        || measure.start >= runs[last].written_end
-                        || wedge.event.at < runs[first].written_start
+                    // Completed prefix wedges can reconstruct destination state.
+                    // Pair that prefix separately: its open starts must never
+                    // consume an endpoint across an actual navigation break.
+                    // Original measure ownership also excludes skipped endings
+                    // whose written offset happens to intersect this run.
+                    if measure.start >= runs[last].written_end
                         || wedge.event.at > runs[last].written_end
                     {
                         continue;
@@ -445,9 +447,87 @@ fn pair_performed_wedges(
                     budget.event(&wedge.event)?;
                     let mut selected_wedge = (*wedge).clone();
                     selected_wedge.event.time_only.clear();
-                    selected.push(selected_wedge);
+                    if (first > 0
+                        && matches!(wedge.kind, WedgeKind::Stop)
+                        && wedge.event.at == runs[first].written_start)
+                        || measure.start < runs[first].written_start
+                        || wedge.event.at < runs[first].written_start
+                    {
+                        if wedge.event.at <= runs[first].written_start {
+                            prefix.push(selected_wedge);
+                        }
+                    } else {
+                        selected.push(selected_wedge);
+                    }
                 }
-                let (paired, mut unresolved) = pair_wedges_bounded(&selected, &[], None, budget)?;
+                let (prefix_pairs, mut unresolved) =
+                    pair_wedges_bounded(&prefix, &[], None, budget)?;
+                budget.charge(
+                    prefix_pairs
+                        .len()
+                        .saturating_mul(std::mem::size_of::<ScoreEvent>()),
+                    prefix_pairs
+                        .len()
+                        .saturating_mul(runs.len())
+                        .saturating_mul(20),
+                )?;
+                let mut paired = Vec::new();
+                for event in prefix_pairs {
+                    let Instruction::Transition(transition) = &event.instruction else {
+                        return Err("Missing paired prefix transition".into());
+                    };
+                    // A stop exactly at the destination reconstructs completed
+                    // state (including an alternative ending); it does not keep
+                    // an open ramp alive inside the new run. Earlier navigation
+                    // boundaries must still split the effective visited prefix.
+                    // The cutoff excludes older visits replaced by a later one.
+                    let mut cutoff = None;
+                    let mut crosses_break = false;
+                    for index in (1..=first).rev() {
+                        let run = &runs[index];
+                        if cutoff.is_none_or(|cut| run.written_start < cut)
+                            && event.at < run.written_start
+                            && run.written_start < transition.end
+                            && (breaks.is_some_and(|b| b.contains(&run.ordinal))
+                                || runs[index - 1].written_end != run.written_start)
+                        {
+                            crosses_break = true;
+                            break;
+                        }
+                        cutoff = Some(
+                            cutoff
+                                .map_or(run.written_start, |cut: Time| cut.min(run.written_start)),
+                        );
+                    }
+                    if crosses_break {
+                        budget.event(&event)?;
+                        unresolved.push(Issue {
+                            start: event.at,
+                            end: transition.end,
+                            kind: IssueKind::UnresolvedSpan,
+                            provenance: Provenance::from_event(&event, 0),
+                            message:
+                                "Wedge endpoints cross a navigation break in the visited prefix."
+                                    .into(),
+                        });
+                    } else {
+                        paired.push(event);
+                    }
+                }
+                let (current, current_issues) = pair_wedges_bounded(&selected, &[], None, budget)?;
+                budget.charge(
+                    current
+                        .len()
+                        .saturating_mul(std::mem::size_of::<ScoreEvent>())
+                        .saturating_add(
+                            current_issues
+                                .len()
+                                .saturating_mul(std::mem::size_of::<Issue>()),
+                        ),
+                    current.len().saturating_add(current_issues.len()),
+                )?;
+                paired.extend(current);
+                unresolved.extend(current_issues);
                 for issue in &mut unresolved {
                     if let Some(pass) = issue
                         .provenance
@@ -463,6 +543,7 @@ fn pair_performed_wedges(
                 for mut event in paired {
                     let start = selected
                         .iter()
+                        .chain(&prefix)
                         .find(|w| {
                             matches!(w.kind, WedgeKind::Start(_))
                                 && w.event.at == event.at
@@ -473,7 +554,10 @@ fn pair_performed_wedges(
                     let key = &event.evidence.source_ids;
                     budget.charge(
                         strings_size(key).saturating_add(64),
-                        selected.len().saturating_add(key.len().saturating_mul(16)),
+                        selected
+                            .len()
+                            .saturating_add(prefix.len())
+                            .saturating_add(key.len().saturating_mul(16)),
                     )?;
                     let prior = emitted.get(key).map(Vec::as_slice).unwrap_or(&[]);
                     budget.charge(
@@ -1704,8 +1788,29 @@ impl ScoreInput {
                         format!("{}:{}:{legacy_id}", owner.part, owner.staff),
                     );
                 }
-                if decimal(payload, "ticks", &mut self.provenance_budget)?.is_some() {
-                    let ticks = text(payload, "ticks").ok_or("Missing explicit hairpin ticks")?;
+                // A malformed single duration remains diagnostic evidence: a
+                // separately authenticated endpoint can still resolve the span.
+                // Repeated durations must nevertheless agree, numerically for
+                // valid values and byte-for-byte for invalid values.
+                if agreed_children(
+                    payload,
+                    "ticks",
+                    &mut self.provenance_budget,
+                    |field, budget| {
+                        let raw = field.text().unwrap_or("").trim();
+                        budget.charge(raw.len(), 1)?;
+                        Ok(Fraction::decimal(raw).map_err(|_| raw.to_owned()))
+                    },
+                )?
+                .is_some()
+                {
+                    // Keep even an authored empty/malformed value as diagnostic
+                    // evidence. A separate authenticated endpoint can still
+                    // resolve the span in finish_staff().
+                    let ticks = child(payload, "ticks")
+                        .and_then(|field| field.text())
+                        .unwrap_or("")
+                        .trim();
                     event
                         .evidence
                         .raw_fields
@@ -2327,6 +2432,151 @@ mod tests {
     }
 
     #[test]
+    fn prefix_reconstruction_respects_earlier_breaks_and_later_replayed_routes() {
+        for replay in [false, true] {
+            let document = roxmltree::Document::parse(r#"<root>
+                <direction><direction-type><wedge type="crescendo" niente="yes"/></direction-type><staff>1</staff></direction>
+                <direction><direction-type><wedge type="stop"/><dynamics><f/></dynamics></direction-type><staff>1</staff></direction>
+            </root>"#).unwrap();
+            let mut input = ScoreInput::default();
+            for (index, node) in document
+                .root_element()
+                .children()
+                .filter(|n| n.is_element())
+                .enumerate()
+            {
+                input
+                    .begin_written_measure("P1", None, index, Time::integer(index as i64))
+                    .unwrap();
+                input
+                    .xml_direction(
+                        node,
+                        if index == 0 { "start" } else { "stop" },
+                        "P1",
+                        if index == 0 {
+                            Time::ZERO
+                        } else {
+                            Fraction::new(3, 2).unwrap()
+                        },
+                        480,
+                    )
+                    .unwrap();
+                input
+                    .end_written_measure(Time::integer(index as i64 + 1))
+                    .unwrap();
+            }
+            input
+                .begin_written_measure("P1", None, 2, Time::integer(2))
+                .unwrap();
+            input.end_written_measure(Time::integer(3)).unwrap();
+            for index in 0..3 {
+                input
+                    .record_measure_run(index, "P1", "1", Time::integer(index as i64), 1, false)
+                    .unwrap();
+            }
+            if replay {
+                for index in 0..3 {
+                    input
+                        .record_measure_run(
+                            index,
+                            "P1",
+                            "1",
+                            Time::integer(index as i64 + 3),
+                            2,
+                            index == 1,
+                        )
+                        .unwrap();
+                }
+            }
+            input.finish().unwrap();
+            let transitions: Vec<_> = input
+                .score
+                .events
+                .iter()
+                .filter(|e| matches!(e.instruction, Instruction::Transition(_)))
+                .collect();
+            assert_eq!(transitions.len(), usize::from(replay));
+            if replay {
+                assert_eq!(transitions[0].time_only, [2]);
+            } else {
+                assert!(input
+                    .issues
+                    .iter()
+                    .any(|i| i.kind == IssueKind::UnresolvedSpan));
+            }
+            assert!(input.retained.contains_key("start") && input.retained.contains_key("stop"));
+        }
+    }
+
+    #[test]
+    fn completed_prefix_wedge_remains_available_after_destination_reset() {
+        let document = roxmltree::Document::parse(
+            r#"<root>
+                <direction><direction-type><wedge type="crescendo" niente="yes"/></direction-type><staff>1</staff></direction>
+                <direction><direction-type><wedge type="stop"/><dynamics><f/></dynamics></direction-type><staff>1</staff></direction>
+            </root>"#,
+        ).unwrap();
+        let mut input = ScoreInput::default();
+        input
+            .begin_written_measure("P1", None, 0, Time::ZERO)
+            .unwrap();
+        for (index, node) in document
+            .root_element()
+            .children()
+            .filter(|n| n.is_element())
+            .enumerate()
+        {
+            input
+                .xml_direction(
+                    node,
+                    if index == 0 {
+                        "prefix-start"
+                    } else {
+                        "prefix-stop"
+                    },
+                    "P1",
+                    Fraction::new(index as i64, 2).unwrap(),
+                    480,
+                )
+                .unwrap();
+        }
+        input.end_written_measure(Time::ONE).unwrap();
+        for index in 1..3 {
+            input
+                .begin_written_measure("P1", None, index, Time::integer(index as i64))
+                .unwrap();
+            input
+                .end_written_measure(Time::integer(index as i64 + 1))
+                .unwrap();
+        }
+        for index in 0..3 {
+            input
+                .record_measure_run(index, "P1", "1", Time::integer(index as i64), 1, index > 0)
+                .unwrap();
+        }
+        input
+            .record_measure_run(1, "P1", "1", Time::integer(3), 2, false)
+            .unwrap();
+        input.finish().unwrap();
+        let transitions: Vec<_> = input
+            .score
+            .events
+            .iter()
+            .filter(|event| matches!(event.instruction, Instruction::Transition(_)))
+            .collect();
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].time_only, [1, 2]);
+        assert_eq!(
+            transitions[0].evidence.source_ids,
+            ["prefix-start", "prefix-stop"]
+        );
+        assert!(
+            matches!(&transitions[0].instruction, Instruction::Transition(t)
+            if t.end == Fraction::new(1, 2).unwrap())
+        );
+    }
+
+    #[test]
     fn source_review5_typed_orphan_endpoints_keep_original_ownership_and_generic_ends_stay_generic()
     {
         for kind in ["HairPin", "TextLine"] {
@@ -2560,6 +2810,39 @@ mod tests {
             matches!(&input.score.events[0].instruction, Instruction::Transition(t) if t.end == Time::ONE)
         );
         assert!(input.issues.is_empty());
+    }
+
+    #[test]
+    fn empty_hairpin_ticks_do_not_hide_a_valid_location_endpoint() {
+        let document = roxmltree::Document::parse(
+            r#"<Spanner type="HairPin"><HairPin><subtype>0</subtype><ticks/></HairPin><next><location><fractions>1/4</fractions></location></next></Spanner>"#,
+        )
+        .unwrap();
+        let mut input = ScoreInput::default();
+        input
+            .ms_element(
+                document.root_element(),
+                "empty-ticks",
+                &owner(),
+                Time::ZERO,
+                0,
+                true,
+                Fraction::integer(120),
+                (1, 1),
+            )
+            .unwrap();
+        input
+            .finish_staff(&[(Time::ZERO, Time::integer(4))], 480)
+            .unwrap();
+        assert!(
+            matches!(&input.score.events[0].instruction, Instruction::Transition(t) if t.end == Time::ONE),
+            "the valid location endpoint must still resolve the hairpin"
+        );
+        assert_eq!(input.retained["empty-ticks"].raw_fields["span_ticks"], "");
+        assert!(input.issues.iter().any(|issue| {
+            issue.kind == IssueKind::UnresolvedSpan
+                && issue.message.contains("Invalid explicit hairpin ticks")
+        }));
     }
 
     #[test]

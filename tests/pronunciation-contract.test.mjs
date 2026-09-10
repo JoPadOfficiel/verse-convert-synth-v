@@ -61,8 +61,8 @@ findChangeTarget(appSource);
 assert.ok(changeTargetSource, "App must expose its actual reanalysis callback");
 const callbackCode = ts.transpileModule(changeTargetSource, { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
 
-function reanalysisHarness(convertFiles) {
-  const state = { items: [{ path: "song.mscz", ok: true }], exportTarget: "ustx", pronunciationProfile: "default",
+function reanalysisHarness(convertFiles, initialProfile = "default") {
+  const state = { items: [{ path: "song.mscz", ok: true }], exportTarget: "ustx", pronunciationProfile: initialProfile,
     selected: new Set(["song.mscz"]), exportErrors: { "song.mscz": "old export error" }, exportProgress: { "song.mscz": {} }, globalError: null, busy: false, savedProfiles: [] };
   const scope = { items: state.items, exportTarget: state.exportTarget, pronunciationProfile: state.pronunciationProfile,
     language: "english", overrides: {}, convertFiles, commandErrorMessage: (error) => error.message,
@@ -126,12 +126,32 @@ test(`${profile}: unchanged selection or the active busy guard prevents another 
 }
 
 test("choosing a profile before import is remembered without running an analysis", async () => {
-  const { state, change } = reanalysisHarness(async () => assert.fail("no files to analyse"));
-  state.items.length = 0;
-  await change("ustx", "frenchMillefeuille");
-  assert.equal(state.pronunciationProfile, "frenchMillefeuille");
-  assert.deepEqual(state.savedProfiles, ["frenchMillefeuille"]);
-  assert.equal(state.busy, false);
+  for (const profile of ["frenchMillefeuille", "englishArpabet", "default"]) {
+    const previous = profile === "default" ? "frenchMillefeuille" : "default";
+    const { state, change } = reanalysisHarness(async () => assert.fail("no files to analyse"), previous);
+    state.items.length = 0;
+    state.busy = true;
+    await change("ustx", profile);
+    assert.equal(state.pronunciationProfile, previous, "an initial import may own the guard while the list is empty");
+    assert.deepEqual(state.savedProfiles, []);
+    state.busy = false;
+    await change("ustx", profile);
+    assert.equal(state.pronunciationProfile, profile);
+    assert.deepEqual(state.savedProfiles, [profile]);
+    assert.equal(state.busy, false);
+  }
+});
+
+test("returning to Default is persisted only after accepted loaded-score reanalysis", async () => {
+  for (const reject of [false, true]) {
+    const { state, change } = reanalysisHarness(async () => {
+      if (reject) throw new Error("rejected Default analysis");
+      return [{ path: "song.mscz", ok: true }];
+    }, "frenchMillefeuille");
+    await change("ustx", "default");
+    assert.equal(state.pronunciationProfile, reject ? "frenchMillefeuille" : "default");
+    assert.deepEqual(state.savedProfiles, reject ? [] : ["default"]);
+  }
 });
 
 test("pronunciation preference survives restart, rejects stale values and tolerates disabled storage", async () => {

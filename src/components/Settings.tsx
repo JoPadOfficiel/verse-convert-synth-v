@@ -86,7 +86,10 @@ export function Settings({
               ? "French pronunciation for compatible DiffSinger Millefeuille banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
               : "Default does not apply French or English pronunciation fixes. Choose the matching profile here before exporting; assigning a singer later in OpenUtau does not apply Verse's corrections."}
           {" "}Assign a compatible singer in OpenUtau. Pronunciation is never
-          detected automatically. Your choice is remembered when Verse restarts. Synthesizer V uses Default.
+          detected automatically. Choose here or beside Theme and Settings in the
+          header. Your choice is remembered even before importing a file; with
+          files loaded, it is saved after reanalysis succeeds. Synthesizer V uses
+          Default without discarding your OpenUtau choice.
         </p>
         <a className="text-xs underline" href="/licenses/french-community-dictionary.txt" target="_blank" rel="noreferrer">
           French community dictionary license

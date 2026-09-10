@@ -6,11 +6,14 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "test": "npm run test:frontend",
+    "test": "npm run test:frontend && npm run test:pronunciation:typecheck && npm run test:pronunciation:browser",
     "test:frontend": "node --test tests/*.test.mjs",
+    "test:openutau:compat": "bash scripts/test-openutau-clean-lyrics.sh",
+    "test:pronunciation:typecheck": "tsc -p tsconfig.browser-test.json",
     "version:check": "node scripts/check-version.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:pronunciation:browser": "node scripts/test-pronunciation-browser.mjs"
   },
   "dependencies": {
     "@radix-ui/react-icons": "^1.3.2",
