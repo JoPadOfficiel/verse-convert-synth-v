@@ -6,8 +6,8 @@
 use crate::engine::midi::{
     merge_measure_marks, unroll, ChordReading, Event, InstrumentInfo, Jump, Kind, Lyric,
     LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource,
-    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track,
-    TrackRoleHint, TrackSource,
+    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, StaffLink, Syllabic,
+    TimeBase, Track, TrackRoleHint, TrackSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
@@ -1173,6 +1173,340 @@ fn measure_marks(measures: &[roxmltree::Node]) -> Result<Vec<MeasureMarks>, Stri
     Ok(marks)
 }
 
+/// Reuse the parser's declaration fallback once for topology and linkage evidence.
+fn declaration_staff_id(
+    part: roxmltree::Node,
+    staff: roxmltree::Node,
+    part_index: usize,
+    staff_index: usize,
+    staff_cursor: usize,
+    body_ids: &[&str],
+) -> String {
+    staff
+        .attribute("id")
+        .map(str::to_string)
+        .or_else(|| body_ids.get(staff_cursor).map(|id| (*id).to_string()))
+        .or_else(|| {
+            // Only the first declaration can be the sole Staff. Avoid scanning
+            // a large Part again for every unresolved anonymous declaration.
+            (staff_index == 0
+                && part
+                    .children()
+                    .filter(|node| node.has_tag_name("Staff"))
+                    .count()
+                    == 1)
+                .then(|| part.attribute("id"))
+                .flatten()
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("{}-{}", part_index + 1, staff_index + 1))
+}
+
+/// MuseScore 3.6.2 Staff::write/readProperties uses masterScore staff indices
+/// (one-based on disk); Part::readProperties appends Staffs in declaration order.
+/// Source: libmscore/staff.cpp:628-634,762-779 and part.cpp:105-112 at v3.6.2.
+/// XML IDs identify bodies, not linkedTo destinations. An index into this selected
+/// Score is only a candidate: external masters may use the same numbers.
+fn linked_staff_views(
+    score: roxmltree::Node,
+) -> Result<std::collections::HashMap<roxmltree::NodeId, Option<String>>, String> {
+    let body_ids: Vec<_> = score
+        .children()
+        .filter(|node| node.has_tag_name("Staff"))
+        .filter_map(|node| node.attribute("id"))
+        .collect();
+    let mut declarations = Vec::new();
+    let mut declaration_ids = BTreeSet::new();
+    let mut bodies = BTreeMap::new();
+    for (part_index, part) in score
+        .children()
+        .filter(|node| node.has_tag_name("Part"))
+        .enumerate()
+    {
+        for (staff_index, staff) in part
+            .children()
+            .filter(|node| node.has_tag_name("Staff"))
+            .enumerate()
+        {
+            let id = declaration_staff_id(
+                part,
+                staff,
+                part_index,
+                staff_index,
+                declarations.len(),
+                &body_ids,
+            );
+            if !declaration_ids.insert(id.clone()) {
+                return Err(format!(
+                    "MuseScore duplicate resolved staff declaration ID: {id:?}"
+                ));
+            }
+            declarations.push((staff, id));
+        }
+    }
+    for staff in score.children().filter(|node| node.has_tag_name("Staff")) {
+        if let Some(id) = staff.attribute("id") {
+            if bodies.insert(id, staff).is_some() {
+                return Err(format!("MuseScore duplicate score-body staff ID: {id:?}"));
+            }
+        }
+    }
+    let mut result = std::collections::HashMap::new();
+    if !declarations
+        .iter()
+        .any(|(staff, _)| child(*staff, "linkedTo").is_some())
+    {
+        return Ok(result);
+    }
+    // Cache each body once. An opaque relationship anywhere in the selected
+    // body could refer to a staff being removed, so it blocks identity erasure.
+    // This bounded proof deliberately supports a subset; unknown content stays.
+    let mut normalized_targets = std::collections::HashMap::new();
+    let mut body_relationships_known = true;
+    for body in score.children().filter(|node| node.has_tag_name("Staff")) {
+        let normalized = normalized_staff_content(body);
+        body_relationships_known &= normalized.is_some();
+        normalized_targets.insert(body.id(), normalized);
+    }
+    for (staff, id) in &declarations {
+        let links: Vec<_> = staff
+            .children()
+            .filter(|node| node.has_tag_name("linkedTo"))
+            .collect();
+        if links.is_empty() {
+            continue;
+        }
+        let canonical = (|| {
+            let [link] = links.as_slice() else {
+                return None;
+            };
+            if !body_relationships_known || !plain_leaf(*link, &[]) {
+                return None;
+            }
+            let index = link.text()?.trim().parse::<usize>().ok()?.checked_sub(1)?;
+            let (target, target_id) = declarations.get(index)?;
+            if target == staff
+                || target.parent() != staff.parent()
+                || child(*target, "linkedTo").is_some()
+            {
+                return None;
+            }
+            let body = *bodies.get(id.as_str())?;
+            let target_body = *bodies.get(target_id.as_str())?;
+            if !body.children().any(|node| node.has_tag_name("Measure")) {
+                return None;
+            }
+            let declaration = normalized_staff_content(*staff)?;
+            let target_declaration = normalized_targets
+                .entry(target.id())
+                .or_insert_with(|| normalized_staff_content(*target))
+                .as_ref()?;
+            if &declaration != target_declaration {
+                return None;
+            }
+            if normalized_targets.get(&body.id())?.as_ref()?
+                != normalized_targets.get(&target_body.id())?.as_ref()?
+            {
+                return None;
+            }
+            Some(target_id.clone())
+        })();
+        result.insert(staff.id(), canonical);
+    }
+    Ok(result)
+}
+
+fn plain_attributes(node: roxmltree::Node, allowed: &[&str]) -> bool {
+    node.tag_name().namespace().is_none()
+        && node
+            .attributes()
+            .all(|attribute| attribute.namespace().is_none() && allowed.contains(&attribute.name()))
+}
+
+fn plain_leaf(node: roxmltree::Node, attributes: &[&str]) -> bool {
+    plain_attributes(node, attributes) && !node.children().any(|node| node.is_element())
+}
+
+/// An ignored visual property must be completely understood, including children
+/// and attributes. Namespaced lookalikes and extra payload are never erased.
+fn harmless_visual(node: roxmltree::Node) -> bool {
+    let tag = node.tag_name().name();
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if node.tag_name().namespace().is_some() || parent.tag_name().namespace().is_some() {
+        return false;
+    }
+    let leaf = |attrs: &[&str]| plain_leaf(node, attrs);
+    let number = || {
+        node.text()
+            .is_some_and(|text| text.trim().parse::<f64>().is_ok_and(f64::is_finite))
+    };
+    match (parent.tag_name().name(), tag) {
+        ("Staff", "linkedTo") => leaf(&[]),
+        ("Staff", "StaffType") => {
+            plain_attributes(node, &["group"])
+                && matches!(node.attribute("group"), Some("pitched" | "tab"))
+                && node.children().all(|child| {
+                    if child.is_text() {
+                        return child.text().unwrap_or("").trim().is_empty();
+                    }
+                    if !child.is_element() {
+                        return true;
+                    }
+                    plain_leaf(child, &[])
+                        && match child.tag_name().name() {
+                            "name" => true,
+                            "lines" | "lineDistance" => child.text().is_some_and(|text| {
+                                text.trim().parse::<f64>().is_ok_and(f64::is_finite)
+                            }),
+                            _ => false,
+                        }
+                })
+        }
+        ("Staff", "defaultClef" | "defaultConcertClef" | "defaultTransposingClef") => {
+            leaf(&[])
+                && matches!(
+                    node.text().map(str::trim),
+                    Some("G" | "F" | "C3" | "C4" | "TAB" | "TAB4")
+                )
+        }
+        ("Staff", "barLineSpan") => leaf(&[]) && number(),
+        ("Staff", "bracket") => {
+            leaf(&["type", "span", "col"])
+                && node.text().unwrap_or("").trim().is_empty()
+                && node
+                    .attributes()
+                    .all(|attribute| attribute.value().parse::<i32>().is_ok())
+        }
+        ("Chord", "stemDirection") => {
+            leaf(&[]) && matches!(node.text().map(str::trim), Some("up" | "down" | "auto"))
+        }
+        ("Note", "fret" | "string") => {
+            leaf(&[])
+                && node
+                    .text()
+                    .is_some_and(|text| text.trim().parse::<i32>().is_ok())
+        }
+        ("Chord" | "Note" | "Rest" | "Lyrics" | "Tempo" | "Clef", "offset" | "pos") => {
+            leaf(&["x", "y"])
+                && node.text().unwrap_or("").trim().is_empty()
+                && node
+                    .attributes()
+                    .all(|attribute| attribute.value().parse::<f64>().is_ok_and(f64::is_finite))
+        }
+        ("Chord" | "Note" | "Rest" | "Lyrics" | "Tempo" | "Clef", "visible" | "autoplace") => {
+            leaf(&[]) && matches!(node.text().map(str::trim), Some("0" | "1"))
+        }
+        _ => false,
+    }
+}
+
+/// Flatten only known harmless rich-text wrappers. Preserve semantic whitespace;
+/// unknown markup, namespaced lookalikes and unknown attributes block equivalence.
+fn equivalent_text(node: roxmltree::Node, out: &mut String) -> Option<()> {
+    let tag = node.tag_name().name();
+    let allowed = match tag {
+        "text" | "b" | "i" | "u" | "s" | "sup" | "sub" => &[][..],
+        "font" => &["face", "size"][..],
+        "br" if plain_leaf(node, &[]) && node.text().unwrap_or("").is_empty() => {
+            out.push(' ');
+            return Some(());
+        }
+        _ => return None,
+    };
+    if !plain_attributes(node, allowed) {
+        return None;
+    }
+    if let Some(size) = node.attribute("size") {
+        if !size.parse::<f64>().is_ok_and(f64::is_finite) {
+            return None;
+        }
+    }
+    for child in node.children() {
+        if child.is_text() {
+            out.push_str(child.text().unwrap_or(""));
+        } else if child.is_element() {
+            equivalent_text(child, out)?;
+        }
+    }
+    Some(())
+}
+
+/// Exact structural proof over a bounded known subset, not a second rhythm
+/// parser or a lossy target projection. Object IDs and unknown relationship
+/// syntax fail closed. QName tokens include namespaces; only the outer Staff ID
+/// is omitted after the selected body's relationships have passed this proof.
+fn normalized_staff_content(staff: roxmltree::Node) -> Option<Vec<String>> {
+    fn visit(node: roxmltree::Node, root: roxmltree::Node, out: &mut Vec<String>) -> Option<()> {
+        if harmless_visual(node) {
+            return Some(());
+        }
+        let tag = node.tag_name().name();
+        let qname = (node.tag_name().namespace(), tag);
+        if node == root {
+            if !plain_attributes(node, &["id"]) {
+                return None;
+            }
+        } else {
+            let allowed = match tag {
+                "Measure" => &["len"][..],
+                "Spanner" => &["type"][..],
+                "voice" | "Chord" | "Rest" | "Note" | "Lyrics" | "TimeSig" | "Tempo"
+                | "durationType" | "duration" | "dots" | "pitch" | "tpc" | "tpc2" | "velocity"
+                | "veloType" | "play" | "tuning" | "syllabic" | "no" | "ticks" | "ticks_f"
+                | "text" | "sigN" | "sigD" | "stretchN" | "stretchD" | "tempo" | "followText"
+                | "Tuplet" | "normalNotes" | "actualNotes" | "endTuplet" | "location"
+                | "fractions" | "measures" | "voices" | "startRepeat" | "endRepeat" | "Marker"
+                | "Jump" | "label" | "type" | "jumpTo" | "playUntil" | "continueAt"
+                | "playRepeats" | "Tie" | "Slur" | "Volta" | "endings" | "next" | "prev"
+                | "acciaccatura" | "appoggiatura" | "grace4" | "grace8" | "grace16" | "grace32"
+                | "grace8after" | "grace16after" | "grace32after" => &[][..],
+                // Staff offsets, absolute staff references, object IDs, linked
+                // object markup and all unknown syntax need a relationship proof
+                // this conservative qualifier does not attempt.
+                _ => return None,
+            };
+            if !plain_attributes(node, allowed) {
+                return None;
+            }
+        }
+        out.push(format!("open:{qname:?}"));
+        if node != root {
+            let mut attributes: Vec<_> = node
+                .attributes()
+                .map(|attribute| (attribute.namespace(), attribute.name(), attribute.value()))
+                .collect();
+            attributes.sort_unstable();
+            for attribute in attributes {
+                out.push(format!("attribute:{attribute:?}"));
+            }
+        }
+        if tag == "text" {
+            let mut text = String::new();
+            equivalent_text(node, &mut text)?;
+            out.push(format!("text:{text}"));
+        } else {
+            let has_elements = node.children().any(|child| child.is_element());
+            for child in node.children() {
+                if child.is_element() {
+                    visit(child, root, out)?;
+                } else if child.is_text() {
+                    let text = child.text().unwrap_or("");
+                    if !has_elements || !text.trim().is_empty() {
+                        out.push(format!("text:{text}"));
+                    }
+                }
+            }
+        }
+        out.push(format!("close:{qname:?}"));
+        Some(())
+    }
+    let mut out = Vec::new();
+    visit(staff, staff, &mut out)?;
+    Some(out)
+}
+
 pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     crate::engine::musicxml::check_nesting(xml)?;
     let opts = roxmltree::ParsingOptions {
@@ -1209,18 +1543,24 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         instruments: Vec<InstrumentInfo>,
     }
 
-    let top_level_staff_ids: Vec<String> = score
+    let top_level_staff_ids: Vec<&str> = score
         .children()
         .filter(|node| node.has_tag_name("Staff"))
-        .filter_map(|staff| staff.attribute("id").map(str::to_string))
+        .filter_map(|node| node.attribute("id"))
         .collect();
     let mut staff_cursor = 0usize;
     let mut staff_info: BTreeMap<String, StaffInfo> = BTreeMap::new();
-    // A staff MuseScore declares `<linkedTo>` another is a second *view* of it —
-    // a tablature beside the notation, a transposed part — and the score body
-    // carries a full copy of the same measures under it. Read as a staff of its
-    // own it doubles every note the instrument plays.
-    let mut linked_staff_ids: BTreeSet<String> = BTreeSet::new();
+    let linked_views = linked_staff_views(score)?;
+    let mut excluded_staff_ids = BTreeSet::new();
+    let mut staff_links = Vec::new();
+    let mut resolved_staff_ids = BTreeSet::new();
+    let body_measure_ids: BTreeSet<_> = score
+        .children()
+        .filter(|node| {
+            node.has_tag_name("Staff") && node.children().any(|child| child.has_tag_name("Measure"))
+        })
+        .filter_map(|node| node.attribute("id"))
+        .collect();
     let mut declared_parts = Vec::new();
     for (part_index, part) in score
         .children()
@@ -1338,20 +1678,40 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .collect();
         let mut declared_staves = Vec::new();
         for (staff_index, staff) in part_staves.iter().copied().enumerate() {
-            let staff_id = staff
-                .attribute("id")
-                .map(str::to_string)
-                .or_else(|| top_level_staff_ids.get(staff_cursor).cloned())
-                .or_else(|| {
-                    (part_staves.len() == 1)
-                        .then(|| part.attribute("id"))
-                        .flatten()
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| format!("{}-{}", part_index + 1, staff_index + 1));
+            let staff_id = declaration_staff_id(
+                part,
+                staff,
+                part_index,
+                staff_index,
+                staff_cursor,
+                &top_level_staff_ids,
+            );
             staff_cursor += 1;
-            if staff.children().any(|node| node.has_tag_name("linkedTo")) {
-                linked_staff_ids.insert(staff_id);
+            if !resolved_staff_ids.insert(staff_id.clone()) {
+                return Err(format!(
+                    "MuseScore duplicate resolved staff declaration ID: {staff_id:?}"
+                ));
+            }
+            for (link_index, link) in staff
+                .children()
+                .filter(|node| node.has_tag_name("linkedTo"))
+                .enumerate()
+            {
+                staff_links.push(StaffLink {
+                    id: format!(
+                        "mscx:part:{part_index}:staff-declaration:{staff_index}:link:{link_index}"
+                    ),
+                    part_id: part_id.clone(),
+                    staff_id: staff_id.clone(),
+                    linked_to: link.text().unwrap_or("").to_string(),
+                    canonical_staff_id: linked_views.get(&staff.id()).cloned().flatten(),
+                    has_body_measures: body_measure_ids.contains(staff_id.as_str()),
+                });
+            }
+            if linked_views.get(&staff.id()).is_some_and(Option::is_some) {
+                // Declaration IDs may be absent. Use the resolved identity
+                // shared by topology and the score body, never the raw attribute.
+                excluded_staff_ids.insert(staff_id);
                 continue;
             }
             declared_staves.push(SourceStaff {
@@ -1426,7 +1786,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         .filter(|n| n.has_tag_name("Staff"))
         .filter(|n| {
             !n.attribute("id")
-                .is_some_and(|id| linked_staff_ids.contains(id))
+                .is_some_and(|id| excluded_staff_ids.contains(id))
         })
         .collect();
     let staff_measures: Vec<Vec<_>> = score_staves
@@ -2073,6 +2433,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         format: 1,
         source_format: SourceFormat::MuseScore,
         topology,
+        staff_links,
         tracks,
     })
 }
@@ -2248,6 +2609,421 @@ mod tests {
             sounded, 1,
             "the tablature is the same note, not a second one"
         );
+    }
+
+    fn linked_score(declarations: &str, staves: &[(&str, &str)]) -> String {
+        let bodies: String = staves
+            .iter()
+            .map(|(id, body)| format!(r#"<Staff id="{id}">{body}</Staff>"#))
+            .collect();
+        format!(
+            "<museScore><Score><Division>480</Division>{declarations}{bodies}</Score></museScore>"
+        )
+    }
+
+    const LINK_MUSIC: &str = "<Measure><voice><Chord><durationType>quarter</durationType><Lyrics><text>word</text></Lyrics><Note><pitch>60</pitch></Note></Chord></voice></Measure>";
+
+    fn link_interpretations(midi: &Midi) -> Vec<(String, Option<String>)> {
+        midi.staff_links
+            .iter()
+            .map(|link| (link.staff_id.clone(), link.canonical_staff_id.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn linked_self_missing_and_empty_references_keep_actual_music() {
+        for target in ["1", "99", ""] {
+            let declaration =
+                format!(r#"<Part><Staff id="1"><linkedTo>{target}</linkedTo></Staff></Part>"#);
+            let xml = linked_score(&declaration, &[("1", LINK_MUSIC)]);
+            for bytes in [xml.as_bytes().to_vec(), zipped_score(xml.as_bytes())] {
+                let midi = parse(&bytes).unwrap();
+                assert_eq!(midi.topology.staff_count(), 1);
+                assert_eq!(played_notes(&midi), vec![(0, 480, 60)]);
+                assert_eq!(link_interpretations(&midi), vec![("1".into(), None)]);
+                let report = crate::engine::convert::convert_midi(&midi, "english");
+                assert!(report
+                    .source_warnings
+                    .iter()
+                    .any(|warning| warning.code == "MUSESCORE_STAFF_LINK_UNRESOLVED"));
+            }
+        }
+    }
+
+    #[test]
+    fn linked_external_id_collision_never_crosses_parts() {
+        let xml = linked_score(
+            r#"<Part><trackName>Soprano</trackName><Staff id="1"/></Part>
+            <Part><trackName>Piano</trackName><Instrument><instrumentId>keyboard.piano</instrumentId></Instrument><Staff id="2"><linkedTo>1</linkedTo></Staff></Part>"#,
+            &[("1", LINK_MUSIC), ("2", LINK_MUSIC)],
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(midi.topology.staff_count(), 2);
+        assert_eq!(played_notes(&midi).len(), 2);
+        let piano = midi
+            .tracks
+            .iter()
+            .find(|track| track.source.staff_id.as_deref() == Some("2"))
+            .unwrap();
+        assert_eq!(piano.name, "Piano");
+        assert_eq!(piano.source.part_id.as_deref(), Some("musescore-part-1"));
+        assert_eq!(
+            piano.instruments[0].sound_id.as_deref(),
+            Some("keyboard.piano")
+        );
+        assert_eq!(link_interpretations(&midi), vec![("2".into(), None)]);
+    }
+
+    #[test]
+    fn linked_cycles_and_unresolved_chains_keep_every_staff() {
+        for last in ["1", "99"] {
+            let declaration = format!(
+                r#"<Part><Staff id="1"><linkedTo>2</linkedTo></Staff><Staff id="2"><linkedTo>{last}</linkedTo></Staff></Part>"#
+            );
+            let midi = parse_mscx(&linked_score(
+                &declaration,
+                &[("1", LINK_MUSIC), ("2", LINK_MUSIC)],
+            ))
+            .unwrap();
+            assert_eq!(midi.topology.staff_count(), 2);
+            assert_eq!(played_notes(&midi).len(), 2);
+            assert!(link_interpretations(&midi)
+                .iter()
+                .all(|(_, target)| target.is_none()));
+        }
+    }
+
+    #[test]
+    fn linked_mixed_views_keep_external_music_and_canonical_identity() {
+        // Put the view before its canonical target to rule out order-based guesses.
+        let xml = linked_score(
+            r#"<Part><Staff id="2"><linkedTo>2</linkedTo></Staff><Staff id="1"/><Staff id="3"><linkedTo>99</linkedTo></Staff></Part>"#,
+            &[("2", LINK_MUSIC), ("1", LINK_MUSIC), ("3", LINK_MUSIC)],
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(
+            midi.topology.parts[0]
+                .staves
+                .iter()
+                .map(|staff| staff.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "3"]
+        );
+        assert_eq!(played_notes(&midi).len(), 2);
+        assert_eq!(
+            link_interpretations(&midi),
+            vec![("2".into(), Some("1".into())), ("3".into(), None)]
+        );
+    }
+
+    #[test]
+    fn linked_divergent_rhythm_lyrics_voices_and_playback_controls_survive() {
+        let declaration =
+            r#"<Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo></Staff></Part>"#;
+        let variants = [
+            LINK_MUSIC.replace("quarter", "half"),
+            LINK_MUSIC.replace("word", "different"),
+            LINK_MUSIC.replace("<voice>", "<voice/><voice>"),
+            LINK_MUSIC.replace("<pitch>60</pitch>", "<pitch>62</pitch>"),
+            LINK_MUSIC.replace("<Note>", "<Note><velocity>50</velocity>"),
+            LINK_MUSIC.replace("<voice>", "<voice><Tempo><tempo>1.5</tempo></Tempo>"),
+            LINK_MUSIC.replace(
+                "<Measure>",
+                "<Measure><startRepeat/><endRepeat>2</endRepeat>",
+            ),
+            LINK_MUSIC.replace("<text>word</text>", "<text>word</text><ticks>480</ticks>"),
+            LINK_MUSIC.replace(
+                "<Note>",
+                "<Note><unknownPlaybackControl>1</unknownPlaybackControl>",
+            ),
+        ];
+        for distinct in variants {
+            let midi = parse_mscx(&linked_score(
+                declaration,
+                &[("1", LINK_MUSIC), ("2", &distinct)],
+            ))
+            .unwrap();
+            assert_eq!(midi.topology.staff_count(), 2, "{distinct}");
+            let control = parse_mscx(&linked_score(
+                &declaration.replace("<linkedTo>1</linkedTo>", ""),
+                &[("1", LINK_MUSIC), ("2", &distinct)],
+            ))
+            .unwrap();
+            assert_eq!(
+                midi.tracks, control.tracks,
+                "all music, IDs and event order: {distinct}"
+            );
+            assert_eq!(midi.topology, control.topology);
+            assert!(played_notes(&midi).len() >= 2);
+            assert_eq!(
+                link_interpretations(&midi),
+                vec![("2".into(), None)],
+                "{distinct}"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_equivalent_views_ignore_only_proven_benign_formatting() {
+        let declaration = r#"<Part><Staff id="1"><StaffType group="pitched"/></Staff><Staff id="2"><linkedTo>1</linkedTo><StaffType group="tab"/></Staff></Part>"#;
+        let notation = LINK_MUSIC.to_string();
+        let tab = LINK_MUSIC
+            .replace(
+                "<Chord>",
+                "<Chord><stemDirection>down</stemDirection><offset x=\"1\" y=\"2\"/>",
+            )
+            .replace("<Note>", "<Note><fret>3</fret><string>2</string>")
+            .replace("<text>word</text>", "<text><font size=\"12\"/>word</text>");
+        let xml = linked_score(declaration, &[("1", &notation), ("2", &tab)]);
+        for bytes in [xml.as_bytes().to_vec(), zipped_score(xml.as_bytes())] {
+            let midi = parse(&bytes).unwrap();
+            assert_eq!(midi.topology.staff_count(), 1);
+            assert_eq!(played_notes(&midi), vec![(0, 480, 60)]);
+            assert_eq!(
+                link_interpretations(&midi),
+                vec![("2".into(), Some("1".into()))]
+            );
+        }
+    }
+
+    #[test]
+    fn linked_anonymous_declaration_excludes_its_resolved_body_once() {
+        let xml = linked_score(
+            r#"<Part><Staff id="1"/><Staff><linkedTo>1</linkedTo></Staff></Part>"#,
+            &[("1", LINK_MUSIC), ("7", LINK_MUSIC)],
+        );
+        for bytes in [xml.as_bytes().to_vec(), zipped_score(xml.as_bytes())] {
+            let midi = parse(&bytes).unwrap();
+            assert_eq!(played_notes(&midi), vec![(0, 480, 60)]);
+            assert_eq!(midi.topology.staff_count(), 1);
+            assert_eq!(midi.topology.parts[0].staves[0].id, "1");
+            assert_eq!(
+                link_interpretations(&midi),
+                vec![("7".into(), Some("1".into()))]
+            );
+            assert_eq!(midi.tracks.len(), 1);
+        }
+    }
+
+    #[test]
+    fn linked_to_uses_declaration_index_with_nontrivial_ids_and_body_order() {
+        let declaration = r#"<Part><Staff id="17"/></Part><Part><Staff id="42"/><Staff id="9"><linkedTo>2</linkedTo></Staff></Part><Part><Staff id="2"/></Part>"#;
+        let other = LINK_MUSIC.replace("60", "65");
+        let midi = parse_mscx(&linked_score(
+            declaration,
+            &[
+                ("9", LINK_MUSIC),
+                ("17", LINK_MUSIC),
+                ("42", LINK_MUSIC),
+                ("2", &other),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(
+            link_interpretations(&midi),
+            vec![("9".into(), Some("42".into()))]
+        );
+        assert_eq!(midi.topology.parts[1].staves[0].id, "42");
+        assert_eq!(
+            played_notes(&midi),
+            vec![(0, 480, 60), (0, 480, 60), (0, 480, 65)]
+        );
+        let self_link = linked_score(
+            r#"<Part><Staff id="42"><linkedTo>1</linkedTo></Staff></Part>"#,
+            &[("42", LINK_MUSIC)],
+        );
+        let midi = parse_mscx(&self_link).unwrap();
+        assert_eq!(link_interpretations(&midi), vec![("42".into(), None)]);
+        assert_eq!(played_notes(&midi), vec![(0, 480, 60)]);
+    }
+
+    #[test]
+    fn linked_unknown_markup_namespaces_and_object_ids_never_authorize_deletion() {
+        let declaration =
+            r#"<Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo></Staff></Part>"#;
+        let variants = [
+            LINK_MUSIC.replace(
+                "<Note>",
+                "<Note><x:velocity xmlns:x=\"urn:playback\">50</x:velocity>",
+            ),
+            LINK_MUSIC.replace(
+                "<Note>",
+                "<Note><x:offset xmlns:x=\"urn:playback\" x=\"1\"/>",
+            ),
+            LINK_MUSIC.replace("<Note>", "<Note id=\"possibly-referenced\">"),
+            LINK_MUSIC.replace("<Chord>", "<Chord id=\"possibly-referenced\">"),
+            LINK_MUSIC.replace("<Measure>", "<Measure id=\"possibly-referenced\">"),
+            LINK_MUSIC.replace("<text>word</text>", "<text><unknown>word</unknown></text>"),
+            LINK_MUSIC.replace(
+                "<text>word</text>",
+                "<text><b playback=\"false\">word</b></text>",
+            ),
+            LINK_MUSIC.replace(
+                "<text>word</text>",
+                "<text><font size=\"12\" unknown=\"1\"/>word</text>",
+            ),
+            LINK_MUSIC.replace(
+                "<text>word</text>",
+                "<text><x:b xmlns:x=\"urn:semantic\">word</x:b></text>",
+            ),
+            LINK_MUSIC.replace("<text>word</text>", "<text><b>word </b></text>"),
+            LINK_MUSIC.replace("<Note>", "<Note><offset x=\"1\"><play>0</play></offset>"),
+            LINK_MUSIC.replace("<Note>", "<Note><string semantic=\"different\">2</string>"),
+            LINK_MUSIC.replace(
+                "<Note>",
+                "<Note><pos xmlns:x=\"urn:semantic\" x:reference=\"2\"/>",
+            ),
+        ];
+        for distinct in variants {
+            let xml = linked_score(declaration, &[("1", LINK_MUSIC), ("2", &distinct)]);
+            let midi = parse_mscx(&xml).unwrap();
+            let control = parse_mscx(&xml.replace("<linkedTo>1</linkedTo>", "")).unwrap();
+            assert_eq!(midi.tracks, control.tracks, "{distinct}");
+            assert_eq!(midi.topology, control.topology, "{distinct}");
+            assert_eq!(
+                played_notes(&midi),
+                vec![(0, 480, 60), (0, 480, 60)],
+                "{distinct}"
+            );
+            assert_eq!(link_interpretations(&midi), vec![("2".into(), None)]);
+        }
+        // Even equal opaque relationships do not prove that IDs can be erased.
+        let opaque = LINK_MUSIC.replace(
+            "<Note>",
+            "<Note id=\"shared\"><reference>shared</reference>",
+        );
+        let midi = parse_mscx(&linked_score(
+            declaration,
+            &[("1", &opaque), ("2", &opaque)],
+        ))
+        .unwrap();
+        assert_eq!(played_notes(&midi).len(), 2);
+        assert_eq!(link_interpretations(&midi), vec![("2".into(), None)]);
+    }
+
+    #[test]
+    fn linked_visual_subtrees_validate_every_attribute_and_child() {
+        for staff_type in [
+            r#"<StaffType group="tab"><name semantic="different">tab6</name></StaffType>"#,
+            r#"<StaffType group="tab"><name><unknown/></name></StaffType>"#,
+            r#"<StaffType group="tab"><lines xmlns:x="urn:semantic" x:ref="1">6</lines></StaffType>"#,
+            r#"<x:StaffType xmlns:x="urn:semantic" group="tab"/>"#,
+            r#"<defaultClef><unknown>G</unknown></defaultClef>"#,
+            r#"<bracket type="1" span="2"><unknown/></bracket>"#,
+        ] {
+            let declaration = format!(
+                r#"<Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo>{staff_type}</Staff></Part>"#
+            );
+            let midi = parse_mscx(&linked_score(
+                &declaration,
+                &[("1", LINK_MUSIC), ("2", LINK_MUSIC)],
+            ))
+            .unwrap();
+            assert_eq!(
+                played_notes(&midi),
+                vec![(0, 480, 60), (0, 480, 60)],
+                "{staff_type}"
+            );
+            assert_eq!(link_interpretations(&midi), vec![("2".into(), None)]);
+        }
+    }
+
+    #[test]
+    fn linked_duplicate_declarations_and_bodies_fail_explicitly() {
+        let declaration =
+            r#"<Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo></Staff></Part>"#;
+        for (declaration, bodies, error) in [
+            (
+                declaration.replace("<Staff id=\"1\"/>", "<Staff id=\"1\"/><Staff id=\"1\"/>"),
+                vec![("1", LINK_MUSIC), ("2", LINK_MUSIC)],
+                "duplicate resolved staff declaration ID",
+            ),
+            (
+                declaration.into(),
+                vec![("1", LINK_MUSIC), ("1", LINK_MUSIC), ("2", LINK_MUSIC)],
+                "duplicate score-body staff ID",
+            ),
+        ] {
+            let error_message = parse_mscx(&linked_score(&declaration, &bodies)).unwrap_err();
+            assert!(error_message.contains(error), "{error_message}");
+        }
+    }
+
+    #[test]
+    fn linked_multiple_links_and_chain_to_unlinked_target_keep_unresolved_music() {
+        let declaration = r#"<Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo><linkedTo>3</linkedTo></Staff><Staff id="3"/></Part>"#;
+        let midi = parse_mscx(&linked_score(
+            declaration,
+            &[("1", LINK_MUSIC), ("2", LINK_MUSIC), ("3", LINK_MUSIC)],
+        ))
+        .unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 60); 3]);
+        assert_eq!(midi.staff_links.len(), 2);
+        assert!(midi
+            .staff_links
+            .iter()
+            .all(|link| link.canonical_staff_id.is_none()));
+        assert_ne!(midi.staff_links[0].id, midi.staff_links[1].id);
+        let declaration = r#"<Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo></Staff><Staff id="3"><linkedTo>2</linkedTo></Staff></Part>"#;
+        let midi = parse_mscx(&linked_score(
+            declaration,
+            &[("1", LINK_MUSIC), ("2", LINK_MUSIC), ("3", LINK_MUSIC)],
+        ))
+        .unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 480, 60); 2]);
+        assert_eq!(
+            link_interpretations(&midi),
+            vec![("2".into(), Some("1".into())), ("3".into(), None)]
+        );
+        assert_eq!(
+            midi.topology.parts[0]
+                .staves
+                .iter()
+                .map(|staff| staff.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "3"]
+        );
+    }
+
+    #[test]
+    fn linked_unmatched_and_missing_id_metadata_is_source_level_and_truthful() {
+        for (declaration,bodies,expected_id,has_measures) in [
+            (r#"<Part><Staff><linkedTo>99</linkedTo></Staff></Part>"#,vec![("7",LINK_MUSIC)],"7",true),
+            (r#"<Part><Staff id="1"/></Part><Part><Staff id="9"><linkedTo>99</linkedTo></Staff></Part>"#,vec![("1",LINK_MUSIC)],"9",false),
+            (r#"<Part><Staff id="1"/></Part><Part><Staff id="9"><linkedTo>99</linkedTo></Staff></Part>"#,vec![("1",LINK_MUSIC),("9","<Measure><voice><Rest><durationType>quarter</durationType></Rest></voice></Measure>")],"9",true),
+        ] {
+            let xml=linked_score(declaration,&bodies);
+            let midi=parse_mscx(&xml).unwrap();
+            let control=parse_mscx(&xml.replace("<linkedTo>99</linkedTo>","")).unwrap();
+            assert_eq!(midi.tracks,control.tracks);
+            assert_eq!(midi.topology,control.topology);
+            assert_eq!(midi.staff_links[0].staff_id,expected_id);
+            assert_eq!(midi.staff_links[0].has_body_measures,has_measures);
+            let outcome=crate::engine::convert::convert_midi(&midi,"english");
+            assert!(outcome.ok);
+            assert_eq!(outcome.source_warnings.len(),1);
+            assert_eq!(outcome.source_warnings[0].source_id,Some(format!("mscx:staff:{expected_id}")));
+            assert_eq!(outcome.source_warnings[0].message.contains("no score-body measures were found"),!has_measures);
+            assert!(outcome.tracks.iter().flat_map(|track|&track.warnings).all(|warning|!warning.code.starts_with("MUSESCORE_STAFF_LINK")));
+        }
+    }
+
+    #[test]
+    fn linked_target_without_body_or_only_in_embedded_score_is_unresolved() {
+        let declaration =
+            r#"<Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo></Staff></Part>"#;
+        let xml = linked_score(declaration, &[("2", LINK_MUSIC)]);
+        for xml in [
+            xml.clone(),
+            xml.replace(
+                "</Score>",
+                &format!(r#"<Score><Staff id="1">{LINK_MUSIC}</Staff></Score></Score>"#),
+            ),
+        ] {
+            let midi = parse_mscx(&xml).unwrap();
+            assert_eq!(played_notes(&midi), vec![(0, 480, 60)]);
+            assert_eq!(link_interpretations(&midi), vec![("2".into(), None)]);
+        }
     }
 
     #[test]

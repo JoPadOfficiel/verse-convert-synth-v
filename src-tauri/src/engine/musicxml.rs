@@ -1637,6 +1637,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
     }
     let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
     Ok(Midi {
+        staff_links: Vec::new(),
         ticks_per_beat: tpb,
         time_base: TimeBase::PulsesPerQuarter(tpb),
         format: 1,

@@ -1281,6 +1281,7 @@ mod tests {
     ) -> ProjectedNote {
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks,
             duration_ticks,
             pitch,

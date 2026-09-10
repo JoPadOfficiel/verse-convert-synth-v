@@ -683,6 +683,15 @@ pub fn build_preservation_ledger(
             }
         }
     }
+    for link in &midi.staff_links {
+        push_entry(
+            &mut entries,
+            link.id.clone(),
+            SourceItemKind::Event,
+            PrimaryDisposition::MetadataOnly,
+            artifact_paths(false, None, layout),
+        );
+    }
     for entry in &mut entries {
         entry.performance_refs = projection
             .performance_refs
@@ -3815,6 +3824,357 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn retained_note_ledger_matches_saved_vocals_in_both_bundle_targets() {
+        let data = smf(&[
+            0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // sung lyric
+            0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0x00, 0xff, 0x05,
+            0x00, // explicit empty lyric, removed with its note
+            0x00, 0x90, 62, 100, 0x83, 0x60, 0x80, 62, 0, 0x00, 0x90, 64, 100, 0x83, 0x60, 0x80,
+            64, 0, // genuinely untexted
+            0x00, 0xff, 0x2f, 0x00,
+        ]);
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let midi = midi::parse(&data).unwrap();
+            let outcome =
+                crate::engine::convert::convert_midi_with_target(&midi, "english", None, target);
+            assert!(outcome.ok, "{:?}", outcome.msg);
+            let projected = outcome.svp.as_ref().unwrap();
+            assert_eq!(projected.tracks.len(), 1);
+            assert_eq!(projected.tracks[0].notes.len(), 1);
+            assert_eq!(projected.tracks[0].notes[0].pitch, 60);
+            let direct = crate::engine::target::serialize_to(target, projected).unwrap();
+            let root = temp_dir(&format!("retained-ledger-{}", target.extension()));
+            let destination = root.join("Song.versebundle");
+            let layout = BundleLayout::new(&destination, "source.mid", target).unwrap();
+            let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+            let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
+            let result = export_bundle(BundleRequest {
+                destination,
+                input: BundleInput {
+                    original_name: "source.mid".into(),
+                    source_format: "standardMidi".into(),
+                    source_bytes: data.clone(),
+                    project: BundleProject::from_projection(target, projected).unwrap(),
+                    stem_plan: stem_plan.clone(),
+                    ledger,
+                    warnings: vec![],
+                },
+                renderer: successful_renderer(&stem_plan.stems),
+                render_limits: RenderLimits {
+                    timeout: Duration::from_secs(60),
+                    max_output_bytes: 1024 * 1024,
+                },
+            })
+            .unwrap();
+            let saved = fs::read(&result.project_path).unwrap();
+            match target {
+                ExportTarget::Svp => {
+                    let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                    let direct: serde_json::Value = serde_json::from_slice(&direct).unwrap();
+                    assert_eq!(saved["tracks"][0], direct["tracks"][0]);
+                    assert_eq!(
+                        saved["tracks"][0]["mainGroup"]["notes"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                    assert_eq!(saved["tracks"][0]["mainGroup"]["notes"][0]["pitch"], 60);
+                }
+                ExportTarget::Ustx => {
+                    let saved = std::str::from_utf8(&saved).unwrap();
+                    let direct = std::str::from_utf8(&direct).unwrap();
+                    assert_eq!(voice_parts_block(saved), voice_parts_block(direct));
+                    assert_eq!(voice_parts_block(saved).matches("        tone:").count(), 1);
+                    assert!(voice_parts_block(saved).contains("        tone: 60\n"));
+                }
+            }
+            assert_eq!(fs::read(&result.source_path).unwrap(), data);
+            let ledger: PreservationLedger = serde_json::from_slice(
+                &fs::read(result.bundle_path.join(PRESERVATION_RELATIVE_PATH)).unwrap(),
+            )
+            .unwrap();
+            let entry = |id: &str| {
+                ledger
+                    .entries
+                    .iter()
+                    .find(|entry| entry.source_id == id)
+                    .unwrap()
+            };
+            for track in &midi.tracks {
+                for event in &track.events {
+                    if !matches!(
+                        event.kind,
+                        Kind::NoteOn(_) | Kind::NoteOff(_) | Kind::Lyrics(_)
+                    ) {
+                        continue;
+                    }
+                    let event_id = format!("event:{}:{}", track.id, event.order);
+                    // Identify the fixture's sung word and its pitched note,
+                    // independently of parser event numbering or metadata.
+                    let retained = match &event.kind {
+                        Kind::NoteOn(note) => note.key == Some(60),
+                        Kind::NoteOff(note) => note.key == Some(60),
+                        Kind::Lyrics(lyric) => lyric.raw == "let",
+                        _ => unreachable!(),
+                    };
+                    let mut ids = vec![event_id];
+                    if let Kind::NoteOn(note) = &event.kind {
+                        ids.push(note_instance_id(&track.id, &note.source, event.order));
+                    }
+                    if let Kind::Lyrics(lyric) = &event.kind {
+                        ids.push(standalone_lyric_instance_id(lyric, &track.id, event.order));
+                    }
+                    for id in ids {
+                        let entry = entry(&id);
+                        assert_eq!(
+                            entry.disposition == PrimaryDisposition::ProjectedExact,
+                            retained,
+                            "{target:?} {id}"
+                        );
+                        assert_eq!(
+                            entry.artifact_paths.contains(&layout.project_relative_path),
+                            retained,
+                            "{id}"
+                        );
+                        assert!(entry.artifact_paths.contains(&layout.source_relative_path));
+                        if matches!(event.kind, Kind::NoteOn(_) | Kind::NoteOff(_)) {
+                            let stem = &stem_plan.stems[0];
+                            assert!(entry
+                                .artifact_paths
+                                .contains(&layout.stem_audio_relative_path(stem)));
+                            if !retained {
+                                assert_eq!(
+                                    entry.disposition,
+                                    PrimaryDisposition::RenderedStem {
+                                        stem_id: stem.stem_id.clone()
+                                    }
+                                );
+                            }
+                        } else if !retained {
+                            assert!(matches!(
+                                entry.disposition,
+                                PrimaryDisposition::SourceOnly { .. }
+                            ));
+                            assert_eq!(
+                                entry.artifact_paths,
+                                vec![layout.source_relative_path.clone()],
+                                "dropped lyric/event has no project or stem artifact"
+                            );
+                        }
+                    }
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn retained_split_verses_match_every_saved_vocal_lane_and_ledger_artifact() {
+        let data = crate::engine::convert::RETAINED_SPLIT_FIXTURE.as_bytes();
+        let midi = crate::engine::musicxml::parse(data).unwrap();
+        // The same source voice overlaps at tick 480. Each verse must split
+        // into two actual voices, with the last note present only in verse 1.
+        let expected = [
+            vec![(0, 960, 60), (1920, 480, 62)],
+            vec![(480, 960, 64)],
+            vec![(0, 960, 60)],
+            vec![(480, 960, 64)],
+        ];
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let outcome =
+                crate::engine::convert::convert_midi_with_target(&midi, "english", None, target);
+            assert!(outcome.ok, "{:?}", outcome.msg);
+            assert!(outcome
+                .tracks
+                .iter()
+                .flat_map(|track| &track.warnings)
+                .any(|warning| warning.code == crate::engine::convert::SIMULTANEOUS_VOICES_SPLIT));
+            let project = outcome.svp.as_ref().unwrap();
+            assert_eq!(project.tracks.len(), expected.len());
+            for (lane, expected) in project.tracks.iter().zip(&expected) {
+                assert_eq!(
+                    lane.notes
+                        .iter()
+                        .map(|note| (note.onset_ticks, note.duration_ticks, note.pitch))
+                        .collect::<Vec<_>>(),
+                    *expected
+                );
+            }
+            let direct = crate::engine::target::serialize_to(target, project).unwrap();
+            let root = temp_dir(&format!("retained-split-{}", target.extension()));
+            let destination = root.join("Song.versebundle");
+            let layout = BundleLayout::new(&destination, "source.musicxml", target).unwrap();
+            let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+            assert_eq!(stem_plan.stems.len(), 1);
+            let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
+            let result = export_bundle(BundleRequest {
+                destination,
+                input: BundleInput {
+                    original_name: "source.musicxml".into(),
+                    source_format: "musicXml".into(),
+                    source_bytes: data.to_vec(),
+                    project: BundleProject::from_projection(target, project).unwrap(),
+                    stem_plan: stem_plan.clone(),
+                    ledger,
+                    warnings: vec![],
+                },
+                renderer: successful_renderer(&stem_plan.stems),
+                render_limits: RenderLimits {
+                    timeout: Duration::from_secs(60),
+                    max_output_bytes: 1024 * 1024,
+                },
+            })
+            .unwrap();
+            assert_eq!(fs::read(&result.source_path).unwrap(), data);
+            let saved = fs::read(&result.project_path).unwrap();
+            match target {
+                ExportTarget::Svp => {
+                    let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                    let direct: serde_json::Value = serde_json::from_slice(&direct).unwrap();
+                    let vocals: Vec<_> = saved["tracks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|track| track["mainRef"]["isInstrumental"] != true)
+                        .collect();
+                    assert_eq!(vocals.len(), expected.len());
+                    for (index, (lane, expected)) in vocals.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            **lane, direct["tracks"][index],
+                            "all saved vocal tracks match direct output"
+                        );
+                        let notes = lane["mainGroup"]["notes"].as_array().unwrap();
+                        assert_eq!(notes.len(), expected.len());
+                        for (note, &(onset, duration, pitch)) in notes.iter().zip(expected) {
+                            assert_eq!(note["onset"], u64::from(onset) * 1_470_000);
+                            assert_eq!(note["duration"], u64::from(duration) * 1_470_000);
+                            assert_eq!(note["pitch"], pitch);
+                        }
+                    }
+                }
+                ExportTarget::Ustx => {
+                    let saved = std::str::from_utf8(&saved).unwrap();
+                    assert_eq!(
+                        voice_parts_block(saved),
+                        voice_parts_block(std::str::from_utf8(&direct).unwrap())
+                    );
+                    let parts: Vec<_> = voice_parts_block(saved)
+                        .split("\n  - name: ")
+                        .skip(1)
+                        .collect();
+                    assert_eq!(parts.len(), expected.len());
+                    for (index, (part, expected)) in parts.iter().zip(&expected).enumerate() {
+                        assert!(part.contains(&format!("    track_no: {index}\n")));
+                        let notes: Vec<_> = part.split("      - position: ").skip(1).collect();
+                        assert_eq!(notes.len(), expected.len());
+                        for (note, (onset, duration, pitch)) in notes.iter().zip(expected) {
+                            assert!(note.starts_with(&format!(
+                                "{onset}\n        duration: {duration}\n        tone: {pitch}\n"
+                            )));
+                        }
+                    }
+                }
+            }
+            let ledger: PreservationLedger = serde_json::from_slice(
+                &fs::read(result.bundle_path.join(PRESERVATION_RELATIVE_PATH)).unwrap(),
+            )
+            .unwrap();
+            let entry = |id: &str| {
+                ledger
+                    .entries
+                    .iter()
+                    .find(|entry| entry.source_id == id)
+                    .unwrap()
+            };
+            let source = &layout.source_relative_path;
+            let vocal = &layout.project_relative_path;
+            let stem = layout.stem_audio_relative_path(&stem_plan.stems[0]);
+            let mut expected_ids = BTreeSet::new();
+            for track in &midi.tracks {
+                for event in &track.events {
+                    let (key, note) = match &event.kind {
+                        Kind::NoteOn(note) => (note.key, Some(note)),
+                        Kind::NoteOff(note) => (note.key, None),
+                        _ => continue,
+                    };
+                    let retained = key != Some(67); // source G4 has no words in either verse
+                    let mut note_ids = vec![format!("event:{}:{}", track.id, event.order)];
+                    if let Some(note) = note {
+                        note_ids.push(note_instance_id(&track.id, &note.source, event.order));
+                        for lyric in &note.lyrics {
+                            let id = attached_lyric_instance_id(lyric, &note.source, event.order);
+                            let entry = entry(&id);
+                            let lyric_retained = !lyric.raw.is_empty();
+                            if lyric_retained {
+                                expected_ids.insert(id.clone());
+                            }
+                            assert_eq!(
+                                entry.disposition == PrimaryDisposition::ProjectedExact,
+                                lyric_retained,
+                                "{id}"
+                            );
+                            assert_eq!(
+                                entry.artifact_paths,
+                                if lyric_retained {
+                                    vec![source.clone(), vocal.clone()]
+                                } else {
+                                    vec![source.clone()]
+                                },
+                                "{id}: exact lyric artifact set"
+                            );
+                            if !lyric_retained {
+                                assert!(matches!(
+                                    entry.disposition,
+                                    PrimaryDisposition::SourceOnly { .. }
+                                ));
+                            }
+                        }
+                    }
+                    for id in note_ids {
+                        if retained {
+                            expected_ids.insert(id.clone());
+                        }
+                        let entry = entry(&id);
+                        assert_eq!(
+                            entry.disposition,
+                            if retained {
+                                PrimaryDisposition::ProjectedExact
+                            } else {
+                                PrimaryDisposition::RenderedStem {
+                                    stem_id: stem_plan.stems[0].stem_id.clone(),
+                                }
+                            },
+                            "{id}"
+                        );
+                        assert_eq!(
+                            entry.artifact_paths,
+                            if retained {
+                                vec![source.clone(), vocal.clone(), stem.clone()]
+                            } else {
+                                vec![source.clone(), stem.clone()]
+                            },
+                            "{id}: exact note/event artifact set"
+                        );
+                    }
+                }
+            }
+            let represented: BTreeSet<_> = project
+                .tracks
+                .iter()
+                .flat_map(|lane| &lane.notes)
+                .flat_map(|note| note.source_evidence.as_ref().unwrap().source_ids())
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(
+                represented, expected_ids,
+                "all original retained note/on/off/lyric identities across every saved lane"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     /// The stems are the bundle's, not the project's: both targets reference the
     /// same WAVs by the same relative paths, and only the file that references them
     /// differs.
@@ -4233,6 +4593,91 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn linked_staff_metadata_is_source_only_and_diagnostics_keep_original_identity() {
+        use crate::engine::{convert, musescore};
+        let music = "<Measure><voice><Chord><durationType>quarter</durationType><Lyrics><text>word</text></Lyrics><Note><pitch>60</pitch></Note></Chord></voice></Measure>";
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let xml = format!(
+                r#"<museScore><Score><Part><Staff id="1"/><Staff id="2"><linkedTo>1</linkedTo></Staff><Staff id="3"><linkedTo>99</linkedTo></Staff></Part><Part><Staff id="9"><linkedTo>99</linkedTo></Staff></Part><Staff id="1">{music}</Staff><Staff id="2">{music}</Staff><Staff id="3">{music}</Staff></Score></museScore>"#
+            );
+            let midi = musescore::parse_mscx(&xml).unwrap();
+            let outcome = convert::convert_midi_with_target(&midi, "english", None, target);
+            assert!(outcome.ok);
+            let collapsed = outcome
+                .source_warnings
+                .iter()
+                .find(|warning| warning.code == "MUSESCORE_LINKED_VIEW_COLLAPSED")
+                .unwrap();
+            assert_eq!(collapsed.severity, convert::DiagnosticSeverity::Info);
+            assert_eq!(collapsed.source_id.as_deref(), Some("mscx:staff:2"));
+            assert_eq!(outcome.source_warnings.len(), 3);
+            assert_eq!(
+                midi.tracks.len(),
+                2,
+                "unmatched declarations never make pseudo-tracks"
+            );
+            let root = temp_dir("linked-source-metadata");
+            let layout =
+                BundleLayout::new(&root.join("Song.versebundle"), "source.mscx", target).unwrap();
+            let stems = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+            assert!(
+                !stems.stems.is_empty(),
+                "the test must exercise a real stem mapping"
+            );
+            let mut evidence = outcome.projection.clone();
+            evidence
+                .source_ids
+                .extend(midi.staff_links.iter().map(|link| link.id.clone()));
+            let ledger = build_preservation_ledger(&midi, &evidence, &layout, &stems);
+            for link in &midi.staff_links {
+                let entry = ledger
+                    .entries
+                    .iter()
+                    .find(|entry| entry.source_id == link.id)
+                    .unwrap();
+                assert_eq!(entry.disposition, PrimaryDisposition::MetadataOnly);
+                assert_eq!(
+                    entry.artifact_paths,
+                    vec![layout.source_relative_path.clone()]
+                );
+            }
+            // Canonical note/event IDs and chronological order are untouched by
+            // metadata, as are their dispositions and source evidence IDs.
+            let control_xml = xml
+                .replace(r#"<Staff id="2"><linkedTo>1</linkedTo></Staff>"#, "")
+                .replace(&format!(r#"<Staff id="2">{music}</Staff>"#), "")
+                .replace("<linkedTo>99</linkedTo>", "");
+            let control = musescore::parse_mscx(&control_xml).unwrap();
+            assert_eq!(midi.tracks, control.tracks);
+            assert_eq!(midi.topology, control.topology);
+            let control_outcome =
+                convert::convert_midi_with_target(&control, "english", None, target);
+            let control_stems = StemPlan::from_source(&control, &control_outcome.tracks).unwrap();
+            let control_ledger = build_preservation_ledger(
+                &control,
+                &control_outcome.projection,
+                &layout,
+                &control_stems,
+            );
+            assert_eq!(outcome.projection, control_outcome.projection);
+            for entry in control_ledger.entries {
+                assert_eq!(
+                    ledger
+                        .entries
+                        .iter()
+                        .find(|candidate| candidate.source_id == entry.source_id),
+                    Some(&entry)
+                );
+            }
+            assert_eq!(
+                crate::engine::target::serialize_to(target, outcome.svp.as_ref().unwrap()).unwrap(),
+                crate::engine::target::serialize_to(target, control_outcome.svp.as_ref().unwrap())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn ledger_uses_per_item_projection_evidence_not_a_global_lyric_count() {
         let data = smf(&[
             0x00, 0xff, 0x05, 0x03, b'l', b'e', b't', // aligned lyric
@@ -4298,6 +4743,7 @@ pub(crate) mod tests {
         ];
         let tracks = vec![metadata];
         let midi = Midi {
+            staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
             format: 1,
@@ -4389,6 +4835,7 @@ pub(crate) mod tests {
         }
         let tracks = vec![words, melody];
         let midi = Midi {
+            staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
             format: 1,

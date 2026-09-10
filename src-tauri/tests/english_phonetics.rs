@@ -118,6 +118,24 @@ fn assert_lanes(midi: &Midi, expected: &[&str]) {
     assert_eq!(output.time_signatures, default_output.time_signatures);
     assert_eq!(result.topology, default.topology);
     assert_eq!(result.projection, default.projection);
+    for (actual, before) in project
+        .tracks
+        .iter()
+        .zip(&default.svp.as_ref().unwrap().tracks)
+    {
+        assert_eq!(actual.notes.len(), before.notes.len());
+        for (note, original) in actual.notes.iter().zip(&before.notes) {
+            assert!(
+                original.source_evidence.is_some(),
+                "real transform input has provenance"
+            );
+            assert_eq!(
+                note.source_evidence, original.source_evidence,
+                "allocation preserves original note/lyric identities"
+            );
+        }
+    }
+
     for (actual, before) in output.voice_parts.iter().zip(&default_output.voice_parts) {
         assert_eq!(actual.notes.len(), before.notes.len());
         for (a, b) in actual.notes.iter().zip(&before.notes) {
@@ -435,6 +453,7 @@ fn source_rows_rests_and_manual_boundaries_block_word_allocation() {
             source.syllabic = Some(syllabic);
             ProjectedNote {
                 performance: None,
+                source_evidence: None,
                 onset_ticks: i as u32 * 480,
                 duration_ticks: 480,
                 pitch: 60,
@@ -471,6 +490,7 @@ fn genuine_hold_after_a_whole_word_stays_a_hold() {
     let mut notes = vec![
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: 0,
             duration_ticks: 480,
             pitch: 60,
@@ -478,6 +498,7 @@ fn genuine_hold_after_a_whole_word_stays_a_hold() {
         },
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: 480,
             duration_ticks: 480,
             pitch: 62,

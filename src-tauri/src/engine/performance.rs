@@ -629,6 +629,7 @@ mod tests {
             .map(|(order, (tick, kind))| Event::new(tick, order as u32, kind))
             .collect();
         let midi = Midi {
+            staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
             format: 1,

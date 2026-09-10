@@ -33,7 +33,22 @@ pub struct Midi {
     /// monophonic projection lanes; several of those lanes may belong to one
     /// notational voice when a source chord has to be split for Synthesizer V.
     pub topology: SourceTopology,
+    /// Source-level interpretation metadata, never a timed musical event or lane.
+    pub staff_links: Vec<StaffLink>,
     pub tracks: Vec<Track>,
+}
+
+/// MuseScore declaration linkage, independent of musical track ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaffLink {
+    /// Declaration/link ordinal identity, also used by the preservation ledger.
+    pub id: String,
+    pub part_id: String,
+    /// The same resolved source ID used for declaration topology.
+    pub staff_id: String,
+    pub linked_to: String,
+    pub canonical_staff_id: Option<String>,
+    pub has_body_measures: bool,
 }
 
 /// Source-owned score hierarchy, independent from target projection lanes.
@@ -1319,6 +1334,7 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
     };
     let topology = SourceTopology::from_tracks(&tracks);
     Ok(Midi {
+        staff_links: Vec::new(),
         ticks_per_beat,
         time_base,
         format,

@@ -85,6 +85,7 @@ fn direct_notes(words: &[&str]) -> Vec<verse_lib::engine::projection::ProjectedN
         .enumerate()
         .map(|(i, word)| ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: i as u32 * 480,
             duration_ticks: 480,
             pitch: 60 + i as u8,
@@ -1103,6 +1104,7 @@ fn another_source_row_inside_a_melisma_prevents_blank_absorption() {
     .enumerate()
     .map(|(i, lyric)| ProjectedNote {
         performance: None,
+        source_evidence: None,
         onset_ticks: i as u32 * 480,
         duration_ticks: 480,
         pitch: 60,
@@ -1514,6 +1516,7 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
     let mut notes = vec![
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: 0,
             duration_ticks: 480,
             pitch: 60,
@@ -1521,6 +1524,7 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
         },
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: 480,
             duration_ticks: 240,
             pitch: 62,
@@ -1528,13 +1532,42 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
         },
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: 720,
             duration_ticks: 480,
             pitch: 64,
             lyric: ProjectedLyric::Source(Box::new(right.clone())),
         },
     ];
+    for (index, note) in notes.iter_mut().enumerate() {
+        let lyric_id = match &note.lyric {
+            ProjectedLyric::Source(lyric) => Some(format!(
+                "lyric:{}:occurrence:0:note-event:{}",
+                lyric.id,
+                index * 2
+            )),
+            _ => None,
+        };
+        note.source_evidence = Some(verse_lib::engine::projection::NoteEvidence {
+            note_id: format!("note:voice:source-{index}:occurrence:0:event:{}", index * 2),
+            note_on_event_id: format!("event:voice:{}", index * 2),
+            note_off_event_id: format!("event:voice:{}", index * 2 + 1),
+            lyric_id,
+            lyric_event_id: None,
+        });
+    }
+    let original_evidence: Vec<_> = notes
+        .iter()
+        .map(|note| note.source_evidence.clone())
+        .collect();
     french::apply(&mut notes, &["0".into(), "1".into(), "2".into()]);
+    assert_eq!(
+        notes
+            .iter()
+            .map(|note| note.source_evidence.clone())
+            .collect::<Vec<_>>(),
+        original_evidence
+    );
     assert_eq!(
         notes[0].lyric,
         ProjectedLyric::Pronounced {
@@ -1746,6 +1779,7 @@ fn a_dictionary_cannot_invent_a_third_vowel_for_a_three_note_word() {
         lyric.syllabic = Some(syllabic);
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks: i as u32 * 480,
             duration_ticks: 480,
             pitch: 60,

@@ -228,6 +228,7 @@ mod tests {
                 muted: false,
                 notes: vec![ProjectedNote {
                     performance: None,
+                    source_evidence: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
                     pitch: 60,
@@ -245,6 +246,7 @@ mod tests {
     ) -> ProjectedNote {
         ProjectedNote {
             performance: None,
+            source_evidence: None,
             onset_ticks,
             duration_ticks,
             pitch,

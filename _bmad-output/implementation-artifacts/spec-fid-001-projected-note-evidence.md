@@ -2,7 +2,9 @@
 title: Make note projection evidence match editable output
 type: bugfix
 created: 2026-09-09
-status: ready-for-dev
+status: done
+review_loop_iteration: 1
+baseline_commit: 588fe2c
 context:
   - docs/contribution-guide.md
   - src-tauri/src/engine/convert.rs
@@ -61,17 +63,16 @@ source files and bundles remain read-only evidence.
 
 ## Tasks and Acceptance
 
-- [ ] Correct the narrow evidence boundary without changing serialized vocal notes.
-- [ ] Cover mixed untexted, protected holds, multiple lyric projections and equal-note identities with positive/negative regressions.
-- [ ] Assert actual bundle ledger note and note-event dispositions against final USTX/SVP notes; preserve raw/stem attribution.
-- [ ] Run required local gate and compare both private masters' musical output unchanged.
-- [ ] Document what projected means, including separate remaining expression mappings and source-only notation.
+- [x] Correct the narrow evidence boundary without changing serialized vocal notes.
+- [x] Cover mixed untexted, protected holds, multiple lyric projections and equal-note identities with positive/negative regressions.
+- [x] Assert actual bundle ledger note and note-event dispositions against final USTX/SVP notes; preserve raw/stem attribution.
+- [x] Run required local gate and compare both private masters' musical output unchanged.
+- [x] Document what projected means, including separate remaining expression mappings and source-only notation.
 
 ## Design Notes
 
-The caller owns integration coordination. FR-004 is committed; EXP-002 currently
-owns shared projection files and Cargo. This specification is ready, but no
-production implementation has begun. FID-002 will reuse the retained note record
+The caller owns integration coordination. FR-004 and EXP002 are committed.
+The reviewed FID001 implementation is integrated with both ownership fields preserved. FID-002 will reuse the retained note record
 for source-owned continuity and technical routing. Do not implement that musical
 change here or depend on optional MIDI performance metadata for note identity.
 Only add ownership fields needed for this evidence correction; source identity
@@ -81,7 +82,63 @@ slot is explicitly released.
 
 ## Verification
 
-Pending. Source audit observed first-pass Alti ger at tick19680 absent from the
-editable project yet projectedExact in historical ledger. Five other PB spans
+Implemented and independently reviewed. The amended isolated engine/bundle and
+French/English suite passes 401 tests; all eight private outputs remain byte-identical
+to baseline588fe2c. Integrated with EXP002 at28abaea, all-targets Rust passes
+514 tests with zero failures and14 expected opt-in ignores. Original source
+identity is cloned for PerformanceNote and also retained in NoteEvidence; both
+fields survive the integration. Source audit observed first-pass Alti ger at
+tick19680 absent from the editable project yet projectedExact in historical ledger. Five other PB spans
 carry no lyrics and may legitimately remain source/stem-only. No generic
 restoration or complete editable fidelity is claimed.
+
+## Isolated implementation workspace
+
+Implement in `/private/tmp/verse-fid-001-note-evidence` on branch
+`codex/fid-001-note-evidence`, based on588fe2c. Resolve production context paths
+relative to this worktree. Read the private source-track report from the main
+checkout at `/Users/jopad/Downloads/verse-convert-synth-v/` (it is intentionally
+not committed or copied into public fixtures). Do not edit main production.
+This baseline predates EXP002 production, so no PerformanceNote field exists
+here; preserve the parent's later optional field at integration and do not add
+competing expression ownership. FID002 will reuse this evidence record.
+
+Do not run Cargo or commit. Parent owns shared Cargo, final integration, reviews
+and commits. Standalone rustc verification of actual engine modules against
+existing cached dependencies is permitted. Existing compile arguments are in
+main `_bmad-output/implementation-artifacts/fr-004/rustc-command-review.json`.
+Set CARGO_MANIFEST_DIR to this worktree's src-tauri and use private outputs;
+`#[path=...] mod engine;` can test the engine without Tauri. Coordinate one
+whole-engine rustc compilation at a time with the parent/FID003 worker; pure
+small harnesses need no shared Cargo. A cached verse_lib bundle builder may be
+used for read-only evidence checks by reparsing the same source in each crate
+and transferring the standard source-ID sets, never treating distinct crate
+IR types as interchangeable. Final integrated Cargo/bundle checks remain pending
+until the parent releases the slot.
+
+Return the changed paths, ready patch and exact evidence. Do not claim full
+integrated acceptance merely from standalone tests. Keep the original note
+outputs byte-identical; the only behavior change is truthful retained evidence.
+
+## Review clarification — iteration 1
+
+See [review triage](fid-001/review-triage.md). Preserve the implemented evidence seam and all musical output. Add actual simultaneous same-verse splitting and multi-verse saved-bundle coverage for both targets, with original note/on/off/lyric IDs and exact artifact sets on every lane. Include representative French/English lyric transformations with populated provenance, tempo/meter evidence independence and the exact existing gap diagnostic. Document source-lyric correspondence without asserting verbatim target text or acoustic fidelity. These non-frozen verification clarifications do not change retention policy.
+
+## Suggested Review Order
+
+- Union provenance only after filtering and lane splitting.
+  [convert.rs:1829](../../src-tauri/src/engine/convert.rs#L1829)
+
+- Move original note and lyric identities together.
+  [projection.rs:148](../../src-tauri/src/engine/projection.rs#L148)
+
+- Verify both targets retain identities through actual overlapping verse splits.
+  [convert.rs:3466](../../src-tauri/src/engine/convert.rs#L3466)
+
+- Reopen saved bundles and verify every vocal lane and artifact disposition.
+  [bundle.rs:3965](../../src-tauri/src/bundle.rs#L3965)
+
+- Check source identity survives French word allocation.
+  [french_phonetics.rs:1509](../../src-tauri/tests/french_phonetics.rs#L1509)
+
+Integrated Clippy, rustfmt and diff checks passed; see [integration evidence](fid-001/integrated-verification.md).

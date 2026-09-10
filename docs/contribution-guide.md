@@ -121,6 +121,29 @@ The following rules are release invariants:
 - A byte-identical source snapshot preserves what the current IR cannot
   project; it does not justify a claim that the target format is lossless.
 
+### What projected evidence means
+
+A note is projected only when an editable note representing that source identity
+survives lyric processing, untexted-note filtering and vocal lane splitting.
+The note carries its original note, note-on/off and selected lyric/event IDs
+through those operations. Evidence is the union of retained representations:
+one verse dropping a note cannot erase another verse's representation, and equal
+pitch/onset/duration does not make two source identities interchangeable.
+
+In the preservation ledger, `projectedExact` for a note or note event claims this
+editable representation. For a lyric, the label records source-lyric correspondence
+through authorized word allocation, phonetic spelling, and hold/split markers;
+it does not promise verbatim target text or acoustic fidelity. Original lyric
+bytes and IDs remain source evidence even when the target sings a derived spelling
+or marker. It does not claim complete expression fidelity: dynamics,
+velocity, controllers, articulation and other performance mappings remain separate
+work. A source snapshot or Part stem alone does not establish editable projection.
+Untexted notation excluded under the existing vocal policy remains in the original
+source and its applicable stem; its note/event entries must not reference the vocal
+project. Lyrics excluded with a note remain source-only. Source-proven holds and
+necessary predecessors remain under the existing retention rule; this evidence
+correction does not resolve verse/melisma ownership or restore omitted notation.
+
 Any new heuristic requires explicit evidence, a deterministic tie-break
 contract, diagnostics for every unresolved case, and negative tests proving
 that unrelated content is not captured.
