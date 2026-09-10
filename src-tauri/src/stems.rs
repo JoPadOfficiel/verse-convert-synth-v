@@ -254,6 +254,7 @@ mod tests {
             note_track("pno", 1),
         ];
         let midi = Midi {
+            score_intensity: None,
             staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
@@ -311,6 +312,7 @@ mod tests {
     fn note_free_metadata_parts_are_not_fake_stems() {
         let tracks = vec![Track::new("words", 0), note_track("music", 1)];
         let midi = Midi {
+            score_intensity: None,
             staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),

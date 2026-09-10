@@ -5,6 +5,58 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [Unreleased] (2026-09-10)
+
+This section records the current incremental fidelity work. It is intentionally
+unreleased: the package version remains 0.6.3 until the remaining review items
+are resolved and accepted.
+
+### Features
+
+* **phonetics:** add source-aware French and English DiffSinger profiles,
+  contextual readings, French lexical data, liaison and silent-ending handling,
+  and safe USTX syllable-separator cleanup. Explicit source readings remain
+  authoritative; unknown words and unsupported voicebank phonemes stay visible
+  as diagnostics instead of being guessed.
+* **performance:** preserve authored MIDI/KAR pitch-bend and CC7/CC11
+  performance data with physical port/channel ownership, exact source bounds,
+  target-grid rounding, bounded sampling and explicit mapped/unsupported
+  evidence.
+* **score fidelity:** retain original note evidence, linked-staff topology,
+  source-owned lyric continuations, repeat occurrences and typed Tie versus
+  Extension provenance across projection and target routing.
+* **score intensity:** interpret source dynamics, numeric note velocities,
+  hairpins, text-line fades, niente tails, controller evidence and repeated
+  playback routes with bounded cumulative provenance accounting for both USTX
+  and SVP ledgers.
+
+### Bug Fixes
+
+* **openutau:** keep French contextual syllables and source pronunciation
+  boundaries intact while avoiding unsupported DiffSinger phoneme labels such as
+  raw English words or malformed separator fragments.
+* **conversion:** preserve original note IDs, timing, pitch, lyrics, source
+  tracks, backing parts and source bytes while moving eligible notes through
+  polyphonic and linked-staff projections.
+* **score parsing:** retain disabled, malformed, unmatched, source-only and
+  zero-width expression declarations with typed ownership and explicit
+  unresolved diagnostics; never invent a performed occurrence.
+* **ledger validation:** validate schema-3 intensity context, exact rational
+  bounds, source ownership, target placement, controller provenance and bounded
+  evidence before publication, while keeping schema-2 and schema-3 records
+  without intensity compatible.
+
+### Verification
+
+* The frozen iteration-5 candidate passed 834 Rust tests, strict Clippy,
+  formatting and whitespace checks, the frontend gates, the native OpenUtau
+  consumer suite, the private 264-case matrix, the pinned public OpenScore
+  audit and the deterministic MuseScore render.
+* The independent iteration-5 review also found additional route, provenance
+  and bundle-adoption cases. They are recorded for the next incremental pass;
+  the current implementation remains paused for review-limit handling. These
+  checks do not claim acoustic equivalence across DiffSinger voices.
+
 ## [0.6.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.2...v0.6.3) (2026-09-03)
 
 

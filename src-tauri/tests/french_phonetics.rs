@@ -256,8 +256,10 @@ fn packed_vowels_and_explicit_echoes_keep_real_holds_in_both_formats() {
                 vec!["es[fr/ae fr/s]", "pa[fr/p fr/ah]", "+~", "ace[fr/ah fr/s]"],
             ),
         ] {
-            let mut midi = sab(&words, native, false);
-            for track in &mut midi.tracks {
+            // Author native evidence in the source, so adapter-owned continuity
+            // and the selected lyric agree. MusicXML retains its legacy seam.
+            let mut midi = sab_with_extension(&words, native, false, Some(1));
+            for track in midi.tracks.iter_mut().filter(|_| !native) {
                 for (i, note) in track
                     .events
                     .iter_mut()
@@ -918,6 +920,15 @@ fn escape(text: &str) -> String {
 /// Three independent voices, all touching quarter notes. None of the source
 /// lyrics has syllabic metadata, as in the original chant arrangement.
 fn sab(words: &[&str], native: bool, repeat: bool) -> Midi {
+    sab_with_extension(words, native, repeat, None)
+}
+
+fn sab_with_extension(
+    words: &[&str],
+    native: bool,
+    repeat: bool,
+    extension: Option<usize>,
+) -> Midi {
     let mut parts = String::new();
     let mut staves = String::new();
     for (index, name) in ["Soprano", "Alto", "Bass"].iter().enumerate() {
@@ -926,7 +937,15 @@ fn sab(words: &[&str], native: bool, repeat: bool) -> Midi {
         let pitch = if index == 2 { 48 } else { 60 };
         if native {
             parts.push_str(&format!("<Part><Staff id=\"{id}\"/><trackName>{name}</trackName><Instrument><trackName>{name}</trackName></Instrument></Part>"));
-            let notes: String = words.iter().map(|word| format!("<Chord><durationType>quarter</durationType><Lyrics><text>{}</text></Lyrics><Note><pitch>{pitch}</pitch><tpc>14</tpc></Note></Chord>", escape(word))).collect();
+            let notes: String = words.iter().enumerate().map(|(i, word)| {
+                let lyrics = if extension.is_some() && word.is_empty() {
+                    String::new()
+                } else {
+                    format!("<Lyrics><text>{}</text>{}</Lyrics>", escape(word),
+                        if extension == Some(i) { "<ticks>480</ticks>" } else { "" })
+                };
+                format!("<Chord><durationType>quarter</durationType>{lyrics}<Note><pitch>{pitch}</pitch><tpc>14</tpc></Note></Chord>")
+            }).collect();
             staves.push_str(&format!("<Staff id=\"{id}\"><Measure len=\"{}/4\">{}<voice><TimeSig><sigN>{}</sigN><sigD>4</sigD></TimeSig>{notes}</voice>{}</Measure></Staff>", words.len(), if repeat { "<startRepeat/>" } else { "" }, words.len(), if repeat { "<endRepeat>2</endRepeat>" } else { "" }));
         } else {
             parts.push_str(&format!(
@@ -1549,6 +1568,7 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
             _ => None,
         };
         note.source_evidence = Some(verse_lib::engine::projection::NoteEvidence {
+            origin: None,
             note_id: format!("note:voice:source-{index}:occurrence:0:event:{}", index * 2),
             note_on_event_id: format!("event:voice:{}", index * 2),
             note_off_event_id: format!("event:voice:{}", index * 2 + 1),

@@ -197,6 +197,128 @@ and `status` (`mapped`, `unsupported` or `representationLimit`). Editable held
 spans are half-open. Source-level records have no target track or affected notes
 and identify raw events with no eligible editable ownership.
 
+EXP-003 uses the same table and schema. Its optional `intensity` object stores
+policy `verse-score-intensity-v1`, neutral curve and provenance, exact rational
+quarter-note `start`/`end`, and target sampling disposition when applicable.
+Rationals have `numerator` and positive `denominator`; signed 128-bit values
+outside the JSON signed 64-bit range are exact decimal strings. Validation checks
+ordering, the supported policy and provenance structure, nested source references,
+terminal ownership and bounded evidence size. Older schema-3 spans without this
+field remain valid.
+
+When any span contains `intensity`, the ledger also requires an independent
+`intensityContext` table. The builder reads source identities from the typed
+`Midi` inventory and eligible ownership from final projected notes and their
+original `source_evidence`; span contents never supply these ownership values.
+All table fields use camelCase:
+
+| Field | Contents |
+|---|---|
+| `sourcePpq` | Nonzero source pulses per quarter note, consistent with its timebase |
+| `sourceTracks` | Inventoried source track IDs |
+| `sourceNotes` | `noteId`, original `sourceTrackId`, `originalSourceId`, `startTick`, `sourceOccurrence`, optional `scoreOwner` and `midiChannel`, actual native MIDI `velocity`/`attackSourceId`/`explicitAttack`, and parser-proven `mergedVelocitySources` |
+| `controllers` | Inventoried CC7/CC11 `sourceId`, `sourceTrackId`, `tick`, channel `owner` (`port`, `channel`), `controller`, and `value` |
+| `projectedNotes` | `noteId`, original `sourceTrackId`, zero-based `targetTrack`, final `destinationTrackId`, source-tick `startTick`/`endTick`, and optional source-proven tie root `intensityAttackNoteId` |
+| `scoreOwners` | Original `sourceTrackId` and typed `owner` (`part`, `staff`, `voice`, optional `instrument`), including declared silent voices |
+| `declarations` | Original `sourceId`, parser `kinds`, original `scope`, exact written `at`, optional raw `noteSourceId`, symmetric original `pairedSourceIds`, and shared source-route `applications` |
+
+Each declaration application records its original typed `owner`, performed
+`occurrence`/`repeatPass`, exact quarter-note route `start`/`end`, and whether the
+declaration is `active` on that route. The builder derives these relations from
+original written-measure membership and the loader's performed route, including
+held prefix state, tempo and endpoint evidence. Transfer reports never supply
+these fields. An unresolved application uses only `0/0`, its exact original
+written point, and `active: false`.
+An endpoint at the end of its own positive written measure can use that
+measure's proved route membership; a skipped measure at the same coordinate
+cannot. Pass-filtered diagnostics may cite an inactive application, while
+mapped evidence requires an active one. Combined endpoint evidence must include
+an original paired declaration. Standalone unmatched endpoint diagnostics
+remain valid without a pair.
+
+Each affected note must belong to the stated source track and have eligible
+ownership on the stated target track. Its projected intervals must cover the
+span. A relocated continuation retains its original source track while recording
+its final destination separately. Source-only diagnostics need an inventoried
+source track but have no target or note ownership. An explicit target terminal
+must coincide with an eligible final note endpoint.
+
+Source integer bounds are exact outward coverage of the musical interval:
+`startTick = floor(start × sourcePpq)` and
+`endTick = ceil(end × sourcePpq)`. Negative, reversed or out-of-u32 bounds are
+invalid. A fractional point can therefore cover two neighboring integer bounds
+while its exact musical start and end remain equal. USTX target bounds use
+exact quarter time × 480, nearest rounding with ties away from zero, and require
+the unrounded value within the nonnegative i32 range. A mapped interval must
+remain positive after rounding; collapse is a representation limit.
+
+Score intensity requires nonempty authenticated provenance and corresponding
+contributing inventory references. Every contributor must be an independently
+inventoried expression declaration or an actual native MIDI attack field.
+Ordinary note, track and lyric entries cannot substitute for score expression.
+Each declaration's original scope must apply to the affected source owner and
+its performed occurrence/pass must agree with the independent application table.
+Combined provenance may include different applicable scopes; at least one
+original declaration must witness the reported scope. Note-owned velocity must
+belong to the original attack or an independently proven tie root; moved notes
+retain original ownership. Source-only unresolved `0/0` cannot claim target notes.
+
+Every contributing typed CC7/CC11 is checked against original MIDI port/channel
+and time, including spans with nonempty velocity provenance. A controller on a
+different physical track is valid on the same port/channel; historical held or
+recovery contributors may precede the span. An empty provenance array is allowed only for
+neutral, controller-only MIDI intensity whose inventoried contributing CC7/CC11
+events match the source notes' port/channel and precede or coincide with the
+span. Authored SVP segments require provenance; unexpressed `Absent` or
+`Held(null)` gap segments may remain neutral. Ordinary segments have positive
+duration and ordered, nonoverlapping bounds. A whole source segment may extend
+beyond the enclosing note, but it must intersect that note; transition segments
+must remain within their authored transition. Ordinary USTX mapped intervals
+likewise remain within the original authored transition, preserving clipped
+phase fragments. The separately reported niente tail retains its own bounded
+containment rule. The native oracle requires the authorized positive floor to
+equal DYN −239 within floating numeric epsilon; the 0.1 dB sample tolerance is
+reserved for unfloored representable values.
+
+The builder preflights references, text and traversal before copying the tables.
+Intensity context and evidence share a 32 MiB serialized-byte ceiling and
+250,000-reference ceiling. Validation reserves index storage before allocation
+and uses an indexed reciprocal contributor table, with a cumulative budget of
+2,000,000 work units. Serialization traversal prepays 64-byte blocks; reference
+and index operations are charged separately. Writer callback fragmentation
+does not multiply the byte-traversal charge. Ownership construction also uses the performance
+work budget. Exceeding a limit prevents validation and bundle
+publication. The table establishes relationships independently of individual
+span assertions; bundle artifact hashes detect changes against the manifest's
+recorded hashes. This is an independent source description, not a cryptographic
+signature against replacement of every source, context and manifest artifact.
+It validates structural/source relationships and does not establish acoustic
+equivalence.
+`intensityContext` is omitted when there is no new intensity. Historical schema-2
+and no-intensity schema-3 ledgers remain readable without it, with unchanged
+rational serialization and no schema-version increase.
+
+Validation sorts a borrowed expected-ID vector and reuses the disposition map
+to check source completeness and duplicates. It does not build a second tree
+of actual IDs. Ownership indexes are prepaid by their own row counts and
+storage requirements; identity-field references remain subject to the separate
+reference ceiling and are not counted as rows of one combined tree.
+
+Source-version contracts, raw fields, interpreted scope and repeat occurrence
+remain available even when a target reports an unsupported curve. Native note
+velocity uses an `expression:event:…:velocity` field reference linked to its
+original event; score fields likewise have separate expression IDs. These
+references do not change nominal NoteOn or per-note evidence ownership.
+Ordinary expression and diagnostic spans use half-open note ownership. A final
+terminal declaration is retained explicitly with `terminalEndpoint: true` and
+no preceding note IDs; an emitted endpoint without a positive sounding interval
+is limited, not a mapped span. Resolved parser diagnostics carry performed
+coordinates and repeat provenance. An unresolved performed scope instead retains
+the written coordinate and explicit unresolved evidence, with numeric occurrence
+and repeat-pass sentinels of zero; it does not assert a performed occurrence.
+Mixed mapped/limited score fields retain both structured
+references and the primary disposition's limitation summary.
+
 One event may map to one polyphonic sibling and be limited on another; its
 references preserve both outcomes without duplicating a full note list in every
 event entry. Reference indices, required schema capability and bounded evidence

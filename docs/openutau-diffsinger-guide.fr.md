@@ -66,18 +66,21 @@ en place et la seconde note reçoit sa propre lecture `fr/s fr/ee`.
 Quand un accord a été réparti entre plusieurs pistes, Verse peut retrouver
 le contexte à partir de la partie, de la portée, de la voix écrite, du verset,
 de la répétition et de l'identité des paroles. Les copies doivent appartenir
-au même accord écrit et leur succession doit être sans ambiguïté. Les notes
-et les paroles restent sur leurs pistes. Un numéro devant une parole, comme
+au même accord écrit et leur succession doit être sans ambiguïté. Ce traitement linguistique conserve les notes et les paroles sur leurs pistes.
+La réparation de tenues décrite plus bas peut, séparément, replacer une note
+dans la piste technique de son propriétaire prouvé. Un numéro devant une parole, comme
 `2.Et`, est omis dans l'indication de prononciation uniquement s'il correspond
 au verset explicite ; le texte source reste intact.
 
-La vérification [FR-004](../_bmad-output/implementation-artifacts/spec-fr-004-contextual-sung-readings.md)
+La vérification initiale [FR-004](../_bmad-output/implementation-artifacts/spec-fr-004-contextual-sung-readings.md)
 résout 480 des 482 avertissements de référence et corrige 51 lectures déjà
 appliquées mais incorrectes. Les deux `3.Et` associés au verset 1 restent
 signalés. Les 3 124 notes gardent leurs données musicales ; l'allocateur
 Millefeuille installé conserve les 3 107 attaques attendues sans symbole
 rejeté. Pour une parole contenant deux voyelles sur une note, les deux restent
 dans le même groupe phonétique et une tenue suivante reste une tenue.
+Ces nombres décrivent cet export de référence, avant les réparations de tenues
+suivies dans [FID-002](../_bmad-output/implementation-artifacts/spec-fid-002-source-sung-continuity.md).
 Cette vérification ne valide ni le minutage interne des phonèmes ni le rendu
 à l'écoute.
 
@@ -93,11 +96,38 @@ et son attaque ont été vérifiés, sans comparaison d'écoute. Cette indicatio
 permet un essai ponctuel ; elle ne justifie pas de modifier automatiquement le
 dialecte de tout le projet. Voir la [table phonétique Millefeuille](https://github.com/imsupposedto/Millefeuille-DiffSinger-French/blob/main/Millefeuille_Phonemes.md).
 
+## Tenues et syllabes sur les deux partitions françaises
+
+La comparaison des sources a confirmé trois notes à rétablir : deux dans le
+projet PB et une dans le projet chant. Les deux projets retrouvent la tenue
+finale de « Même » dans la seconde piste technique d’Alti ; le PB retrouve aussi
+la tenue après « murs ». Verse conserve les notes séparées, avec leurs hauteurs,
+durées et identités sources. Il choisit leur piste à partir de la liaison écrite
+et des paroles, sans ajouter une voix ni combler un silence.
+
+Au passage suivant, une syllabe réellement écrite sur cette note garde son
+attaque. Une note liée à la précédente par une liaison de prolongation conserve
+le contexte d’intensité de sa note de départ ; elle ne doit pas consommer un
+accent destiné à la prochaine attaque. Une prolongation de syllabe sans cette
+liaison de notes garde sa propre attaque.
+
+Cinq autres notes sans paroles du PB restent dans la source et les pistes
+d’accompagnement. La partition ne fournit pas de lien suffisant pour leur
+inventer une parole. Ces corrections de continuité sont suivies dans
+[FID-002](../_bmad-output/implementation-artifacts/spec-fid-002-source-sung-continuity.md).
+
 ## Hauteur et timbre
 
 La hauteur est portée par les notes du piano roll. B3, E4 ou E5 désignent des
 hauteurs musicales, pas un genre de voix. Déplacer toutes les notes d'une octave
 change la musique et doit rester une décision d'arrangement.
+
+Sur les deux partitions françaises examinées, la comparaison des hauteurs et
+des instants des notes avec la source ne montre pas de décalage automatique
+d'octave. Cinq courts rendus de contrôle ont aussi retrouvé les hauteurs
+attendues. Cela ne constitue pas une validation sonore de toute la chanson.
+Une voix peut sembler plus claire ou plus aiguë par son timbre même lorsque
+la note chantée est correcte.
 
 **GEN** est l'expression classique « gender ». Pour une banque DiffSinger qui
 prend en charge le décalage de timbre, OpenUtau utilise la courbe **GENC**.
@@ -116,16 +146,57 @@ Source : [OpenUtau — support DiffSinger](https://github.com/openutau/OpenUtau/
 ## Pitch, vibrato et fondus
 
 Les points de portamento par défaut d'OpenUtau ne sont pas la preuve qu'une
-partition contenait une courbe de pitch. Dans l'export Verse audité, la transition
-standard comporte deux points à −40 et +40 ms et un vibrato désactivé. OpenUtau
+partition contenait une courbe de pitch. Dans l'export Verse de référence, la transition
+standard comporte deux points à −40 et +40 ms et un vibrato désactivé.
+Ces valeurs sont un réglage fixe d'export, pas une courbe retrouvée dans la
+partition. Le début négatif place une partie de la transition avant la note ;
+son dépassement visuel du mot ne prouve donc pas une erreur d'alignement. OpenUtau
 peut ajuster le premier point pour rejoindre la note précédente.
 
 Une courbe de hauteur, un vibrato et un fondu de volume sont trois contrôles
 différents. Un silence écrit dans la partition doit rester un silence. Verse
 ne doit pas inventer un fondu ou un vibrato absent du fichier pour prétendre à
-une conversion identique. L'import complet des expressions de chaque format
-reste suivi dans [EXP-001](../_bmad-output/implementation-artifacts/spec-exp-001-expression-fidelity.md) ; le correctif
-de prononciation ne l'implémente pas.
+une conversion identique.
+
+Le transfert [EXP-002](../_bmad-output/implementation-artifacts/spec-exp-002-midi-performance-curves.md)
+conserve maintenant les variations explicites de pitch bend et les contrôleurs
+MIDI/KAR de volume et d'expression dans les courbes **PITD** et **DYN** d'OpenUtau.
+Il tient compte du port, du canal et de la sensibilité de pitch bend déclarée.
+Les notes gardent leurs hauteurs et durées ; les passages gouvernés par une
+courbe de pitch reçoivent une base plate pour ne pas ajouter le portamento
+standard. Les autres gardent le réglage d'export décrit plus haut.
+
+La grille et la plage d'OpenUtau imposent des limites : certaines variations
+très brèves ou hors plage sont signalées comme non transférées fidèlement.
+Les données d'origine restent conservées. La validation couvre le chargement
+et l'échantillonnage par le consommateur OpenUtau installé ; elle ne démontre
+pas un rendu acoustique identique avec toutes les voix. Le transfert de ces
+expressions vers SVP n'est pas encore actif.
+
+Le volume global d'une piste et les nuances à l'intérieur du morceau restent
+deux réglages distincts. Monter toute la piste ne recrée pas un crescendo perdu.
+L'import des autres expressions demeure suivi dans
+[EXP-001](../_bmad-output/implementation-artifacts/spec-exp-001-expression-fidelity.md).
+
+L'inventaire des 22 partitions distinctes du corpus local a retrouvé des
+nuances et des vélocités explicites, mais pas de courbes de bend, de vibrato
+ni de soufflets dans les corps de partition examinés. Il faut distinguer
+ces données écrites des valeurs générales du style ou de l'instrument.
+Leur absence dans ce corpus ne signifie pas que les formats ne peuvent pas
+les contenir. Verse transfère maintenant les nuances et soufflets pris en charge dans
+la courbe DYN d’OpenUtau, selon [EXP-003](../_bmad-output/implementation-artifacts/spec-exp-003-numeric-score-performance.md).
+Sa règle d'interprétation est explicite : `mf` sert de référence, `p` vaut
+−7,75 dB et `f` +4 dB. Les valeurs numériques écrites dans la source prennent
+la priorité prévue sur les symboles ; une vélocité de note et une nuance ne
+doivent pas compter deux fois la même intensité.
+
+Un crescendo ou un diminuendo écrit fournit une durée de transition. Une
+indication de disparition au silence permet un fondu vers zéro ; un simple
+diminuendo ne signifie pas automatiquement « couper le son ». Ces règles
+interprètent la partition et ne garantissent pas la même sensation de volume
+entre une banque DiffSinger et l'instrument utilisé dans MuseScore. Dans
+OpenUtau, la courbe **DYN** permet d'examiner et de retoucher ce résultat ; le
+fader de piste reste disponible pour régler l'équilibre avec l'accompagnement.
 
 Conserver un projet retouché dans OpenUtau sous un nom distinct. Une nouvelle
 conversion du fichier source ne réimporte pas automatiquement ces retouches.

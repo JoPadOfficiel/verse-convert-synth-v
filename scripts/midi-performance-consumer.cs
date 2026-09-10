@@ -8,6 +8,14 @@ using OpenUtau.Core.Ustx;
 using OpenUtau.Core.Util;
 using OpenUtau.Core.Render;
 class Program {
+const int MaxScoreSamples=2_000_001;
+const int MaxFixtureBytes=32*1024*1024;
+static string ReadFixtureText(string path) {
+    using var stream=File.OpenRead(path);
+    if(stream.Length>MaxFixtureBytes)throw new Exception("Native fixture exceeds bounded storage");
+    using var reader=new StreamReader(stream);
+    return reader.ReadToEnd();
+}
 static void Main(string[] args) {
     var app=Environment.GetEnvironmentVariable("VERSE_OPENUTAU_APP_DIR") ?? "/Applications/OpenUtau.app/Contents/MacOS";
     AssemblyLoadContext.Default.Resolving+=(ctx,name)=>{var p=Path.Combine(app,name.Name+".dll");return File.Exists(p)?ctx.LoadFromAssemblyPath(p):null;};
@@ -24,13 +32,17 @@ static void Run(string[] args) {
     Console.WriteLine("CONSUMER "+version);
     if(version==null || !version.Contains("3f213e8993ca792c3e6f8958c92ab27eae78eac5"))throw new Exception("Wrong consumer revision");
     var expectedNames=new[]{"pitch","gain","pulse","tempo-rest","default"};
-    if(!args.Select(Path.GetFileNameWithoutExtension).Order().SequenceEqual(expectedNames.Order()))throw new Exception("Expected exactly five named fixtures");
+    if(!args.Select(Path.GetFileNameWithoutExtension).Where(n=>!n.StartsWith("score-")).Order().SequenceEqual(expectedNames.Order()))throw new Exception("Expected exactly five named fixtures");
     foreach(var path in args) {
         var fixtureName=Path.GetFileNameWithoutExtension(path);
-        var project=Yaml.DefaultDeserializer.Deserialize<UProject>(File.ReadAllText(path));
+        bool scoreFixture=fixtureName.StartsWith("score-");
+        using var scoreOracle=scoreFixture?JsonDocument.Parse(ReadFixtureText(Path.ChangeExtension(path,".expected.json"))):null;
+        var project=Yaml.DefaultDeserializer.Deserialize<UProject>(ReadFixtureText(path));
         var expectedNotes=fixtureName=="pitch" || fixtureName=="tempo-rest"?2:1;
-        var expectedCurves=fixtureName=="default"?Array.Empty<string>():new[]{fixtureName=="gain"?"dyn":"pitd"};
+        var expectedCurves=fixtureName=="default" || fixtureName=="gain"?new[]{"dyn"}:new[]{"dyn","pitd"};
+        if(scoreFixture) { expectedNotes=scoreOracle.RootElement.GetProperty("noteCount").GetInt32();expectedCurves=new[]{"dyn"}; }
         if(project.tracks.Count!=1 || project.voiceParts.Count!=1 || project.voiceParts[0].notes.Count!=expectedNotes)throw new Exception("Fixture part/note counts changed: "+fixtureName);
+        var oracle=scoreFixture?ReadScoreOracle(scoreOracle.RootElement,project,project.voiceParts[0]):null;
         if(!project.voiceParts[0].curves.Select(c=>c.abbr).Order().SequenceEqual(expectedCurves.Order()))throw new Exception("Missing/unexpected curves: "+fixtureName);
         if(project.voiceParts[0].curves.Any(c=>c.xs.Count==0 || c.xs.Count!=c.ys.Count))throw new Exception("Empty or unpaired required curve: "+fixtureName);
         // Exercise the real load, migration and full synchronous validation
@@ -66,6 +78,28 @@ static void Run(string[] args) {
             var name=Path.GetFileNameWithoutExtension(path);
             var pitch=part.curves.FirstOrDefault(c=>c.abbr=="pitd");
             var gain=part.curves.FirstOrDefault(c=>c.abbr=="dyn");
+            if(scoreFixture) {
+                var expected=oracle.Gains;
+                var method=typeof(RenderPhrase).GetMethod("SampleCurve",BindingFlags.NonPublic|BindingFlags.Static,null,new[]{typeof(UCurve),typeof(int),typeof(int),typeof(Func<float,UCurve,float>)},null);
+                Func<float,UCurve,float> convert=(x,c)=>x==c.descriptor.min?0:(float)MusicMath.DecibelToLinear(x*0.1);
+                for(int i=0;i<expected.Length;i++) {
+                    int tick=oracle.Start+i;
+                    var value=gain.Sample(tick);
+                    var actual=value==gain.descriptor.min?0:MusicMath.DecibelToLinear(value*0.1);
+                    CheckScoreGain(expected[i],actual,tick,oracle.AllowsFloor(tick));
+                }
+                for(int origin=0;origin<5;origin++) {
+                    if(origin>=expected.Length)continue;
+                    int count=(expected.Length-1-origin)/5+1;
+                    var samples=(float[])method.Invoke(null,new object[]{gain,oracle.Start+origin,count,convert});
+                    if(samples.Length!=count)throw new Exception("Native score sample count mismatch");
+                    for(int i=0;i<samples.Length;i++) {
+                        int tick=oracle.Start+origin+5*i;
+                        CheckScoreGain(expected[origin+5*i],samples[i],tick,oracle.AllowsFloor(tick));
+                    }
+                }
+                Console.WriteLine("SCORE_GAIN "+name+" exact endpoints/all integer values/native SampleCurve phases=0..4 verified");
+            }
             if(name=="pitch") {
                 for(int tick=0;tick<=960;tick++) {
                     var expected=tick<240?0:tick<480?100:tick<720?-200:0;
@@ -118,10 +152,75 @@ static void Run(string[] args) {
                 if(pitch.Sample(1439)!=625 || pitch.Sample(1920)!=625)throw new Exception("Held state lost across rest/end");
             }
             if(name=="default") {
-                if(!notes[0].pitch.snapFirst || notes[0].pitch.data[0].X!=-40 || notes[0].pitch.data[1].X!=40 || part.curves.Count!=0)throw new Exception("Default changed");
+                if(!notes[0].pitch.snapFirst || notes[0].pitch.data[0].X!=-40 || notes[0].pitch.data[1].X!=40 || part.curves.Any(c=>c.abbr!="dyn") || part.curves.Single(c=>c.abbr=="dyn").ys.Any(v=>v!=0))throw new Exception("Default changed");
             }
             Console.WriteLine(JsonSerializer.Serialize(new{file=name,notes=notes.Length,curves=part.curves.Select(c=>c.abbr).ToArray(),validated=true}));
         }
     }
+}
+sealed record FadeInterval(int Start,int End);
+sealed record ScoreOracle(int Start,double[] Gains,FadeInterval[] Fades) {
+    public bool AllowsFloor(int tick) {
+        int lo=0,hi=Fades.Length;
+        while(lo<hi) { int mid=lo+(hi-lo)/2;if(Fades[mid].Start<tick)lo=mid+1;else hi=mid; }
+        return lo>0 && tick<Fades[lo-1].End;
+    }
+}
+static ScoreOracle ReadScoreOracle(JsonElement root,UProject project,UVoicePart part) {
+    const string domainError="Score oracle domain mismatch";
+    if(root.GetProperty("schema").GetInt32()!=1 || root.GetProperty("ticksPerQuarter").GetInt32()!=480 ||
+       project.resolution!=480 || part.position!=0 || root.GetProperty("tickStep").GetInt32()!=1)
+        throw new Exception(domainError);
+    int start=root.GetProperty("startTick").GetInt32(),end=root.GetProperty("endTick").GetInt32();
+    if(start<0 || end<=start || start!=part.notes.Min(n=>n.position) || end!=part.notes.Max(n=>n.End))
+        throw new Exception(domainError);
+    var values=root.GetProperty("gains");
+    if(values.GetArrayLength()!=(long)end-start+1 || values.GetArrayLength()>MaxScoreSamples)
+        throw new Exception("Score oracle must cover every tick through final endpoint within bounded storage");
+    var gains=values.EnumerateArray().Select(x=>x.GetDouble()).ToArray();
+    if(gains.Any(g=>!double.IsFinite(g)||g<0))throw new Exception("Score oracle invalid gain");
+    var fades=new List<FadeInterval>();
+    var fadeValues=root.GetProperty("nienteFadeIntervals");
+    if(fadeValues.GetArrayLength()>gains.Length)throw new Exception("Score oracle invalid niente interval");
+    foreach(var fade in fadeValues.EnumerateArray()) {
+        int a=fade.GetProperty("startTick").GetInt32(),b=fade.GetProperty("endTick").GetInt32();
+        string direction=fade.GetProperty("direction").GetString();
+        if(a<start || b>end || b<=a ||
+           (direction!="in" && direction!="out"))throw new Exception("Score oracle invalid niente interval");
+        double from=gains[a-start],to=gains[b-start];
+        if(direction=="out" ? from<=0 || to!=0 : from!=0 || to<=0)
+            throw new Exception("Score oracle invalid niente endpoint");
+        fades.Add(new FadeInterval(a,b));
+    }
+    fades.Sort((left,right)=>left.Start.CompareTo(right.Start));
+    for(int i=1;i<fades.Count;i++)if(fades[i].Start<fades[i-1].End)
+        throw new Exception("Score oracle invalid niente interval");
+    // After proving nonoverlap, total interior work is bounded by the domain.
+    foreach(var fade in fades)
+        for(int tick=fade.Start+1;tick<fade.End;tick++)if(gains[tick-start]<=0)
+            throw new Exception("Score oracle invalid niente interior");
+    var oracle=new ScoreOracle(start,gains,fades.ToArray());
+    for(int i=0;i<gains.Length;i++)if(gains[i]>0 && NeedsFloor(gains[i]) && !oracle.AllowsFloor(start+i))
+        throw new Exception("Score gain floor outside authored niente interval");
+    return oracle;
+}
+static bool NeedsFloor(double gain)=>Math.Round(20*Math.Log10(gain)*10,MidpointRounding.AwayFromZero)<=-240;
+static void CheckScoreGain(double expected,double actual,int tick,bool allowFloor) {
+    if(!double.IsFinite(expected)||expected<0 || !double.IsFinite(actual)||actual<0)
+        throw new Exception("Score nonfinite/invalid sampled gain at "+tick);
+    if(expected==0) {if(actual!=0)throw new Exception("Score mute endpoint mismatch at "+tick);return;}
+    if(actual<=0)throw new Exception("Positive score gain became mute at "+tick);
+    // The oracle contains the intended gain. Only the authorized niente tail
+    // may use the smallest positive DYN value, never the exact-mute sentinel.
+    double expectedDb=20*Math.Log10(expected);
+    if(NeedsFloor(expected)) {
+        if(!allowFloor)throw new Exception("Score gain floor outside authored niente interval");
+        // The floor is one exact target value, DYN -239. Allow only the
+        // floating-point error of native float gain conversion (not 0.1 dB).
+        if(Math.Abs(20*Math.Log10(actual)+23.9)>0.00001)
+            throw new Exception("Score authorized floor must equal DYN -239 at "+tick);
+        return;
+    }
+    if(Math.Abs(20*Math.Log10(actual)-expectedDb)>0.10001)throw new Exception("Score sampled-value error exceeds 0.1dB at "+tick);
 }
 }

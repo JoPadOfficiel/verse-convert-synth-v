@@ -35,6 +35,8 @@ pub struct Midi {
     pub topology: SourceTopology,
     /// Source-level interpretation metadata, never a timed musical event or lane.
     pub staff_links: Vec<StaffLink>,
+    /// Exact written expression and playback occurrences; never synthetic MIDI events.
+    pub score_intensity: Option<super::score_intensity::source::ScoreInput>,
     pub tracks: Vec<Track>,
 }
 
@@ -491,6 +493,15 @@ pub fn merge_measure_marks(
 /// cannot represent is an explicit error; a partial playback order is never
 /// returned.
 pub fn unroll(marks: &[MeasureMarks]) -> Result<Vec<(usize, u32)>, String> {
+    Ok(unroll_with_passes(marks)?
+        .into_iter()
+        .map(|(measure, occurrence, _)| (measure, occurrence))
+        .collect())
+}
+
+/// Existing zero-based per-measure identity plus the actual one-based repeat
+/// pass. A first visit to a second ending is still repeat pass two.
+pub fn unroll_with_passes(marks: &[MeasureMarks]) -> Result<Vec<(usize, u32, u32)>, String> {
     const MAX_UNROLLED_MEASURES: usize = 1_000_000;
     const MAX_UNROLL_STEPS: usize = MAX_UNROLLED_MEASURES * 8 + 16;
 
@@ -592,7 +603,7 @@ pub fn unroll(marks: &[MeasureMarks]) -> Result<Vec<(usize, u32)>, String> {
             }
         }
     }
-    let mut order: Vec<(usize, u32)> =
+    let mut order: Vec<(usize, u32, u32)> =
         Vec::with_capacity(n.saturating_mul(2).min(MAX_UNROLLED_MEASURES));
     let mut emitted = vec![0u32; n];
     let mut jumps_left: Vec<u32> = marks
@@ -635,7 +646,7 @@ pub fn unroll(marks: &[MeasureMarks]) -> Result<Vec<(usize, u32)>, String> {
                      {MAX_UNROLLED_MEASURES} measures"
                 ));
             }
-            order.push((i, emitted[i]));
+            order.push((i, emitted[i], region_pass));
             emitted[i] = emitted[i]
                 .checked_add(1)
                 .ok_or_else(|| format!("measure {i} playback count overflowed"))?;
@@ -811,6 +822,76 @@ pub struct NoteSource {
     pub measure: Option<u32>,
     pub grace: bool,
     pub unpitched: Option<UnpitchedInfo>,
+    /// Adapter-validated continuity, independent of target lanes and performance.
+    /// Absent for adapters that have not established equivalent source evidence.
+    pub continuity: Option<std::sync::Arc<SourceContinuity>>,
+}
+
+/// A reference into the decoded source XML, retaining the exact element bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceEvidenceRef {
+    pub source_format: SourceFormat,
+    pub source_version: Option<std::sync::Arc<str>>,
+    pub program_version: Option<std::sync::Arc<str>>,
+    pub source_id: String,
+    pub raw_xml: std::sync::Arc<str>,
+}
+
+/// Original notation identity qualified by its playback occurrence and segment.
+/// The projector resolves this to its original note-instance evidence, never to
+/// a destination lane or a nearby note with matching geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceNoteRef {
+    pub source_id: String,
+    pub occurrence: u32,
+    pub playback_segment: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceExtension {
+    pub lyric_id: String,
+    pub lane: String,
+    pub chord_id: String,
+    pub occurrence: u32,
+    pub playback_segment: u32,
+    pub start_tick: u32,
+    /// Inclusive onset of the last covered chord, not the end of its sound.
+    /// None means the bounds are invalid or contradictory and authorize nothing.
+    pub end_tick: Option<u32>,
+    /// Exact IR-scaled value; the original numeric fraction remains independent.
+    pub extend_ticks: Option<i64>,
+    pub extend_fraction: Option<(i64, i64)>,
+    /// Original Division units, including MuseScore's temporary ticks=1 sentinel.
+    pub raw_ticks: Option<i64>,
+    pub evidence: SourceEvidenceRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceTie {
+    pub head: SourceNoteRef,
+    pub tail: SourceNoteRef,
+    pub contact_tick: u32,
+    pub pitch: u8,
+    /// Original head and tail XML containing the source link declarations.
+    pub evidence: Vec<SourceEvidenceRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceContinuityIssue {
+    pub code: &'static str,
+    pub message: String,
+    pub evidence: SourceEvidenceRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceContinuity {
+    pub evidence: SourceEvidenceRef,
+    /// Present for every note, including lyric-free and already merged tie tails.
+    pub chord_id: String,
+    pub playback_segment: u32,
+    pub extensions: Vec<SourceExtension>,
+    pub incoming_tie: Option<SourceTie>,
+    pub issues: Vec<SourceContinuityIssue>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1334,6 +1415,7 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
     };
     let topology = SourceTopology::from_tracks(&tracks);
     Ok(Midi {
+        score_intensity: None,
         staff_links: Vec::new(),
         ticks_per_beat,
         time_base,

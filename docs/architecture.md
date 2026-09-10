@@ -46,7 +46,8 @@ files, build manifests, launch processes, or commit output.
 | Orchestration | `src-tauri/src/lib.rs` | Input validation, snapshot read, parse/project/export workflow |
 | Shared musical model | `engine/midi.rs` | Events, source evidence, topology, timing, repeats/navigation |
 | Projection policy | `engine/convert.rs` | Classification, lyric ownership, vocal projection, diagnostics |
-| MIDI performance | `engine/performance.rs` | Source-owned port/channel timelines in cents and linear gain; original event/note IDs and held interpolation |
+| Performance ownership | `engine/performance.rs` | Typed MIDI port/channel or score voice ownership; shared timelines and note intensity retain original source IDs |
+| Score intensity | `engine/score_intensity.rs`, `engine/score_intensity/source.rs` | Actual loaders supply written timing; scoped levels, transitions and occurrence evaluation use `verse-score-intensity-v1`; USTX owns gain sampling |
 | Input adapters | `engine/midi.rs`, `musicxml.rs`, `musescore.rs` | Format-specific parsing into the shared model |
 | Projection seam | `engine/projection.rs` | Target-neutral projection in source-exact IR ticks |
 | Word reassembly | `engine/syllable.rs` | One word per run of syllables, target-neutral |
@@ -90,6 +91,16 @@ oversized files, detects the correct parser, constructs stable topology,
 classifies tracks, projects eligible vocal notes, asks the selected target
 whether it can represent the result, and returns a `FileResult`. No MuseScore
 process is required.
+
+MuseScore continuity evidence retains each original XML element once in an
+immutable shared allocation. Playback occurrences and projected note origins
+share it; their distinct occurrence and source identities remain explicit.
+A cumulative 128 MiB evidence budget checks new payloads and retained metadata
+before allocation. Continuity records also remain shared through extraction and
+projection, so repeated verses do not multiply their XML or extension arrays.
+Score performance uses a separate cumulative provenance budget across source
+normalization, proven tie inheritance and selected lyric groups. Target reporting
+checks borrowed evidence before constructing its persisted JSON representation.
 
 The exactness gate belongs to analysis, not to export: a refusal the user only
 discovered at export would be a refusal the convertibility report had already

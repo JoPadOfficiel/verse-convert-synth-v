@@ -251,7 +251,10 @@ const GOLDEN_USTX: &str = concat!(
     "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
     "        phoneme_expressions: []\n",
     "        phoneme_overrides: []\n",
-    "    curves: []\n",
+    "    curves:\n",
+    "      - abbr: \"dyn\"\n",
+    "        xs: [0, 720]\n",
+    "        ys: [50, 50]\n",
     "  - name: \"Track 1\"\n",
     "    track_no: 1\n",
     "    position: 0\n",
@@ -264,7 +267,10 @@ const GOLDEN_USTX: &str = concat!(
     "        vibrato: {length: 0, period: 175, depth: 25, in: 10, out: 10, shift: 0, drift: 0}\n",
     "        phoneme_expressions: []\n",
     "        phoneme_overrides: []\n",
-    "    curves: []\n",
+    "    curves:\n",
+    "      - abbr: \"dyn\"\n",
+    "        xs: [0, 960]\n",
+    "        ys: [0, 0]\n",
     "wave_parts: []\n",
 );
 
