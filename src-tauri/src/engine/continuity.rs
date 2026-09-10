@@ -4,7 +4,7 @@
 use super::{report_warning, DiagnosticSeverity, SourceNote, TrackReport};
 use crate::engine::midi::{LyricState, NoteSource, SourceExtension, SourceNoteRef};
 use crate::engine::projection::{
-    ContinuationOwner, NoteOrigin, ProjectedLyric, ProjectedNote, ProjectedTrack,
+    ContinuationOwner, MergedTieSource, NoteOrigin, ProjectedLyric, ProjectedNote, ProjectedTrack,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -237,6 +237,28 @@ fn retained_tie_head(
     accepts: impl Fn(usize) -> bool,
     budget: &Budget,
 ) -> Option<usize> {
+    visit_retained_tie_head(
+        reference,
+        scope,
+        projected,
+        sources,
+        accepts,
+        |_| Ok(()),
+        budget,
+    )
+}
+
+/// The selected continuation captures exactly the raw links walked by the same
+/// ownership lookup. Other discovery queries neither copy nor retain them.
+fn visit_retained_tie_head(
+    reference: &SourceNoteRef,
+    scope: &Domain,
+    projected: &BTreeMap<RefKey, Vec<usize>>,
+    sources: &BTreeMap<RefKey, Vec<&SourceNote>>,
+    accepts: impl Fn(usize) -> bool,
+    mut visit: impl FnMut(&SourceNote) -> Result<(), String>,
+    budget: &Budget,
+) -> Option<usize> {
     let mut reference = reference;
     let mut visited = BTreeSet::new();
     loop {
@@ -283,8 +305,51 @@ fn retained_tie_head(
         if &tie.tail != reference || tie.contact_tick != source.onset {
             return None;
         }
+        if visit(source).is_err() {
+            return None;
+        }
         reference = &tie.head;
     }
+}
+
+fn push_merged_tie_source(
+    collected: &mut Vec<MergedTieSource>,
+    note: &SourceNote,
+    budget: &Budget,
+) -> Result<(), String> {
+    let source = &note.source;
+    let mut bytes = source.id.len();
+    for field in [
+        &source.part_id,
+        &source.staff_id,
+        &source.voice,
+        &source.chord_id,
+        &source.instrument_id,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bytes = bytes.saturating_add(field.len());
+    }
+    if let Some(unpitched) = &source.unpitched {
+        for field in [&unpitched.instrument_id, &unpitched.display_step]
+            .into_iter()
+            .flatten()
+        {
+            bytes = bytes.saturating_add(field.len());
+        }
+    }
+    // Source continuity/XML is Arc-backed and stays shared. Four record slots
+    // per entry conservatively cover the Vec's initial and amortized growth.
+    bytes = bytes.saturating_add(std::mem::size_of::<MergedTieSource>().saturating_mul(4));
+    budget.reserve(bytes)?;
+    budget.charge(bytes / 8 + 1)?;
+    collected.push(MergedTieSource {
+        source: source.clone(),
+        onset_ticks: note.onset,
+        duration_ticks: note.duration,
+    });
+    Ok(())
 }
 
 fn diagnose(
@@ -1468,6 +1533,32 @@ pub(super) fn resolve_bounded(
             } else {
                 None
             };
+            let merged_tie_sources = if tie_head == Some(head_index) {
+                let mut collected = Vec::new();
+                let resolved = visit_retained_tie_head(
+                    &incoming.unwrap().head,
+                    &scope,
+                    &projected_refs,
+                    &source_refs,
+                    |head| {
+                        source_row(&atoms[head], &rows).is_none_or(|row| {
+                            accepts_row(&pending[atoms[tail_index].original_lane].1, row)
+                        })
+                    },
+                    |source| push_merged_tie_source(&mut collected, source, budget),
+                    budget,
+                );
+                // A poisoned shared budget is a refusal, never missing proof.
+                budget.charge(0)?;
+                if resolved != Some(head_index) {
+                    return Err(format!(
+                        "{LINK_INVALID}: selected tie no longer reaches its retained predecessor"
+                    ));
+                }
+                collected
+            } else {
+                Vec::new()
+            };
             let link = ContinuationOwner {
                 kind: if tie_head == Some(head_index) {
                     crate::engine::projection::ContinuationKind::Tie
@@ -1475,6 +1566,7 @@ pub(super) fn resolve_bounded(
                     crate::engine::projection::ContinuationKind::Extension
                 },
                 intensity_attack_note_id,
+                merged_tie_sources,
                 predecessor_id: atoms[head_index].id().to_string(),
                 lyric_owner_id,
                 destination_track_id: pending[destination].2.source_track_id.clone(),

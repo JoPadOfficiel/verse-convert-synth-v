@@ -6,6 +6,24 @@ created: 2026-09-09
 
 # Prononciation et réglages DiffSinger dans OpenUtau
 
+## Activer les corrections dans Verse avant l'export
+
+Dans l'écran principal, sélectionner **French Millefeuille** dans
+**Pronunciation**, puis exporter à nouveau depuis la partition source. Le choix
+est conservé au redémarrage de Verse, après acceptation de la nouvelle analyse.
+Le profil **Default — no pronunciation fixes** ne génère aucune indication
+phonétique française. Choisir ensuite **DIFFS FR MILLE** ou une voix française
+dans OpenUtau ne réapplique pas les corrections de Verse à cet ancien fichier.
+
+Un export corrigé contient par exemple `rêves[fr/r fr/ae fr/v]` : le `s` écrit
+reste dans le mot, mais aucun phonème `fr/s` n'est ajouté. Un découpage chanté
+comme `rê / ê / ves` conserve ses attaques et son « e » final chanté, avec des
+indications distinctes. Les consonnes réellement prononcées de `trace`,
+`espace` ou `laisse` restent présentes. La partition originale n'est pas modifiée.
+
+Réexporter dans un nouveau fichier pour conserver les retouches déjà faites
+dans OpenUtau. L'ancien projet ne se met pas à jour quand Verse est mis à jour.
+
 ## Choisir un phonémiseur compatible
 
 Un phonémiseur traduit les paroles vers les symboles attendus par une banque.

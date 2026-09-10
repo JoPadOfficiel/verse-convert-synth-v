@@ -9,6 +9,7 @@ pub struct ScoreInput {
     pub overrides: BTreeMap<String, VelocityEvidence>,
     pub runs: BTreeMap<(String, String), Vec<Occurrence>>,
     route_keys: BTreeMap<String, BTreeMap<String, (String, String)>>,
+    route_breaks: BTreeMap<(String, String), BTreeSet<u32>>,
     /// Legacy diagnostic coordinates only. Exact written measure membership
     /// below determines ambiguity; coordinate equality never does.
     pub declaration_points: BTreeMap<(String, String), Vec<DeclarationPoint>>,
@@ -24,6 +25,7 @@ pub struct ScoreInput {
     pub ties: BTreeMap<(String, u32, u32), String>,
     wedges: Vec<Wedge>,
     spanners: Vec<PendingSpanner>,
+    typed_ends: Vec<TypedEndpoint>,
     legacy_ends: BTreeMap<String, Vec<(Time, u32, Evidence)>>,
     pub issues: Vec<Issue>,
     pub issue_passes: BTreeMap<String, Vec<u32>>,
@@ -102,6 +104,16 @@ struct PendingSpanner {
     measure: usize,
     start: Time,
     delta: Option<(i64, Time)>,
+    kind: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TypedEndpoint {
+    event: ScoreEvent,
+    owner: ScoreVoice,
+    measure: usize,
+    delta: Option<(i64, Time)>,
+    kind: String,
 }
 
 pub fn child<'a>(node: Node<'a, '_>, tag: &str) -> Option<Node<'a, 'a>> {
@@ -110,8 +122,131 @@ pub fn child<'a>(node: Node<'a, '_>, tag: &str) -> Option<Node<'a, 'a>> {
 pub fn text<'a>(node: Node<'a, '_>, tag: &str) -> Option<&'a str> {
     child(node, tag).and_then(|n| n.text()).map(str::trim)
 }
-fn decimal(node: Node, tag: &str) -> Result<Option<Fraction>> {
-    text(node, tag).map(Fraction::decimal).transpose()
+// Intensity decoding must agree on every supported occurrence. Keep the public
+// first-child helpers unchanged: nominal loaders own their timing/geometry.
+fn agree_value<T: PartialEq>(value: &mut Option<T>, next: T, tag: &str) -> Result<()> {
+    if value.as_ref().is_some_and(|value| value != &next) {
+        return Err(format!("Conflicting repeated {tag} fields"));
+    }
+    if value.is_none() {
+        *value = Some(next);
+    }
+    Ok(())
+}
+
+fn agreed_children<T: PartialEq>(
+    node: Node,
+    tag: &str,
+    budget: &mut ProvenanceBudget,
+    mut decode: impl FnMut(Node, &mut ProvenanceBudget) -> Result<T>,
+) -> Result<Option<T>> {
+    budget.charge(0, node.range().len().saturating_add(1))?;
+    let mut value = None;
+    for field in node.children().filter(|n| n.has_tag_name(tag)) {
+        agree_value(&mut value, decode(field, budget)?, tag)?;
+    }
+    Ok(value)
+}
+
+fn scalar<T: PartialEq>(
+    node: Node,
+    tag: &str,
+    budget: &mut ProvenanceBudget,
+    mut decode: impl FnMut(&str) -> Result<T>,
+) -> Result<Option<T>> {
+    agreed_children(node, tag, budget, |field, _| {
+        decode(field.text().unwrap_or("").trim())
+    })
+}
+
+fn scalar_text(node: Node, tag: &str, budget: &mut ProvenanceBudget) -> Result<Option<String>> {
+    agreed_children(node, tag, budget, |field, budget| {
+        budget.charge(field.range().len(), 1)?;
+        Ok(field.text().unwrap_or("").trim().to_owned())
+    })
+}
+
+fn scalar_bool(node: Node, tag: &str, budget: &mut ProvenanceBudget) -> Result<Option<bool>> {
+    scalar(node, tag, budget, |value| {
+        bool_field(Some(value)).map(|value| value.unwrap())
+    })
+}
+
+fn decimal(node: Node, tag: &str, budget: &mut ProvenanceBudget) -> Result<Option<Fraction>> {
+    scalar(node, tag, budget, Fraction::decimal)
+}
+
+fn integer(node: Node, tag: &str, budget: &mut ProvenanceBudget) -> Result<Option<i64>> {
+    scalar(node, tag, budget, |value| {
+        value
+            .parse()
+            .map_err(|_| format!("Invalid {tag} displacement"))
+    })
+}
+
+fn rich_text(node: Node, tag: &str, budget: &mut ProvenanceBudget) -> Result<Option<String>> {
+    agreed_children(node, tag, budget, |field, budget| {
+        budget.charge(field.range().len(), field.range().len())?;
+        Ok(field
+            .descendants()
+            .filter(|n| n.is_text())
+            .filter_map(|n| n.text())
+            .collect())
+    })
+}
+
+fn sound_attribute<T: PartialEq>(
+    node: Node,
+    attribute: &str,
+    budget: &mut ProvenanceBudget,
+    mut decode: impl FnMut(&str) -> Result<T>,
+) -> Result<Option<T>> {
+    budget.charge(0, node.range().len().saturating_add(1))?;
+    let mut value = None;
+    for sound in node
+        .children()
+        .chain(std::iter::once(node))
+        .filter(|n| n.has_tag_name("sound"))
+    {
+        if let Some(raw) = sound.attribute(attribute) {
+            agree_value(&mut value, decode(raw)?, attribute)?;
+        }
+    }
+    Ok(value)
+}
+
+fn spanner_delta(
+    node: Node,
+    direction: &str,
+    stretch: (i64, i64),
+    budget: &mut ProvenanceBudget,
+) -> Result<Option<(i64, Time)>> {
+    agreed_children(node, direction, budget, |next, budget| {
+        agreed_children(next, "location", budget, |loc, budget| {
+            let measures = integer(loc, "measures", budget)?.unwrap_or(0);
+            let staves = integer(loc, "staves", budget)?.unwrap_or(0);
+            let voices = integer(loc, "voices", budget)?.unwrap_or(0);
+            let fractions = scalar(loc, "fractions", budget, |value| {
+                let (n, d) = value.split_once('/').ok_or("Invalid spanner fraction")?;
+                Fraction::new(
+                    n.parse().map_err(|_| "Invalid spanner numerator")?,
+                    d.parse().map_err(|_| "Invalid spanner denominator")?,
+                )
+            })?
+            .unwrap_or(Time::ZERO);
+            Ok((measures, fractions, staves, voices))
+        })
+    })?
+    .flatten()
+    .map(|(measures, fractions, _, _)| {
+        Ok((
+            measures,
+            fractions
+                .checked_mul(Fraction::integer(4))?
+                .checked_mul(Fraction::new(stretch.0, stretch.1)?)?,
+        ))
+    })
+    .transpose()
 }
 pub fn time(tick: i64, ppq: u16) -> Result<Time> {
     Fraction::new(tick, i64::from(ppq))
@@ -174,6 +309,209 @@ fn route_point_pass(runs: &[Occurrence], index: usize, at: Time, terminal: bool)
         }
     }
     None
+}
+
+/// Reuse the numbered/same-scope pairing rules on each proven forward route.
+/// Pass labels belong to individual declarations, not to the whole route.
+fn pair_performed_wedges(
+    input: &ScoreInput,
+    wedges: &[Wedge],
+    budget: &mut ProvenanceBudget,
+) -> Result<(Vec<ScoreEvent>, Vec<Issue>)> {
+    budget.charge(
+        wedges.len().saturating_mul(128),
+        wedges.len().saturating_mul(16),
+    )?;
+    let mut scopes: BTreeMap<&Scope, Vec<&Wedge>> = BTreeMap::new();
+    let mut synthetic = Vec::new();
+    for wedge in wedges {
+        if input
+            .original_declarations
+            .get(&wedge.event.evidence.source_ids[0])
+            .is_none_or(|d| d.written_measure.is_none())
+        {
+            budget.event(&wedge.event)?;
+            synthetic.push(wedge.clone());
+        } else {
+            scopes.entry(&wedge.event.scope).or_default().push(wedge);
+        }
+    }
+    let run_count = input.runs.values().map(Vec::len).sum::<usize>();
+    budget.charge(run_count.saturating_mul(4), run_count)?;
+    let passes: Vec<_> = input.runs.values().flatten().map(|r| r.pass).collect();
+    let (mut events, mut issues) = pair_wedges_bounded(&synthetic, &passes, None, budget)?;
+    let mut emitted = BTreeMap::<Vec<String>, Vec<usize>>::new();
+    for (scope, candidates) in scopes {
+        budget.charge(0, input.runs.len())?;
+        for (route_key, runs) in &input.runs {
+            let (part, staff) = route_key;
+            let breaks = input.route_breaks.get(route_key);
+            let voice = match scope {
+                Scope::Part(p) if p == part => "1",
+                Scope::Staff { part: p, staff: s } if p == part && s == staff => "1",
+                Scope::Voice {
+                    part: p,
+                    staff: s,
+                    voice,
+                } if p == part && s.as_deref().is_none_or(|s| s == staff) => voice,
+                _ => continue,
+            };
+            budget.charge(
+                part.len()
+                    .saturating_add(staff.len())
+                    .saturating_add(voice.len())
+                    .saturating_add(64),
+                1,
+            )?;
+            let owner = ScoreVoice {
+                part: part.clone(),
+                staff: staff.clone(),
+                voice: voice.into(),
+                instrument: None,
+            };
+            let mut first = 0;
+            while first < runs.len() {
+                let mut last = first;
+                while last + 1 < runs.len() {
+                    let current = &runs[last];
+                    let next = &runs[last + 1];
+                    budget.charge(0, 16)?;
+                    if current.written_end != next.written_start
+                        || current
+                            .performed_start
+                            .checked_add(current.written_end.checked_sub(current.written_start)?)?
+                            != next.performed_start
+                        || breaks.is_some_and(|breaks| breaks.contains(&next.ordinal))
+                    {
+                        break;
+                    }
+                    last += 1;
+                }
+                budget.charge(candidates.len().saturating_mul(128), candidates.len())?;
+                let mut selected = Vec::new();
+                let mut local_passes = BTreeMap::new();
+                for wedge in &candidates {
+                    let id = &wedge.event.evidence.source_ids[0];
+                    let measure = &input.written_measures
+                        [input.original_declarations[id].written_measure.unwrap()];
+                    // Original measure ownership prevents a skipped ending with
+                    // an offset into this route from consuming another start.
+                    if measure.start < runs[first].written_start
+                        || measure.start >= runs[last].written_end
+                        || wedge.event.at < runs[first].written_start
+                        || wedge.event.at > runs[last].written_end
+                    {
+                        continue;
+                    }
+                    budget.charge(
+                        id.len().saturating_add(64),
+                        runs.len()
+                            .saturating_mul(3)
+                            .saturating_add(wedge.event.time_only.len())
+                            .saturating_add(16),
+                    )?;
+                    let Some(pass) = input.declaration_route_pass(
+                        id,
+                        &owner,
+                        runs[last].ordinal,
+                        runs[last].pass,
+                    ) else {
+                        continue;
+                    };
+                    local_passes.insert(id.as_str(), pass);
+                    if !wedge.event.enabled
+                        || (!wedge.event.time_only.is_empty()
+                            && !wedge.event.time_only.contains(&pass))
+                    {
+                        budget.event(&wedge.event)?;
+                        issues.push(Issue {
+                            start: wedge.event.at,
+                            end: wedge.event.at,
+                            kind: if wedge.event.enabled {
+                                IssueKind::PassFiltered
+                            } else {
+                                IssueKind::Disabled
+                            },
+                            provenance: Provenance::from_event(&wedge.event, pass),
+                            message: if wedge.event.enabled {
+                                "time-only excludes this repeat pass."
+                            } else {
+                                "Playback-disabled wedge endpoint retained inactive."
+                            }
+                            .into(),
+                        });
+                        continue;
+                    }
+                    budget.event(&wedge.event)?;
+                    let mut selected_wedge = (*wedge).clone();
+                    selected_wedge.event.time_only.clear();
+                    selected.push(selected_wedge);
+                }
+                let (paired, mut unresolved) = pair_wedges_bounded(&selected, &[], None, budget)?;
+                for issue in &mut unresolved {
+                    if let Some(pass) = issue
+                        .provenance
+                        .evidence
+                        .iter()
+                        .flat_map(|e| &e.source_ids)
+                        .find_map(|id| local_passes.get(id.as_str()))
+                    {
+                        issue.provenance.repeat_pass = *pass;
+                    }
+                }
+                issues.extend(unresolved);
+                for mut event in paired {
+                    let start = selected
+                        .iter()
+                        .find(|w| {
+                            matches!(w.kind, WedgeKind::Start(_))
+                                && w.event.at == event.at
+                                && w.event.order == event.order
+                        })
+                        .ok_or("Missing paired wedge start")?;
+                    let pass = local_passes[start.event.evidence.source_ids[0].as_str()];
+                    let key = &event.evidence.source_ids;
+                    budget.charge(
+                        strings_size(key).saturating_add(64),
+                        selected.len().saturating_add(key.len().saturating_mul(16)),
+                    )?;
+                    let prior = emitted.get(key).map(Vec::as_slice).unwrap_or(&[]);
+                    budget.charge(
+                        0,
+                        evidence_size(&event.evidence)
+                            .saturating_add(scope_size(&event.scope))
+                            .saturating_add(256)
+                            .saturating_mul(prior.len()),
+                    )?;
+                    // The same direction node may author distinct numbered
+                    // wedges. Equal source-ID sets alone do not prove equal
+                    // candidates (in particular, their directions may conflict).
+                    let same = prior.iter().copied().find(|&index| {
+                        let previous = &events[index];
+                        previous.at == event.at
+                            && previous.order == event.order
+                            && previous.scope == event.scope
+                            && previous.scope_interpretation == event.scope_interpretation
+                            && previous.enabled == event.enabled
+                            && previous.evidence == event.evidence
+                            && previous.instruction == event.instruction
+                    });
+                    if let Some(index) = same {
+                        budget.charge(4, events[index].time_only.len().saturating_add(1))?;
+                        if !events[index].time_only.contains(&pass) {
+                            events[index].time_only.push(pass);
+                        }
+                    } else {
+                        emitted.entry(key.clone()).or_default().push(events.len());
+                        event.time_only = vec![pass];
+                        events.push(event);
+                    }
+                }
+                first = last + 1;
+            }
+        }
+    }
+    Ok((events, issues))
 }
 
 impl ScoreInput {
@@ -303,6 +641,64 @@ impl ScoreInput {
     pub fn owner_runs(&self, owner: &ScoreVoice) -> Option<&[Occurrence]> {
         let key = self.route_keys.get(&owner.part)?.get(&owner.staff)?;
         self.runs.get(key).map(Vec::as_slice)
+    }
+
+    /// A pass-label change can remain forward playback. Explicit navigation
+    /// breaks take precedence even when both coordinate boundaries touch.
+    pub(super) fn forward_route_boundary(
+        &self,
+        owner: &ScoreVoice,
+        previous: &Occurrence,
+        next: &Occurrence,
+        budget: &mut ProvenanceBudget,
+    ) -> Result<bool> {
+        budget.charge(0, 16)?;
+        if previous.written_end != next.written_start
+            || previous
+                .performed_start
+                .checked_add(previous.written_end.checked_sub(previous.written_start)?)?
+                != next.performed_start
+        {
+            return Ok(false);
+        }
+        let depth = |count: usize| usize::BITS as usize - count.leading_zeros() as usize + 1;
+        // Borrow stored keys throughout; no cloned owner strings or route
+        // inventories are needed. Charge string comparisons before each lookup.
+        budget.charge(
+            0,
+            owner
+                .part
+                .len()
+                .saturating_add(1)
+                .saturating_mul(depth(self.route_keys.len())),
+        )?;
+        let Some(staves) = self.route_keys.get(&owner.part) else {
+            return Ok(false);
+        };
+        budget.charge(
+            0,
+            owner
+                .staff
+                .len()
+                .saturating_add(1)
+                .saturating_mul(depth(staves.len())),
+        )?;
+        let Some(key) = staves.get(&owner.staff) else {
+            return Ok(false);
+        };
+        budget.charge(
+            0,
+            key.0
+                .len()
+                .saturating_add(key.1.len())
+                .saturating_add(1)
+                .saturating_mul(depth(self.route_breaks.len())),
+        )?;
+        let Some(breaks) = self.route_breaks.get(key) else {
+            return Ok(true);
+        };
+        budget.charge(0, depth(breaks.len()))?;
+        Ok(!breaks.contains(&next.ordinal))
     }
 
     /// A metadata lane supplements missing declared voices without changing
@@ -650,6 +1046,14 @@ impl ScoreInput {
             }
         }
         if written.1 > written.0 {
+            if !forward {
+                self.provenance_budget
+                    .charge(part.len().saturating_add(staff.len()).saturating_add(64), 1)?;
+                self.route_breaks
+                    .entry((part.into(), staff.into()))
+                    .or_default()
+                    .insert(runs.len() as u32 + 1);
+            }
             runs.push(Occurrence {
                 written_start: written.0,
                 written_end: written.1,
@@ -692,7 +1096,7 @@ impl ScoreInput {
         Ok(())
     }
     pub fn ms_note(&mut self, node: Node, id: &str, modern: bool) -> Result<()> {
-        if let Some(raw_value) = text(node, "velocity") {
+        if child(node, "velocity").is_some() {
             let e = self.evidence(
                 node,
                 &format!("expression:{id}:velocity"),
@@ -703,33 +1107,38 @@ impl ScoreInput {
                 },
             )?;
             self.retain(&e)?;
-            let value = match Fraction::decimal(raw_value) {
+            let decoded = (|| -> Result<AttackVelocity> {
+                let value = decimal(node, "velocity", &mut self.provenance_budget)?
+                    .ok_or("Missing note velocity")?;
+                let user = scalar(
+                    node,
+                    "veloType",
+                    &mut self.provenance_budget,
+                    |value| match value {
+                        "user" | "1" => Ok(true),
+                        "offset" | "0" => Ok(false),
+                        other => Err(format!("Unknown note veloType {other:?}")),
+                    },
+                )?
+                .unwrap_or(modern);
+                Ok(if user {
+                    AttackVelocity::MuseScoreUser {
+                        value,
+                        legacy: !modern,
+                    }
+                } else {
+                    AttackVelocity::MuseScoreOffset {
+                        percent: value,
+                        legacy: !modern,
+                    }
+                })
+            })();
+            let velocity = match decoded {
                 Ok(value) => value,
-                Err(message) => {
-                    self.overrides.insert(
-                        id.into(),
-                        VelocityEvidence {
-                            value: AttackVelocity::Invalid(message),
-                            evidence: e,
-                        },
-                    );
-                    return Ok(());
+                Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => {
+                    return Err(message)
                 }
-            };
-            let velocity = match text(node, "veloType") {
-                Some("user" | "1") => AttackVelocity::MuseScoreUser {
-                    value,
-                    legacy: !modern,
-                },
-                None if modern => AttackVelocity::MuseScoreUser {
-                    value,
-                    legacy: false,
-                },
-                None | Some("offset" | "0") => AttackVelocity::MuseScoreOffset {
-                    percent: value,
-                    legacy: !modern,
-                },
-                Some(other) => AttackVelocity::Invalid(format!("Unknown note veloType {other:?}")),
+                Err(message) => AttackVelocity::Invalid(message),
             };
             self.overrides.insert(
                 id.into(),
@@ -749,13 +1158,12 @@ impl ScoreInput {
         at: Time,
         divisions: u32,
     ) -> Result<()> {
-        let sound = if node.has_tag_name("sound") {
-            Some(node)
-        } else {
-            child(node, "sound")
-        };
-        let scope = Scope::musicxml(part, text(node, "staff"), text(node, "voice"));
         let e = self.evidence(node, id, SourceContract::MusicXml)?;
+        let decoded_scope = (|| -> Result<Scope> {
+            let staff = scalar_text(node, "staff", &mut self.provenance_budget)?;
+            let voice = scalar_text(node, "voice", &mut self.provenance_budget)?;
+            Ok(Scope::musicxml(part, staff.as_deref(), voice.as_deref()))
+        })();
         self.provenance_budget.charge(0, node.range().len())?;
         for piece in node.descendants().filter(|piece| piece.is_element()) {
             let kind = match piece.tag_name().name() {
@@ -777,12 +1185,32 @@ impl ScoreInput {
         // Decode independent facts before interpreting the instruction. An
         // invalid level/wedge must not discard a valid playback offset or pass.
         let position = (|| -> Result<Time> {
-            let offset = sound
-                .and_then(|n| child(n, "offset"))
-                .or_else(|| child(node, "offset").filter(|o| o.attribute("sound") == Some("yes")));
+            let mut offset = None;
+            self.provenance_budget.charge(0, node.range().len())?;
+            for sound in node
+                .children()
+                .chain(std::iter::once(node))
+                .filter(|n| n.has_tag_name("sound"))
+            {
+                if let Some(value) = decimal(sound, "offset", &mut self.provenance_budget)? {
+                    agree_value(&mut offset, value, "offset")?;
+                }
+            }
+            if offset.is_none() && !node.has_tag_name("sound") {
+                self.provenance_budget.charge(0, node.range().len())?;
+                for field in node
+                    .children()
+                    .filter(|n| n.has_tag_name("offset") && n.attribute("sound") == Some("yes"))
+                {
+                    agree_value(
+                        &mut offset,
+                        Fraction::decimal(field.text().unwrap_or("").trim())?,
+                        "offset",
+                    )?;
+                }
+            }
             let position = match offset {
-                Some(offset) => {
-                    let value = Fraction::decimal(offset.text().unwrap_or(""))?;
+                Some(value) => {
                     at.checked_add(value.checked_mul(Fraction::new(1, i64::from(divisions))?)?)?
                 }
                 None => at,
@@ -792,9 +1220,8 @@ impl ScoreInput {
             }
             Ok(position)
         })();
-        let passes = match sound.and_then(|s| s.attribute("time-only")) {
-            None => Ok(vec![]),
-            Some(raw) => raw
+        let passes = sound_attribute(node, "time-only", &mut self.provenance_budget, |raw| {
+            let mut passes = raw
                 .split(',')
                 .map(|s| {
                     s.trim()
@@ -803,11 +1230,27 @@ impl ScoreInput {
                         .filter(|p| *p > 0)
                         .ok_or_else(|| format!("Invalid sound time-only {raw:?}"))
                 })
-                .collect::<Result<Vec<_>>>(),
-        };
+                .collect::<Result<Vec<_>>>()?;
+            passes.sort_unstable();
+            passes.dedup();
+            Ok(passes)
+        })
+        .map(Option::unwrap_or_default);
         let mut problems = Vec::new();
+        let scope = match decoded_scope {
+            Ok(scope) => scope,
+            Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => return Err(message),
+            Err(message) => {
+                problems.push(message.clone());
+                Scope::Unsupported {
+                    part: part.into(),
+                    raw: message,
+                }
+            }
+        };
         let resolved_at = match position {
             Ok(position) => position,
+            Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => return Err(message),
             Err(message) => {
                 problems.push(format!("Unresolved playback offset; diagnostic attached to the written cursor: {message}"));
                 // This is only a diagnostic attachment to the source cursor;
@@ -817,6 +1260,7 @@ impl ScoreInput {
         };
         let time_only = match passes {
             Ok(passes) => passes,
+            Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => return Err(message),
             Err(message) => {
                 problems.push(message);
                 vec![]
@@ -838,10 +1282,15 @@ impl ScoreInput {
             .descendants()
             .filter(|n| n.has_tag_name("dynamics"))
             .collect();
-        let raw_numeric = sound.and_then(|n| n.attribute("dynamics"));
-        if raw_numeric.is_some() || !dynamics.is_empty() {
+        let numeric = sound_attribute(
+            node,
+            "dynamics",
+            &mut self.provenance_budget,
+            Fraction::decimal,
+        );
+        if !numeric.as_ref().is_ok_and(|value| value.is_none()) || !dynamics.is_empty() {
             let instruction = (|| -> Result<Instruction> {
-                let numeric = raw_numeric.map(Fraction::decimal).transpose()?;
+                let numeric = numeric?;
                 let symbols: Vec<_> = dynamics
                     .iter()
                     .flat_map(|d| d.children().filter(|n| n.is_element()))
@@ -867,6 +1316,11 @@ impl ScoreInput {
                     ..Dynamic::default()
                 }))
             })();
+            if let Err(message) = &instruction {
+                if message.starts_with("SCORE_INTENSITY_LIMIT:") {
+                    return Err(message.clone());
+                }
+            }
             self.provenance_budget.event(&base)?;
             self.push(ScoreEvent {
                 instruction: instruction.unwrap_or_else(Instruction::Unsupported),
@@ -1004,8 +1458,64 @@ impl ScoreInput {
         } else {
             Some(node)
         };
-        // A reciprocal stop carries no second instruction.
+        // A typed reciprocal stop carries no second instruction, but is still
+        // original intensity evidence even when no start can be proved.
         let Some(payload) = payload else {
+            let evidence = self.evidence(
+                node,
+                id,
+                if modern {
+                    SourceContract::MuseScoreModern
+                } else {
+                    SourceContract::MuseScoreLegacy
+                },
+            )?;
+            self.record_original(id, DeclarationKind::SpannerEndpoint)?;
+            let event = ScoreEvent {
+                at,
+                order: node.id().get(),
+                scope: Scope::musicxml(&owner.part, Some(&owner.staff), Some(&owner.voice)),
+                scope_interpretation: interpretation(
+                    id,
+                    "scope",
+                    "Typed endpoint retains its original source staff and voice.",
+                    true,
+                ),
+                enabled: true,
+                time_only: vec![],
+                evidence,
+                instruction: Instruction::Unsupported(
+                    "Typed intensity endpoint without a payload".into(),
+                ),
+            };
+            self.retain(&event.evidence)?;
+            self.record_declaration(&event)?;
+            match spanner_delta(node, "prev", stretch, &mut self.provenance_budget) {
+                Ok(delta) => {
+                    self.provenance_budget
+                        .charge(scope_size(&event.scope).saturating_add(256), 1)?;
+                    self.typed_ends.push(TypedEndpoint {
+                        event,
+                        owner: owner.clone(),
+                        measure,
+                        delta,
+                        kind: node.attribute("type").unwrap().into(),
+                    });
+                }
+                Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => {
+                    return Err(message)
+                }
+                Err(message) => {
+                    self.provenance_budget.event(&event)?;
+                    self.issues.push(Issue {
+                        start: at,
+                        end: at,
+                        kind: IssueKind::UnresolvedSpan,
+                        provenance: Provenance::from_event(&event, 0),
+                        message,
+                    });
+                }
+            }
             return Ok(());
         };
         let e = self.evidence(
@@ -1026,20 +1536,28 @@ impl ScoreInput {
             },
         )?;
         let decoded_scope = (|| -> Result<_> {
-            let assignment = match text(payload, "voiceAssignment") {
-                None => None,
-                Some("currentVoiceOnly") => Some(VoiceAssignment::CurrentVoice),
-                Some("allInStaff") => Some(VoiceAssignment::StaffVoices),
-                Some("allInInstrument") => Some(VoiceAssignment::InstrumentVoices),
-                Some(value) => return Err(format!("Unknown voiceAssignment {value:?}")),
-            };
-            let legacy = match text(payload, "dynType") {
-                None => None,
-                Some("0" | "staff") => Some(LegacyRange::Staff),
-                Some("1" | "part") => Some(LegacyRange::Part),
-                Some("2" | "system") => Some(LegacyRange::System),
-                Some(value) => return Err(format!("Unknown dynType {value:?}")),
-            };
+            let assignment = scalar(
+                payload,
+                "voiceAssignment",
+                &mut self.provenance_budget,
+                |value| match value {
+                    "currentVoiceOnly" => Ok(VoiceAssignment::CurrentVoice),
+                    "allInStaff" => Ok(VoiceAssignment::StaffVoices),
+                    "allInInstrument" => Ok(VoiceAssignment::InstrumentVoices),
+                    value => Err(format!("Unknown voiceAssignment {value:?}")),
+                },
+            )?;
+            let legacy = scalar(
+                payload,
+                "dynType",
+                &mut self.provenance_budget,
+                |value| match value {
+                    "0" | "staff" => Ok(LegacyRange::Staff),
+                    "1" | "part" => Ok(LegacyRange::Part),
+                    "2" | "system" => Ok(LegacyRange::System),
+                    value => Err(format!("Unknown dynType {value:?}")),
+                },
+            )?;
             let (mut scope, mut reason) = musescore_scope(owner, modern, assignment, legacy);
             if assignment.is_none() && legacy.is_none() {
                 if payload.has_tag_name("StaffText") {
@@ -1058,6 +1576,7 @@ impl ScoreInput {
         let mut problems = Vec::new();
         let (scope, reason, explicit) = match decoded_scope {
             Ok(decoded) => decoded,
+            Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => return Err(message),
             Err(message) => {
                 problems.push(message.clone());
                 (
@@ -1070,8 +1589,9 @@ impl ScoreInput {
                 )
             }
         };
-        let enabled = match bool_field(text(payload, "play")) {
+        let enabled = match scalar_bool(payload, "play", &mut self.provenance_budget) {
             Ok(enabled) => enabled.unwrap_or(true),
+            Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => return Err(message),
             Err(message) => {
                 problems.push(message);
                 false
@@ -1094,30 +1614,33 @@ impl ScoreInput {
                 return Err(problems.join("; "));
             }
             if payload.has_tag_name("Dynamic") {
-                let speed = match text(payload, "veloChangeSpeed") {
-                    None | Some("1" | "normal") => Speed::Normal,
-                    Some("0" | "slow") => Speed::Slow,
-                    Some("2" | "fast") => Speed::Fast,
-                    Some(value) => return Err(format!("Unknown velocity speed {value:?}")),
-                };
+                let speed = scalar(
+                    payload,
+                    "veloChangeSpeed",
+                    &mut self.provenance_budget,
+                    |value| match value {
+                        "1" | "normal" => Ok(Speed::Normal),
+                        "0" | "slow" => Ok(Speed::Slow),
+                        "2" | "fast" => Ok(Speed::Fast),
+                        value => Err(format!("Unknown velocity speed {value:?}")),
+                    },
+                )?
+                .unwrap_or_default();
                 event.instruction = Instruction::Dynamic(Dynamic {
-                    symbol: text(payload, "subtype").map(str::to_owned),
-                    numeric: decimal(payload, "velocity")?.map(NumericLevel::MuseScoreDynamic),
-                    velo_change: decimal(payload, "veloChange")?,
+                    symbol: scalar_text(payload, "subtype", &mut self.provenance_budget)?,
+                    numeric: decimal(payload, "velocity", &mut self.provenance_budget)?
+                        .map(NumericLevel::MuseScoreDynamic),
+                    velo_change: decimal(payload, "veloChange", &mut self.provenance_budget)?,
                     speed,
                     tempo_at_start: Some(tempo),
                 });
             } else if payload.has_tag_name("HairPin") || payload.has_tag_name("TextLine") {
-                let subtype = text(payload, "subtype").unwrap_or("0");
                 let labels: Vec<_> = ["beginText", "text", "endText"]
                     .iter()
-                    .filter_map(|tag| child(payload, tag))
-                    .map(|n| {
-                        n.descendants()
-                            .filter(|n| n.is_text())
-                            .filter_map(|n| n.text())
-                            .collect::<String>()
-                    })
+                    .map(|tag| rich_text(payload, tag, &mut self.provenance_budget))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
                     .collect();
                 let intents: Vec<_> = labels
                     .iter()
@@ -1137,11 +1660,14 @@ impl ScoreInput {
                             format!("Unrecognized text-line intensity {labels:?}")
                         })?)
                     } else {
-                        match subtype {
-                            "0" | "2" | "crescendo" => Direction::Crescendo,
-                            "1" | "3" | "decrescendo" => Direction::Diminuendo,
-                            _ => return Err(format!("Unknown hairpin subtype {subtype:?}")),
-                        }
+                        scalar(payload, "subtype", &mut self.provenance_budget, |subtype| {
+                            match subtype {
+                                "0" | "2" | "crescendo" => Ok(Direction::Crescendo),
+                                "1" | "3" | "decrescendo" => Ok(Direction::Diminuendo),
+                                _ => Err(format!("Unknown hairpin subtype {subtype:?}")),
+                            }
+                        })?
+                        .unwrap_or(Direction::Crescendo)
                     };
                 if intents
                     .iter()
@@ -1154,56 +1680,32 @@ impl ScoreInput {
                     );
                 }
                 let mut transition = Transition::new(at, direction);
-                transition.velo_change = decimal(payload, "veloChange")?;
-                transition.method = text(payload, "veloChangeMethod").map(str::to_owned);
-                transition.single_note_dynamics = bool_field(text(payload, "singleNoteDynamics"))?;
-                let niente = bool_field(text(payload, "nienteCircled"))?.unwrap_or(false);
+                transition.velo_change =
+                    decimal(payload, "veloChange", &mut self.provenance_budget)?;
+                transition.method =
+                    scalar_text(payload, "veloChangeMethod", &mut self.provenance_budget)?;
+                transition.single_note_dynamics =
+                    scalar_bool(payload, "singleNoteDynamics", &mut self.provenance_budget)?;
+                let niente = scalar_bool(payload, "nienteCircled", &mut self.provenance_budget)?
+                    .unwrap_or(false);
                 transition.niente_start = (niente && direction == Direction::Crescendo)
                     || intents.contains(&TextIntent::FadeIn);
                 transition.niente_end = (niente && direction == Direction::Diminuendo)
                     || intents.contains(&TextIntent::FadeOut);
-                transition.end_level = text(payload, "endText").and_then(standard_level);
+                transition.end_level = rich_text(payload, "endText", &mut self.provenance_budget)?
+                    .as_deref()
+                    .and_then(standard_level);
                 event.instruction = Instruction::Transition(transition);
-                let location = child(node, "next").and_then(|n| child(n, "location"));
-                let delta = location
-                    .map(|loc| -> Result<_> {
-                        let measures = text(loc, "measures")
-                            .unwrap_or("0")
-                            .parse::<i64>()
-                            .map_err(|_| "Invalid spanner measure displacement")?;
-                        for tag in ["staves", "voices"] {
-                            if let Some(value) = text(loc, tag) {
-                                value
-                                    .parse::<i64>()
-                                    .map_err(|_| format!("Invalid spanner {tag} displacement"))?;
-                            }
-                        }
-                        // These displacements locate the endpoint's engraving
-                        // anchor. Timing is given by measures/fractions; the
-                        // playback scope remains the start instance's declared
-                        // dynType/voiceAssignment, including across staves.
-                        let fractions = text(loc, "fractions").unwrap_or("0/1");
-                        let (n, d) = fractions
-                            .split_once('/')
-                            .ok_or("Invalid spanner fraction")?;
-                        Ok((
-                            measures,
-                            Fraction::new(
-                                n.parse().map_err(|_| "Invalid spanner numerator")?,
-                                d.parse().map_err(|_| "Invalid spanner denominator")?,
-                            )?
-                            .checked_mul(Fraction::integer(4))?
-                            .checked_mul(Fraction::new(stretch.0, stretch.1)?)?,
-                        ))
-                    })
-                    .transpose()?;
+                // Anchor displacements never replace the start's playback scope.
+                let delta = spanner_delta(node, "next", stretch, &mut self.provenance_budget)?;
                 if let Some(legacy_id) = payload.attribute("id") {
                     event.evidence.raw_fields.insert(
                         "legacy_spanner".into(),
                         format!("{}:{}:{legacy_id}", owner.part, owner.staff),
                     );
                 }
-                if let Some(ticks) = text(payload, "ticks") {
+                if decimal(payload, "ticks", &mut self.provenance_budget)?.is_some() {
+                    let ticks = text(payload, "ticks").ok_or("Missing explicit hairpin ticks")?;
                     event
                         .evidence
                         .raw_fields
@@ -1212,14 +1714,8 @@ impl ScoreInput {
                 span_delta = delta;
                 is_span = true;
             } else {
-                let words = child(payload, "text")
-                    .map(|n| {
-                        n.descendants()
-                            .filter(|n| n.is_text())
-                            .filter_map(|n| n.text())
-                            .collect::<String>()
-                    })
-                    .unwrap_or_default();
+                let words =
+                    rich_text(payload, "text", &mut self.provenance_budget)?.unwrap_or_default();
                 event.instruction = Instruction::Text {
                     text: words,
                     end: None,
@@ -1242,6 +1738,7 @@ impl ScoreInput {
                 measure,
                 start: at,
                 delta: span_delta,
+                kind: spanner.then(|| payload.tag_name().name().into()),
             });
         } else {
             self.push(event)?;
@@ -1256,7 +1753,7 @@ impl ScoreInput {
         raw: &str,
         modern: bool,
     ) -> Result<Option<Fraction>> {
-        let exact = (|| -> Result<Fraction> {
+        let parse_exact = |raw: &str| -> Result<Fraction> {
             let (mantissa, exponent) = raw.split_once(['e', 'E']).unwrap_or((raw, "0"));
             let mantissa = if mantissa.contains('.') {
                 mantissa.trim_end_matches('0').trim_end_matches('.')
@@ -1278,8 +1775,13 @@ impl ScoreInput {
                     Fraction::wide(1, scale)?
                 })?
                 .checked_mul(Fraction::integer(60))
-        })()
-        .ok();
+        };
+        let exact = match scalar(node, "tempo", &mut self.provenance_budget, parse_exact) {
+            Ok(Some(value)) => Some(value),
+            Ok(None) => parse_exact(raw).ok(),
+            Err(message) if message.starts_with("SCORE_INTENSITY_LIMIT:") => return Err(message),
+            Err(_) => None,
+        };
         self.tempos
             .entry(at)
             .and_modify(|previous| {
@@ -1320,11 +1822,13 @@ impl ScoreInput {
     }
 
     pub fn finish_staff(&mut self, bounds: &[(Time, Time)], source_ppq: u16) -> Result<()> {
+        let mut resolved = Vec::new();
         for PendingSpanner {
             mut event,
             measure,
             start,
             delta,
+            kind,
         } in std::mem::take(&mut self.spanners)
         {
             let mut candidates = Vec::new();
@@ -1418,6 +1922,21 @@ impl ScoreInput {
                 if let Instruction::Transition(transition) = &mut event.instruction {
                     transition.end = *end;
                 }
+                if let Some(kind) = kind {
+                    self.provenance_budget.charge(
+                        scope_size(&event.scope)
+                            .saturating_add(strings_size(&event.evidence.source_ids))
+                            .saturating_add(256),
+                        1,
+                    )?;
+                    resolved.push((
+                        kind,
+                        event.scope.clone(),
+                        start,
+                        *end,
+                        event.evidence.source_ids.clone(),
+                    ));
+                }
                 if !problems.is_empty() {
                     self.provenance_budget.event(&event)?;
                     self.issues.push(Issue {
@@ -1434,6 +1953,49 @@ impl ScoreInput {
             }
             self.record_pairs(&event.evidence.source_ids)?;
             self.push(event)?;
+        }
+        for endpoint in std::mem::take(&mut self.typed_ends) {
+            let event = endpoint.event;
+            let previous = endpoint.delta.and_then(|(dm, fraction)| {
+                let target = i64::try_from(endpoint.measure).ok()?.checked_add(dm)?;
+                let from = bounds.get(endpoint.measure)?;
+                let to = bounds.get(usize::try_from(target).ok()?)?;
+                event
+                    .at
+                    .checked_add(to.0.checked_sub(from.0).ok()?)
+                    .ok()?
+                    .checked_add(fraction)
+                    .ok()
+            });
+            self.provenance_budget.charge(
+                resolved.len().saturating_mul(8),
+                resolved.len().saturating_mul(16),
+            )?;
+            let matches: Vec<_> = resolved
+                .iter()
+                .filter(|(kind, scope, start, end, _)| {
+                    kind == &endpoint.kind
+                        && scope.applies(&endpoint.owner)
+                        && previous == Some(*start)
+                        && *end == event.at
+                })
+                .collect();
+            if let [(_, _, _, _, ids)] = matches.as_slice() {
+                self.provenance_budget.charge(
+                    strings_size(ids).saturating_add(strings_size(&event.evidence.source_ids)),
+                    ids.len().saturating_add(1),
+                )?;
+                let mut pair = ids.clone();
+                pair.extend(event.evidence.source_ids.iter().cloned());
+                self.record_pairs(&pair)?;
+            } else {
+                self.provenance_budget.event(&event)?;
+                self.issues.push(Issue {
+                    start: event.at, end: event.at, kind: IssueKind::UnresolvedSpan,
+                    provenance: Provenance::from_event(&event, 0),
+                    message: "Typed intensity endpoint has no unique reciprocal start in its source staff.".into(),
+                });
+            }
         }
         Ok(())
     }
@@ -1453,79 +2015,10 @@ impl ScoreInput {
                     .is_none_or(|m| m.start < m.end && !m.visits.is_empty())
             })
         });
-        let run_count = self.runs.values().map(Vec::len).sum::<usize>();
-        self.provenance_budget
-            .charge(run_count.saturating_mul(4), run_count)?;
-        let passes: Vec<_> = self.runs.values().flatten().map(|run| run.pass).collect();
-        self.provenance_budget
-            .charge(wedges.len().saturating_mul(64), wedges.len())?;
-        let mut route_passes = Vec::new();
-        for wedge in &wedges {
-            let id = &wedge.event.evidence.source_ids[0];
-            let mut eligible = BTreeSet::new();
-            if self
-                .original_declarations
-                .get(id)
-                .is_none_or(|d| d.written_measure.is_none())
-            {
-                // The score-only synthetic seam has no parser route contract.
-                let count = passes
-                    .len()
-                    .saturating_add(wedge.event.time_only.len())
-                    .saturating_add(1);
-                self.provenance_budget
-                    .charge(count.saturating_mul(64), count.saturating_mul(16))?;
-                eligible.extend(
-                    std::iter::once(1)
-                        .chain(passes.iter().copied())
-                        .chain(wedge.event.time_only.iter().copied()),
-                );
-            } else {
-                self.provenance_budget.charge(0, self.runs.len())?;
-                for ((part, staff), runs) in &self.runs {
-                    let (scope_part, scope_staff, voice) = match &wedge.event.scope {
-                        Scope::Part(part) => (part, None, "1"),
-                        Scope::Staff { part, staff } => (part, Some(staff.as_str()), "1"),
-                        Scope::Voice { part, staff, voice } => {
-                            (part, staff.as_deref(), voice.as_str())
-                        }
-                        _ => continue,
-                    };
-                    if part != scope_part || scope_staff.is_some_and(|s| s != staff) {
-                        continue;
-                    }
-                    self.provenance_budget.charge(
-                        part.len()
-                            .saturating_add(staff.len())
-                            .saturating_add(voice.len())
-                            .saturating_add(64),
-                        1,
-                    )?;
-                    let owner = ScoreVoice {
-                        part: part.clone(),
-                        staff: staff.clone(),
-                        voice: voice.into(),
-                        instrument: None,
-                    };
-                    for run in runs {
-                        self.provenance_budget
-                            .charge(64, runs.len().saturating_mul(3).saturating_add(64))?;
-                        if let Some(pass) =
-                            self.declaration_route_pass(id, &owner, run.ordinal, run.pass)
-                        {
-                            eligible.insert(pass);
-                        }
-                    }
-                }
-            }
-            route_passes.push(eligible);
-        }
-        let (events, issues) = pair_wedges_bounded(
-            &wedges,
-            &passes,
-            Some(&route_passes),
-            &mut self.provenance_budget,
-        )?;
+        let mut budget = std::mem::take(&mut self.provenance_budget);
+        let paired = pair_performed_wedges(self, &wedges, &mut budget);
+        self.provenance_budget = budget;
+        let (events, issues) = paired?;
         for event in &events {
             self.record_pairs(&event.evidence.source_ids)?;
         }
@@ -1603,12 +2096,533 @@ impl ScoreInput {
 mod tests {
     use super::*;
 
+    #[test]
+    fn forward_route_boundary_uses_owner_breaks_and_bounded_borrowed_lookups() {
+        let mut input = ScoreInput::default();
+        for (staff, forward) in [("1", true), ("2", false)] {
+            input
+                .record_run("P1", staff, (Time::ZERO, Time::ONE), Time::ZERO, 2, false)
+                .unwrap();
+            input
+                .record_run(
+                    "P1",
+                    staff,
+                    (Time::ONE, Time::integer(2)),
+                    Time::ONE,
+                    1,
+                    forward,
+                )
+                .unwrap();
+        }
+        let owner = owner();
+        let runs = input.owner_runs(&owner).unwrap();
+        assert_eq!((runs[0].pass, runs[1].pass), (2, 1));
+        let mut measured = ProvenanceBudget::with_limits(0, MAX_RESOLUTION_WORK);
+        assert!(input
+            .forward_route_boundary(&owner, &runs[0], &runs[1], &mut measured)
+            .unwrap());
+        assert_eq!(measured.bytes, 0, "the helper borrows every route key");
+        assert!(
+            measured.work > 16,
+            "lookup work is charged as well as coordinates"
+        );
+        let mut denied = ProvenanceBudget::with_limits(0, measured.work - 1);
+        assert!(input
+            .forward_route_boundary(&owner, &runs[0], &runs[1], &mut denied)
+            .is_err());
+
+        let other = ScoreVoice {
+            staff: "2".into(),
+            ..owner.clone()
+        };
+        let other_runs = input.owner_runs(&other).unwrap();
+        assert!(
+            !input
+                .forward_route_boundary(
+                    &other,
+                    &other_runs[0],
+                    &other_runs[1],
+                    &mut ProvenanceBudget::default()
+                )
+                .unwrap(),
+            "a recorded navigation break wins over coordinate adjacency"
+        );
+        for field in ["written", "performed"] {
+            let mut next = runs[1].clone();
+            if field == "written" {
+                next.written_start = Time::integer(2);
+            } else {
+                next.performed_start = Time::integer(2);
+            }
+            assert!(
+                !input
+                    .forward_route_boundary(
+                        &owner,
+                        &runs[0],
+                        &next,
+                        &mut ProvenanceBudget::default()
+                    )
+                    .unwrap(),
+                "{field} gap"
+            );
+        }
+        for other in [
+            ScoreVoice {
+                part: "unknown".into(),
+                ..owner.clone()
+            },
+            ScoreVoice {
+                staff: "unknown".into(),
+                ..owner.clone()
+            },
+        ] {
+            assert!(!input
+                .forward_route_boundary(
+                    &other,
+                    &runs[0],
+                    &runs[1],
+                    &mut ProvenanceBudget::default()
+                )
+                .unwrap());
+        }
+    }
+
     fn owner() -> ScoreVoice {
         ScoreVoice {
             part: "P1".into(),
             staff: "1".into(),
             voice: "1".into(),
             instrument: None,
+        }
+    }
+
+    fn review5_wedge_route(
+        forward: bool,
+        stop_pass: u32,
+        disabled: bool,
+        skipped: bool,
+    ) -> ScoreInput {
+        let document = roxmltree::Document::parse(r#"<root>
+            <direction><direction-type><wedge type="crescendo" niente="yes"/></direction-type><staff>1</staff><sound time-only="2"/></direction>
+            <direction><direction-type><wedge type="stop"/><dynamics><f/></dynamics></direction-type><staff>1</staff><sound time-only="1"/></direction>
+        </root>"#).unwrap();
+        let mut input = ScoreInput::default();
+        for (index, node) in document
+            .root_element()
+            .children()
+            .filter(|n| n.is_element())
+            .enumerate()
+        {
+            input
+                .begin_written_measure("P1", None, index, Time::integer(index as i64))
+                .unwrap();
+            input
+                .xml_direction(
+                    node,
+                    if index == 0 { "start" } else { "stop" },
+                    "P1",
+                    if index == 0 {
+                        Time::ZERO
+                    } else {
+                        Fraction::new(3, 2).unwrap()
+                    },
+                    480,
+                )
+                .unwrap();
+            input
+                .end_written_measure(Time::integer(index as i64 + 1))
+                .unwrap();
+        }
+        input
+            .begin_written_measure("P1", None, 2, Time::integer(2))
+            .unwrap();
+        input.end_written_measure(Time::integer(3)).unwrap();
+        if disabled {
+            input.wedges[1].event.enabled = false;
+            input.declarations.get_mut("stop").unwrap().enabled = false;
+        }
+        input
+            .record_measure_run(0, "P1", "1", Time::ZERO, 1, false)
+            .unwrap();
+        input
+            .record_measure_run(0, "P1", "1", Time::ONE, 2, false)
+            .unwrap();
+        input
+            .record_measure_run(
+                if skipped { 2 } else { 1 },
+                "P1",
+                "1",
+                Time::integer(2),
+                stop_pass,
+                forward,
+            )
+            .unwrap();
+        input.finish().unwrap();
+        input
+    }
+
+    #[test]
+    fn source_review5_wedges_cross_contiguous_pass_labels_but_not_jumps_or_exclusions() {
+        let input = review5_wedge_route(true, 1, false, false);
+        let transitions: Vec<_> = input
+            .score
+            .events
+            .iter()
+            .filter(|event| matches!(event.instruction, Instruction::Transition(_)))
+            .collect();
+        assert_eq!(transitions.len(), 1);
+        let event = transitions[0];
+        assert_eq!(event.time_only, [2]);
+        assert_eq!(event.evidence.source_ids, ["start", "stop"]);
+        assert!(
+            matches!(&event.instruction, Instruction::Transition(t) if t.end == Fraction::new(3, 2).unwrap())
+        );
+        assert_eq!(input.declarations["start"].time_only, [2]);
+        assert_eq!(input.declarations["stop"].time_only, [1]);
+        let runs = input.owner_runs(&owner()).unwrap();
+        let timeline = input
+            .occurrences(
+                &owner(),
+                runs,
+                &runs.iter().map(|r| r.written_end).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert!(timeline
+            .segments
+            .iter()
+            .any(|segment| segment.start >= Time::integer(2)
+                && segment.provenance.as_ref().is_some_and(|p| p
+                    .evidence
+                    .iter()
+                    .any(|e| e.source_ids == ["start", "stop"]))));
+        for (forward, pass, disabled, skipped) in [
+            (false, 1, false, false),
+            (true, 2, false, false),
+            (true, 1, true, false),
+            (true, 1, false, true),
+        ] {
+            let negative = review5_wedge_route(forward, pass, disabled, skipped);
+            assert!(
+                !negative
+                    .score
+                    .events
+                    .iter()
+                    .any(|event| matches!(event.instruction, Instruction::Transition(_))),
+                "forward={forward} pass={pass} disabled={disabled} skipped={skipped}"
+            );
+            assert!(negative.retained.contains_key("stop"));
+            if disabled {
+                assert!(negative
+                    .issues
+                    .iter()
+                    .any(|i| i.kind == IssueKind::Disabled));
+            }
+            if pass == 2 {
+                assert!(negative
+                    .issues
+                    .iter()
+                    .any(|i| i.kind == IssueKind::PassFiltered));
+            }
+        }
+    }
+
+    #[test]
+    fn source_review5_typed_orphan_endpoints_keep_original_ownership_and_generic_ends_stay_generic()
+    {
+        for kind in ["HairPin", "TextLine"] {
+            let xml = format!(
+                r#"<Spanner type="{kind}"><prev><location><fractions>-1/4</fractions></location></prev></Spanner>"#
+            );
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let mut input = ScoreInput::default();
+            let mut endpoint_owner = owner();
+            endpoint_owner.voice = "7".into();
+            input
+                .begin_written_measure("P1", Some("1"), 0, Time::ZERO)
+                .unwrap();
+            input
+                .ms_element(
+                    document.root_element(),
+                    "endpoint",
+                    &endpoint_owner,
+                    Time::ONE,
+                    0,
+                    true,
+                    Fraction::integer(120),
+                    (1, 1),
+                )
+                .unwrap();
+            input.end_written_measure(Time::integer(2)).unwrap();
+            input
+                .finish_staff(&[(Time::ZERO, Time::integer(2))], 480)
+                .unwrap();
+            input.finish().unwrap();
+            assert_eq!(input.retained["endpoint"].raw_fields["xml"], xml);
+            assert_eq!(
+                input.declarations["endpoint"].scope,
+                Scope::musicxml("P1", Some("1"), Some("7"))
+            );
+            assert_eq!(input.declarations["endpoint"].at, Time::ONE);
+            assert_eq!(
+                input.original_declarations["endpoint"].written_measure,
+                Some(0)
+            );
+            assert!(input.original_declarations["endpoint"]
+                .kinds
+                .contains(&DeclarationKind::SpannerEndpoint));
+            assert_eq!(input.issues.len(), 1);
+            assert_eq!(
+                (
+                    input.issues[0].start,
+                    input.issues[0].end,
+                    input.issues[0].kind
+                ),
+                (Time::ONE, Time::ONE, IssueKind::UnresolvedSpan)
+            );
+            assert!(input.score.events.is_empty());
+        }
+        for xml in [
+            r#"<endSpanner id="unmatched"/>"#,
+            r#"<Spanner type="Slur"><prev/></Spanner>"#,
+        ] {
+            let document = roxmltree::Document::parse(xml).unwrap();
+            let mut input = ScoreInput::default();
+            input
+                .ms_element(
+                    document.root_element(),
+                    "generic",
+                    &owner(),
+                    Time::ONE,
+                    0,
+                    false,
+                    Fraction::integer(120),
+                    (1, 1),
+                )
+                .unwrap();
+            input
+                .finish_staff(&[(Time::ZERO, Time::integer(2))], 480)
+                .unwrap();
+            input.finish().unwrap();
+            assert!(
+                input.retained.is_empty()
+                    && input.declarations.is_empty()
+                    && input.issues.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn source_review5_reciprocal_typed_endpoint_is_retained_without_an_orphan_warning() {
+        for kind in ["HairPin", "TextLine"] {
+            let xml = format!(
+                r#"<root><Spanner type="{kind}"><{kind}><beginText>cresc.</beginText></{kind}><next><location><fractions>1/4</fractions></location></next></Spanner><Spanner type="{kind}"><prev><location><fractions>-1/4</fractions></location></prev></Spanner></root>"#
+            );
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let mut input = ScoreInput::default();
+            for (index, node) in document
+                .root_element()
+                .children()
+                .filter(|n| n.is_element())
+                .enumerate()
+            {
+                input
+                    .ms_element(
+                        node,
+                        if index == 0 { "start" } else { "stop" },
+                        &owner(),
+                        Time::integer(index as i64),
+                        0,
+                        true,
+                        Fraction::integer(120),
+                        (1, 1),
+                    )
+                    .unwrap();
+            }
+            input
+                .finish_staff(&[(Time::ZERO, Time::integer(2))], 480)
+                .unwrap();
+            assert!(input.issues.is_empty());
+            assert!(input.retained.contains_key("stop"));
+            assert!(input.paired_declarations["start"].contains("stop"));
+            assert!(
+                matches!(&input.score.events[0].instruction, Instruction::Transition(t) if t.end == Time::ONE)
+            );
+        }
+    }
+
+    #[test]
+    fn source_review5_note_scalars_coalesce_semantically_equal_values_and_retain_conflicts() {
+        for modern in [false, true] {
+            for (velocity, mode, valid) in [
+                ("64.00", "1", true),
+                ("65", "1", false),
+                ("64", "offset", false),
+            ] {
+                let xml = format!("<Note><velocity>64</velocity><velocity>{velocity}</velocity><veloType>user</veloType><veloType>{mode}</veloType></Note>");
+                let document = roxmltree::Document::parse(&xml).unwrap();
+                let mut input = ScoreInput::default();
+                input
+                    .ms_note_owned(document.root_element(), "note", modern, &owner(), Time::ONE)
+                    .unwrap();
+                assert_eq!(
+                    text(document.root_element(), "velocity"),
+                    Some("64"),
+                    "nominal helper remains first-child"
+                );
+                assert_eq!(
+                    matches!(input.overrides["note"].value, AttackVelocity::MuseScoreUser { value, .. } if value == Fraction::integer(64)),
+                    valid
+                );
+                assert_eq!(
+                    matches!(input.overrides["note"].value, AttackVelocity::Invalid(_)),
+                    !valid
+                );
+                assert_eq!(
+                    input.retained["expression:note:velocity"].raw_fields["xml"],
+                    xml
+                );
+                assert_eq!(input.declarations["expression:note:velocity"].at, Time::ONE);
+            }
+        }
+    }
+
+    #[test]
+    fn source_review5_dynamic_scalar_conflicts_cannot_select_active_arithmetic() {
+        for fields in [
+            "<velocity>40</velocity><velocity>90</velocity>",
+            "<veloChange>10</veloChange><veloChange>20</veloChange>",
+            "<voiceAssignment>currentVoiceOnly</voiceAssignment><voiceAssignment>allInStaff</voiceAssignment>",
+            "<dynType>0</dynType><dynType>2</dynType>",
+            "<play>1</play><play>0</play>",
+            "<veloChangeSpeed>fast</veloChangeSpeed><veloChangeSpeed>slow</veloChangeSpeed>",
+        ] {
+            let xml = format!("<Dynamic><subtype>f</subtype>{fields}</Dynamic>");
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let mut input = ScoreInput::default();
+            input.ms_element(document.root_element(), "conflict", &owner(), Time::ONE, 0, true, Fraction::integer(120), (1, 1)).unwrap();
+            assert!(matches!(&input.score.events[0].instruction, Instruction::Unsupported(message) if message.contains("Conflicting repeated")), "{fields}");
+            assert_eq!(input.retained["conflict"].raw_fields["xml"], xml);
+        }
+        let document = roxmltree::Document::parse("<Dynamic><subtype>f</subtype><velocity>64</velocity><velocity>64.0</velocity><dynType>staff</dynType><dynType>0</dynType><play>true</play><play>1</play><veloChangeSpeed>fast</veloChangeSpeed><veloChangeSpeed>2</veloChangeSpeed></Dynamic>").unwrap();
+        let mut input = ScoreInput::default();
+        input
+            .ms_element(
+                document.root_element(),
+                "equal",
+                &owner(),
+                Time::ZERO,
+                0,
+                true,
+                Fraction::integer(120),
+                (1, 1),
+            )
+            .unwrap();
+        assert!(
+            matches!(&input.score.events[0].instruction, Instruction::Dynamic(d) if d.numeric == Some(NumericLevel::MuseScoreDynamic(Fraction::integer(64))) && d.speed == Speed::Fast)
+        );
+    }
+
+    #[test]
+    fn source_review5_spanner_timing_and_text_conflicts_remain_inactive() {
+        for (fields, location) in [
+            ("<ticks>480</ticks><ticks>960</ticks>", ""),
+            ("<beginText>cresc.</beginText><beginText>dim.</beginText>", ""),
+            ("<singleNoteDynamics>1</singleNoteDynamics><singleNoteDynamics>0</singleNoteDynamics>", ""),
+            ("", "<measures>0</measures><measures>1</measures>"),
+            ("", "<fractions>1/4</fractions><fractions>1/2</fractions>"),
+            ("", "<voices>0</voices><voices>1</voices>"),
+        ] {
+            let xml = format!(r#"<Spanner type="HairPin"><HairPin><subtype>0</subtype>{fields}</HairPin><next><location>{location}</location></next></Spanner>"#);
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let mut input = ScoreInput::default();
+            input.ms_element(document.root_element(), "span", &owner(), Time::ZERO, 0, true, Fraction::integer(120), (1, 1)).unwrap();
+            input.finish_staff(&[(Time::ZERO, Time::integer(4))], 480).unwrap();
+            assert!(matches!(&input.score.events[0].instruction, Instruction::Unsupported(message) if message.contains("Conflicting repeated")), "{xml}");
+        }
+        let document = roxmltree::Document::parse(r#"<Spanner type="HairPin"><HairPin><ticks>480</ticks><ticks>480.0</ticks><subtype>0</subtype><subtype>crescendo</subtype></HairPin><next><location><fractions>1/4</fractions><fractions>2/8</fractions></location></next></Spanner>"#).unwrap();
+        let mut input = ScoreInput::default();
+        input
+            .ms_element(
+                document.root_element(),
+                "equal-span",
+                &owner(),
+                Time::ZERO,
+                0,
+                true,
+                Fraction::integer(120),
+                (1, 1),
+            )
+            .unwrap();
+        input
+            .finish_staff(&[(Time::ZERO, Time::integer(4))], 480)
+            .unwrap();
+        assert!(
+            matches!(&input.score.events[0].instruction, Instruction::Transition(t) if t.end == Time::ONE)
+        );
+        assert!(input.issues.is_empty());
+    }
+
+    #[test]
+    fn source_review5_musicxml_scalar_conflicts_preserve_source_and_valid_timing() {
+        for fields in [
+            "<staff>1</staff><staff>2</staff>",
+            "<voice>1</voice><voice>2</voice>",
+            "<sound><offset>0</offset><offset>480</offset></sound>",
+            "<offset sound=\"yes\">0</offset><offset sound=\"yes\">480</offset>",
+            "<sound dynamics=\"40\"/><sound dynamics=\"90\"/>",
+            "<sound time-only=\"1\"/><sound time-only=\"2\"/>",
+        ] {
+            let xml = format!("<direction><direction-type><dynamics><f/></dynamics></direction-type>{fields}</direction>");
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let mut input = ScoreInput::default();
+            input
+                .xml_direction(
+                    document.root_element(),
+                    "xml-conflict",
+                    "P1",
+                    Time::ONE,
+                    480,
+                )
+                .unwrap();
+            assert!(
+                matches!(&input.score.events[0].instruction, Instruction::Unsupported(message) if message.contains("Conflicting repeated")),
+                "{xml}"
+            );
+            assert_eq!(input.retained["xml-conflict"].raw_fields["xml"], xml);
+        }
+        let document = roxmltree::Document::parse(r#"<direction><staff>1</staff><staff>1</staff><sound dynamics="64" time-only="2,1"><offset>480</offset><offset>480.0</offset></sound><sound dynamics="64.0" time-only="1,2"/></direction>"#).unwrap();
+        let mut input = ScoreInput::default();
+        input
+            .xml_direction(document.root_element(), "equal-xml", "P1", Time::ONE, 480)
+            .unwrap();
+        assert_eq!(input.score.events[0].at, Time::integer(2));
+        assert_eq!(input.score.events[0].time_only, [1, 2]);
+        assert!(matches!(
+            &input.score.events[0].instruction,
+            Instruction::Dynamic(_)
+        ));
+    }
+
+    #[test]
+    fn source_review5_repeated_tempo_and_scalar_scans_are_bounded() {
+        for (other, expected) in [("2.0e0", Some(Fraction::integer(120))), ("3", None)] {
+            let xml = format!("<Tempo><tempo>2</tempo><tempo>{other}</tempo></Tempo>");
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let mut input = ScoreInput::default();
+            assert_eq!(
+                input
+                    .ms_tempo(document.root_element(), "tempo", Time::ZERO, "2", true)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                input.tempo_candidates[&Time::ZERO][0].evidence.raw_fields["xml"],
+                xml
+            );
+            let mut denied = ProvenanceBudget::with_limits(MAX_PROVENANCE_BYTES, 0);
+            assert!(decimal(document.root_element(), "tempo", &mut denied)
+                .unwrap_err()
+                .starts_with("SCORE_INTENSITY_LIMIT:"));
         }
     }
 

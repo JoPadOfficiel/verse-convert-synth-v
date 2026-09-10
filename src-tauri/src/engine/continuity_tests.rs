@@ -1474,11 +1474,117 @@ fn validated_merged_intermediate_tie_resolves_to_retained_sung_head() {
     // The adapter has already absorbed this bare intermediate into the head.
     let mut merged = source_obstacle(&middle, 480, 480, None);
     merged.source = origin(&middle).source.clone();
+    let expected_source = merged.source.clone();
     owner.duration_ticks = 960;
     let mut lanes = pending(vec![vec![tail], vec![owner]]);
     run_with_sources(&mut lanes, &[vec![merged]]);
     assert_hold(&lanes, "last", "technical:1", "head", "first-verse");
     assert_eq!(find(&lanes, "head").1.duration_ticks, 960);
+    let captured = &origin(find(&lanes, "last").1)
+        .continuation
+        .as_ref()
+        .unwrap()
+        .merged_tie_sources;
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].source, expected_source);
+    assert_eq!(
+        (captured[0].onset_ticks, captured[0].duration_ticks),
+        (480, 480)
+    );
+    assert!(
+        Arc::ptr_eq(
+            captured[0].source.continuity.as_ref().unwrap(),
+            expected_source.continuity.as_ref().unwrap()
+        ),
+        "raw XML remains shared"
+    );
+}
+
+#[test]
+fn selected_merged_tie_captures_intermediates_tail_to_head_without_retained_owner() {
+    let (mut owner, mut first) = tied_pair();
+    first.duration_ticks = 480;
+    let mut second = note("second-merged", 960, 480, 64);
+    tie(&first, &mut second);
+    let mut tail = note("last", 1440, 240, 64);
+    tie(&second, &mut tail);
+    let originals: Vec<_> = [&first, &second]
+        .into_iter()
+        .map(|note| {
+            let mut raw = source_obstacle(note, note.onset_ticks, note.duration_ticks, None);
+            raw.source = origin(note).source.clone();
+            raw
+        })
+        .collect();
+    owner.duration_ticks = 1440;
+    let mut lanes = pending(vec![vec![tail], vec![owner]]);
+    run_with_sources(&mut lanes, &[originals.clone()]);
+    assert_hold(&lanes, "last", "technical:1", "head", "first-verse");
+    let captured = &origin(find(&lanes, "last").1)
+        .continuation
+        .as_ref()
+        .unwrap()
+        .merged_tie_sources;
+    assert_eq!(captured.len(), 2);
+    for (actual, expected) in captured.iter().zip(originals.iter().rev()) {
+        assert_eq!(actual.source, expected.source);
+        assert_eq!(
+            (actual.onset_ticks, actual.duration_ticks),
+            (expected.onset, expected.duration)
+        );
+    }
+    assert_eq!(find(&lanes, "head").1.duration_ticks, 1440);
+}
+
+#[test]
+fn direct_ties_and_lyric_extensions_capture_no_merged_intermediates() {
+    for use_tie in [false, true] {
+        let mut owner = head("head", 64, "owner", "chord", 480);
+        let mut tail = note("last", 480, 240, 64);
+        if use_tie {
+            continuity_mut(&mut owner).extensions.clear();
+            tie(&owner, &mut tail);
+        }
+        let mut lanes = pending(vec![vec![tail], vec![owner]]);
+        run(&mut lanes);
+        assert_hold(&lanes, "last", "technical:1", "head", "owner");
+        assert!(origin(find(&lanes, "last").1)
+            .continuation
+            .as_ref()
+            .unwrap()
+            .merged_tie_sources
+            .is_empty());
+    }
+}
+
+#[test]
+fn merged_source_copies_preflight_owned_metadata_and_poison_cumulative_budget() {
+    let (_, middle) = tied_pair();
+    let mut raw = source_obstacle(&middle, 480, 480, None);
+    raw.source.unpitched = Some(crate::engine::midi::UnpitchedInfo {
+        display_step: Some("large-source-metadata".repeat(1024)),
+        ..Default::default()
+    });
+    for storage_limit in [false, true] {
+        let budget = Budget::default();
+        if storage_limit {
+            budget.reserved_bytes.set(128 * 1024 * 1024 - 1024);
+        } else {
+            budget.work.set(MAX_WORK - 1);
+        }
+        let mut captured = Vec::new();
+        assert!(push_merged_tie_source(&mut captured, &raw, &budget)
+            .unwrap_err()
+            .starts_with(LIMIT));
+        assert!(
+            captured.is_empty(),
+            "the source must not be copied before preflight succeeds"
+        );
+        assert!(
+            budget.charge(0).is_err(),
+            "resource refusal cannot masquerade as absent proof"
+        );
+    }
 }
 
 #[test]

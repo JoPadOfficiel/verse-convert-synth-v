@@ -49,8 +49,48 @@ impl ProjectedProject {
     /// A proven continuation must still follow its actual retained predecessor
     /// after filtering, pronunciation and technical lane splitting.
     pub fn continuity_violation(&self) -> Option<String> {
-        let mut intensity_budget = crate::engine::score_intensity::ProvenanceBudget::default();
+        self.validate_continuity_bounded(
+            &mut crate::engine::score_intensity::ProvenanceBudget::default(),
+        ).err()
+    }
+
+    fn validate_continuity_bounded(
+        &self,
+        intensity_budget: &mut crate::engine::score_intensity::ProvenanceBudget,
+    ) -> Result<(), String> {
         for track in &self.tracks {
+            if !track.notes.iter().any(|note| note.source_evidence.as_ref()
+                .and_then(|e| e.origin.as_ref())
+                .is_some_and(|origin| origin.continuation.is_some()))
+            {
+                continue;
+            }
+            let count = track.notes.len();
+            let depth = usize::BITS as usize - count.leading_zeros() as usize + 1;
+            // Reserve the reference vector and stable-sort scratch before either
+            // allocation. All tracks and subsequent proof comparisons share this cap.
+            intensity_budget.charge(
+                count.saturating_mul(std::mem::size_of::<&ProjectedNote>() * 2),
+                count.saturating_mul(depth.saturating_add(4)),
+            )?;
+            for note in &track.notes {
+                let Some(evidence) = &note.source_evidence else { continue };
+                let link = evidence.origin.as_ref().and_then(|o| o.continuation.as_ref());
+                if note.lyric.sung_owner_identity().is_some() || link.is_some() {
+                    intensity_budget.charge(
+                        128,
+                        evidence.note_id.len().saturating_add(8).saturating_mul(depth) / 8 + 1,
+                    )?;
+                }
+                if let Some(link) = link {
+                    let bytes = link.predecessor_id.len()
+                        .saturating_add(link.lyric_owner_id.len())
+                        .saturating_add(link.destination_track_id.len())
+                        .saturating_add(track.source_track_id.len())
+                        .saturating_add(link.intensity_attack_note_id.as_ref().map_or(0, String::len));
+                    intensity_budget.charge(0, bytes.saturating_add(8).saturating_mul(depth) / 8 + 1)?;
+                }
+            }
             let mut notes: Vec<_> = track.notes.iter().collect();
             notes.sort_by_key(|note| note.onset_ticks);
             let mut root_owners = std::collections::BTreeMap::<&str, &str>::new();
@@ -81,13 +121,19 @@ impl ProjectedProject {
                                 != Some(note.onset_ticks)
                     })
                 {
-                    return Some(format!("source continuation at tick {} on track {} no longer follows its proven predecessor {}",
+                    return Err(format!("source continuation at tick {} on track {} no longer follows its proven predecessor {}",
                         note.onset_ticks, track.source_track_id, link.predecessor_id));
                 }
                 let head = previous.unwrap();
+                let origin = note.source_evidence.as_ref().unwrap().origin.as_ref().unwrap();
+                let source_has_tie = origin.source.continuity.as_ref()
+                    .is_some_and(|c| c.incoming_tie.is_some());
+                if source_has_tie != (link.kind == ContinuationKind::Tie) {
+                    return Err("Source-proven tie cannot be reclassified as a syllable extension".into());
+                }
                 match link.kind {
                     ContinuationKind::Extension if link.intensity_attack_note_id.is_some() => {
-                        return Some(
+                        return Err(
                             "A syllable extension cannot claim an inherited tie attack".into(),
                         );
                     }
@@ -100,32 +146,10 @@ impl ProjectedProject {
                             .filter(|link| link.kind == ContinuationKind::Tie)
                             .and_then(|link| link.intensity_attack_note_id.as_deref())
                             .unwrap_or(&head_evidence.note_id);
-                        let source = &note
-                            .source_evidence
-                            .as_ref()
-                            .unwrap()
-                            .origin
-                            .as_ref()
-                            .unwrap()
-                            .source;
-                        let typed_tail = source
-                            .continuity
-                            .as_ref()
-                            .and_then(|c| c.incoming_tie.as_ref())
-                            .is_some_and(|tie| {
-                                tie.tail.source_id == source.id
-                                    && tie.tail.occurrence == source.occurrence
-                                    && source.continuity.as_ref().is_some_and(|c| {
-                                        c.playback_segment == tie.tail.playback_segment
-                                    })
-                                    && tie.contact_tick == note.onset_ticks
-                                    && tie.pitch == note.pitch
-                                    && head.pitch == note.pitch
-                            });
-                        if !typed_tail
+                        if !valid_source_tie(head, note, link, intensity_budget)?
                             || link.intensity_attack_note_id.as_deref() != Some(expected_root)
                         {
-                            return Some(
+                            return Err(
                                 "Source tie attack identity no longer follows its proven chain"
                                     .into(),
                             );
@@ -140,13 +164,14 @@ impl ProjectedProject {
                                 ) => {
                                     match tail.intensity.as_deref().zip(head.intensity.as_deref()) {
                                         Some((tail, head)) if a == b => {
-                                            match tail.is_continuation_of_bounded(
-                                                head,
-                                                &mut intensity_budget,
-                                            ) {
-                                                Ok(valid) => valid,
-                                                Err(error) => return Some(error),
-                                            }
+                                            use crate::engine::score_intensity::Time;
+                                            let start = Time::new(i64::from(note.onset_ticks), i64::from(self.ticks_per_beat))?;
+                                            let end = Time::new(
+                                                i64::from(note.onset_ticks) + i64::from(note.duration_ticks),
+                                                i64::from(self.ticks_per_beat),
+                                            )?;
+                                            tail.start <= start && tail.end >= end
+                                                && tail.is_continuation_of_bounded(head, intensity_budget)?
                                         }
                                         _ => false,
                                     }
@@ -159,20 +184,24 @@ impl ProjectedProject {
                             (Some(note), None) | (None, Some(note)) => note.channel_key().is_some(),
                         };
                         if !valid {
-                            return Some(format!(
+                            return Err(format!(
                                 "Source tie at tick {} lost its proven inherited intensity attack",
                                 note.onset_ticks
                             ));
                         }
                     }
-                    ContinuationKind::Extension => {}
+                    ContinuationKind::Extension => {
+                        if !link.merged_tie_sources.is_empty() {
+                            return Err("A syllable extension cannot claim merged tie sources".into());
+                        }
+                    }
                 }
                 if let Some(evidence) = &note.source_evidence {
                     root_owners.insert(&evidence.note_id, &link.lyric_owner_id);
                 }
             }
         }
-        None
+        Ok(())
     }
 
     /// The tempo entries in the order the source revealed them, which is the
@@ -321,6 +350,91 @@ pub struct ContinuationOwner {
     pub destination_track_id: String,
     pub kind: ContinuationKind,
     pub intensity_attack_note_id: Option<String>,
+    /// Original pitchless intermediates selected by the continuity planner,
+    /// ordered backwards from the incoming head to the retained predecessor.
+    pub merged_tie_sources: Vec<MergedTieSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergedTieSource {
+    pub source: crate::engine::midi::NoteSource,
+    pub onset_ticks: u32,
+    pub duration_ticks: u32,
+}
+
+fn valid_source_tie(
+    head: &ProjectedNote,
+    tail: &ProjectedNote,
+    link: &ContinuationOwner,
+    budget: &mut crate::engine::score_intensity::ProvenanceBudget,
+) -> Result<bool, String> {
+    use crate::engine::midi::{NoteSource, SourceNoteRef};
+    let matches_ref = |source: &NoteSource, reference: &SourceNoteRef| {
+        source.id == reference.source_id
+            && source.occurrence == reference.occurrence
+            && source.continuity.as_ref().is_some_and(|c| c.playback_segment == reference.playback_segment)
+    };
+    let charge = |source: &NoteSource, budget: &mut crate::engine::score_intensity::ProvenanceBudget| {
+        let mut bytes = source.id.len();
+        for field in [&source.part_id, &source.staff_id, &source.voice].into_iter().flatten() {
+            bytes = bytes.saturating_add(field.len());
+        }
+        if let Some(tie) = source.continuity.as_ref().and_then(|c| c.incoming_tie.as_ref()) {
+            bytes = bytes.saturating_add(tie.head.source_id.len()).saturating_add(tie.tail.source_id.len());
+        }
+        budget.charge(0, bytes / 8 + 16)
+    };
+    let Some(head_origin) = head.source_evidence.as_ref().and_then(|e| e.origin.as_ref()) else {
+        return Ok(false);
+    };
+    let Some(tail_origin) = tail.source_evidence.as_ref().and_then(|e| e.origin.as_ref()) else {
+        return Ok(false);
+    };
+    let head_source = &head_origin.source;
+    let tail_source = &tail_origin.source;
+    charge(head_source, budget)?;
+    charge(tail_source, budget)?;
+    let same_domain = |source: &NoteSource| {
+        source.part_id.is_some() && source.part_id == head_source.part_id
+            && source.staff_id.is_some() && source.staff_id == head_source.staff_id
+            && source.voice.is_some() && source.voice == head_source.voice
+            && source.continuity.as_ref().zip(head_source.continuity.as_ref())
+                .is_some_and(|(a, b)| a.playback_segment == b.playback_segment)
+    };
+    if head_origin.lyric_conflict || tail_origin.lyric_conflict
+        || !same_domain(tail_source) || head.pitch != tail.pitch
+    {
+        return Ok(false);
+    }
+    let Some(tie) = tail_source.continuity.as_ref().and_then(|c| c.incoming_tie.as_ref()) else {
+        return Ok(false);
+    };
+    if !matches_ref(tail_source, &tie.tail) || tie.contact_tick != tail.onset_ticks || tie.pitch != tail.pitch {
+        return Ok(false);
+    }
+    budget.charge(0, link.merged_tie_sources.len())?;
+    let mut reference = &tie.head;
+    let mut contact = tail.onset_ticks;
+    for merged in &link.merged_tie_sources {
+        charge(&merged.source, budget)?;
+        if !matches_ref(&merged.source, reference) || !same_domain(&merged.source)
+            || merged.onset_ticks <= head.onset_ticks || merged.onset_ticks >= contact
+            || merged.onset_ticks.checked_add(merged.duration_ticks) != Some(contact)
+        {
+            return Ok(false);
+        }
+        let Some(incoming) = merged.source.continuity.as_ref().and_then(|c| c.incoming_tie.as_ref()) else {
+            return Ok(false);
+        };
+        if !matches_ref(&merged.source, &incoming.tail)
+            || incoming.contact_tick != merged.onset_ticks || incoming.pitch != tail.pitch
+        {
+            return Ok(false);
+        }
+        reference = &incoming.head;
+        contact = merged.onset_ticks;
+    }
+    Ok(matches_ref(head_source, reference))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -510,5 +624,213 @@ mod tests {
     fn a_note_ending_past_the_tick_range_is_measured_without_overflowing() {
         let project = lane(vec![note(u32::MAX - 1, 480, 60)]);
         assert_eq!(project.monophony_violation(), None);
+    }
+
+    fn origin_mut(note: &mut ProjectedNote) -> &mut NoteOrigin {
+        note.source_evidence.as_mut().unwrap().origin.as_mut().unwrap()
+    }
+
+    fn source_reference(source: &crate::engine::midi::NoteSource) -> crate::engine::midi::SourceNoteRef {
+        crate::engine::midi::SourceNoteRef {
+            source_id: source.id.clone(),
+            occurrence: source.occurrence,
+            playback_segment: source.continuity.as_ref().unwrap().playback_segment,
+        }
+    }
+
+    fn owned_note(id: &str, at: u32) -> ProjectedNote {
+        use crate::engine::midi::{NoteSource, SourceContinuity, SourceEvidenceRef, SourceFormat};
+        let mut note = note(at, 480, 60);
+        note.source_evidence = Some(NoteEvidence {
+            note_id: format!("retained:{id}"),
+            note_on_event_id: format!("on:{id}"),
+            note_off_event_id: format!("off:{id}"),
+            lyric_id: None,
+            lyric_event_id: None,
+            origin: Some(NoteOrigin {
+                track_id: "original".into(),
+                note_on_order: at,
+                note_off_order: at + 480,
+                source: NoteSource {
+                    id: id.into(),
+                    part_id: Some("P1".into()),
+                    staff_id: Some("1".into()),
+                    voice: Some("1".into()),
+                    occurrence: 2,
+                    continuity: Some(std::sync::Arc::new(SourceContinuity {
+                        evidence: SourceEvidenceRef {
+                            source_format: SourceFormat::MuseScore,
+                            source_version: Some("3.02".into()),
+                            program_version: None,
+                            source_id: id.into(),
+                            raw_xml: "<Note/>".into(),
+                        },
+                        chord_id: format!("chord:{id}"),
+                        playback_segment: 3,
+                        incoming_tie: None,
+                        extensions: Vec::new(),
+                        issues: Vec::new(),
+                    })),
+                    ..NoteSource::default()
+                },
+                lyric_conflict: false,
+                continuation: None,
+            }),
+        });
+        note
+    }
+
+    fn incoming(head: &ProjectedNote, tail: &mut ProjectedNote) {
+        let head = &head.source_evidence.as_ref().unwrap().origin.as_ref().unwrap().source;
+        let at = tail.onset_ticks;
+        let pitch = tail.pitch;
+        let source = &mut origin_mut(tail).source;
+        let tie = crate::engine::midi::SourceTie {
+            head: source_reference(head),
+            tail: source_reference(source),
+            contact_tick: at,
+            pitch,
+            evidence: Vec::new(),
+        };
+        std::sync::Arc::make_mut(source.continuity.as_mut().unwrap()).incoming_tie = Some(tie);
+    }
+
+    fn tied_project() -> ProjectedProject {
+        let mut head = owned_note("head", 0);
+        head.lyric = ProjectedLyric::Source(Box::new(Lyric::text("word", "la".into())));
+        let mut tail = owned_note("tail", 480);
+        incoming(&head, &mut tail);
+        tail.lyric = ProjectedLyric::Extension;
+        origin_mut(&mut tail).continuation = Some(ContinuationOwner {
+            predecessor_id: "retained:head".into(),
+            lyric_owner_id: "word".into(),
+            destination_track_id: "voice".into(),
+            kind: ContinuationKind::Tie,
+            intensity_attack_note_id: Some("retained:head".into()),
+            merged_tie_sources: Vec::new(),
+        });
+        lane(vec![head, tail])
+    }
+
+    #[test]
+    fn continuation_authenticates_original_head_identity_and_domain() {
+        let project = tied_project();
+        assert_eq!(project.continuity_violation(), None);
+        for field in 0..6 {
+            let mut changed = project.clone();
+            let source = &mut origin_mut(&mut changed.tracks[0].notes[1]).source;
+            match field {
+                0..=2 => {
+                    let tie = std::sync::Arc::make_mut(source.continuity.as_mut().unwrap())
+                        .incoming_tie.as_mut().unwrap();
+                    match field {
+                        0 => tie.head.source_id = "unrelated-original-note".into(),
+                        1 => tie.head.occurrence += 1,
+                        _ => tie.head.playback_segment += 1,
+                    }
+                }
+                3 => source.part_id = Some("P2".into()),
+                4 => source.staff_id = Some("2".into()),
+                _ => source.voice = Some("2".into()),
+            }
+            assert!(changed.continuity_violation().is_some(), "field {field}");
+        }
+    }
+
+    #[test]
+    fn merged_original_links_are_authenticated_in_tail_to_head_order() {
+        let mut project = tied_project();
+        let head = project.tracks[0].notes[0].clone();
+        let mut first = owned_note("merged-first", 480);
+        incoming(&head, &mut first);
+        let mut second = owned_note("merged-second", 960);
+        incoming(&first, &mut second);
+        project.tracks[0].notes[0].duration_ticks = 1440;
+        let tail = &mut project.tracks[0].notes[1];
+        tail.onset_ticks = 1440;
+        incoming(&second, tail);
+        origin_mut(tail).continuation.as_mut().unwrap().merged_tie_sources = [second, first]
+            .into_iter().map(|note| MergedTieSource {
+                onset_ticks: note.onset_ticks,
+                duration_ticks: note.duration_ticks,
+                source: note.source_evidence.unwrap().origin.unwrap().source,
+            }).collect();
+        assert_eq!(project.continuity_violation(), None);
+        for mutation in 0..5 {
+            let mut changed = project.clone();
+            let chain = &mut origin_mut(&mut changed.tracks[0].notes[1])
+                .continuation.as_mut().unwrap().merged_tie_sources;
+            match mutation {
+                0 => chain.reverse(),
+                1 => chain[0].source.id.push('x'),
+                2 => chain[1].source.voice = Some("other".into()),
+                3 => chain[0].duration_ticks -= 1,
+                _ => { chain.pop(); }
+            }
+            assert!(changed.continuity_violation().is_some(), "mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn a_proven_tie_cannot_disable_inheritance_by_claiming_extension() {
+        let mut project = tied_project();
+        let link = origin_mut(&mut project.tracks[0].notes[1]).continuation.as_mut().unwrap();
+        link.kind = ContinuationKind::Extension;
+        link.intensity_attack_note_id = None;
+        assert!(project.continuity_violation().is_some());
+
+        // A real extension has its own attack and may change pitch.
+        let tail = &mut project.tracks[0].notes[1];
+        std::sync::Arc::make_mut(origin_mut(tail).source.continuity.as_mut().unwrap())
+            .incoming_tie = None;
+        tail.pitch = 64;
+        assert_eq!(project.continuity_violation(), None);
+
+        // A selected new syllable on a source tie remains a separate attack.
+        let mut project = tied_project();
+        let tail = &mut project.tracks[0].notes[1];
+        tail.lyric = ProjectedLyric::Source(Box::new(Lyric::text("next-word", "mi".into())));
+        origin_mut(tail).continuation = None;
+        assert_eq!(project.continuity_violation(), None);
+    }
+
+    #[test]
+    fn continuation_requires_full_exact_tail_coverage_but_allows_longer_context() {
+        use crate::engine::performance::{PerformanceNote, PerformanceOwner};
+        use crate::engine::score_intensity::{NoteIntensity, ScoreVoice, Time};
+        use std::sync::Arc;
+        let mut project = tied_project();
+        let attack = NoteIntensity::midi_attack("original-attack".into(), Time::ZERO,
+            Time::integer(1), 100, 0, 0, "original-velocity".into()).unwrap();
+        let owner = PerformanceOwner::Score { voice: ScoreVoice {
+            part: "P1".into(), staff: "1".into(), voice: "1".into(), instrument: None,
+        }};
+        project.tracks[0].notes[0].performance = Some(PerformanceNote {
+            source_id: "head".into(), owner: owner.clone(), intensity: Some(Arc::new(attack.clone())),
+        });
+        // Construct the expected inherited value directly, without using the
+        // production continuation helper as the test oracle.
+        for (end, valid) in [(Time::integer(2), true), (Time::integer(5), true),
+            (Time::new(959, 480).unwrap(), false)] {
+            let mut inherited = attack.clone();
+            inherited.end = end;
+            project.tracks[0].notes[1].performance = Some(PerformanceNote {
+                source_id: "tail".into(), owner: owner.clone(), intensity: Some(Arc::new(inherited)),
+            });
+            assert_eq!(project.continuity_violation().is_none(), valid, "end {end:?}");
+        }
+    }
+
+    #[test]
+    fn continuation_index_budget_is_cumulative_and_skips_unlinked_tracks() {
+        use crate::engine::score_intensity::ProvenanceBudget;
+        let plain = lane(vec![note(0, 480, 60); 10_000]);
+        assert!(plain.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(0, 0)).is_ok());
+        let mut project = tied_project();
+        assert!(project.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(0, usize::MAX)).is_err());
+        assert!(project.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(512, usize::MAX)).is_ok());
+        project.tracks.push(project.tracks[0].clone());
+        assert!(project.validate_continuity_bounded(&mut ProvenanceBudget::with_limits(512, usize::MAX))
+            .is_err_and(|error| error.contains("SCORE_INTENSITY_LIMIT")));
     }
 }

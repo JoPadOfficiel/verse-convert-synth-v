@@ -63,9 +63,10 @@ const callbackCode = ts.transpileModule(changeTargetSource, { compilerOptions: {
 
 function reanalysisHarness(convertFiles) {
   const state = { items: [{ path: "song.mscz", ok: true }], exportTarget: "ustx", pronunciationProfile: "default",
-    selected: new Set(["song.mscz"]), exportErrors: { "song.mscz": "old export error" }, exportProgress: { "song.mscz": {} }, globalError: null, busy: false };
+    selected: new Set(["song.mscz"]), exportErrors: { "song.mscz": "old export error" }, exportProgress: { "song.mscz": {} }, globalError: null, busy: false, savedProfiles: [] };
   const scope = { items: state.items, exportTarget: state.exportTarget, pronunciationProfile: state.pronunciationProfile,
     language: "english", overrides: {}, convertFiles, commandErrorMessage: (error) => error.message,
+    storePronunciationProfile: (profile) => state.savedProfiles.push(profile),
     beginBusy: () => { if (state.busy) return false; state.busy = true; return true; }, endBusy: () => { state.busy = false; } };
   for (const key of ["items", "exportTarget", "pronunciationProfile", "selected", "exportErrors", "exportProgress", "globalError"]) {
     scope[`set${key[0].toUpperCase()}${key.slice(1)}`] = (value) => { state[key] = typeof value === "function" ? value(state[key]) : value; };
@@ -86,11 +87,13 @@ test(`${profile}: same-target pronunciation change waits for reanalysis and adop
   assert.deepEqual(requested[0], [["song.mscz"], false, "english", undefined, {}, "ustx", profile]);
   assert.equal(state.busy, true);
   assert.equal(state.pronunciationProfile, "default", "no selection change before the command returns");
+  assert.deepEqual(state.savedProfiles, [], "pending analysis must not change the next session's profile");
   const verdicts = [{ path: "song.mscz", ok: false, msg: "target cannot represent this source" },
     { path: "other.mscz", ok: true, warnings: [{ code: unsupported }] }];
   resolve(verdicts);
   await pending;
   assert.equal(state.pronunciationProfile, profile);
+  assert.deepEqual(state.savedProfiles, [profile]);
   assert.equal(state.items, verdicts, "not-ok and unsupported diagnostics are valid new-profile verdicts");
   assert.equal(state.selected.size, 0);
   assert.deepEqual(state.exportErrors, {});
@@ -105,6 +108,7 @@ test(`${profile}: rejected reanalysis preserves the old selection and diagnostic
   await change("ustx", profile);
   assert.equal(state.items, original);
   assert.equal(state.pronunciationProfile, "default");
+  assert.deepEqual(state.savedProfiles, [], "failed analysis must not persist an unaccepted choice");
   assert.equal(state.globalError, "command unavailable");
   assert.equal(state.exportErrors["song.mscz"], "old export error");
   assert.equal(state.busy, false);
@@ -117,5 +121,43 @@ test(`${profile}: unchanged selection or the active busy guard prevents another 
   await change("ustx", profile);
   assert.equal(state.pronunciationProfile, "default");
   assert.equal(state.busy, true, "another operation still owns the guard");
+  assert.deepEqual(state.savedProfiles, []);
 });
 }
+
+test("choosing a profile before import is remembered without running an analysis", async () => {
+  const { state, change } = reanalysisHarness(async () => assert.fail("no files to analyse"));
+  state.items.length = 0;
+  await change("ustx", "frenchMillefeuille");
+  assert.equal(state.pronunciationProfile, "frenchMillefeuille");
+  assert.deepEqual(state.savedProfiles, ["frenchMillefeuille"]);
+  assert.equal(state.busy, false);
+});
+
+test("pronunciation preference survives restart, rejects stale values and tolerates disabled storage", async () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  try {
+    const values = new Map();
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, value),
+    } });
+    const preference = await load("../src/lib/pronunciation-preference.ts");
+    assert.equal(preference.storedPronunciationProfile(), "default");
+    for (const profile of ["frenchMillefeuille", "englishArpabet", "default"]) {
+      preference.storePronunciationProfile(profile);
+      const restarted = await load("../src/lib/pronunciation-preference.ts");
+      assert.equal(restarted.storedPronunciationProfile(), profile);
+    }
+    for (const value of ["unknown", "French", "", "null"]) {
+      values.set("verse.pronunciationProfile", value);
+      assert.equal(preference.storedPronunciationProfile(), "default");
+    }
+    Object.defineProperty(globalThis, "localStorage", { configurable: true, get() { throw new Error("storage disabled"); } });
+    assert.equal(preference.storedPronunciationProfile(), "default");
+    assert.doesNotThrow(() => preference.storePronunciationProfile("frenchMillefeuille"));
+  } finally {
+    if (original) Object.defineProperty(globalThis, "localStorage", original);
+    else delete globalThis.localStorage;
+  }
+});
