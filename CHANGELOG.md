@@ -5,6 +5,32 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.7.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.3...v0.7.0) (2026-09-10)
+
+
+### Features
+
+* add source-aware French and English DiffSinger profiles ([425dab1](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/425dab11208c3a8663b41aaa41defe601bac13aa))
+* **fidelity:** preserve score intensity and sung continuations ([2ae3d81](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/2ae3d813d360fe3503a56cb6e75ee31d52aa2607))
+* **fidelity:** preserve score intensity and sung continuations ([1a7a62a](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/1a7a62a263c58a20b805c413bc5c9e0e1e765408))
+* import pinned French and English pronunciation lexicons ([e0c6325](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/e0c6325e75e06b9b180cc3eb524575a4e188e9cc))
+* **performance:** preserve authored MIDI pitch and gain curves ([277f8bf](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/277f8bfefa017d3d775fd6f616128a8a5c455b06))
+* **phonetics:** preserve contextual French and English DiffSinger lyrics ([b3a5c78](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/b3a5c786b942cc78f6e701309f1772288262173f))
+* **ustx:** preserve explicit MIDI pitch and gain curves ([28abaea](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/28abaea44e20951a32d26a61de68c10139d34712))
+
+
+### Bug Fixes
+
+* **ci:** run lexicon tests without local rtk ([956a290](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/956a290e2b6e606bb14a76033316735347d01c56))
+* **ci:** run lexicon tests without local rtk ([a3623b3](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/a3623b3b80768b367006728c3fe6e2fb655ced55))
+* **fidelity:** collect evidence from retained vocal notes ([1043b1f](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/1043b1fc8a08826f31d00d757746e1edc63970f1))
+* **fidelity:** preserve source note evidence and linked staves ([9a715b2](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/9a715b29b4dc1feb66eade365f04addd9eef7ddf))
+* **musescore:** retain standalone staves with external links ([35b3de2](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/35b3de22f4f878a3ecff3d98022042979ae52666))
+* **phonetics:** preserve contextual French syllable readings ([05d4b35](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/05d4b359ef0a43ca46182462d63bbd10a86f3391))
+* preserve French sung syllables for DiffSinger ([f6133a5](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/f6133a50fdfbb913cc762abca8085642b3b272ad))
+* **ustx:** clean French syllable separators without lexical guesses ([e04120e](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/e04120ee94cc520aeeec72db246074204eb102f4))
+* **ustx:** protect controls and numeric signs during syllable cleanup ([5e4c436](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/5e4c436fc1fcd71a5c070fa64051a4bb34b5f76c))
+
 ## [Unreleased] (2026-09-10)
 
 This section records the current incremental fidelity work. It is intentionally
