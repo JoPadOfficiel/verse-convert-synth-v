@@ -8,7 +8,7 @@ and bounded evidence.json (or failure.json). This is native part validation and
 lyric reading, not full Ustx.Load, G2P, singer validation, or acoustic rendering.
 
 Example, from the worktree:
-  rtk proxy python3 scripts/probe-source-continuity-consumer.py \
+  proxy python3 scripts/probe-source-continuity-consumer.py \
     --source-dir /private/tmp/verse-openutau-reverse \
     --fixtures-dir /private/tmp/fid002-native-exports \
     --output-dir /private/tmp/fid002-native-evidence

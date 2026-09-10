@@ -80,3 +80,7 @@ release metadata are the operational authority. Files under
 `_bmad-output/` are local planning and historical evidence; they are not
 shipped in Git. The authoritative BMAD architecture has therefore been
 reconciled into [architecture.md](architecture.md).
+
+---
+
+_Generated and reconciled with the BMAD Method `document-project` workflow._
