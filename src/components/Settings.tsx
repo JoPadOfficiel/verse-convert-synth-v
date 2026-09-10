@@ -13,6 +13,8 @@ import {
   pickDirectory,
   pickRenderer,
   type RendererStatus,
+  type ExportTarget,
+  type PronunciationProfile,
 } from "@/lib/tauri";
 
 export function Settings({
@@ -21,6 +23,11 @@ export function Settings({
   rendererPath,
   setRendererPath,
   rendererStatus,
+  exportTarget,
+  pronunciationProfile,
+  onPronunciationChange,
+  busy,
+  error,
   onClose,
 }: {
   outDir?: string;
@@ -28,6 +35,11 @@ export function Settings({
   rendererPath?: string;
   setRendererPath: (path?: string) => void;
   rendererStatus: RendererStatus | null;
+  exportTarget: ExportTarget;
+  pronunciationProfile: PronunciationProfile;
+  onPronunciationChange: (profile: PronunciationProfile) => void;
+  busy: boolean;
+  error: string | null;
   onClose: () => void;
 }) {
   const { theme, setTheme } = useTheme();
@@ -52,6 +64,37 @@ export function Settings({
           <ChevronLeftIcon />
         </Button>
         <h2 className="text-lg font-semibold">Settings</h2>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <Label htmlFor="pronunciation-profile">OpenUtau pronunciation</Label>
+        <select
+          id="pronunciation-profile"
+          value={pronunciationProfile}
+          disabled={busy || exportTarget !== "ustx"}
+          onChange={(event) => onPronunciationChange(event.target.value as PronunciationProfile)}
+          className="rounded-md border bg-background px-3 py-2 text-sm disabled:opacity-50"
+        >
+          <option value="default">Default</option>
+          <option value="frenchMillefeuille">French DiffSinger Millefeuille</option>
+          <option value="englishArpabet">English DiffSinger ARPAbet</option>
+        </select>
+        <p className="text-xs text-muted-foreground">
+          {pronunciationProfile === "englishArpabet"
+            ? "English pronunciation for compatible DiffSinger banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
+            : pronunciationProfile === "frenchMillefeuille"
+              ? "French pronunciation for compatible DiffSinger Millefeuille banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
+              : "Default keeps the existing lyric projection and OpenUtau phonemizer convention."}
+          {" "}Assign a compatible singer in OpenUtau. Pronunciation is never
+          detected automatically. Synthesizer V uses Default.
+        </p>
+        <a className="text-xs underline" href="/licenses/french-community-dictionary.txt" target="_blank" rel="noreferrer">
+          French community dictionary license
+        </a>
+        <a className="text-xs underline" href="/licenses/cmudict.txt" target="_blank" rel="noreferrer">
+          CMU English dictionary license
+        </a>
+        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
       </div>
 
       <div className="flex flex-col gap-2">

@@ -10,10 +10,12 @@
 //!
 //! The format facts below were read from the OpenUtau `0.1.568` sources, not
 //! from documentation, and each one is cited at the line that depends on it.
+use super::PronunciationProfile;
 use crate::engine::midi::LyricState;
 use crate::engine::projection::{
     ProjectedLyric, ProjectedNote, ProjectedProject, ProjectedTempo, ProjectedTrack,
 };
+use crate::engine::syllable::SYLLABLE_HYPHENS;
 use std::collections::BTreeMap;
 
 /// One quarter note. `UProject.resolution` is `[YamlIgnore] => 480`, so the
@@ -372,6 +374,8 @@ fn exact_ustx_ticks(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i3
 /// state cannot silently fall into a wrong marker.
 fn lyric_text(lyric: &ProjectedLyric) -> String {
     match lyric {
+        ProjectedLyric::Pronounced { text, phonemes, .. } => format!("{text}[{phonemes}]"),
+        ProjectedLyric::PronouncedSplit { .. } => "+".into(),
         ProjectedLyric::Source(source) => match &source.state {
             LyricState::Text(text) => text.clone(),
             // The source states that the previous syllable is *held* across this
@@ -400,6 +404,43 @@ fn lyric_text(lyric: &ProjectedLyric) -> String {
         ProjectedLyric::Extension => HELD_SYLLABLE.into(),
         ProjectedLyric::Absent => String::new(),
     }
+}
+
+/// French export spelling only: discard edge syllable separators without
+/// claiming a lexical reading or changing the source evidence. Punctuation,
+/// whitespace and internal lexical hyphens retain their original bytes.
+fn french_syllable_text(text: &str) -> String {
+    if text.contains(['[', ']']) || text.trim_start().starts_with(['+', '?']) {
+        return text.into();
+    }
+    let edge = |c: char| {
+        c.is_whitespace() || ",.;:!?…\"«»‹›“”„‚'‘’(){}".contains(c) || SYLLABLE_HYPHENS.contains(&c)
+    };
+    // A separator can surround an existing force/control prefix. Never turn
+    // that text into a newly active alias by stripping its protective edge.
+    if text
+        .trim_start_matches(|c| c != '?' && c != '+' && edge(c))
+        .starts_with(['?', '+'])
+    {
+        return text.into();
+    }
+    let core = text.trim_matches(edge);
+    // A standalone dash or punctuation does not prove a syllable.
+    if !core.chars().any(char::is_alphabetic) || core.starts_with(['+', '?']) {
+        return text.into();
+    }
+    let start = text.len() - text.trim_start_matches(edge).len();
+    let end = start + core.len();
+    text[..start]
+        .chars()
+        .filter(|c| !SYLLABLE_HYPHENS.contains(c))
+        .chain(core.chars())
+        .chain(
+            text[end..]
+                .chars()
+                .filter(|c| !SYLLABLE_HYPHENS.contains(c)),
+        )
+        .collect()
 }
 
 /// Whether this lyric is a marker Verse rendered rather than text the source
@@ -498,7 +539,12 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
         let track_no = i32::try_from(index)
             .map_err(|_| "projected lane count exceeds the OpenUtau track range".to_string())?;
         tracks.push(UstxTrack {
-            phonemizer: DEFAULT_PHONEMIZER.into(),
+            phonemizer: match project.pronunciation_profile {
+                super::PronunciationProfile::Default => DEFAULT_PHONEMIZER,
+                super::PronunciationProfile::FrenchMillefeuille => super::french::PHONEMIZER,
+                super::PronunciationProfile::EnglishArpabet => super::english::PHONEMIZER,
+            }
+            .into(),
             track_name: track.name.clone(),
             // OpenUtau carries mute on the track and nowhere else, so a lane the
             // projection opens silent has to state it here.
@@ -510,6 +556,7 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
             track_no,
             track,
             project.ticks_per_beat,
+            project.pronunciation_profile,
         )?);
     }
     // Same shape as the Synthesizer V target: refuse a position while walking
@@ -625,13 +672,14 @@ fn serialize_voice_part(
     track_no: i32,
     track: &ProjectedTrack,
     ticks_per_beat: u16,
+    profile: PronunciationProfile,
 ) -> Result<UstxVoicePart, String> {
     let mut notes = Vec::with_capacity(track.notes.len());
     for note in &track.notes {
         notes.push((
             note.onset_ticks,
             is_rendered_marker(&note.lyric),
-            serialize_note(note, &track.source_track_id, ticks_per_beat)?,
+            serialize_note(note, &track.source_track_id, ticks_per_beat, profile)?,
         ));
     }
     // `UNote.CompareTo` falls back to `GetHashCode()` at equal positions, so the
@@ -707,6 +755,7 @@ fn serialize_note(
     note: &ProjectedNote,
     source_track_id: &str,
     ticks_per_beat: u16,
+    profile: PronunciationProfile,
 ) -> Result<UstxNote, String> {
     let position = exact_ustx_ticks(
         note.onset_ticks,
@@ -730,7 +779,15 @@ fn serialize_note(
         position,
         duration,
         tone: note.pitch,
-        lyric: lyric_text(&note.lyric),
+        lyric: match (&note.lyric, profile) {
+            (ProjectedLyric::Source(source), PronunciationProfile::FrenchMillefeuille) => {
+                match &source.state {
+                    LyricState::Text(text) => french_syllable_text(text),
+                    _ => lyric_text(&note.lyric),
+                }
+            }
+            _ => lyric_text(&note.lyric),
+        },
         pitch: UstxPitch::default(),
         vibrato: UstxVibrato::default(),
     })
@@ -1193,6 +1250,7 @@ mod tests {
     /// a meter. Every refusal has its own projection instead.
     fn projected() -> ProjectedProject {
         ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             language: "japanese".into(),
             meters: vec![ProjectedMeter {
@@ -1242,6 +1300,100 @@ mod tests {
 
     fn yaml(project: &ProjectedProject) -> String {
         to_yaml(&serialize(project).expect("the projection is exactly representable"))
+    }
+
+    #[test]
+    fn french_edge_cleanup_preserves_all_other_spelling_and_controls() {
+        for dash in SYLLABLE_HYPHENS {
+            for (input, expected) in [
+                (format!("zyx{dash}"), "zyx".into()),
+                (format!("{dash}qwv"), "qwv".into()),
+                (format!("{dash}Zyx{dash}"), "Zyx".into()),
+                (format!(" \t« {dash}Zyx{dash}, »\n"), " \t« Zyx, »\n".into()),
+                (format!("{dash} «Zyx», {dash} "), " «Zyx»,  ".into()),
+                (format!("{dash}ABI\u{302}Q{dash}"), "ABI\u{302}Q".into()),
+                (format!("zyx{dash}qwv"), format!("zyx{dash}qwv")),
+                (format!("{dash}"), format!("{dash}")),
+                (format!(" {dash}{dash} "), format!(" {dash}{dash} ")),
+                (format!(" «{dash},» "), format!(" «{dash},» ")),
+                (format!(" ?alias{dash} "), format!(" ?alias{dash} ")),
+                (format!(" +alias{dash} "), format!(" +alias{dash} ")),
+                (format!("mot{dash}[phones]"), format!("mot{dash}[phones]")),
+                (format!("mot[phones]{dash}"), format!("mot[phones]{dash}")),
+            ] {
+                assert_eq!(french_syllable_text(&input), expected, "{input:?}");
+                assert_eq!(french_syllable_text(&expected), expected, "idempotent");
+                assert!(!expected.is_empty());
+            }
+        }
+        assert_eq!(french_syllable_text("‹zyx-›"), "‹zyx›");
+        assert_eq!(french_syllable_text("zyx-‚"), "zyx‚");
+        for text in [
+            "arc-en-ciel",
+            "-",
+            "+",
+            "+~",
+            "?alias-",
+            "mot[phones]",
+            "",
+            "  ",
+            "l'",
+            "d'un",
+            "-12",
+            "−12",
+            "-?alias-",
+            "(?alias-)",
+            "-+alias-",
+        ] {
+            assert_eq!(french_syllable_text(text), text);
+        }
+    }
+
+    #[test]
+    fn french_cleanup_changes_only_serialized_source_text() {
+        use crate::engine::midi::{LineBreak, LyricExtension, Syllabic};
+        let mut project = projected();
+        let mut lyric = Lyric::text("unknown", " «Zyx-», ".into());
+        lyric.raw_bytes = vec![0xff, 0x2d, 0xc3];
+        lyric.lane = "verse-two".into();
+        lyric.verse = 2;
+        lyric.syllabic = Some(Syllabic::Begin);
+        lyric.line_break = Some(LineBreak::Paragraph);
+        lyric.time_only = vec![1, 3];
+        lyric.extension = Some(LyricExtension::Start);
+        lyric.extend_ticks = Some(480);
+        lyric.extend_fraction = Some((1, 4));
+        project.tracks[0].notes[0].lyric = ProjectedLyric::Source(Box::new(lyric));
+        let baseline = serialize(&project).unwrap();
+        let svp =
+            crate::engine::target::serialize_to(super::super::ExportTarget::Svp, &project).unwrap();
+        project.pronunciation_profile = PronunciationProfile::FrenchMillefeuille;
+        let before = project.clone();
+        let output = serialize(&project).unwrap();
+        assert_eq!(output.voice_parts[0].notes[0].lyric, " «Zyx», ");
+        let mut expected = baseline.clone();
+        expected.tracks[0].phonemizer = super::super::french::PHONEMIZER.into();
+        expected.voice_parts[0].notes[0].lyric = " «Zyx», ".into();
+        assert_eq!(
+            output, expected,
+            "all notes, timing, pitch, vibrato and markers survive"
+        );
+        assert_eq!(
+            project, before,
+            "every source lyric field survives serialization"
+        );
+        assert_eq!(serialize(&project).unwrap(), output);
+        assert_eq!(
+            crate::engine::target::serialize_to(super::super::ExportTarget::Svp, &project).unwrap(),
+            svp
+        );
+        project.pronunciation_profile = PronunciationProfile::Default;
+        assert_eq!(serialize(&project).unwrap(), baseline);
+        project.pronunciation_profile = PronunciationProfile::EnglishArpabet;
+        assert_eq!(
+            serialize(&project).unwrap().voice_parts,
+            baseline.voice_parts
+        );
     }
 
     /// Pins the whole seam: one fixed projection in, one exact OpenUtau project
@@ -1840,6 +1992,7 @@ mod tests {
     #[test]
     fn a_zero_ppq_is_refused_even_with_nothing_to_convert() {
         let empty = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 0,
             ..Default::default()
         };
@@ -1885,6 +2038,7 @@ mod tests {
     #[test]
     fn an_unrepresentable_tempo_names_the_event_the_source_revealed_first() {
         let project = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 448,
             meters: vec![ProjectedMeter {
                 bar_index: 0,
@@ -1926,6 +2080,7 @@ mod tests {
     #[test]
     fn the_emitted_tempo_map_is_position_ordered_whatever_the_projection_holds() {
         let project = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             meters: vec![ProjectedMeter {
                 bar_index: 0,

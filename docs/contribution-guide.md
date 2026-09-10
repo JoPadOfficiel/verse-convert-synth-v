@@ -90,9 +90,11 @@ The following rules are release invariants:
   Synthesizer V, `+~`/`+` for OpenUtau. Never carry rendered marker text through
   the projection, and never map one target's markers onto the other's by string
   substitution: `-` and `+~` mean the hold, `+` alone means the split.
-- Preserve source lyric text byte for byte. There is no language selection and
-  nothing about lyric text depends on one; never translate or normalize the
-  words.
+- Preserve original lyric bytes and metadata in source evidence. The Default
+  profile retains its existing text behavior. An explicitly selected
+  pronunciation profile may derive target-compatible hints and source-supported
+  syllable spelling, with source-linked diagnostics; it must never translate
+  words, rewrite original evidence, or change notes to fit a dictionary reading.
 - Never name a Synthesizer V voice database, an OpenUtau singer, or a renderer in
   the output. Verse has not seen the voice a track will be sung with.
 - Refuse rather than round. Timing that does not divide exactly into the selected

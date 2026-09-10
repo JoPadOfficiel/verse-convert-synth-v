@@ -1,0 +1,63 @@
+# Community dictionary v1.6, SHA-256 b4560adb8e5e2145f7b8a25f810db4c2f798d7db518f1d814d0dbae9728f7d34
+# Source: https://github.com/mmemim/OpenUTAU-French-Dictionary/blob/1e11bbe4df10bd4df03dfbf90ace92924c56e5b0/cmudict_fr.txt
+# License: public/licenses/french-community-dictionary.txt
+# key	Millefeuille symbols	upstream line	upstream symbols
+amours	fr/ah fr/m fr/ou fr/r	4112	aa mm ou rr
+blessures	fr/b fr/l fr/ae fr/s fr/uh fr/r	11665	bb ll ai ss uu rr
+blessures(2)	fr/b fr/l fr/ae fr/s fr/uh fr/r fr/ee	11666	bb ll ai ss uu rr ee
+changer	fr/sh fr/en fr/j fr/eh	16829	ch an jj ei
+est	fr/ae	35696	ai
+ferons	fr/f fr/ee fr/r fr/on	38284	ff ee rr on
+fond	fr/f fr/on	39563	ff on
+genoux	fr/j fr/ee fr/n fr/ou	42232	jj ee nn ou
+même	fr/m fr/ae fr/m	63919	mm ai mm
+même(2)	fr/m fr/ae fr/m fr/ee	63920	mm ai mm ee
+presse	fr/p fr/r fr/ae fr/s	73895	pp rr ai ss
+presse(2)	fr/p fr/r fr/ae fr/s fr/ee	73896	pp rr ai ss ee
+rêves	fr/r fr/ae fr/v	85681	rr ai vv
+rêves(2)	fr/r fr/ae fr/v fr/ee	85682	rr ai vv ee
+tempêtes	fr/t fr/en fr/p fr/ae fr/t	94165	tt an pp ai tt
+tempêtes(2)	fr/t fr/en fr/p fr/ae fr/t fr/ee	94166	tt an pp ai tt ee
+tout	fr/t fr/ou	95813	tt ou
+un	fr/in	97973	un
+vent	fr/v fr/en	99136	vv an
+murs	fr/m fr/uh fr/r	62923	mm uu rr
+court	fr/k fr/ou fr/r	23850	kk ou rr
+gaz	fr/g fr/ah fr/z	42092	gg aa zz
+sud	fr/s fr/uh fr/d	91693	ss uu dd
+net	fr/n fr/ae fr/t	64553	nn ai tt
+au	fr/oh	7963	au
+à	fr/ah	102144	aa
+mes	fr/m fr/eh	60142	mm ei
+les	fr/l fr/eh	55334	ll ei
+des	fr/d fr/eh	26359	dd ei
+une	fr/uh fr/n	98006	uu nn
+amis	fr/ah fr/m fr/ih	4038	aa mm ii
+ami	fr/ah fr/m fr/ih	4002	aa mm ii
+enfants	fr/en fr/f fr/en	34174	an ff an
+enfant	fr/en fr/f fr/en	34161	an ff an
+le	fr/l fr/ee	55059	ll ee
+hou	fr/ou	46229	ou
+rêve	fr/r fr/ae fr/v	85673	rr ai vv
+tempête	fr/t fr/en fr/p fr/ae fr/t	94163	tt an pp ai tt
+creux	fr/k fr/r fr/ee	24230	kk rr eu
+moments	fr/m fr/oo fr/m fr/en	61601	mm oo mm an
+ses	fr/s fr/ae	88042	ss ai
+tes	fr/t fr/ae	94530	tt ai
+nos	fr/n fr/oh	65257	nn au
+vos	fr/v fr/oh	100750	vv au
+mon	fr/m fr/on	61608	mm on
+ton	fr/t fr/on	95375	tt on
+son	fr/s fr/on	89511	ss on
+laisse	fr/l fr/ae fr/s	54452	ll ai ss
+laisse(2)	fr/l fr/ae fr/s fr/ee	54453	ll ai ss ee
+de	fr/d fr/ee	25850	dd ee
+bout	fr/b fr/ou	12764	bb ou
+blessure	fr/b fr/l fr/ae fr/s fr/uh fr/r	11663	bb ll ai ss uu rr
+genou	fr/j fr/ee fr/n fr/ou	42230	jj ee nn ou
+arrête	fr/ah fr/r fr/ae fr/t	6699	aa rr ai tt
+arrête(2)	fr/ah fr/r fr/ae fr/t fr/ee	6700	aa rr ai tt ee
+jure	fr/j fr/uh fr/r	53220	jj uu rr
+mur	fr/m fr/uh fr/r	62873	mm uu rr
+murmure	fr/m fr/uh fr/r fr/m fr/uh fr/r	62907	mm uu rr mm uu rr
+murmures	fr/m fr/uh fr/r fr/m fr/uh fr/r	62912	mm uu rr mm uu rr

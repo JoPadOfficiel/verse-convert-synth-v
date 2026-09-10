@@ -2417,7 +2417,7 @@ impl BundleHook for NoopHook {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::target::svp::{RenderConfig, Time};
     use crate::renderer::{MuseScoreRenderer, RendererCapabilities, WavInfo};
@@ -2426,6 +2426,10 @@ mod tests {
     use std::sync::Mutex;
 
     static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) fn successful_renderer(stems: &[StemDescriptor]) -> Arc<dyn AudioRenderer> {
+        Arc::new(FakeRenderer::with_stems(FakeMode::Success, stems))
+    }
 
     #[derive(Clone, Copy)]
     enum FakeMode {
@@ -2693,6 +2697,7 @@ mod tests {
             }),
             ExportTarget::Ustx => BundleProject::Ustx(
                 ustx::serialize(&ProjectedProject {
+                    pronunciation_profile: Default::default(),
                     ticks_per_beat: 480,
                     meters: vec![crate::engine::projection::ProjectedMeter {
                         bar_index: 0,

@@ -1,0 +1,3966 @@
+{
+  "allowed_phones": [
+    "fr/ae",
+    "fr/ah",
+    "fr/b",
+    "fr/d",
+    "fr/ee",
+    "fr/eh",
+    "fr/en",
+    "fr/f",
+    "fr/g",
+    "fr/h",
+    "fr/ih",
+    "fr/in",
+    "fr/j",
+    "fr/k",
+    "fr/l",
+    "fr/m",
+    "fr/n",
+    "fr/ng",
+    "fr/oe",
+    "fr/oh",
+    "fr/on",
+    "fr/oo",
+    "fr/ou",
+    "fr/p",
+    "fr/q",
+    "fr/r",
+    "fr/s",
+    "fr/sh",
+    "fr/t",
+    "fr/uh",
+    "fr/uy",
+    "fr/v",
+    "fr/w",
+    "fr/y",
+    "fr/z"
+  ],
+  "comment_lines": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    192,
+    193,
+    238,
+    239,
+    240
+  ],
+  "counts": {
+    "accepted_keys": 104943,
+    "accepted_multiword_keys": 1255,
+    "accepted_numbered_variant_keys": 42536,
+    "accepted_source_rows": 104983,
+    "blank_rows": 3,
+    "comment_lines": 12,
+    "deduplicated_extra_rows": 40,
+    "deduplicated_keys": 40,
+    "entry_rows": 105105,
+    "excluded_rows": 125,
+    "excluded_rows_by_reason": {
+      "conflicting_readings": 30,
+      "empty_reading": 5,
+      "empty_row": 3,
+      "invalid_alternative": 2,
+      "malformed_separator": 2,
+      "no_vowel": 72,
+      "unsupported_phonemes": 11
+    },
+    "gn_accepted_source_rows": 1043,
+    "gn_source_rows": 1043,
+    "quarantined_keys": 27,
+    "quarantined_keys_by_reason": {
+      "conflicting_readings": 16,
+      "invalid_alternative": 13
+    },
+    "quarantined_source_rows": 54,
+    "source_lines": 105120
+  },
+  "deduplications": [
+    {
+      "key": "i",
+      "rows": [
+        {
+          "key": "i",
+          "line": 139,
+          "phones": [
+            "fr/ih"
+          ],
+          "symbols": "ii",
+          "word": "i"
+        },
+        {
+          "key": "i",
+          "line": 46954,
+          "phones": [
+            "fr/ih"
+          ],
+          "symbols": "ii",
+          "word": "i"
+        }
+      ]
+    },
+    {
+      "key": "l'équipe",
+      "rows": [
+        {
+          "key": "l'équipe",
+          "line": 54237,
+          "phones": [
+            "fr/l",
+            "fr/eh",
+            "fr/k",
+            "fr/ih",
+            "fr/p"
+          ],
+          "symbols": "ll ei kk ii pp",
+          "word": "l'Équipe"
+        },
+        {
+          "key": "l'équipe",
+          "line": 105114,
+          "phones": [
+            "fr/l",
+            "fr/eh",
+            "fr/k",
+            "fr/ih",
+            "fr/p"
+          ],
+          "symbols": "ll ei kk ii pp",
+          "word": "l'équipe"
+        }
+      ]
+    },
+    {
+      "key": "l'étudiant",
+      "rows": [
+        {
+          "key": "l'étudiant",
+          "line": 54238,
+          "phones": [
+            "fr/l",
+            "fr/eh",
+            "fr/t",
+            "fr/uh",
+            "fr/d",
+            "fr/y",
+            "fr/en"
+          ],
+          "symbols": "ll ei tt uu dd yy an",
+          "word": "l'Étudiant"
+        },
+        {
+          "key": "l'étudiant",
+          "line": 105115,
+          "phones": [
+            "fr/l",
+            "fr/eh",
+            "fr/t",
+            "fr/uh",
+            "fr/d",
+            "fr/y",
+            "fr/en"
+          ],
+          "symbols": "ll ei tt uu dd yy an",
+          "word": "l'étudiant"
+        }
+      ]
+    },
+    {
+      "key": "l'événement",
+      "rows": [
+        {
+          "key": "l'événement",
+          "line": 54239,
+          "phones": [
+            "fr/l",
+            "fr/eh",
+            "fr/v",
+            "fr/eh",
+            "fr/n",
+            "fr/ee",
+            "fr/m",
+            "fr/en"
+          ],
+          "symbols": "ll ei vv ei nn ee mm an",
+          "word": "l'Événement"
+        },
+        {
+          "key": "l'événement",
+          "line": 105116,
+          "phones": [
+            "fr/l",
+            "fr/eh",
+            "fr/v",
+            "fr/eh",
+            "fr/n",
+            "fr/ee",
+            "fr/m",
+            "fr/en"
+          ],
+          "symbols": "ll ei vv ei nn ee mm an",
+          "word": "l'événement"
+        }
+      ]
+    },
+    {
+      "key": "länder",
+      "rows": [
+        {
+          "key": "länder",
+          "line": 57121,
+          "phones": [
+            "fr/l",
+            "fr/ah",
+            "fr/n",
+            "fr/d",
+            "fr/eh"
+          ],
+          "symbols": "ll aa nn dd ei",
+          "word": "lÄnder"
+        },
+        {
+          "key": "länder",
+          "line": 57161,
+          "phones": [
+            "fr/l",
+            "fr/ah",
+            "fr/n",
+            "fr/d",
+            "fr/eh"
+          ],
+          "symbols": "ll aa nn dd ei",
+          "word": "länder"
+        }
+      ]
+    },
+    {
+      "key": "to",
+      "rows": [
+        {
+          "key": "to",
+          "line": 145,
+          "phones": [
+            "fr/t",
+            "fr/oh"
+          ],
+          "symbols": "tt au",
+          "word": "to"
+        },
+        {
+          "key": "to",
+          "line": 95203,
+          "phones": [
+            "fr/t",
+            "fr/oh"
+          ],
+          "symbols": "tt au",
+          "word": "to"
+        }
+      ]
+    },
+    {
+      "key": "zu",
+      "rows": [
+        {
+          "key": "zu",
+          "line": 153,
+          "phones": [
+            "fr/z",
+            "fr/uh"
+          ],
+          "symbols": "zz uu",
+          "word": "zu"
+        },
+        {
+          "key": "zu",
+          "line": 156,
+          "phones": [
+            "fr/z",
+            "fr/uh"
+          ],
+          "symbols": "zz uu",
+          "word": "zu"
+        }
+      ]
+    },
+    {
+      "key": "âge",
+      "rows": [
+        {
+          "key": "âge",
+          "line": 102100,
+          "phones": [
+            "fr/ah",
+            "fr/j"
+          ],
+          "symbols": "aa jj",
+          "word": "Âge"
+        },
+        {
+          "key": "âge",
+          "line": 102344,
+          "phones": [
+            "fr/ah",
+            "fr/j"
+          ],
+          "symbols": "aa jj",
+          "word": "âge"
+        }
+      ]
+    },
+    {
+      "key": "échos",
+      "rows": [
+        {
+          "key": "échos",
+          "line": 102101,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/oh"
+          ],
+          "symbols": "ei kk au",
+          "word": "Échos"
+        },
+        {
+          "key": "échos",
+          "line": 102617,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/oh"
+          ],
+          "symbols": "ei kk au",
+          "word": "échos"
+        }
+      ]
+    },
+    {
+      "key": "éclair",
+      "rows": [
+        {
+          "key": "éclair",
+          "line": 102102,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/l",
+            "fr/ae",
+            "fr/r"
+          ],
+          "symbols": "ei kk ll ai rr",
+          "word": "Éclair"
+        },
+        {
+          "key": "éclair",
+          "line": 102644,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/l",
+            "fr/ae",
+            "fr/r"
+          ],
+          "symbols": "ei kk ll ai rr",
+          "word": "éclair"
+        }
+      ]
+    },
+    {
+      "key": "école",
+      "rows": [
+        {
+          "key": "école",
+          "line": 102103,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/oo",
+            "fr/l"
+          ],
+          "symbols": "ei kk oo ll",
+          "word": "École"
+        },
+        {
+          "key": "école",
+          "line": 102752,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/oo",
+            "fr/l"
+          ],
+          "symbols": "ei kk oo ll",
+          "word": "école"
+        }
+      ]
+    },
+    {
+      "key": "économie",
+      "rows": [
+        {
+          "key": "économie",
+          "line": 102104,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/oo",
+            "fr/n",
+            "fr/oo",
+            "fr/m",
+            "fr/ih"
+          ],
+          "symbols": "ei kk oo nn oo mm ii",
+          "word": "Économie"
+        },
+        {
+          "key": "économie",
+          "line": 102797,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/oo",
+            "fr/n",
+            "fr/oo",
+            "fr/m",
+            "fr/ih"
+          ],
+          "symbols": "ei kk oo nn oo mm ii",
+          "word": "économie"
+        }
+      ]
+    },
+    {
+      "key": "écritures",
+      "rows": [
+        {
+          "key": "écritures",
+          "line": 102105,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/r",
+            "fr/ih",
+            "fr/t",
+            "fr/uh",
+            "fr/r"
+          ],
+          "symbols": "ei kk rr ii tt uu rr",
+          "word": "Écritures"
+        },
+        {
+          "key": "écritures",
+          "line": 102951,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/r",
+            "fr/ih",
+            "fr/t",
+            "fr/uh",
+            "fr/r"
+          ],
+          "symbols": "ei kk rr ii tt uu rr",
+          "word": "écritures"
+        }
+      ]
+    },
+    {
+      "key": "édouard",
+      "rows": [
+        {
+          "key": "édouard",
+          "line": 102106,
+          "phones": [
+            "fr/eh",
+            "fr/d",
+            "fr/ou",
+            "fr/ah",
+            "fr/r"
+          ],
+          "symbols": "ei dd ou aa rr",
+          "word": "Édouard"
+        },
+        {
+          "key": "édouard",
+          "line": 103097,
+          "phones": [
+            "fr/eh",
+            "fr/d",
+            "fr/ou",
+            "fr/ah",
+            "fr/r"
+          ],
+          "symbols": "ei dd ou aa rr",
+          "word": "édouard"
+        }
+      ]
+    },
+    {
+      "key": "éducation",
+      "rows": [
+        {
+          "key": "éducation",
+          "line": 102107,
+          "phones": [
+            "fr/eh",
+            "fr/d",
+            "fr/uh",
+            "fr/k",
+            "fr/ah",
+            "fr/s",
+            "fr/y",
+            "fr/on"
+          ],
+          "symbols": "ei dd uu kk aa ss yy on",
+          "word": "Éducation"
+        },
+        {
+          "key": "éducation",
+          "line": 103104,
+          "phones": [
+            "fr/eh",
+            "fr/d",
+            "fr/uh",
+            "fr/k",
+            "fr/ah",
+            "fr/s",
+            "fr/y",
+            "fr/on"
+          ],
+          "symbols": "ei dd uu kk aa ss yy on",
+          "word": "éducation"
+        }
+      ]
+    },
+    {
+      "key": "église",
+      "rows": [
+        {
+          "key": "église",
+          "line": 102108,
+          "phones": [
+            "fr/eh",
+            "fr/g",
+            "fr/l",
+            "fr/ih",
+            "fr/z"
+          ],
+          "symbols": "ei gg ll ii zz",
+          "word": "Église"
+        },
+        {
+          "key": "église",
+          "line": 103165,
+          "phones": [
+            "fr/eh",
+            "fr/g",
+            "fr/l",
+            "fr/ih",
+            "fr/z"
+          ],
+          "symbols": "ei gg ll ii zz",
+          "word": "église"
+        }
+      ]
+    },
+    {
+      "key": "ékaterinbourg",
+      "rows": [
+        {
+          "key": "ékaterinbourg",
+          "line": 102110,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/ah",
+            "fr/t",
+            "fr/ee",
+            "fr/r",
+            "fr/in",
+            "fr/b",
+            "fr/ou",
+            "fr/r"
+          ],
+          "symbols": "ei kk aa tt ee rr in bb ou rr",
+          "word": "Ékaterinbourg"
+        },
+        {
+          "key": "ékaterinbourg",
+          "line": 105092,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/ah",
+            "fr/t",
+            "fr/ee",
+            "fr/r",
+            "fr/in",
+            "fr/b",
+            "fr/ou",
+            "fr/r"
+          ],
+          "symbols": "ei kk aa tt ee rr in bb ou rr",
+          "word": "ékaterinbourg"
+        }
+      ]
+    },
+    {
+      "key": "élysées",
+      "rows": [
+        {
+          "key": "élysées",
+          "line": 102115,
+          "phones": [
+            "fr/eh",
+            "fr/l",
+            "fr/ih",
+            "fr/z",
+            "fr/eh"
+          ],
+          "symbols": "ei ll ii zz ei",
+          "word": "Élysées"
+        },
+        {
+          "key": "élysées",
+          "line": 105098,
+          "phones": [
+            "fr/eh",
+            "fr/l",
+            "fr/ih",
+            "fr/z",
+            "fr/eh"
+          ],
+          "symbols": "ei ll ii zz ei",
+          "word": "élysées"
+        }
+      ]
+    },
+    {
+      "key": "émirat",
+      "rows": [
+        {
+          "key": "émirat",
+          "line": 102117,
+          "phones": [
+            "fr/eh",
+            "fr/m",
+            "fr/ih",
+            "fr/r",
+            "fr/ah"
+          ],
+          "symbols": "ei mm ii rr aa",
+          "word": "Émirat"
+        },
+        {
+          "key": "émirat",
+          "line": 103681,
+          "phones": [
+            "fr/eh",
+            "fr/m",
+            "fr/ih",
+            "fr/r",
+            "fr/ah"
+          ],
+          "symbols": "ei mm ii rr aa",
+          "word": "émirat"
+        }
+      ]
+    },
+    {
+      "key": "émirats",
+      "rows": [
+        {
+          "key": "émirats",
+          "line": 102118,
+          "phones": [
+            "fr/eh",
+            "fr/m",
+            "fr/ih",
+            "fr/r",
+            "fr/ah"
+          ],
+          "symbols": "ei mm ii rr aa",
+          "word": "Émirats"
+        },
+        {
+          "key": "émirats",
+          "line": 103684,
+          "phones": [
+            "fr/eh",
+            "fr/m",
+            "fr/ih",
+            "fr/r",
+            "fr/ah"
+          ],
+          "symbols": "ei mm ii rr aa",
+          "word": "émirats"
+        }
+      ]
+    },
+    {
+      "key": "équatoriale",
+      "rows": [
+        {
+          "key": "équatoriale",
+          "line": 102119,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/w",
+            "fr/ah",
+            "fr/t",
+            "fr/oo",
+            "fr/r",
+            "fr/y",
+            "fr/ah",
+            "fr/l"
+          ],
+          "symbols": "ei kk ww aa tt oo rr yy aa ll",
+          "word": "Équatoriale"
+        },
+        {
+          "key": "équatoriale",
+          "line": 104204,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/w",
+            "fr/ah",
+            "fr/t",
+            "fr/oo",
+            "fr/r",
+            "fr/y",
+            "fr/ah",
+            "fr/l"
+          ],
+          "symbols": "ei kk ww aa tt oo rr yy aa ll",
+          "word": "équatoriale"
+        }
+      ]
+    },
+    {
+      "key": "équestre",
+      "rows": [
+        {
+          "key": "équestre",
+          "line": 102120,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/ae",
+            "fr/s",
+            "fr/t",
+            "fr/r"
+          ],
+          "symbols": "ei kk ai ss tt rr",
+          "word": "Équestre"
+        },
+        {
+          "key": "équestre",
+          "line": 104209,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/ae",
+            "fr/s",
+            "fr/t",
+            "fr/r"
+          ],
+          "symbols": "ei kk ai ss tt rr",
+          "word": "équestre"
+        }
+      ]
+    },
+    {
+      "key": "équipe",
+      "rows": [
+        {
+          "key": "équipe",
+          "line": 102121,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/ih",
+            "fr/p"
+          ],
+          "symbols": "ei kk ii pp",
+          "word": "Équipe"
+        },
+        {
+          "key": "équipe",
+          "line": 104246,
+          "phones": [
+            "fr/eh",
+            "fr/k",
+            "fr/ih",
+            "fr/p"
+          ],
+          "symbols": "ei kk ii pp",
+          "word": "équipe"
+        }
+      ]
+    },
+    {
+      "key": "érignac",
+      "rows": [
+        {
+          "key": "érignac",
+          "line": 102122,
+          "phones": [
+            "fr/eh",
+            "fr/r",
+            "fr/ih",
+            "fr/n",
+            "fr/y",
+            "fr/ah",
+            "fr/k"
+          ],
+          "symbols": "ei rr ii nn yy aa kk",
+          "word": "Érignac"
+        },
+        {
+          "key": "érignac",
+          "line": 105104,
+          "phones": [
+            "fr/eh",
+            "fr/r",
+            "fr/ih",
+            "fr/n",
+            "fr/y",
+            "fr/ah",
+            "fr/k"
+          ],
+          "symbols": "ei rr ii gn aa kk",
+          "word": "érignac"
+        }
+      ]
+    },
+    {
+      "key": "érythrée",
+      "rows": [
+        {
+          "key": "érythrée",
+          "line": 102123,
+          "phones": [
+            "fr/eh",
+            "fr/r",
+            "fr/ih",
+            "fr/t",
+            "fr/r",
+            "fr/eh"
+          ],
+          "symbols": "ei rr ii tt rr ei",
+          "word": "Érythrée"
+        },
+        {
+          "key": "érythrée",
+          "line": 105105,
+          "phones": [
+            "fr/eh",
+            "fr/r",
+            "fr/ih",
+            "fr/t",
+            "fr/r",
+            "fr/eh"
+          ],
+          "symbols": "ei rr ii tt rr ei",
+          "word": "érythrée"
+        }
+      ]
+    },
+    {
+      "key": "érythréens",
+      "rows": [
+        {
+          "key": "érythréens",
+          "line": 102124,
+          "phones": [
+            "fr/eh",
+            "fr/r",
+            "fr/ih",
+            "fr/t",
+            "fr/r",
+            "fr/eh",
+            "fr/in"
+          ],
+          "symbols": "ei rr ii tt rr ei in",
+          "word": "Érythréens"
+        },
+        {
+          "key": "érythréens",
+          "line": 104365,
+          "phones": [
+            "fr/eh",
+            "fr/r",
+            "fr/ih",
+            "fr/t",
+            "fr/r",
+            "fr/eh",
+            "fr/in"
+          ],
+          "symbols": "ei rr ii tt rr ei in",
+          "word": "érythréens"
+        }
+      ]
+    },
+    {
+      "key": "état",
+      "rows": [
+        {
+          "key": "état",
+          "line": 102125,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/ah"
+          ],
+          "symbols": "ei tt aa",
+          "word": "État"
+        },
+        {
+          "key": "état",
+          "line": 104469,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/ah"
+          ],
+          "symbols": "ei tt aa",
+          "word": "état"
+        }
+      ]
+    },
+    {
+      "key": "états",
+      "rows": [
+        {
+          "key": "états",
+          "line": 102126,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/ah"
+          ],
+          "symbols": "ei tt aa",
+          "word": "États"
+        },
+        {
+          "key": "états",
+          "line": 104483,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/ah"
+          ],
+          "symbols": "ei tt aa",
+          "word": "états"
+        }
+      ]
+    },
+    {
+      "key": "éthiopiens",
+      "rows": [
+        {
+          "key": "éthiopiens",
+          "line": 102128,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/y",
+            "fr/oo",
+            "fr/p",
+            "fr/y",
+            "fr/in"
+          ],
+          "symbols": "ei tt yy oo pp yy in",
+          "word": "Éthiopiens"
+        },
+        {
+          "key": "éthiopiens",
+          "line": 104566,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/y",
+            "fr/oo",
+            "fr/p",
+            "fr/y",
+            "fr/in"
+          ],
+          "symbols": "ei tt yy oo pp yy in",
+          "word": "éthiopiens"
+        }
+      ]
+    },
+    {
+      "key": "étincelle",
+      "rows": [
+        {
+          "key": "étincelle",
+          "line": 102130,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/in",
+            "fr/s",
+            "fr/ae",
+            "fr/l"
+          ],
+          "symbols": "ei tt in ss ai ll",
+          "word": "Étincelle"
+        },
+        {
+          "key": "étincelle",
+          "line": 104584,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/in",
+            "fr/s",
+            "fr/ae",
+            "fr/l"
+          ],
+          "symbols": "ei tt in ss ai ll",
+          "word": "étincelle"
+        }
+      ]
+    },
+    {
+      "key": "étudiant",
+      "rows": [
+        {
+          "key": "étudiant",
+          "line": 102131,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/uh",
+            "fr/d",
+            "fr/y",
+            "fr/en"
+          ],
+          "symbols": "ei tt uu dd yy an",
+          "word": "Étudiant"
+        },
+        {
+          "key": "étudiant",
+          "line": 104751,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/uh",
+            "fr/d",
+            "fr/y",
+            "fr/en"
+          ],
+          "symbols": "ei tt uu dd yy an",
+          "word": "étudiant"
+        }
+      ]
+    },
+    {
+      "key": "éva",
+      "rows": [
+        {
+          "key": "éva",
+          "line": 102132,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/ah"
+          ],
+          "symbols": "ei vv aa",
+          "word": "Éva"
+        },
+        {
+          "key": "éva",
+          "line": 105109,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/ah"
+          ],
+          "symbols": "ei vv aa",
+          "word": "éva"
+        }
+      ]
+    },
+    {
+      "key": "évin",
+      "rows": [
+        {
+          "key": "évin",
+          "line": 102134,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/in"
+          ],
+          "symbols": "ei vv in",
+          "word": "Évin"
+        },
+        {
+          "key": "évin",
+          "line": 105111,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/in"
+          ],
+          "symbols": "ei vv in",
+          "word": "évin"
+        }
+      ]
+    },
+    {
+      "key": "éyadéma",
+      "rows": [
+        {
+          "key": "éyadéma",
+          "line": 102136,
+          "phones": [
+            "fr/eh",
+            "fr/y",
+            "fr/ah",
+            "fr/d",
+            "fr/eh",
+            "fr/m",
+            "fr/ah"
+          ],
+          "symbols": "ei yy aa dd ei mm aa",
+          "word": "Éyadéma"
+        },
+        {
+          "key": "éyadéma",
+          "line": 105112,
+          "phones": [
+            "fr/eh",
+            "fr/y",
+            "fr/ah",
+            "fr/d",
+            "fr/eh",
+            "fr/m",
+            "fr/ah"
+          ],
+          "symbols": "ei yy aa dd ei mm aa",
+          "word": "éyadéma"
+        }
+      ]
+    },
+    {
+      "key": "île",
+      "rows": [
+        {
+          "key": "île",
+          "line": 102137,
+          "phones": [
+            "fr/ih",
+            "fr/l"
+          ],
+          "symbols": "ii ll",
+          "word": "Île"
+        },
+        {
+          "key": "île",
+          "line": 105072,
+          "phones": [
+            "fr/ih",
+            "fr/l"
+          ],
+          "symbols": "ii ll",
+          "word": "île"
+        }
+      ]
+    },
+    {
+      "key": "îles",
+      "rows": [
+        {
+          "key": "îles",
+          "line": 102138,
+          "phones": [
+            "fr/ih",
+            "fr/l"
+          ],
+          "symbols": "ii ll",
+          "word": "Îles"
+        },
+        {
+          "key": "îles",
+          "line": 105074,
+          "phones": [
+            "fr/ih",
+            "fr/l"
+          ],
+          "symbols": "ii ll",
+          "word": "îles"
+        }
+      ]
+    },
+    {
+      "key": "ô",
+      "rows": [
+        {
+          "key": "ô",
+          "line": 102140,
+          "phones": [
+            "fr/oh"
+          ],
+          "symbols": "au",
+          "word": "Ô"
+        },
+        {
+          "key": "ô",
+          "line": 105083,
+          "phones": [
+            "fr/oh"
+          ],
+          "symbols": "au",
+          "word": "ô"
+        }
+      ]
+    },
+    {
+      "key": "öcalan",
+      "rows": [
+        {
+          "key": "öcalan",
+          "line": 102141,
+          "phones": [
+            "fr/oh",
+            "fr/k",
+            "fr/ah",
+            "fr/l",
+            "fr/en"
+          ],
+          "symbols": "au kk aa ll an",
+          "word": "Öcalan"
+        },
+        {
+          "key": "öcalan",
+          "line": 105117,
+          "phones": [
+            "fr/oh",
+            "fr/k",
+            "fr/ah",
+            "fr/l",
+            "fr/en"
+          ],
+          "symbols": "au kk aa ll an",
+          "word": "öcalan"
+        }
+      ]
+    },
+    {
+      "key": "övp",
+      "rows": [
+        {
+          "key": "övp",
+          "line": 102142,
+          "phones": [
+            "fr/oh",
+            "fr/v",
+            "fr/eh",
+            "fr/p",
+            "fr/eh"
+          ],
+          "symbols": "au vv ei pp ei",
+          "word": "Övp"
+        },
+        {
+          "key": "övp",
+          "line": 105118,
+          "phones": [
+            "fr/oh",
+            "fr/v",
+            "fr/eh",
+            "fr/p",
+            "fr/eh"
+          ],
+          "symbols": "au vv ei pp ei",
+          "word": "övp"
+        }
+      ]
+    },
+    {
+      "key": "özkök",
+      "rows": [
+        {
+          "key": "özkök",
+          "line": 102143,
+          "phones": [
+            "fr/oh",
+            "fr/z",
+            "fr/k",
+            "fr/oh",
+            "fr/k"
+          ],
+          "symbols": "au zz kk au kk",
+          "word": "Özkök"
+        },
+        {
+          "key": "özkök",
+          "line": 105119,
+          "phones": [
+            "fr/oh",
+            "fr/z",
+            "fr/k",
+            "fr/oh",
+            "fr/k"
+          ],
+          "symbols": "au zz kk au kk",
+          "word": "özkök"
+        }
+      ]
+    }
+  ],
+  "excluded_rows": [
+    {
+      "key": "っ",
+      "line": 8,
+      "phones": null,
+      "raw": "っ  -",
+      "reason": "unsupported_phonemes",
+      "symbols": "-",
+      "unsupported_phonemes": [
+        "-"
+      ],
+      "word": "っ"
+    },
+    {
+      "key": "ら",
+      "line": 47,
+      "phones": null,
+      "raw": "ら  4 aa",
+      "reason": "unsupported_phonemes",
+      "symbols": "4 aa",
+      "unsupported_phonemes": [
+        "4"
+      ],
+      "word": "ら"
+    },
+    {
+      "key": "り",
+      "line": 48,
+      "phones": null,
+      "raw": "り  4 ii",
+      "reason": "unsupported_phonemes",
+      "symbols": "4 ii",
+      "unsupported_phonemes": [
+        "4"
+      ],
+      "word": "り"
+    },
+    {
+      "key": "る",
+      "line": 49,
+      "phones": null,
+      "raw": "る  4 ou",
+      "reason": "unsupported_phonemes",
+      "symbols": "4 ou",
+      "unsupported_phonemes": [
+        "4"
+      ],
+      "word": "る"
+    },
+    {
+      "key": "れ",
+      "line": 50,
+      "phones": null,
+      "raw": "れ  4 ai",
+      "reason": "unsupported_phonemes",
+      "symbols": "4 ai",
+      "unsupported_phonemes": [
+        "4"
+      ],
+      "word": "れ"
+    },
+    {
+      "key": "ろ",
+      "line": 51,
+      "phones": null,
+      "raw": "ろ  4 au",
+      "reason": "unsupported_phonemes",
+      "symbols": "4 au",
+      "unsupported_phonemes": [
+        "4"
+      ],
+      "word": "ろ"
+    },
+    {
+      "key": "ん",
+      "line": 58,
+      "phones": [
+        "fr/n"
+      ],
+      "raw": "ん  nn",
+      "reason": "no_vowel",
+      "symbols": "nn",
+      "word": "ん"
+    },
+    {
+      "key": "u",
+      "line": 140,
+      "phones": [
+        "fr/uh"
+      ],
+      "quarantine_key": "u",
+      "reason": "invalid_alternative",
+      "symbols": "uu",
+      "word": "u"
+    },
+    {
+      "key": "e",
+      "line": 141,
+      "phones": [
+        "fr/ee"
+      ],
+      "quarantine_key": "e",
+      "reason": "invalid_alternative",
+      "symbols": "ee",
+      "word": "e"
+    },
+    {
+      "key": "ui",
+      "line": 148,
+      "phones": null,
+      "raw": "ui  uy ih",
+      "reason": "unsupported_phonemes",
+      "symbols": "uy ih",
+      "unsupported_phonemes": [
+        "ih"
+      ],
+      "word": "ui"
+    },
+    {
+      "key": "che",
+      "line": 188,
+      "phones": [
+        "fr/sh",
+        "fr/ae"
+      ],
+      "quarantine_key": "che",
+      "reason": "conflicting_readings",
+      "symbols": "ch ai",
+      "word": "che"
+    },
+    {
+      "key": "bye",
+      "line": 191,
+      "phones": [
+        "fr/b",
+        "fr/y",
+        "fr/ae"
+      ],
+      "quarantine_key": "bye",
+      "reason": "conflicting_readings",
+      "symbols": "bb yy ai",
+      "word": "bye"
+    },
+    {
+      "key": "instagram",
+      "line": 222,
+      "phones": null,
+      "raw": "instagram  in ss tt aa gg rr aa m",
+      "reason": "unsupported_phonemes",
+      "symbols": "in ss tt aa gg rr aa m",
+      "unsupported_phonemes": [
+        "m"
+      ],
+      "word": "instagram"
+    },
+    {
+      "key": "y'",
+      "line": 233,
+      "phones": [
+        "fr/y"
+      ],
+      "raw": "y' yy",
+      "reason": "malformed_separator",
+      "symbols": "yy",
+      "word": "y'"
+    },
+    {
+      "key": "-ce",
+      "line": 241,
+      "phones": [
+        "fr/s"
+      ],
+      "raw": "-ce  ss",
+      "reason": "no_vowel",
+      "symbols": "ss",
+      "word": "-ce"
+    },
+    {
+      "key": "-je",
+      "line": 259,
+      "phones": [
+        "fr/j"
+      ],
+      "raw": "-je  jj",
+      "reason": "no_vowel",
+      "symbols": "jj",
+      "word": "-je"
+    },
+    {
+      "key": "-le",
+      "line": 262,
+      "phones": [
+        "fr/l"
+      ],
+      "raw": "-le  ll",
+      "reason": "no_vowel",
+      "symbols": "ll",
+      "word": "-le"
+    },
+    {
+      "key": "aires(3)",
+      "line": 2926,
+      "phones": [
+        "fr/ae",
+        "fr/r",
+        "fr/ee"
+      ],
+      "quarantine_key": "aires(3)",
+      "reason": "conflicting_readings",
+      "symbols": "ai rr ee",
+      "word": "aires(3)"
+    },
+    {
+      "key": "aires(3)",
+      "line": 2927,
+      "phones": [
+        "fr/ae",
+        "fr/r",
+        "fr/ee",
+        "fr/z"
+      ],
+      "quarantine_key": "aires(3)",
+      "reason": "conflicting_readings",
+      "symbols": "ai rr ee zz",
+      "word": "aires(3)"
+    },
+    {
+      "key": "an",
+      "line": 4309,
+      "phones": null,
+      "raw": "an  ",
+      "reason": "empty_reading",
+      "symbols": "",
+      "word": "an"
+    },
+    {
+      "key": "bt",
+      "line": 13758,
+      "phones": [
+        "fr/b"
+      ],
+      "raw": "bt  bb",
+      "reason": "no_vowel",
+      "symbols": "bb",
+      "word": "bt"
+    },
+    {
+      "key": "bye",
+      "line": 14034,
+      "phones": [
+        "fr/b"
+      ],
+      "quarantine_key": "bye",
+      "raw": "bye  bb",
+      "reason": "no_vowel",
+      "symbols": "bb",
+      "word": "bye"
+    },
+    {
+      "key": "c'",
+      "line": 14305,
+      "phones": [
+        "fr/s"
+      ],
+      "quarantine_key": "c'",
+      "raw": "c'  ss",
+      "reason": "no_vowel",
+      "symbols": "ss",
+      "word": "c'"
+    },
+    {
+      "key": "cc",
+      "line": 16139,
+      "phones": [
+        "fr/k",
+        "fr/k"
+      ],
+      "raw": "cc  kk kk",
+      "reason": "no_vowel",
+      "symbols": "kk kk",
+      "word": "cc"
+    },
+    {
+      "key": "c'",
+      "line": 16171,
+      "phones": [
+        "fr/s"
+      ],
+      "quarantine_key": "c'",
+      "raw": "c'  ss",
+      "reason": "no_vowel",
+      "symbols": "ss",
+      "word": "c'"
+    },
+    {
+      "key": "ch",
+      "line": 16581,
+      "phones": null,
+      "raw": "ch  ",
+      "reason": "empty_reading",
+      "symbols": "",
+      "word": "ch"
+    },
+    {
+      "key": "che",
+      "line": 17364,
+      "phones": [
+        "fr/sh"
+      ],
+      "quarantine_key": "che",
+      "raw": "che  ch",
+      "reason": "no_vowel",
+      "symbols": "ch",
+      "word": "che"
+    },
+    {
+      "key": "cl",
+      "line": 18538,
+      "phones": [
+        "fr/k",
+        "fr/l"
+      ],
+      "raw": "cl  kk ll",
+      "reason": "no_vowel",
+      "symbols": "kk ll",
+      "word": "cl"
+    },
+    {
+      "key": "cm",
+      "line": 18994,
+      "phones": [
+        "fr/k",
+        "fr/m"
+      ],
+      "raw": "cm  kk mm",
+      "reason": "no_vowel",
+      "symbols": "kk mm",
+      "word": "cm"
+    },
+    {
+      "key": "cne",
+      "line": 19018,
+      "phones": [
+        "fr/k",
+        "fr/n"
+      ],
+      "raw": "cne  kk nn",
+      "reason": "no_vowel",
+      "symbols": "kk nn",
+      "word": "cne"
+    },
+    {
+      "key": "d'",
+      "line": 25451,
+      "phones": [
+        "fr/d"
+      ],
+      "quarantine_key": "d'",
+      "raw": "d'  dd",
+      "reason": "no_vowel",
+      "symbols": "dd",
+      "word": "d'"
+    },
+    {
+      "key": "db",
+      "line": 25836,
+      "phones": [
+        "fr/d",
+        "fr/b"
+      ],
+      "raw": "db  dd bb",
+      "reason": "no_vowel",
+      "symbols": "dd bb",
+      "word": "db"
+    },
+    {
+      "key": "d'",
+      "line": 25849,
+      "phones": [
+        "fr/d"
+      ],
+      "quarantine_key": "d'",
+      "raw": "d'  dd",
+      "reason": "no_vowel",
+      "symbols": "dd",
+      "word": "d'"
+    },
+    {
+      "key": "dj",
+      "line": 28159,
+      "phones": [
+        "fr/d",
+        "fr/j"
+      ],
+      "raw": "dj  dd jj",
+      "reason": "no_vowel",
+      "symbols": "dd jj",
+      "word": "dj"
+    },
+    {
+      "key": "dns",
+      "line": 28207,
+      "phones": [
+        "fr/d",
+        "fr/n"
+      ],
+      "raw": "dns  dd nn",
+      "reason": "no_vowel",
+      "symbols": "dd nn",
+      "word": "dns"
+    },
+    {
+      "key": "dns(2)",
+      "line": 28208,
+      "phones": [
+        "fr/d",
+        "fr/n",
+        "fr/s"
+      ],
+      "raw": "dns(2)  dd nn ss",
+      "reason": "no_vowel",
+      "symbols": "dd nn ss",
+      "word": "dns(2)"
+    },
+    {
+      "key": "e",
+      "line": 32781,
+      "phones": null,
+      "quarantine_key": "e",
+      "raw": "e  u",
+      "reason": "unsupported_phonemes",
+      "symbols": "u",
+      "unsupported_phonemes": [
+        "u"
+      ],
+      "word": "e"
+    },
+    {
+      "key": "eu",
+      "line": 35872,
+      "phones": null,
+      "raw": "eu  ",
+      "reason": "empty_reading",
+      "symbols": "",
+      "word": "eu"
+    },
+    {
+      "key": "fpö",
+      "line": 40177,
+      "phones": [
+        "fr/ae",
+        "fr/f",
+        "fr/p",
+        "fr/eh",
+        "fr/oo"
+      ],
+      "quarantine_key": "fpö",
+      "reason": "conflicting_readings",
+      "symbols": "ai ff pp ei oo",
+      "word": "fpÖ"
+    },
+    {
+      "key": "h",
+      "line": 44600,
+      "phones": null,
+      "raw": "h  aa c",
+      "reason": "unsupported_phonemes",
+      "symbols": "aa c",
+      "unsupported_phonemes": [
+        "c"
+      ],
+      "word": "h"
+    },
+    {
+      "key": "htm",
+      "line": 46292,
+      "phones": [
+        "fr/t",
+        "fr/m"
+      ],
+      "raw": "htm  tt mm",
+      "reason": "no_vowel",
+      "symbols": "tt mm",
+      "word": "htm"
+    },
+    {
+      "key": "html",
+      "line": 46293,
+      "phones": [
+        "fr/t",
+        "fr/m",
+        "fr/l"
+      ],
+      "raw": "html  tt mm ll",
+      "reason": "no_vowel",
+      "symbols": "tt mm ll",
+      "word": "html"
+    },
+    {
+      "key": "http",
+      "line": 46294,
+      "phones": [
+        "fr/t",
+        "fr/t"
+      ],
+      "raw": "http  tt tt",
+      "reason": "no_vowel",
+      "symbols": "tt tt",
+      "word": "http"
+    },
+    {
+      "key": "hôtel",
+      "line": 46676,
+      "phones": [
+        "fr/oo",
+        "fr/t",
+        "fr/ae",
+        "fr/l"
+      ],
+      "quarantine_key": "hôtel",
+      "reason": "conflicting_readings",
+      "symbols": "oo tt ai ll",
+      "word": "hÔtel"
+    },
+    {
+      "key": "hôtel",
+      "line": 46927,
+      "phones": [
+        "fr/oh",
+        "fr/t",
+        "fr/ae",
+        "fr/l"
+      ],
+      "quarantine_key": "hôtel",
+      "reason": "conflicting_readings",
+      "symbols": "au tt ai ll",
+      "word": "hôtel"
+    },
+    {
+      "key": "j'",
+      "line": 52250,
+      "phones": [
+        "fr/j"
+      ],
+      "quarantine_key": "j'",
+      "raw": "j'  jj",
+      "reason": "no_vowel",
+      "symbols": "jj",
+      "word": "j'"
+    },
+    {
+      "key": "j'",
+      "line": 52502,
+      "phones": [
+        "fr/j"
+      ],
+      "quarantine_key": "j'",
+      "raw": "j'  jj ",
+      "reason": "no_vowel",
+      "symbols": "jj",
+      "word": "j'"
+    },
+    {
+      "key": "jr",
+      "line": 53043,
+      "phones": [
+        "fr/j",
+        "fr/r"
+      ],
+      "raw": "jr  jj rr",
+      "reason": "no_vowel",
+      "symbols": "jj rr",
+      "word": "jr"
+    },
+    {
+      "key": "kg",
+      "line": 53713,
+      "phones": [
+        "fr/k"
+      ],
+      "raw": "kg  kk",
+      "reason": "no_vowel",
+      "symbols": "kk",
+      "word": "kg"
+    },
+    {
+      "key": "km",
+      "line": 53966,
+      "phones": [
+        "fr/k",
+        "fr/m"
+      ],
+      "raw": "km  kk mm",
+      "reason": "no_vowel",
+      "symbols": "kk mm",
+      "word": "km"
+    },
+    {
+      "key": "kw",
+      "line": 54175,
+      "phones": [
+        "fr/k",
+        "fr/w"
+      ],
+      "raw": "kw  kk ww",
+      "reason": "no_vowel",
+      "symbols": "kk ww",
+      "word": "kw"
+    },
+    {
+      "key": "l'",
+      "line": 54205,
+      "phones": [
+        "fr/l"
+      ],
+      "quarantine_key": "l'",
+      "raw": "l'  ll",
+      "reason": "no_vowel",
+      "symbols": "ll",
+      "word": "l'"
+    },
+    {
+      "key": "l'",
+      "line": 55058,
+      "phones": [
+        "fr/l"
+      ],
+      "quarantine_key": "l'",
+      "raw": "l'  ll",
+      "reason": "no_vowel",
+      "symbols": "ll",
+      "word": "l'"
+    },
+    {
+      "key": "ls",
+      "line": 56780,
+      "phones": [
+        "fr/l",
+        "fr/s"
+      ],
+      "raw": "ls  ll ss",
+      "reason": "no_vowel",
+      "symbols": "ll ss",
+      "word": "ls"
+    },
+    {
+      "key": "m'",
+      "line": 57386,
+      "phones": [
+        "fr/m"
+      ],
+      "quarantine_key": "m'",
+      "raw": "m'  mm",
+      "reason": "no_vowel",
+      "symbols": "mm",
+      "word": "m'"
+    },
+    {
+      "key": "mds(2)",
+      "line": 59757,
+      "phones": [
+        "fr/m",
+        "fr/d",
+        "fr/z"
+      ],
+      "raw": "mds(2)  mm dd zz",
+      "reason": "no_vowel",
+      "symbols": "mm dd zz",
+      "word": "mds(2)"
+    },
+    {
+      "key": "m'",
+      "line": 59758,
+      "phones": [
+        "fr/m"
+      ],
+      "quarantine_key": "m'",
+      "raw": "m'  mm",
+      "reason": "no_vowel",
+      "symbols": "mm",
+      "word": "m'"
+    },
+    {
+      "key": "mg(2)",
+      "line": 60397,
+      "phones": [
+        "fr/m"
+      ],
+      "raw": "mg(2)  mm",
+      "reason": "no_vowel",
+      "symbols": "mm",
+      "word": "mg(2)"
+    },
+    {
+      "key": "mhz",
+      "line": 60402,
+      "phones": [
+        "fr/m",
+        "fr/z"
+      ],
+      "raw": "mhz  mm zz",
+      "reason": "no_vowel",
+      "symbols": "mm zz",
+      "word": "mhz"
+    },
+    {
+      "key": "ml",
+      "line": 61227,
+      "phones": [
+        "fr/m",
+        "fr/l"
+      ],
+      "raw": "ml  mm ll",
+      "reason": "no_vowel",
+      "symbols": "mm ll",
+      "word": "ml"
+    },
+    {
+      "key": "mm",
+      "line": 61235,
+      "phones": null,
+      "raw": "mm   ",
+      "reason": "empty_reading",
+      "symbols": "",
+      "word": "mm"
+    },
+    {
+      "key": "mme(3)",
+      "line": 61239,
+      "phones": [
+        "fr/m",
+        "fr/m"
+      ],
+      "raw": "mme(3)  mm mm",
+      "reason": "no_vowel",
+      "symbols": "mm mm",
+      "word": "mme(3)"
+    },
+    {
+      "key": "mn",
+      "line": 61240,
+      "phones": [
+        "fr/m",
+        "fr/n"
+      ],
+      "raw": "mn  mm nn",
+      "reason": "no_vowel",
+      "symbols": "mm nn",
+      "word": "mn"
+    },
+    {
+      "key": "mrs",
+      "line": 62677,
+      "phones": [
+        "fr/m",
+        "fr/r"
+      ],
+      "raw": "mrs  mm rr",
+      "reason": "no_vowel",
+      "symbols": "mm rr",
+      "word": "mrs"
+    },
+    {
+      "key": "mrs(2)",
+      "line": 62678,
+      "phones": [
+        "fr/m",
+        "fr/r",
+        "fr/s"
+      ],
+      "raw": "mrs(2)  mm rr ss",
+      "reason": "no_vowel",
+      "symbols": "mm rr ss",
+      "word": "mrs(2)"
+    },
+    {
+      "key": "n'",
+      "line": 63955,
+      "phones": [
+        "fr/n"
+      ],
+      "quarantine_key": "n'",
+      "raw": "n'  nn",
+      "reason": "no_vowel",
+      "symbols": "nn",
+      "word": "n'"
+    },
+    {
+      "key": "n'",
+      "line": 64491,
+      "phones": [
+        "fr/n"
+      ],
+      "quarantine_key": "n'",
+      "raw": "n'  nn",
+      "reason": "no_vowel",
+      "symbols": "nn",
+      "word": "n'"
+    },
+    {
+      "key": "pdf",
+      "line": 69963,
+      "phones": [
+        "fr/p",
+        "fr/d",
+        "fr/f"
+      ],
+      "raw": "pdf  pp dd ff",
+      "reason": "no_vowel",
+      "symbols": "pp dd ff",
+      "word": "pdf"
+    },
+    {
+      "key": "php",
+      "line": 71163,
+      "phones": [
+        "fr/f"
+      ],
+      "raw": "php  ff",
+      "reason": "no_vowel",
+      "symbols": "ff",
+      "word": "php"
+    },
+    {
+      "key": "pr(2)",
+      "line": 73719,
+      "phones": [
+        "fr/p",
+        "fr/r"
+      ],
+      "raw": "pr(2)  pp rr",
+      "reason": "no_vowel",
+      "symbols": "pp rr",
+      "word": "pr(2)"
+    },
+    {
+      "key": "prs(2)",
+      "line": 75388,
+      "phones": [
+        "fr/p",
+        "fr/r"
+      ],
+      "raw": "prs(2)  pp rr",
+      "reason": "no_vowel",
+      "symbols": "pp rr",
+      "word": "prs(2)"
+    },
+    {
+      "key": "ps-mrg",
+      "line": 76374,
+      "phones": [
+        "fr/p",
+        "fr/s",
+        "fr/m",
+        "fr/r",
+        "fr/g"
+      ],
+      "raw": "ps-mrg  pp ss mm rr gg",
+      "reason": "no_vowel",
+      "symbols": "pp ss mm rr gg",
+      "word": "ps-mrg"
+    },
+    {
+      "key": "pt(2)",
+      "line": 76481,
+      "phones": [
+        "fr/p",
+        "fr/t"
+      ],
+      "raw": "pt(2)  pp tt",
+      "reason": "no_vowel",
+      "symbols": "pp tt",
+      "word": "pt(2)"
+    },
+    {
+      "key": "pts",
+      "line": 76483,
+      "phones": [
+        "fr/p",
+        "fr/t"
+      ],
+      "raw": "pts  pp tt",
+      "reason": "no_vowel",
+      "symbols": "pp tt",
+      "word": "pts"
+    },
+    {
+      "key": "qu",
+      "line": 77385,
+      "phones": [
+        "fr/k"
+      ],
+      "raw": "qu  kk",
+      "reason": "no_vowel",
+      "symbols": "kk",
+      "word": "qu"
+    },
+    {
+      "key": "qu'",
+      "line": 77387,
+      "phones": [
+        "fr/k"
+      ],
+      "quarantine_key": "qu'",
+      "raw": "qu'  kk",
+      "reason": "no_vowel",
+      "symbols": "kk",
+      "word": "qu'"
+    },
+    {
+      "key": "qu'",
+      "line": 77607,
+      "phones": [
+        "fr/k"
+      ],
+      "quarantine_key": "qu'",
+      "raw": "qu'  kk",
+      "reason": "no_vowel",
+      "symbols": "kk",
+      "word": "qu'"
+    },
+    {
+      "key": "r'",
+      "line": 78980,
+      "phones": [
+        "fr/r"
+      ],
+      "raw": "r'  rr",
+      "reason": "no_vowel",
+      "symbols": "rr",
+      "word": "r'"
+    },
+    {
+      "key": "res(2)",
+      "line": 81473,
+      "phones": [
+        "fr/r",
+        "fr/z"
+      ],
+      "raw": "res(2)  rr zz",
+      "reason": "no_vowel",
+      "symbols": "rr zz",
+      "word": "res(2)"
+    },
+    {
+      "key": "s'",
+      "line": 85719,
+      "phones": [
+        "fr/s"
+      ],
+      "quarantine_key": "s'",
+      "raw": "s'  ss",
+      "reason": "no_vowel",
+      "symbols": "ss",
+      "word": "s'"
+    },
+    {
+      "key": "s'",
+      "line": 87385,
+      "phones": [
+        "fr/s"
+      ],
+      "quarantine_key": "s'",
+      "raw": "s'  ss",
+      "reason": "no_vowel",
+      "symbols": "ss",
+      "word": "s'"
+    },
+    {
+      "key": "seulement(3)",
+      "line": 88062,
+      "phones": [
+        "fr/s",
+        "fr/oe",
+        "fr/l",
+        "fr/m",
+        "fr/en"
+      ],
+      "raw": "seulement(3) ss oe ll mm an",
+      "reason": "malformed_separator",
+      "symbols": "ss oe ll mm an",
+      "word": "seulement(3)"
+    },
+    {
+      "key": "shtml",
+      "line": 88250,
+      "phones": [
+        "fr/sh",
+        "fr/t",
+        "fr/m",
+        "fr/l"
+      ],
+      "raw": "shtml  ch tt mm ll",
+      "reason": "no_vowel",
+      "symbols": "ch tt mm ll",
+      "word": "shtml"
+    },
+    {
+      "key": "sncf(2)",
+      "line": 88978,
+      "phones": [
+        "fr/s",
+        "fr/n",
+        "fr/k",
+        "fr/f"
+      ],
+      "raw": "sncf(2)  ss nn kk ff",
+      "reason": "no_vowel",
+      "symbols": "ss nn kk ff",
+      "word": "sncf(2)"
+    },
+    {
+      "key": "sne",
+      "line": 88980,
+      "phones": [
+        "fr/s",
+        "fr/n"
+      ],
+      "raw": "sne  ss nn",
+      "reason": "no_vowel",
+      "symbols": "ss nn",
+      "word": "sne"
+    },
+    {
+      "key": "snj-cgt",
+      "line": 88993,
+      "phones": [
+        "fr/s",
+        "fr/n",
+        "fr/j",
+        "fr/k",
+        "fr/g",
+        "fr/t"
+      ],
+      "raw": "snj-cgt  ss nn jj kk gg tt",
+      "reason": "no_vowel",
+      "symbols": "ss nn jj kk gg tt",
+      "word": "snj-cgt"
+    },
+    {
+      "key": "spö",
+      "line": 90649,
+      "phones": [
+        "fr/ae",
+        "fr/s",
+        "fr/p",
+        "fr/eh",
+        "fr/oo"
+      ],
+      "quarantine_key": "spö",
+      "reason": "conflicting_readings",
+      "symbols": "ai ss pp ei oo",
+      "word": "spÖ"
+    },
+    {
+      "key": "st(3)",
+      "line": 90781,
+      "phones": [
+        "fr/s",
+        "fr/t"
+      ],
+      "raw": "st(3)  ss tt",
+      "reason": "no_vowel",
+      "symbols": "ss tt",
+      "word": "st(3)"
+    },
+    {
+      "key": "t'",
+      "line": 93321,
+      "phones": [
+        "fr/t"
+      ],
+      "quarantine_key": "t'",
+      "raw": "t'  tt",
+      "reason": "no_vowel",
+      "symbols": "tt",
+      "word": "t'"
+    },
+    {
+      "key": "t'",
+      "line": 93951,
+      "phones": [
+        "fr/t"
+      ],
+      "quarantine_key": "t'",
+      "raw": "t'  tt",
+      "reason": "no_vowel",
+      "symbols": "tt",
+      "word": "t'"
+    },
+    {
+      "key": "the",
+      "line": 94640,
+      "phones": [
+        "fr/t"
+      ],
+      "raw": "the  tt",
+      "reason": "no_vowel",
+      "symbols": "tt",
+      "word": "the"
+    },
+    {
+      "key": "",
+      "line": 95377,
+      "phones": null,
+      "raw": "",
+      "reason": "empty_row",
+      "symbols": "",
+      "word": ""
+    },
+    {
+      "key": "tx",
+      "line": 97552,
+      "phones": [
+        "fr/t",
+        "fr/k",
+        "fr/s"
+      ],
+      "raw": "tx  tt kk ss",
+      "reason": "no_vowel",
+      "symbols": "tt kk ss",
+      "word": "tx"
+    },
+    {
+      "key": "u",
+      "line": 97839,
+      "phones": null,
+      "quarantine_key": "u",
+      "raw": "u  ",
+      "reason": "empty_reading",
+      "symbols": "",
+      "word": "u"
+    },
+    {
+      "key": "v'",
+      "line": 98477,
+      "phones": [
+        "fr/v"
+      ],
+      "raw": "v'  vv",
+      "reason": "no_vowel",
+      "symbols": "vv",
+      "word": "v'"
+    },
+    {
+      "key": "",
+      "line": 98483,
+      "phones": null,
+      "raw": "",
+      "reason": "empty_row",
+      "symbols": "",
+      "word": ""
+    },
+    {
+      "key": "",
+      "line": 101124,
+      "phones": null,
+      "raw": "\t\t\t\t\t\t\t\t\t\t\t\t ",
+      "reason": "empty_row",
+      "symbols": "",
+      "word": ""
+    },
+    {
+      "key": "vérifiés(2)",
+      "line": 101154,
+      "phones": null,
+      "raw": "vérifiés(2)  vv ei rr ii ff yy ei zzvérita  vv ei rr ii tt aa",
+      "reason": "unsupported_phonemes",
+      "symbols": "vv ei rr ii ff yy ei zzvérita vv ei rr ii tt aa",
+      "unsupported_phonemes": [
+        "zzvérita"
+      ],
+      "word": "vérifiés(2)"
+    },
+    {
+      "key": "we",
+      "line": 101348,
+      "phones": [
+        "fr/w"
+      ],
+      "raw": "we  ww",
+      "reason": "no_vowel",
+      "symbols": "ww",
+      "word": "we"
+    },
+    {
+      "key": "wes",
+      "line": 101416,
+      "phones": [
+        "fr/w",
+        "fr/z"
+      ],
+      "raw": "wes  ww zz",
+      "reason": "no_vowel",
+      "symbols": "ww zz",
+      "word": "wes"
+    },
+    {
+      "key": "wye",
+      "line": 101609,
+      "phones": [
+        "fr/w",
+        "fr/y"
+      ],
+      "raw": "wye  ww yy",
+      "reason": "no_vowel",
+      "symbols": "ww yy",
+      "word": "wye"
+    },
+    {
+      "key": "x",
+      "line": 101615,
+      "phones": [
+        "fr/k",
+        "fr/s"
+      ],
+      "raw": "x  kk ss",
+      "reason": "no_vowel",
+      "symbols": "kk ss",
+      "word": "x"
+    },
+    {
+      "key": "yes",
+      "line": 101726,
+      "phones": [
+        "fr/y",
+        "fr/z"
+      ],
+      "raw": "yes  yy zz",
+      "reason": "no_vowel",
+      "symbols": "yy zz",
+      "word": "yes"
+    },
+    {
+      "key": "éguilles",
+      "line": 102109,
+      "phones": [
+        "fr/eh",
+        "fr/g",
+        "fr/ih",
+        "fr/y"
+      ],
+      "quarantine_key": "éguilles",
+      "reason": "conflicting_readings",
+      "symbols": "ei gg ii yy",
+      "word": "Éguilles"
+    },
+    {
+      "key": "élie",
+      "line": 102111,
+      "phones": [
+        "fr/eh",
+        "fr/l",
+        "fr/ih"
+      ],
+      "quarantine_key": "élie",
+      "reason": "conflicting_readings",
+      "symbols": "ei ll ii",
+      "word": "Élie"
+    },
+    {
+      "key": "élim",
+      "line": 102112,
+      "phones": [
+        "fr/eh",
+        "fr/l",
+        "fr/ih",
+        "fr/m"
+      ],
+      "quarantine_key": "élim",
+      "reason": "conflicting_readings",
+      "symbols": "ei ll ii mm",
+      "word": "Élim"
+    },
+    {
+      "key": "élisabethville",
+      "line": 102113,
+      "phones": [
+        "fr/eh",
+        "fr/l",
+        "fr/ih",
+        "fr/z",
+        "fr/ah",
+        "fr/b",
+        "fr/ae",
+        "fr/t",
+        "fr/v",
+        "fr/ih",
+        "fr/l"
+      ],
+      "quarantine_key": "élisabethville",
+      "reason": "conflicting_readings",
+      "symbols": "ei ll ii zz aa bb ai tt vv ii ll",
+      "word": "Élisabethville"
+    },
+    {
+      "key": "émilienne",
+      "line": 102116,
+      "phones": [
+        "fr/eh",
+        "fr/m",
+        "fr/ih",
+        "fr/l",
+        "fr/y",
+        "fr/ae",
+        "fr/n"
+      ],
+      "quarantine_key": "émilienne",
+      "reason": "conflicting_readings",
+      "symbols": "ei mm ii ll yy ai nn",
+      "word": "Émilienne"
+    },
+    {
+      "key": "éthiopie",
+      "line": 102127,
+      "phones": [
+        "fr/eh",
+        "fr/t",
+        "fr/y",
+        "fr/oo",
+        "fr/p",
+        "fr/ih"
+      ],
+      "quarantine_key": "éthiopie",
+      "reason": "conflicting_readings",
+      "symbols": "ei tt yy oo pp ii",
+      "word": "Éthiopie"
+    },
+    {
+      "key": "étienne",
+      "line": 102129,
+      "phones": [
+        "fr/eh",
+        "fr/t",
+        "fr/y",
+        "fr/ae",
+        "fr/n"
+      ],
+      "quarantine_key": "étienne",
+      "reason": "conflicting_readings",
+      "symbols": "ei tt yy ai nn",
+      "word": "Étienne"
+    },
+    {
+      "key": "évian",
+      "line": 102133,
+      "phones": [
+        "fr/eh",
+        "fr/v",
+        "fr/y",
+        "fr/en"
+      ],
+      "quarantine_key": "évian",
+      "reason": "conflicting_readings",
+      "symbols": "ei vv yy an",
+      "word": "Évian"
+    },
+    {
+      "key": "évêché",
+      "line": 102135,
+      "phones": [
+        "fr/eh",
+        "fr/v",
+        "fr/eh",
+        "fr/sh",
+        "fr/eh"
+      ],
+      "quarantine_key": "évêché",
+      "reason": "conflicting_readings",
+      "symbols": "ei vv ei ch ei",
+      "word": "Évêché"
+    },
+    {
+      "key": "îles(2)",
+      "line": 102139,
+      "phones": [
+        "fr/ih",
+        "fr/l",
+        "fr/z"
+      ],
+      "quarantine_key": "îles(2)",
+      "reason": "conflicting_readings",
+      "symbols": "ii ll zz",
+      "word": "Îles(2)"
+    },
+    {
+      "key": "évêché",
+      "line": 105055,
+      "phones": [
+        "fr/eh",
+        "fr/v",
+        "fr/ae",
+        "fr/sh",
+        "fr/eh"
+      ],
+      "quarantine_key": "évêché",
+      "reason": "conflicting_readings",
+      "symbols": "ei vv ai ch ei",
+      "word": "évêché"
+    },
+    {
+      "key": "îles(2)",
+      "line": 105075,
+      "phones": [
+        "fr/ih",
+        "fr/l",
+        "fr/ee"
+      ],
+      "quarantine_key": "îles(2)",
+      "reason": "conflicting_readings",
+      "symbols": "ii ll ee",
+      "word": "îles(2)"
+    },
+    {
+      "key": "éguilles",
+      "line": 105091,
+      "phones": [
+        "fr/eh",
+        "fr/g",
+        "fr/uy",
+        "fr/y",
+        "fr/ih",
+        "fr/ee"
+      ],
+      "quarantine_key": "éguilles",
+      "reason": "conflicting_readings",
+      "symbols": "ei gg uy yy ii ee",
+      "word": "éguilles"
+    },
+    {
+      "key": "élie",
+      "line": 105093,
+      "phones": [
+        "fr/ee",
+        "fr/l",
+        "fr/ih"
+      ],
+      "quarantine_key": "élie",
+      "reason": "conflicting_readings",
+      "symbols": "ee ll ii",
+      "word": "élie"
+    },
+    {
+      "key": "élim",
+      "line": 105094,
+      "phones": [
+        "fr/ee",
+        "fr/l",
+        "fr/ih",
+        "fr/m"
+      ],
+      "quarantine_key": "élim",
+      "reason": "conflicting_readings",
+      "symbols": "ee ll ii mm",
+      "word": "élim"
+    },
+    {
+      "key": "élisabethville",
+      "line": 105095,
+      "phones": [
+        "fr/eh",
+        "fr/l",
+        "fr/ih",
+        "fr/z",
+        "fr/ah",
+        "fr/b",
+        "fr/eh",
+        "fr/t",
+        "fr/v",
+        "fr/ih",
+        "fr/l"
+      ],
+      "quarantine_key": "élisabethville",
+      "reason": "conflicting_readings",
+      "symbols": "ei ll ii zz aa bb ei tt vv ii ll",
+      "word": "élisabethville"
+    },
+    {
+      "key": "émilienne",
+      "line": 105099,
+      "phones": [
+        "fr/eh",
+        "fr/m",
+        "fr/ih",
+        "fr/l",
+        "fr/ih",
+        "fr/ae",
+        "fr/n"
+      ],
+      "quarantine_key": "émilienne",
+      "reason": "conflicting_readings",
+      "symbols": "ei mm ii ll ii ai nn",
+      "word": "émilienne"
+    },
+    {
+      "key": "éthiopie",
+      "line": 105107,
+      "phones": [
+        "fr/eh",
+        "fr/t",
+        "fr/ih",
+        "fr/oo",
+        "fr/p",
+        "fr/ih"
+      ],
+      "quarantine_key": "éthiopie",
+      "reason": "conflicting_readings",
+      "symbols": "ei tt ii oo pp ii",
+      "word": "éthiopie"
+    },
+    {
+      "key": "étienne",
+      "line": 105108,
+      "phones": [
+        "fr/eh",
+        "fr/t",
+        "fr/ih",
+        "fr/ae",
+        "fr/n"
+      ],
+      "quarantine_key": "étienne",
+      "reason": "conflicting_readings",
+      "symbols": "ei tt ii ai nn",
+      "word": "étienne"
+    },
+    {
+      "key": "évian",
+      "line": 105110,
+      "phones": [
+        "fr/eh",
+        "fr/v",
+        "fr/ih",
+        "fr/en"
+      ],
+      "quarantine_key": "évian",
+      "reason": "conflicting_readings",
+      "symbols": "ei vv ii an",
+      "word": "évian"
+    },
+    {
+      "key": "fpö",
+      "line": 105113,
+      "phones": [
+        "fr/ae",
+        "fr/f",
+        "fr/p",
+        "fr/eh",
+        "fr/oh"
+      ],
+      "quarantine_key": "fpö",
+      "reason": "conflicting_readings",
+      "symbols": "ai ff pp ei au",
+      "word": "fpö"
+    },
+    {
+      "key": "spö",
+      "line": 105120,
+      "phones": [
+        "fr/ae",
+        "fr/s",
+        "fr/p",
+        "fr/eh",
+        "fr/oh"
+      ],
+      "quarantine_key": "spö",
+      "reason": "conflicting_readings",
+      "symbols": "ai ss pp ei au",
+      "word": "spö"
+    }
+  ],
+  "license": {
+    "path": "public/licenses/french-community-dictionary.txt",
+    "sha256": "11e3c35cb4439d0086b5cc9309b31ab00185a7b10bb1f584e042769d0d78302c",
+    "url": "https://raw.githubusercontent.com/mmemim/OpenUTAU-French-Dictionary/1e11bbe4df10bd4df03dfbf90ace92924c56e5b0/LICENSE"
+  },
+  "mapping": {
+    "aa": [
+      "fr/ah"
+    ],
+    "ai": [
+      "fr/ae"
+    ],
+    "an": [
+      "fr/en"
+    ],
+    "au": [
+      "fr/oh"
+    ],
+    "bb": [
+      "fr/b"
+    ],
+    "ch": [
+      "fr/sh"
+    ],
+    "dd": [
+      "fr/d"
+    ],
+    "ee": [
+      "fr/ee"
+    ],
+    "ei": [
+      "fr/eh"
+    ],
+    "eu": [
+      "fr/ee"
+    ],
+    "ff": [
+      "fr/f"
+    ],
+    "gg": [
+      "fr/g"
+    ],
+    "gn": [
+      "fr/n",
+      "fr/y"
+    ],
+    "hh": [
+      "fr/h"
+    ],
+    "ii": [
+      "fr/ih"
+    ],
+    "in": [
+      "fr/in"
+    ],
+    "jj": [
+      "fr/j"
+    ],
+    "kk": [
+      "fr/k"
+    ],
+    "ll": [
+      "fr/l"
+    ],
+    "mm": [
+      "fr/m"
+    ],
+    "nn": [
+      "fr/n"
+    ],
+    "oe": [
+      "fr/oe"
+    ],
+    "on": [
+      "fr/on"
+    ],
+    "oo": [
+      "fr/oo"
+    ],
+    "ou": [
+      "fr/ou"
+    ],
+    "pp": [
+      "fr/p"
+    ],
+    "rr": [
+      "fr/r"
+    ],
+    "ss": [
+      "fr/s"
+    ],
+    "tt": [
+      "fr/t"
+    ],
+    "un": [
+      "fr/in"
+    ],
+    "uu": [
+      "fr/uh"
+    ],
+    "uy": [
+      "fr/uy"
+    ],
+    "vv": [
+      "fr/v"
+    ],
+    "ww": [
+      "fr/w"
+    ],
+    "yy": [
+      "fr/y"
+    ],
+    "zz": [
+      "fr/z"
+    ]
+  },
+  "mapping_evidence": {
+    "gn": {
+      "method": "Installed OpenUtau Millefeuille embedded dictionary queries (--embedded)",
+      "observations": {
+        "gagner": [
+          "g",
+          "ah",
+          "n",
+          "y",
+          "eh"
+        ],
+        "ligne": [
+          "l",
+          "ih",
+          "n",
+          "y"
+        ],
+        "montagne": [
+          "m",
+          "on",
+          "t",
+          "ah",
+          "n",
+          "y"
+        ]
+      },
+      "policy": "gn expands to fr/n fr/y; no invented fr/ny token",
+      "verified_date": "2026-09-09"
+    },
+    "mapped_phones_outside_audited_model_inventory": [],
+    "model_inventory_file": "millefeuille_v001.phonemes.json",
+    "model_inventory_sha256": "a618b0e2030b91c492c3227ab21529591dff0f9d0bb6edeee040b49661b50249",
+    "no_vowel": "uy, y and w are semivowels; only vowel_phones qualify as sung nuclei",
+    "phoneme_inventory_source_sha256": "98e4d2d8c7101b5cb6df496fe679e7b810530b4f9a2026a5ce73a4605865147e",
+    "phoneme_inventory_url": "https://raw.githubusercontent.com/openutau/OpenUtau/3f213e8993ca792c3e6f8958c92ab27eae78eac5/OpenUtau.Core/G2p/FrenchMillefeuilleG2p.cs",
+    "un": "FR-001 metropolitan convention: upstream un maps to fr/in"
+  },
+  "output": {
+    "bytes": 7712238,
+    "columns": [
+      "key",
+      "phones",
+      "source_lines",
+      "source_symbols"
+    ],
+    "encoding": "UTF-8 without BOM; LF endings; Unicode code point key order",
+    "path": "src-tauri/src/engine/target/french-community.tsv",
+    "provenance_separators": {
+      "source_lines": ",",
+      "source_symbols": "|"
+    },
+    "sha256": "9d919e5119bfeeeaed8c6ecd8cfae3aff4f7837608a39696a39dc952a15595cd"
+  },
+  "policy": {
+    "deduplication": "Equal canonical keys and mapped readings merge, preserving all source lines and symbol sequences",
+    "exclusions": "Malformed/empty rows, unsupported phonemes and readings without a vowel never enter automatic sung lookup",
+    "malformed_key_attribution": "Without a separator, first whitespace field identifies the quarantined key; row is never accepted",
+    "normalization": "lowercase; U+2018/U+2019 to ASCII apostrophe; NFC; no edge-punctuation or variant stripping",
+    "parsing": "Two or more ASCII spaces or a tab separate key from phones; single internal spaces belong to the key",
+    "quarantine": "Any conflicting mapped readings or invalid alternative quarantine the entire canonical-key group",
+    "runtime_scope": "Static symbol-compatible data only; curated FR-001 overrides, fragment guards and homograph/context decisions remain separate"
+  },
+  "quarantines": [
+    {
+      "key": "aires(3)",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "aires(3)",
+          "line": 2926,
+          "phones": [
+            "fr/ae",
+            "fr/r",
+            "fr/ee"
+          ],
+          "symbols": "ai rr ee",
+          "word": "aires(3)"
+        },
+        {
+          "key": "aires(3)",
+          "line": 2927,
+          "phones": [
+            "fr/ae",
+            "fr/r",
+            "fr/ee",
+            "fr/z"
+          ],
+          "symbols": "ai rr ee zz",
+          "word": "aires(3)"
+        }
+      ]
+    },
+    {
+      "key": "bye",
+      "reasons": [
+        "conflicting_readings",
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "bye",
+          "line": 191,
+          "phones": [
+            "fr/b",
+            "fr/y",
+            "fr/ae"
+          ],
+          "symbols": "bb yy ai",
+          "word": "bye"
+        },
+        {
+          "key": "bye",
+          "line": 14034,
+          "phones": [
+            "fr/b"
+          ],
+          "raw": "bye  bb",
+          "reason": "no_vowel",
+          "symbols": "bb",
+          "word": "bye"
+        }
+      ]
+    },
+    {
+      "key": "c'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "c'",
+          "line": 14305,
+          "phones": [
+            "fr/s"
+          ],
+          "raw": "c'  ss",
+          "reason": "no_vowel",
+          "symbols": "ss",
+          "word": "c'"
+        },
+        {
+          "key": "c'",
+          "line": 16171,
+          "phones": [
+            "fr/s"
+          ],
+          "raw": "c'  ss",
+          "reason": "no_vowel",
+          "symbols": "ss",
+          "word": "c'"
+        }
+      ]
+    },
+    {
+      "key": "che",
+      "reasons": [
+        "conflicting_readings",
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "che",
+          "line": 188,
+          "phones": [
+            "fr/sh",
+            "fr/ae"
+          ],
+          "symbols": "ch ai",
+          "word": "che"
+        },
+        {
+          "key": "che",
+          "line": 17364,
+          "phones": [
+            "fr/sh"
+          ],
+          "raw": "che  ch",
+          "reason": "no_vowel",
+          "symbols": "ch",
+          "word": "che"
+        }
+      ]
+    },
+    {
+      "key": "d'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "d'",
+          "line": 25451,
+          "phones": [
+            "fr/d"
+          ],
+          "raw": "d'  dd",
+          "reason": "no_vowel",
+          "symbols": "dd",
+          "word": "d'"
+        },
+        {
+          "key": "d'",
+          "line": 25849,
+          "phones": [
+            "fr/d"
+          ],
+          "raw": "d'  dd",
+          "reason": "no_vowel",
+          "symbols": "dd",
+          "word": "d'"
+        }
+      ]
+    },
+    {
+      "key": "e",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "e",
+          "line": 141,
+          "phones": [
+            "fr/ee"
+          ],
+          "symbols": "ee",
+          "word": "e"
+        },
+        {
+          "key": "e",
+          "line": 32781,
+          "phones": null,
+          "raw": "e  u",
+          "reason": "unsupported_phonemes",
+          "symbols": "u",
+          "unsupported_phonemes": [
+            "u"
+          ],
+          "word": "e"
+        }
+      ]
+    },
+    {
+      "key": "fpö",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "fpö",
+          "line": 40177,
+          "phones": [
+            "fr/ae",
+            "fr/f",
+            "fr/p",
+            "fr/eh",
+            "fr/oo"
+          ],
+          "symbols": "ai ff pp ei oo",
+          "word": "fpÖ"
+        },
+        {
+          "key": "fpö",
+          "line": 105113,
+          "phones": [
+            "fr/ae",
+            "fr/f",
+            "fr/p",
+            "fr/eh",
+            "fr/oh"
+          ],
+          "symbols": "ai ff pp ei au",
+          "word": "fpö"
+        }
+      ]
+    },
+    {
+      "key": "hôtel",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "hôtel",
+          "line": 46676,
+          "phones": [
+            "fr/oo",
+            "fr/t",
+            "fr/ae",
+            "fr/l"
+          ],
+          "symbols": "oo tt ai ll",
+          "word": "hÔtel"
+        },
+        {
+          "key": "hôtel",
+          "line": 46927,
+          "phones": [
+            "fr/oh",
+            "fr/t",
+            "fr/ae",
+            "fr/l"
+          ],
+          "symbols": "au tt ai ll",
+          "word": "hôtel"
+        }
+      ]
+    },
+    {
+      "key": "j'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "j'",
+          "line": 52250,
+          "phones": [
+            "fr/j"
+          ],
+          "raw": "j'  jj",
+          "reason": "no_vowel",
+          "symbols": "jj",
+          "word": "j'"
+        },
+        {
+          "key": "j'",
+          "line": 52502,
+          "phones": [
+            "fr/j"
+          ],
+          "raw": "j'  jj ",
+          "reason": "no_vowel",
+          "symbols": "jj",
+          "word": "j'"
+        }
+      ]
+    },
+    {
+      "key": "l'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "l'",
+          "line": 54205,
+          "phones": [
+            "fr/l"
+          ],
+          "raw": "l'  ll",
+          "reason": "no_vowel",
+          "symbols": "ll",
+          "word": "l'"
+        },
+        {
+          "key": "l'",
+          "line": 55058,
+          "phones": [
+            "fr/l"
+          ],
+          "raw": "l'  ll",
+          "reason": "no_vowel",
+          "symbols": "ll",
+          "word": "l'"
+        }
+      ]
+    },
+    {
+      "key": "m'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "m'",
+          "line": 57386,
+          "phones": [
+            "fr/m"
+          ],
+          "raw": "m'  mm",
+          "reason": "no_vowel",
+          "symbols": "mm",
+          "word": "m'"
+        },
+        {
+          "key": "m'",
+          "line": 59758,
+          "phones": [
+            "fr/m"
+          ],
+          "raw": "m'  mm",
+          "reason": "no_vowel",
+          "symbols": "mm",
+          "word": "m'"
+        }
+      ]
+    },
+    {
+      "key": "n'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "n'",
+          "line": 63955,
+          "phones": [
+            "fr/n"
+          ],
+          "raw": "n'  nn",
+          "reason": "no_vowel",
+          "symbols": "nn",
+          "word": "n'"
+        },
+        {
+          "key": "n'",
+          "line": 64491,
+          "phones": [
+            "fr/n"
+          ],
+          "raw": "n'  nn",
+          "reason": "no_vowel",
+          "symbols": "nn",
+          "word": "n'"
+        }
+      ]
+    },
+    {
+      "key": "qu'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "qu'",
+          "line": 77387,
+          "phones": [
+            "fr/k"
+          ],
+          "raw": "qu'  kk",
+          "reason": "no_vowel",
+          "symbols": "kk",
+          "word": "qu'"
+        },
+        {
+          "key": "qu'",
+          "line": 77607,
+          "phones": [
+            "fr/k"
+          ],
+          "raw": "qu'  kk",
+          "reason": "no_vowel",
+          "symbols": "kk",
+          "word": "qu'"
+        }
+      ]
+    },
+    {
+      "key": "s'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "s'",
+          "line": 85719,
+          "phones": [
+            "fr/s"
+          ],
+          "raw": "s'  ss",
+          "reason": "no_vowel",
+          "symbols": "ss",
+          "word": "s'"
+        },
+        {
+          "key": "s'",
+          "line": 87385,
+          "phones": [
+            "fr/s"
+          ],
+          "raw": "s'  ss",
+          "reason": "no_vowel",
+          "symbols": "ss",
+          "word": "s'"
+        }
+      ]
+    },
+    {
+      "key": "spö",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "spö",
+          "line": 90649,
+          "phones": [
+            "fr/ae",
+            "fr/s",
+            "fr/p",
+            "fr/eh",
+            "fr/oo"
+          ],
+          "symbols": "ai ss pp ei oo",
+          "word": "spÖ"
+        },
+        {
+          "key": "spö",
+          "line": 105120,
+          "phones": [
+            "fr/ae",
+            "fr/s",
+            "fr/p",
+            "fr/eh",
+            "fr/oh"
+          ],
+          "symbols": "ai ss pp ei au",
+          "word": "spö"
+        }
+      ]
+    },
+    {
+      "key": "t'",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "t'",
+          "line": 93321,
+          "phones": [
+            "fr/t"
+          ],
+          "raw": "t'  tt",
+          "reason": "no_vowel",
+          "symbols": "tt",
+          "word": "t'"
+        },
+        {
+          "key": "t'",
+          "line": 93951,
+          "phones": [
+            "fr/t"
+          ],
+          "raw": "t'  tt",
+          "reason": "no_vowel",
+          "symbols": "tt",
+          "word": "t'"
+        }
+      ]
+    },
+    {
+      "key": "u",
+      "reasons": [
+        "invalid_alternative"
+      ],
+      "rows": [
+        {
+          "key": "u",
+          "line": 140,
+          "phones": [
+            "fr/uh"
+          ],
+          "symbols": "uu",
+          "word": "u"
+        },
+        {
+          "key": "u",
+          "line": 97839,
+          "phones": null,
+          "raw": "u  ",
+          "reason": "empty_reading",
+          "symbols": "",
+          "word": "u"
+        }
+      ]
+    },
+    {
+      "key": "éguilles",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "éguilles",
+          "line": 102109,
+          "phones": [
+            "fr/eh",
+            "fr/g",
+            "fr/ih",
+            "fr/y"
+          ],
+          "symbols": "ei gg ii yy",
+          "word": "Éguilles"
+        },
+        {
+          "key": "éguilles",
+          "line": 105091,
+          "phones": [
+            "fr/eh",
+            "fr/g",
+            "fr/uy",
+            "fr/y",
+            "fr/ih",
+            "fr/ee"
+          ],
+          "symbols": "ei gg uy yy ii ee",
+          "word": "éguilles"
+        }
+      ]
+    },
+    {
+      "key": "élie",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "élie",
+          "line": 102111,
+          "phones": [
+            "fr/eh",
+            "fr/l",
+            "fr/ih"
+          ],
+          "symbols": "ei ll ii",
+          "word": "Élie"
+        },
+        {
+          "key": "élie",
+          "line": 105093,
+          "phones": [
+            "fr/ee",
+            "fr/l",
+            "fr/ih"
+          ],
+          "symbols": "ee ll ii",
+          "word": "élie"
+        }
+      ]
+    },
+    {
+      "key": "élim",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "élim",
+          "line": 102112,
+          "phones": [
+            "fr/eh",
+            "fr/l",
+            "fr/ih",
+            "fr/m"
+          ],
+          "symbols": "ei ll ii mm",
+          "word": "Élim"
+        },
+        {
+          "key": "élim",
+          "line": 105094,
+          "phones": [
+            "fr/ee",
+            "fr/l",
+            "fr/ih",
+            "fr/m"
+          ],
+          "symbols": "ee ll ii mm",
+          "word": "élim"
+        }
+      ]
+    },
+    {
+      "key": "élisabethville",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "élisabethville",
+          "line": 102113,
+          "phones": [
+            "fr/eh",
+            "fr/l",
+            "fr/ih",
+            "fr/z",
+            "fr/ah",
+            "fr/b",
+            "fr/ae",
+            "fr/t",
+            "fr/v",
+            "fr/ih",
+            "fr/l"
+          ],
+          "symbols": "ei ll ii zz aa bb ai tt vv ii ll",
+          "word": "Élisabethville"
+        },
+        {
+          "key": "élisabethville",
+          "line": 105095,
+          "phones": [
+            "fr/eh",
+            "fr/l",
+            "fr/ih",
+            "fr/z",
+            "fr/ah",
+            "fr/b",
+            "fr/eh",
+            "fr/t",
+            "fr/v",
+            "fr/ih",
+            "fr/l"
+          ],
+          "symbols": "ei ll ii zz aa bb ei tt vv ii ll",
+          "word": "élisabethville"
+        }
+      ]
+    },
+    {
+      "key": "émilienne",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "émilienne",
+          "line": 102116,
+          "phones": [
+            "fr/eh",
+            "fr/m",
+            "fr/ih",
+            "fr/l",
+            "fr/y",
+            "fr/ae",
+            "fr/n"
+          ],
+          "symbols": "ei mm ii ll yy ai nn",
+          "word": "Émilienne"
+        },
+        {
+          "key": "émilienne",
+          "line": 105099,
+          "phones": [
+            "fr/eh",
+            "fr/m",
+            "fr/ih",
+            "fr/l",
+            "fr/ih",
+            "fr/ae",
+            "fr/n"
+          ],
+          "symbols": "ei mm ii ll ii ai nn",
+          "word": "émilienne"
+        }
+      ]
+    },
+    {
+      "key": "éthiopie",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "éthiopie",
+          "line": 102127,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/y",
+            "fr/oo",
+            "fr/p",
+            "fr/ih"
+          ],
+          "symbols": "ei tt yy oo pp ii",
+          "word": "Éthiopie"
+        },
+        {
+          "key": "éthiopie",
+          "line": 105107,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/ih",
+            "fr/oo",
+            "fr/p",
+            "fr/ih"
+          ],
+          "symbols": "ei tt ii oo pp ii",
+          "word": "éthiopie"
+        }
+      ]
+    },
+    {
+      "key": "étienne",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "étienne",
+          "line": 102129,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/y",
+            "fr/ae",
+            "fr/n"
+          ],
+          "symbols": "ei tt yy ai nn",
+          "word": "Étienne"
+        },
+        {
+          "key": "étienne",
+          "line": 105108,
+          "phones": [
+            "fr/eh",
+            "fr/t",
+            "fr/ih",
+            "fr/ae",
+            "fr/n"
+          ],
+          "symbols": "ei tt ii ai nn",
+          "word": "étienne"
+        }
+      ]
+    },
+    {
+      "key": "évian",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "évian",
+          "line": 102133,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/y",
+            "fr/en"
+          ],
+          "symbols": "ei vv yy an",
+          "word": "Évian"
+        },
+        {
+          "key": "évian",
+          "line": 105110,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/ih",
+            "fr/en"
+          ],
+          "symbols": "ei vv ii an",
+          "word": "évian"
+        }
+      ]
+    },
+    {
+      "key": "évêché",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "évêché",
+          "line": 102135,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/eh",
+            "fr/sh",
+            "fr/eh"
+          ],
+          "symbols": "ei vv ei ch ei",
+          "word": "Évêché"
+        },
+        {
+          "key": "évêché",
+          "line": 105055,
+          "phones": [
+            "fr/eh",
+            "fr/v",
+            "fr/ae",
+            "fr/sh",
+            "fr/eh"
+          ],
+          "symbols": "ei vv ai ch ei",
+          "word": "évêché"
+        }
+      ]
+    },
+    {
+      "key": "îles(2)",
+      "reasons": [
+        "conflicting_readings"
+      ],
+      "rows": [
+        {
+          "key": "îles(2)",
+          "line": 102139,
+          "phones": [
+            "fr/ih",
+            "fr/l",
+            "fr/z"
+          ],
+          "symbols": "ii ll zz",
+          "word": "Îles(2)"
+        },
+        {
+          "key": "îles(2)",
+          "line": 105075,
+          "phones": [
+            "fr/ih",
+            "fr/l",
+            "fr/ee"
+          ],
+          "symbols": "ii ll ee",
+          "word": "îles(2)"
+        }
+      ]
+    }
+  ],
+  "reproduce": {
+    "check": "python3 scripts/import-french-lexicon.py --source SOURCE --check",
+    "generate": "python3 scripts/import-french-lexicon.py --source SOURCE",
+    "requirements": "Python 3.9+ stdlib; local pinned source and repository license; no network"
+  },
+  "schema_version": 1,
+  "source": {
+    "bytes": 3470701,
+    "commit": "1e11bbe4df10bd4df03dfbf90ace92924c56e5b0",
+    "encoding": "UTF-8; hash covers original bytes including CRLF",
+    "repository": "https://github.com/mmemim/OpenUTAU-French-Dictionary",
+    "sha256": "b4560adb8e5e2145f7b8a25f810db4c2f798d7db518f1d814d0dbae9728f7d34",
+    "url": "https://raw.githubusercontent.com/mmemim/OpenUTAU-French-Dictionary/1e11bbe4df10bd4df03dfbf90ace92924c56e5b0/cmudict_fr.txt",
+    "version": "1.6"
+  },
+  "vowel_phones": [
+    "fr/ae",
+    "fr/ah",
+    "fr/ee",
+    "fr/eh",
+    "fr/en",
+    "fr/ih",
+    "fr/in",
+    "fr/oe",
+    "fr/oh",
+    "fr/on",
+    "fr/oo",
+    "fr/ou",
+    "fr/uh"
+  ]
+}

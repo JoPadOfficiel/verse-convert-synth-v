@@ -129,6 +129,7 @@ export type FileResult = {
 };
 
 export type Overrides = Record<string, Record<number, boolean>>;
+export type PronunciationProfile = "default" | "frenchMillefeuille" | "englishArpabet";
 export type Language = "english" | "french";
 /**
  * Which format an export writes. Declared with the path helpers that consume it
@@ -239,6 +240,7 @@ export async function exportVocalsWithDialog(
   language: Language,
   overrides?: Record<number, boolean>,
   exportTarget: ExportTarget = "svp",
+  pronunciationProfile: PronunciationProfile = "default",
 ): Promise<string | undefined> {
   const target = await save({
     defaultPath: defaultVocalPath(file.path, exportTarget),
@@ -253,6 +255,7 @@ export async function exportVocalsWithDialog(
     language,
     overrides: overrides ?? null,
     exportTarget,
+    pronunciationProfile,
   });
 }
 
@@ -273,6 +276,7 @@ export async function exportBundle(
   rendererPath?: string,
   onProgress?: (event: BundleProgressEvent) => void,
   exportTarget: ExportTarget = "svp",
+  pronunciationProfile: PronunciationProfile = "default",
 ): Promise<BundleResult> {
   const progress = new Channel<BundleProgressEvent>();
   progress.onmessage = (event) => onProgress?.(event);
@@ -283,6 +287,7 @@ export async function exportBundle(
     overrides: overrides ?? null,
     rendererPath: rendererPath?.trim() || null,
     exportTarget,
+    pronunciationProfile,
     onProgress: progress,
   });
 }
@@ -310,6 +315,7 @@ export async function convertFiles(
   outDir?: string,
   overrides?: Overrides,
   exportTarget: ExportTarget = "svp",
+  pronunciationProfile: PronunciationProfile = "default",
 ): Promise<FileResult[]> {
   return await invoke<FileResult[]>("convert_files", {
     paths,
@@ -318,5 +324,6 @@ export async function convertFiles(
     language,
     overrides: overrides ?? null,
     exportTarget,
+    pronunciationProfile,
   });
 }

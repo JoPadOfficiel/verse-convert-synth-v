@@ -806,6 +806,7 @@ fn note_lyrics(note: roxmltree::Node, source_id: &str) -> Vec<Lyric> {
                 raw: raw.clone(),
                 raw_bytes: Vec::new(),
                 fragments,
+                verse_from_score: lane.parse::<u32>().is_ok_and(|number| number > 0),
                 lane,
                 verse,
                 state,

@@ -15,6 +15,7 @@ use crate::engine::midi::{Lyric, LyricState};
 /// One source, projected. A target consumes this and nothing else.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProjectedProject {
+    pub pronunciation_profile: crate::engine::target::PronunciationProfile,
     /// IR ticks per quarter note; the denominator of every position below.
     pub ticks_per_beat: u16,
     /// The voice-database language the user selected. Neutral here because it
@@ -144,6 +145,16 @@ pub enum ProjectedLyric {
     /// A source lyric, carried whole so no evidence is lost on the way out.
     /// Boxed because it dwarfs the other two variants, which carry no data.
     Source(Box<Lyric>),
+    /// An explicit, verified reading of a source syllable. The source object is
+    /// never rewritten; target spelling and phonemes are separate evidence.
+    Pronounced {
+        source: Box<Lyric>,
+        text: String,
+        phonemes: String,
+    },
+    /// The next source-owned syllable of an explicitly recognized word.
+    /// The target uses its syllable-split marker; the original lyric survives.
+    PronouncedSplit { source: Box<Lyric> },
     /// A source lyric extension carries the previous syllable onto this note.
     /// There is no lyric object of its own; the source stated the extension on
     /// a neighbour, as a MusicXML `<extend>` or a MuseScore extension length.
@@ -169,6 +180,8 @@ impl ProjectedLyric {
                 LyricState::Continuation | LyricState::SyllableSplit
             ),
             ProjectedLyric::Absent => false,
+            ProjectedLyric::Pronounced { .. } => false,
+            ProjectedLyric::PronouncedSplit { .. } => true,
         }
     }
 
@@ -183,6 +196,8 @@ impl ProjectedLyric {
             ProjectedLyric::Extension => true,
             ProjectedLyric::Source(source) => !matches!(source.state, LyricState::ExplicitEmpty),
             ProjectedLyric::Absent => false,
+            ProjectedLyric::Pronounced { .. } => true,
+            ProjectedLyric::PronouncedSplit { .. } => true,
         }
     }
 }
@@ -202,6 +217,7 @@ mod tests {
 
     fn lane(notes: Vec<ProjectedNote>) -> ProjectedProject {
         ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             tracks: vec![ProjectedTrack {
                 name: "Voice".into(),

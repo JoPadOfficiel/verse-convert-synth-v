@@ -9,7 +9,7 @@ use crate::engine::midi::{
 use crate::engine::projection::{
     ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedProject, ProjectedTempo, ProjectedTrack,
 };
-use crate::engine::target::ExportTarget;
+use crate::engine::target::{ExportTarget, PronunciationProfile};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -552,24 +552,97 @@ fn word_lanes(note: &SourceNote) -> impl Iterator<Item = &str> {
         .map(|lyric| lyric.lane.as_str())
 }
 
+fn blank_lyric(lyric: &Lyric) -> bool {
+    matches!(&lyric.state, midi::LyricState::ExplicitEmpty)
+        || matches!(&lyric.state, midi::LyricState::Text(text) if text.trim().is_empty())
+}
+
+/// One source row and one playback priority class, shared by selection and
+/// diagnostics. Different time-only lists can be eligible on the same pass.
+fn eligible_attached_lyrics<'a>(note: &'a SourceNote, lane: &str) -> Vec<&'a Lyric> {
+    let playback = note.source.occurrence + 1;
+    let specific = note
+        .lyrics
+        .iter()
+        .any(|lyric| lyric.lane == lane && lyric.time_only.contains(&playback));
+    note.lyrics
+        .iter()
+        .filter(move |lyric| {
+            lyric.lane == lane
+                && if specific {
+                    lyric.time_only.contains(&playback)
+                } else {
+                    lyric.time_only.is_empty()
+                }
+        })
+        .collect()
+}
+
+fn pick_attached_lyric<'a>(
+    note: &'a SourceNote,
+    lane: &str,
+    profile: PronunciationProfile,
+) -> Option<&'a Lyric> {
+    let mut eligible = eligible_attached_lyrics(note, lane).into_iter();
+    let first = eligible.next()?;
+    if profile != PronunciationProfile::Default && blank_lyric(first) {
+        eligible.find(|lyric| !blank_lyric(lyric)).or(Some(first))
+    } else {
+        Some(first)
+    }
+}
+
+fn conflicting_lyric(lyric: &Lyric, selected: &Lyric) -> bool {
+    !blank_lyric(lyric)
+        && (lyric.state != selected.state
+            || lyric.syllabic != selected.syllabic
+            || lyric.verse != selected.verse
+            || lyric.extension != selected.extension
+            || lyric.extend_ticks != selected.extend_ticks
+            || lyric.extend_fraction != selected.extend_fraction)
+}
+
+fn duplicate_lyric_diagnostics(
+    note: &SourceNote,
+    selected: &Lyric,
+    id: &str,
+    profile: PronunciationProfile,
+) -> Vec<Diagnostic> {
+    let (blank_code, conflict_code) = match profile {
+        PronunciationProfile::Default => return Vec::new(),
+        PronunciationProfile::FrenchMillefeuille => (
+            "FRENCH_DUPLICATE_BLANK_RESOLVED",
+            "FRENCH_DUPLICATE_LYRIC_CONFLICT",
+        ),
+        PronunciationProfile::EnglishArpabet => (
+            "ENGLISH_DUPLICATE_BLANK_RESOLVED",
+            "ENGLISH_DUPLICATE_LYRIC_CONFLICT",
+        ),
+    };
+    let candidates = eligible_attached_lyrics(note, &selected.lane);
+    let mut diagnostics = Vec::new();
+    if !blank_lyric(selected) && candidates.iter().any(|lyric| blank_lyric(lyric)) {
+        diagnostics.push(report_warning(blank_code, DiagnosticSeverity::Info,
+            "Selected the first nonblank lyric among same-lane playback-eligible duplicates; all original lyric records remain in the preserved source.", id));
+    }
+    if candidates
+        .iter()
+        .any(|lyric| conflicting_lyric(lyric, selected))
+    {
+        diagnostics.push(report_warning(conflict_code, DiagnosticSeverity::Warning,
+            "Conflicting nonblank lyrics in the same source row are eligible for this playback; original priority is retained and all records remain in the preserved source.", id));
+    }
+    diagnostics
+}
+
 fn selected_attached_lyric<'a>(
     note: &'a SourceNote,
     lanes: &[String],
     replayed: &BTreeSet<&str>,
     lane_words: &BTreeSet<(u32, &str)>,
+    profile: PronunciationProfile,
 ) -> Option<&'a Lyric> {
-    let playback = note.source.occurrence + 1;
-    let pick = |lane: &String| {
-        note.lyrics
-            .iter()
-            .filter(|lyric| &lyric.lane == lane)
-            .find(|lyric| !lyric.time_only.is_empty() && lyric.time_only.contains(&playback))
-            .or_else(|| {
-                note.lyrics
-                    .iter()
-                    .find(|lyric| &lyric.lane == lane && lyric.time_only.is_empty())
-            })
-    };
+    let pick = |lane: &String| pick_attached_lyric(note, lane, profile);
     let this_pass = usize::try_from(note.source.occurrence)
         .ok()
         .and_then(|pass| lanes.get(pass))
@@ -600,6 +673,153 @@ fn selected_attached_lyric<'a>(
     None
 }
 
+/// Recover pronunciation context lost when adapters separate chord members.
+/// The map can only annotate an already selected original lyric; it cannot
+/// change lyric selection, lane membership, or the source objects themselves.
+fn french_source_context(
+    midi: &Midi,
+    notes_by_track: &[Vec<SourceNote>],
+) -> HashMap<(String, u32, String), String> {
+    type Domain = (String, String, String, u32);
+    type Entry<'a> = (usize, &'a SourceNote);
+    let mut domains: BTreeMap<Domain, Vec<Entry<'_>>> = BTreeMap::new();
+    for (track, notes) in notes_by_track.iter().enumerate() {
+        for note in notes {
+            let (Some(part), Some(staff), Some(voice)) = (
+                &note.source.part_id,
+                &note.source.staff_id,
+                &note.source.voice,
+            ) else {
+                continue;
+            };
+            // Every source note supplies chronology, even with no lyric in this
+            // verse. Silence cannot hide a competing attack or sustained note.
+            domains
+                .entry((
+                    part.clone(),
+                    staff.clone(),
+                    voice.clone(),
+                    note.source.occurrence,
+                ))
+                .or_default()
+                .push((track, note));
+        }
+    }
+    let mut result = HashMap::new();
+    for domain in domains.into_values() {
+        if domain.iter().map(|e| e.0).collect::<BTreeSet<_>>().len() < 2 {
+            continue;
+        }
+        let rows: BTreeSet<_> = domain
+            .iter()
+            .flat_map(|(_, n)| &n.lyrics)
+            .map(|l| (l.lane.clone(), l.verse))
+            .collect();
+        for (row, verse) in rows {
+            let mut onsets =
+                BTreeMap::<u32, Vec<(usize, &SourceNote, Option<&Lyric>, bool)>>::new();
+            for &(track, note) in &domain {
+                let selected =
+                    pick_attached_lyric(note, &row, PronunciationProfile::FrenchMillefeuille);
+                let conflict = selected.is_some_and(|selected| {
+                    eligible_attached_lyrics(note, &row)
+                        .iter()
+                        .any(|other| conflicting_lyric(other, selected))
+                });
+                onsets.entry(note.onset).or_default().push((
+                    track,
+                    note,
+                    selected.filter(|l| l.verse == verse && !blank_lyric(l)),
+                    conflict,
+                ));
+            }
+            let groups: Vec<_> = onsets.into_values().collect();
+            let mut notes: Vec<_> = groups
+                .iter()
+                .map(|entries| {
+                    let (_, first, lyric, _) = entries
+                        .iter()
+                        .find(|e| e.2.is_some())
+                        .unwrap_or(&entries[0]);
+                    // Untexted members of the identical written chord are harmless,
+                    // but never acquire lyric ownership. Missing/different chord IDs
+                    // and competing nonblank records cannot establish a copy.
+                    let unambiguous = entries.iter().all(|(_, note, other, conflict)| {
+                        !conflict
+                            && (entries.len() == 1
+                                || (first.source.chord_id.is_some()
+                                    && note.source.chord_id == first.source.chord_id
+                                    && note.duration == first.duration
+                                    && other.is_none_or(|other| Some(other) == *lyric)))
+                    });
+                    ProjectedNote {
+                        onset_ticks: first.onset,
+                        duration_ticks: first.duration,
+                        pitch: first.pitch.unwrap_or(60),
+                        lyric: if unambiguous && first.pitch.is_some() && first.duration > 0 {
+                            lyric.map_or(ProjectedLyric::Absent, |l| {
+                                ProjectedLyric::Source(Box::new(l.clone()))
+                            })
+                        } else {
+                            ProjectedLyric::Absent
+                        },
+                    }
+                })
+                .collect();
+            let mut latest_end = 0u64;
+            for (index, entries) in groups.iter().enumerate() {
+                let onset = u64::from(notes[index].onset_ticks);
+                let end = entries
+                    .iter()
+                    .map(|(_, n, _, _)| u64::from(n.onset) + u64::from(n.duration))
+                    .max()
+                    .unwrap();
+                if latest_end > onset
+                    || notes
+                        .get(index + 1)
+                        .is_some_and(|next| end > u64::from(next.onset_ticks))
+                {
+                    // Mask before evaluating pronunciation, including liaison
+                    // from a preceding word whose geometry is ambiguous.
+                    notes[index].lyric = ProjectedLyric::Absent;
+                }
+                latest_end = latest_end.max(end);
+            }
+            for reading in crate::engine::target::french::contextual_readings(&notes) {
+                if reading.windows(2).any(|pair| {
+                    pair[0].0 + 1 != pair[1].0
+                        || !crate::engine::syllable::touches(&notes[pair[0].0], &notes[pair[1].0])
+                }) || reading
+                    .iter()
+                    .flat_map(|(index, _)| &groups[*index])
+                    .filter(|e| e.2.is_some())
+                    .map(|e| e.0)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    < 2
+                {
+                    continue;
+                }
+                for (index, hint) in reading {
+                    for &(track, note, lyric, _) in &groups[index] {
+                        if let Some(lyric) = lyric {
+                            result.insert(
+                                (
+                                    midi.tracks[track].id.clone(),
+                                    note.source_order,
+                                    lyric.id.clone(),
+                                ),
+                                hint.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 struct TrackProjection<'a> {
     source_track_id: &'a str,
     lanes: &'a [String],
@@ -609,6 +829,8 @@ struct TrackProjection<'a> {
     /// depends on it; it exists only so the diagnostics below can ask whether
     /// that target's application reads a source word differently.
     target: ExportTarget,
+    profile: PronunciationProfile,
+    contextual_french: &'a HashMap<(String, u32, String), String>,
     /// Per-note diagnostics raised while projecting this lane, merged into the
     /// source track's `TrackReport.warnings` by the caller.
     diagnostics: &'a mut Vec<Diagnostic>,
@@ -624,6 +846,7 @@ fn project_track(
 ) -> ProjectedTrack {
     let mut projected_notes = Vec::with_capacity(notes.len());
     let mut note_ids: Vec<String> = Vec::with_capacity(notes.len());
+    let mut domains = Vec::with_capacity(notes.len());
     let replayed = replayed_note_ids(notes);
     let lane_words = lane_words_by_measure(notes);
     let mut explicit_extension_end = None;
@@ -631,8 +854,13 @@ fn project_track(
     for (index, source_note) in notes.iter().enumerate() {
         let mut lyric_source_id = None;
         let mut lyric_event_id = None;
-        let attached =
-            selected_attached_lyric(source_note, projection.lanes, &replayed, &lane_words);
+        let attached = selected_attached_lyric(
+            source_note,
+            projection.lanes,
+            &replayed,
+            &lane_words,
+            projection.profile,
+        );
         let lyric = if let Some(attached) = attached {
             if let Some(ticks) = attached.extend_ticks.filter(|ticks| *ticks > 0) {
                 explicit_extension_end = u32::try_from(ticks)
@@ -702,6 +930,22 @@ fn project_track(
             &source_note.source,
             source_note.source_order,
         );
+        domains.push((
+            source_note.source.part_id.clone(),
+            source_note.source.staff_id.clone(),
+            source_note.source.voice.clone(),
+            source_note.source.occurrence,
+        ));
+        if projection.profile != PronunciationProfile::Default {
+            if let Some(selected) = attached {
+                projection.diagnostics.extend(duplicate_lyric_diagnostics(
+                    source_note,
+                    selected,
+                    &note_id,
+                    projection.profile,
+                ));
+            }
+        }
         note_ids.push(note_id.clone());
         projection.evidence.source_ids.insert(note_id);
         projection.evidence.source_ids.insert(format!(
@@ -718,10 +962,50 @@ fn project_track(
             pitch,
             lyric,
         });
+        if let Some(attached) = attached {
+            if let Some(hint) = projection.contextual_french.get(&(
+                projection.source_track_id.to_string(),
+                source_note.source_order,
+                attached.id.clone(),
+            )) {
+                projection.diagnostics.push(
+                    crate::engine::target::french::apply_contextual_reading(
+                        projected_notes.last_mut().unwrap(),
+                        hint,
+                        note_ids.last().unwrap(),
+                    ),
+                );
+            }
+        }
     }
     // Before anything is diagnosed: the syllables a score spreads over several
     // notes are the word it writes, and it is that word the file will state.
-    let words = crate::engine::syllable::join_words(&mut projected_notes);
+    let words = if projection.profile != PronunciationProfile::Default {
+        // A source voice or repeat occurrence boundary must not supply lexical
+        // context, even when playback makes the two notes touch.
+        let mut start = 0;
+        while start < projected_notes.len() {
+            let mut end = start + 1;
+            while end < domains.len() && domains[end] == domains[start] {
+                end += 1;
+            }
+            let notes = &mut projected_notes[start..end];
+            let ids = &note_ids[start..end];
+            projection.diagnostics.extend(match projection.profile {
+                PronunciationProfile::FrenchMillefeuille => {
+                    crate::engine::target::french::apply(notes, ids)
+                }
+                PronunciationProfile::EnglishArpabet => {
+                    crate::engine::target::english::apply(notes, ids)
+                }
+                PronunciationProfile::Default => Vec::new(),
+            });
+            start = end;
+        }
+        crate::engine::syllable::JoinedWords::default()
+    } else {
+        crate::engine::syllable::join_words(&mut projected_notes)
+    };
     if !words.joined.is_empty() {
         projection.diagnostics.push(report_warning(
             crate::engine::syllable::SYLLABLES_JOINED_INTO_WORDS,
@@ -1070,6 +1354,25 @@ pub fn convert_midi_with_target(
     overrides: Option<&HashMap<usize, bool>>,
     target: ExportTarget,
 ) -> ConvertOutcome {
+    convert_midi_with_profile(
+        midi,
+        language,
+        overrides,
+        target,
+        PronunciationProfile::Default,
+    )
+}
+
+/// Shared analysis/direct/bundle policy entry point. SVP always retains the
+/// default behavior, irrespective of a saved OpenUtau pronunciation selection.
+pub fn convert_midi_with_profile(
+    midi: &Midi,
+    language: &str,
+    overrides: Option<&HashMap<usize, bool>>,
+    target: ExportTarget,
+    profile: PronunciationProfile,
+) -> ConvertOutcome {
+    let profile = profile.for_target(target);
     let fail = |msg: String| ConvertOutcome {
         ok: false,
         msg: Some(msg),
@@ -1123,6 +1426,11 @@ pub fn convert_midi_with_target(
     let mut total_placed = 0usize;
     let mut projection = ProjectionEvidence::default();
     let notes_by_track: Vec<_> = midi.tracks.iter().map(extract_notes).collect();
+    let contextual_french = if profile == PronunciationProfile::FrenchMillefeuille {
+        french_source_context(midi, &notes_by_track)
+    } else {
+        HashMap::new()
+    };
     let tokens_by_track: Vec<_> = midi.tracks.iter().map(track_tokens).collect();
     let external = resolve_external_lyrics(midi, &notes_by_track, &tokens_by_track, tpb);
 
@@ -1247,7 +1555,7 @@ pub fn convert_midi_with_target(
                 } else {
                     &no_assignment
                 };
-                placed += projected_lyric_count(notes, group, standalone);
+                placed += projected_lyric_count(notes, group, standalone, profile);
                 let lane_name = match group.as_slice() {
                     [lane] if lanes.len() > 1 => format!("{name} — lyric lane {lane}"),
                     _ => name.clone(),
@@ -1261,6 +1569,8 @@ pub fn convert_midi_with_target(
                         standalone,
                         evidence: &mut projection,
                         target,
+                        profile,
+                        contextual_french: &contextual_french,
                         diagnostics: &mut lyric_diagnostics,
                     },
                 );
@@ -1493,6 +1803,7 @@ pub fn convert_midi_with_target(
     projection.source_ids.extend(meter_evidence);
     projection.source_ids.extend(tempo_evidence);
     let projected = ProjectedProject {
+        pronunciation_profile: profile,
         ticks_per_beat: tpb,
         language: language.to_string(),
         meters: meter,
@@ -1916,6 +2227,7 @@ fn projected_lyric_count(
     notes: &[SourceNote],
     lanes: &[String],
     assignment: &HashMap<usize, TimedLyric>,
+    profile: PronunciationProfile,
 ) -> usize {
     let replayed = replayed_note_ids(notes);
     let lane_words = lane_words_by_measure(notes);
@@ -1926,7 +2238,7 @@ fn projected_lyric_count(
             if note.pitch.is_none() || note.duration == 0 {
                 return false;
             }
-            selected_attached_lyric(note, lanes, &replayed, &lane_words)
+            selected_attached_lyric(note, lanes, &replayed, &lane_words, profile)
                 .or_else(|| assignment.get(index).map(|timed| &timed.lyric))
                 .is_some_and(|lyric| {
                     matches!(
@@ -2539,6 +2851,7 @@ mod tests {
         // guard on the writer, not the reason the rule exists; that is covered
         // by `a_wordless_note_a_marker_leans_on_across_a_gap_is_kept_too`.
         let project = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             language: "english".into(),
             meters: vec![ProjectedMeter {
@@ -3802,6 +4115,141 @@ mod tests {
             vec!["let", "it"]
         );
         assert_eq!(outcome.tracks[0].lyric_status.source_text_count, 2);
+    }
+
+    #[test]
+    fn explicit_profiles_duplicate_selection_retains_meaningful_priority_and_reports_conflicts() {
+        for (profile, prefix) in [
+            (PronunciationProfile::FrenchMillefeuille, "FRENCH"),
+            (PronunciationProfile::EnglishArpabet, "ENGLISH"),
+        ] {
+            for state in [
+                midi::LyricState::Continuation,
+                midi::LyricState::SyllableSplit,
+                midi::LyricState::Unsupported("opaque".into()),
+                midi::LyricState::Text("vent".into()),
+            ] {
+                for blank_first in [false, true] {
+                    let mut first = Lyric::text("first-meaningful", "original".into());
+                    first.state = state.clone();
+                    let mut lyrics = vec![first, Lyric::text("second", "rêves".into())];
+                    if blank_first {
+                        lyrics.insert(0, Lyric::text("blank", " ".into()));
+                    }
+                    let note = SourceNote {
+                        onset: 0,
+                        duration: 480,
+                        pitch: Some(60),
+                        source_order: 0,
+                        end_order: 1,
+                        source: midi::NoteSource::default(),
+                        lyrics,
+                    };
+                    let before = note.lyrics.clone();
+                    let lanes = vec!["1".into()];
+                    let selected = selected_attached_lyric(
+                        &note,
+                        &lanes,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                        profile,
+                    )
+                    .unwrap();
+                    assert_eq!(selected.id, "first-meaningful");
+                    let diagnostics = duplicate_lyric_diagnostics(&note, selected, "note", profile);
+                    assert!(diagnostics
+                        .iter()
+                        .any(|w| w.code == format!("{prefix}_DUPLICATE_LYRIC_CONFLICT")));
+                    assert_eq!(
+                        diagnostics
+                            .iter()
+                            .any(|w| w.code == format!("{prefix}_DUPLICATE_BLANK_RESOLVED")),
+                        blank_first
+                    );
+                    assert_eq!(note.lyrics, before);
+                    let default = selected_attached_lyric(
+                        &note,
+                        &lanes,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                        PronunciationProfile::Default,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        default.id,
+                        if blank_first {
+                            "blank"
+                        } else {
+                            "first-meaningful"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_profiles_duplicate_diagnostics_follow_playback_eligibility_and_specific_priority() {
+        for (profile, prefix) in [
+            (PronunciationProfile::FrenchMillefeuille, "FRENCH"),
+            (PronunciationProfile::EnglishArpabet, "ENGLISH"),
+        ] {
+            let mut blank = Lyric::text("blank", String::new());
+            blank.time_only = vec![1];
+            let mut text = Lyric::text("specific", "rêves".into());
+            text.time_only = vec![1, 2];
+            let unrestricted = Lyric::text("unrestricted", "vent".into());
+            let mut other_row = Lyric::text("other-row", "court".into());
+            other_row.lane = "2".into();
+            let mut note = SourceNote {
+                onset: 0,
+                duration: 480,
+                pitch: Some(60),
+                source_order: 0,
+                end_order: 1,
+                source: midi::NoteSource::default(),
+                lyrics: vec![unrestricted, blank, text, other_row],
+            };
+            for (occurrence, expected, resolved) in [
+                (0, "specific", true),
+                (1, "specific", false),
+                (2, "unrestricted", false),
+            ] {
+                note.source.occurrence = occurrence;
+                let selected = selected_attached_lyric(
+                    &note,
+                    &["1".into()],
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    profile,
+                )
+                .unwrap();
+                assert_eq!(selected.id, expected);
+                let diagnostics = duplicate_lyric_diagnostics(&note, selected, "note", profile);
+                assert_eq!(diagnostics.len(), usize::from(resolved));
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .any(|w| w.code == format!("{prefix}_DUPLICATE_BLANK_RESOLVED")),
+                    resolved
+                );
+            }
+            note.source.occurrence = 0;
+            note.lyrics.retain(|lyric| lyric.id != "specific");
+            let selected = selected_attached_lyric(
+                &note,
+                &["1".into()],
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                profile,
+            )
+            .unwrap();
+            assert_eq!(
+                selected.id, "blank",
+                "unrestricted text cannot replace a playback-specific blank"
+            );
+            assert!(duplicate_lyric_diagnostics(&note, selected, "note", profile).is_empty());
+        }
     }
 
     #[test]

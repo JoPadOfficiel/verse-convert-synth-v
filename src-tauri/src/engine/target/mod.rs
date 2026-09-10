@@ -5,6 +5,9 @@
 //! reads [`crate::engine::projection::ProjectedProject`] and nothing else, so
 //! adding a target cannot reach back into the conversion engine and cannot
 //! change what another target writes.
+pub mod english;
+pub mod french;
+pub(crate) mod lexical;
 pub mod svp;
 pub mod ustx;
 
@@ -23,6 +26,27 @@ pub enum ExportTarget {
     Svp,
     /// OpenUtau.
     Ustx,
+}
+
+/// Explicit pronunciation convention, independent of the legacy language hint
+/// and of the singer the user assigns in the target application.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PronunciationProfile {
+    #[default]
+    Default,
+    FrenchMillefeuille,
+    EnglishArpabet,
+}
+
+impl PronunciationProfile {
+    pub fn for_target(self, target: ExportTarget) -> Self {
+        if target == ExportTarget::Ustx {
+            self
+        } else {
+            Self::Default
+        }
+    }
 }
 
 impl ExportTarget {
@@ -141,8 +165,37 @@ mod tests {
         ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedTempo, ProjectedTrack,
     };
 
+    #[test]
+    fn pronunciation_profile_is_explicit_and_its_protocol_values_are_stable() {
+        assert_eq!(
+            PronunciationProfile::default(),
+            PronunciationProfile::Default
+        );
+        for (profile, value) in [
+            (PronunciationProfile::Default, "\"default\""),
+            (
+                PronunciationProfile::FrenchMillefeuille,
+                "\"frenchMillefeuille\"",
+            ),
+            (PronunciationProfile::EnglishArpabet, "\"englishArpabet\""),
+        ] {
+            assert_eq!(serde_json::to_string(&profile).unwrap(), value);
+            assert_eq!(
+                serde_json::from_str::<PronunciationProfile>(value).unwrap(),
+                profile
+            );
+            assert_eq!(profile.for_target(ExportTarget::Ustx), profile);
+            assert_eq!(
+                profile.for_target(ExportTarget::Svp),
+                PronunciationProfile::Default
+            );
+        }
+        assert!(serde_json::from_str::<PronunciationProfile>("\"french\"").is_err());
+    }
+
     fn projected() -> ProjectedProject {
         ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             language: "japanese".into(),
             meters: vec![ProjectedMeter {

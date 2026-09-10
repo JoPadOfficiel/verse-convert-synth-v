@@ -29,6 +29,7 @@ import {
   type FileResult,
   type Language,
   type Overrides,
+  type PronunciationProfile,
   type RendererStatus,
 } from "@/lib/tauri";
 import { applyTrackOverrides } from "@/lib/vocal-overrides";
@@ -68,6 +69,7 @@ export default function App() {
   // never seen the voice database the user will assign. Lyrics never depended on
   // it, in any language.
   const language: Language = "english";
+  const [pronunciationProfile, setPronunciationProfile] = useState<PronunciationProfile>("default");
   const [exportTarget, setExportTarget] = useState<ExportTarget>("ustx");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [overrides, setOverrides] = useState<Overrides>({});
@@ -142,6 +144,7 @@ export default function App() {
           undefined,
           overrides,
           exportTarget,
+          pronunciationProfile,
         );
         setItems((previous) => {
           const seen = new Set(previous.map((item) => item.path));
@@ -156,7 +159,7 @@ export default function App() {
         endBusy();
       }
     },
-    [beginBusy, endBusy, exportTarget, language, overrides],
+    [beginBusy, endBusy, exportTarget, pronunciationProfile, language, overrides],
   );
 
   useEffect(() => {
@@ -204,10 +207,11 @@ export default function App() {
   // Re-analyses every loaded file, because the target is part of
   // the convertibility verdict: OpenUtau's fixed 480 ticks per quarter refuse
   // timing Synthesizer V accepts, so the diagnostics belong to the target that was
-  // analysed. The target is left unchanged when the re-analysis fails, so what is
-  // displayed always matches the selected target.
-  async function changeTarget(nextTarget: ExportTarget) {
-    if (nextTarget === exportTarget) return;
+  // analysed. A rejected command leaves the selection unchanged. Returned
+  // per-file failures are valid verdicts for the new target/profile and replace
+  // the previous diagnostics along with successful results.
+  async function changeTarget(nextTarget: ExportTarget, nextProfile = pronunciationProfile) {
+    if (nextTarget === exportTarget && nextProfile === pronunciationProfile) return;
     if (!items.length) {
       // Still takes the guard: an addPaths analysis can be in flight with the
       // list still empty, and it captured the previous target. Switching outside
@@ -216,6 +220,7 @@ export default function App() {
       // user is no longer exporting to.
       if (!beginBusy()) return;
       setExportTarget(nextTarget);
+      setPronunciationProfile(nextProfile);
       endBusy();
       return;
     }
@@ -229,8 +234,10 @@ export default function App() {
         undefined,
         overrides,
         nextTarget,
+        nextProfile,
       );
       setExportTarget(nextTarget);
+      setPronunciationProfile(nextProfile);
       setItems(results);
       // An export failure names the format it was written for, so a message from
       // the previous target would contradict the new selection. The results are
@@ -285,6 +292,7 @@ export default function App() {
         // The bundle carries the selected target's project, referencing the same
         // stems the other target would.
         exportTarget,
+        pronunciationProfile,
       );
       setItems((previous) =>
         previous.map((candidate) =>
@@ -386,6 +394,7 @@ export default function App() {
         language,
         overrides[item.path],
         exportTarget,
+        pronunciationProfile,
       );
       if (saved) {
         setItems((previous) =>
@@ -427,6 +436,7 @@ export default function App() {
         undefined,
         next,
         exportTarget,
+        pronunciationProfile,
       );
       setItems((previous) =>
         previous.map(
@@ -504,6 +514,11 @@ export default function App() {
           rendererPath={rendererPath}
           setRendererPath={setRendererPath}
           rendererStatus={rendererStatus}
+          exportTarget={exportTarget}
+          pronunciationProfile={pronunciationProfile}
+          onPronunciationChange={(profile) => void changeTarget(exportTarget, profile)}
+          busy={busy}
+          error={globalError}
           onClose={() => setShowSettings(false)}
         />
       ) : (
@@ -539,6 +554,11 @@ export default function App() {
                 Synthesizer V
               </button>
             </div>
+            {exportTarget === "ustx" && (
+              <span className="text-xs text-muted-foreground">
+                Pronunciation: {pronunciationProfile === "frenchMillefeuille" ? "French Millefeuille" : pronunciationProfile === "englishArpabet" ? "English ARPAbet" : "Default"}
+              </span>
+            )}
             <div className="flex-1" />
             {items.length > 0 && (
               <Button

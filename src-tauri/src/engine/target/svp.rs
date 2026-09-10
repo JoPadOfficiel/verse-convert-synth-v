@@ -219,7 +219,9 @@ fn exact_blicks(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i64, S
 /// only place it is safe to decide.
 fn lyric_text(lyric: &ProjectedLyric) -> String {
     match lyric {
-        ProjectedLyric::Source(source) => match &source.state {
+        ProjectedLyric::Source(source)
+        | ProjectedLyric::Pronounced { source, .. }
+        | ProjectedLyric::PronouncedSplit { source } => match &source.state {
             LyricState::Text(text) => text.clone(),
             LyricState::Continuation => "-".into(),
             LyricState::SyllableSplit => "+".into(),
@@ -448,6 +450,7 @@ mod tests {
         let mut split = Lyric::text("split", "syl".into());
         split.state = LyricState::SyllableSplit;
         ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             language: "japanese".into(),
             meters: vec![ProjectedMeter {
@@ -526,6 +529,7 @@ mod tests {
     fn an_unrepresentable_tempo_names_the_event_the_source_revealed_first() {
         // At PPQ 1024 an odd tick is not exactly representable in blicks.
         let project = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 1024,
             tempos: vec![
                 ProjectedTempo {
@@ -562,6 +566,7 @@ mod tests {
     #[test]
     fn the_emitted_tempo_map_is_position_ordered_whatever_the_projection_holds() {
         let project = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 480,
             tempos: vec![
                 ProjectedTempo {
@@ -605,6 +610,7 @@ mod tests {
     #[test]
     fn a_zero_ppq_is_refused_even_with_nothing_to_convert() {
         let empty = ProjectedProject {
+            pronunciation_profile: Default::default(),
             ticks_per_beat: 0,
             ..Default::default()
         };
