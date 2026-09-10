@@ -706,10 +706,15 @@ fn serialize_voice_part(
     clock: &performance::Clock,
     budget: &mut super::performance::Budget,
 ) -> Result<UstxVoicePart, String> {
-    let performance = performance::adapt(track, ticks_per_beat, clock, track_no as usize, budget)?;
+    // Validate nominal note timing before performance spans so expression does
+    // not mask the established refusal for an unrepresentable source note.
     let mut notes = Vec::with_capacity(track.notes.len());
-    for (index, note) in track.notes.iter().enumerate() {
-        let mut emitted = serialize_note(note, &track.source_track_id, ticks_per_beat, profile)?;
+    for note in &track.notes {
+        let emitted = serialize_note(note, &track.source_track_id, ticks_per_beat, profile)?;
+        notes.push((note.onset_ticks, is_rendered_marker(&note.lyric), emitted));
+    }
+    let performance = performance::adapt(track, ticks_per_beat, clock, track_no as usize, budget)?;
+    for (index, (_, _, emitted)) in notes.iter_mut().enumerate() {
         if performance.flat_notes.contains(&index) {
             // OpenUtau 3f213e8993ca792c3e6f8958c92ab27eae78eac5:
             // UNote.cs:108-114 rewrites the first Y only when snapFirst=true;
@@ -725,7 +730,6 @@ fn serialize_voice_part(
                 snap_first: false,
             };
         }
-        notes.push((note.onset_ticks, is_rendered_marker(&note.lyric), emitted));
     }
     // `UNote.CompareTo` falls back to `GetHashCode()` at equal positions, so the
     // order OpenUtau loads a part in is only defined while positions ascend.

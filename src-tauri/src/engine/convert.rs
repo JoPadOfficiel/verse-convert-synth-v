@@ -7,10 +7,12 @@ use crate::engine::midi::{
     TrackRoleHint,
 };
 use crate::engine::projection::{
-    NoteEvidence, ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedProject, ProjectedTempo,
-    ProjectedTrack,
+    NoteEvidence, NoteOrigin, ProjectedLyric, ProjectedMeter, ProjectedNote, ProjectedProject,
+    ProjectedTempo, ProjectedTrack,
 };
 use crate::engine::target::{ExportTarget, PronunciationProfile};
+#[path = "continuity.rs"]
+mod continuity;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -123,6 +125,8 @@ pub struct ProjectionEvidence {
     pub performance_unmapped: BTreeMap<String, String>,
     pub performance_spans: Vec<crate::engine::performance::PerformanceReference>,
     pub performance_refs: BTreeMap<String, Vec<usize>>,
+    /// Independent final note ownership, built before reading mapped span IDs.
+    pub intensity_note_owners: Vec<crate::engine::projection::IntensityNoteProjection>,
 }
 
 pub(crate) fn note_instance_id(
@@ -152,19 +156,19 @@ pub(crate) fn standalone_lyric_instance_id(lyric: &Lyric, track_id: &str, order:
 }
 
 #[derive(Clone, Debug)]
-struct SourceNote {
-    onset: u32,
-    duration: u32,
-    pitch: Option<u8>,
-    source_order: u32,
-    end_order: u32,
-    source: midi::NoteSource,
-    lyrics: Vec<Lyric>,
+pub(crate) struct SourceNote {
+    pub(crate) onset: u32,
+    pub(crate) duration: u32,
+    pub(crate) pitch: Option<u8>,
+    pub(crate) source_order: u32,
+    pub(crate) end_order: u32,
+    pub(crate) source: midi::NoteSource,
+    pub(crate) lyrics: Vec<Lyric>,
 }
 
 /// Native MIDI notes are paired FIFO by `(channel, key)`. XML adapters also
 /// supply an exact source ID so overlapping same-key voices close correctly.
-fn extract_notes(track: &Track) -> Vec<SourceNote> {
+pub(crate) fn extract_notes(track: &Track) -> Vec<SourceNote> {
     let mut active: HashMap<String, (u32, u32, NoteOn)> = HashMap::new();
     let mut by_key: HashMap<(Option<u8>, Option<u8>), Vec<String>> = HashMap::new();
     let mut out = Vec::new();
@@ -836,12 +840,8 @@ struct TrackProjection<'a> {
     performance: &'a crate::engine::performance::PerformanceIndex,
     lanes: &'a [String],
     standalone: &'a HashMap<usize, TimedLyric>,
-    /// The target the caller will export to. Nothing about the projection itself
-    /// depends on it; it exists only so the diagnostics below can ask whether
-    /// that target's application reads a source word differently.
-    target: ExportTarget,
+    /// Retain existing profile-specific eligible blank duplicate selection.
     profile: PronunciationProfile,
-    contextual_french: &'a HashMap<(String, u32, String), String>,
     /// Per-note diagnostics raised while projecting this lane, merged into the
     /// source track's `TrackReport.warnings` by the caller.
     diagnostics: &'a mut Vec<Diagnostic>,
@@ -850,30 +850,343 @@ struct TrackProjection<'a> {
 /// Projects one monophonic lane. Positions stay in IR ticks and the lyric is
 /// carried whole, so no target decision is taken here — including which marker
 /// text a continuation gets, which is not the same string in every target.
-fn project_track(
+fn prepare_track(
     name: &str,
     notes: &[SourceNote],
     projection: TrackProjection<'_>,
 ) -> ProjectedTrack {
-    let mut projected_notes = Vec::with_capacity(notes.len());
-    let mut note_ids: Vec<String> = Vec::with_capacity(notes.len());
-    let mut domains = Vec::with_capacity(notes.len());
-    let replayed = replayed_note_ids(notes);
-    let lane_words = lane_words_by_measure(notes);
+    let context = TrackLyricContext::new(notes);
+    prepare_track_indices(name, notes, 0..notes.len(), &context, projection)
+}
+
+/// Borrow the complete track's verse context once, even when only a few
+/// identity-selected notes need a candidate projection.
+struct TrackLyricContext<'a> {
+    replayed: BTreeSet<&'a str>,
+    lane_words: BTreeSet<(u32, &'a str)>,
+}
+impl<'a> TrackLyricContext<'a> {
+    fn new(notes: &'a [SourceNote]) -> Self {
+        Self {
+            replayed: replayed_note_ids(notes),
+            lane_words: lane_words_by_measure(notes),
+        }
+    }
+}
+
+struct CandidateTrackContext<'a> {
+    lyrics: TrackLyricContext<'a>,
+    by_order: BTreeMap<u32, Vec<usize>>,
+}
+
+#[cfg(test)]
+mod candidate_preparation_review_tests {
+    use super::*;
+
+    fn source(id: &str, order: u32, occurrence: u32, lyrics: Vec<Lyric>) -> SourceNote {
+        SourceNote {
+            onset: order * 480,
+            duration: 480,
+            pitch: Some(64),
+            source_order: order,
+            end_order: order + 1,
+            source: midi::NoteSource {
+                id: id.into(),
+                occurrence,
+                measure: Some(0),
+                ..Default::default()
+            },
+            lyrics,
+        }
+    }
+
+    #[test]
+    fn candidates_keep_complete_verse_context_without_unrelated_notes_or_diagnostics() {
+        let mut other_verse = Lyric::text("verse-2", "other verse".into());
+        other_verse.lane = "2".into();
+        other_verse.verse = 2;
+        let mut unrelated = Lyric::text("verse-1", "word".into());
+        unrelated.lane = "1".into();
+        let mut conflicting = unrelated.clone();
+        conflicting.id = "conflict".into();
+        conflicting.state = midi::LyricState::Text("conflicting word".into());
+        let notes = vec![
+            source("repeated", 0, 0, vec![other_verse.clone()]),
+            source("unrelated", 1, 0, vec![unrelated, conflicting]),
+            source("repeated", 2, 1, vec![other_verse]),
+        ];
+        let budget = continuity::Budget::default();
+        let context = CandidateTrackContext::new(&notes, &budget).unwrap();
+        let performance = crate::engine::performance::PerformanceIndex::default();
+        let lanes = vec!["1".into(), "2".into()];
+        let standalone = HashMap::new();
+        let mut diagnostics = Vec::new();
+        let projection = TrackProjection {
+            source_track_id: "original",
+            performance: &performance,
+            lanes: &lanes,
+            standalone: &standalone,
+            profile: PronunciationProfile::FrenchMillefeuille,
+            diagnostics: &mut diagnostics,
+        };
+        let indices = context
+            .selected_indices(&notes, &BTreeSet::from([0]), &projection, &budget)
+            .unwrap();
+        let track = prepare_track_indices(
+            "Voice",
+            &notes,
+            indices.into_iter(),
+            &context.lyrics,
+            projection,
+        );
+        assert_eq!(track.notes.len(), 1);
+        assert!(
+            matches!(track.notes[0].lyric, ProjectedLyric::Absent),
+            "verse2 cannot steal verse1's deliberate gap"
+        );
+        assert_eq!(
+            track.notes[0]
+                .source_evidence
+                .as_ref()
+                .unwrap()
+                .origin
+                .as_ref()
+                .unwrap()
+                .note_on_order,
+            0
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "unselected conflicting lyrics must not emit candidate warnings"
+        );
+    }
+
+    #[test]
+    fn candidate_selection_reuses_large_track_context_across_small_groups() {
+        let notes: Vec<_> = (0..4096)
+            .map(|i| source(&format!("source-{i}"), i, 0, vec![]))
+            .collect();
+        let budget = continuity::Budget::default();
+        let context = CandidateTrackContext::new(&notes, &budget).unwrap();
+        let performance = crate::engine::performance::PerformanceIndex::default();
+        let standalone = HashMap::new();
+        for _ in 0..256 {
+            let mut diagnostics = Vec::new();
+            let projection = TrackProjection {
+                source_track_id: "original",
+                performance: &performance,
+                lanes: &[],
+                standalone: &standalone,
+                profile: PronunciationProfile::Default,
+                diagnostics: &mut diagnostics,
+            };
+            let indices = context
+                .selected_indices(&notes, &BTreeSet::from([4000]), &projection, &budget)
+                .unwrap();
+            let track = prepare_track_indices(
+                "Voice",
+                &notes,
+                indices.into_iter(),
+                &context.lyrics,
+                projection,
+            );
+            assert_eq!(track.notes.len(), 1);
+            assert_eq!(track.notes[0].onset_ticks, 4000 * 480);
+        }
+        // The same budget must also reject further preparation before allocation.
+        budget.charge(1_970_000).unwrap();
+        assert!(CandidateTrackContext::new(&notes, &budget).is_err());
+    }
+
+    #[test]
+    fn candidate_preparation_rejects_storage_before_note_and_lyric_copies() {
+        let notes = vec![source(
+            "source",
+            0,
+            0,
+            vec![Lyric::text("lyric", "word".into())],
+        )];
+        let budget = continuity::Budget::default();
+        let context = CandidateTrackContext::new(&notes, &budget).unwrap();
+        budget.reserve(128 * 1024 * 1024 - 1024).unwrap();
+        let performance = crate::engine::performance::PerformanceIndex::default();
+        let standalone = HashMap::new();
+        let mut diagnostics = Vec::new();
+        let projection = TrackProjection {
+            source_track_id: "original",
+            performance: &performance,
+            lanes: &["1".into()],
+            standalone: &standalone,
+            profile: PronunciationProfile::FrenchMillefeuille,
+            diagnostics: &mut diagnostics,
+        };
+        assert!(context
+            .selected_indices(&notes, &BTreeSet::from([0]), &projection, &budget)
+            .unwrap_err()
+            .contains("bounded storage"));
+        assert!(diagnostics.is_empty());
+    }
+}
+
+impl<'a> CandidateTrackContext<'a> {
+    fn new(notes: &'a [SourceNote], budget: &continuity::Budget) -> Result<Self, String> {
+        // Three borrowed indices and their transient construction state. Build
+        // once per source track, not once per candidate lyric group.
+        budget.charge(notes.len().saturating_mul(4))?;
+        budget.reserve(notes.len().saturating_mul(256))?;
+        for note in notes {
+            budget.charge(
+                note.lyrics
+                    .len()
+                    .saturating_add(note.source.id.len().div_ceil(64)),
+            )?;
+            budget.reserve(note.lyrics.len().saturating_mul(64))?;
+            for lyric in &note.lyrics {
+                let text_work = match &lyric.state {
+                    midi::LyricState::Text(text) => text.len().div_ceil(64),
+                    _ => 0,
+                };
+                budget.charge(lyric.lane.len().div_ceil(64).saturating_add(text_work))?;
+            }
+        }
+        let mut by_order: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (index, note) in notes.iter().enumerate() {
+            by_order.entry(note.source_order).or_default().push(index);
+        }
+        Ok(Self {
+            lyrics: TrackLyricContext::new(notes),
+            by_order,
+        })
+    }
+
+    fn selected_indices(
+        &self,
+        notes: &[SourceNote],
+        orders: &BTreeSet<u32>,
+        projection: &TrackProjection<'_>,
+        budget: &continuity::Budget,
+    ) -> Result<BTreeSet<usize>, String> {
+        budget.charge(orders.len())?;
+        let mut selected = BTreeSet::new();
+        for order in orders {
+            if let Some(indices) = self.by_order.get(order) {
+                budget.charge(indices.len())?;
+                budget.reserve(indices.len().saturating_mul(64))?;
+                for &index in indices {
+                    let note = &notes[index];
+                    budget.charge(
+                        note.lyrics
+                            .len()
+                            .saturating_mul(projection.lanes.len().saturating_add(4)),
+                    )?;
+                    budget.reserve(
+                        note.lyrics
+                            .len()
+                            .saturating_mul(std::mem::size_of::<&Lyric>())
+                            .saturating_mul(4),
+                    )?;
+                    // Original continuity and performance timelines are shared
+                    // Arcs. Charge copied identity strings, selected lyric and
+                    // bounded diagnostic records before preparing any note.
+                    let mut bytes = 1024usize
+                        .saturating_add(std::mem::size_of::<ProjectedNote>())
+                        .saturating_add(std::mem::size_of::<Lyric>())
+                        .saturating_add(2 * std::mem::size_of::<Diagnostic>())
+                        .saturating_add(projection.source_track_id.len().saturating_mul(8))
+                        .saturating_add(note.source.id.len().saturating_mul(4));
+                    for field in [
+                        &note.source.part_id,
+                        &note.source.staff_id,
+                        &note.source.voice,
+                        &note.source.chord_id,
+                        &note.source.instrument_id,
+                    ] {
+                        bytes = bytes.saturating_add(field.as_ref().map_or(0, String::len));
+                    }
+                    if let Some(unpitched) = &note.source.unpitched {
+                        bytes = bytes
+                            .saturating_add(unpitched.instrument_id.as_ref().map_or(0, String::len))
+                            .saturating_add(unpitched.display_step.as_ref().map_or(0, String::len));
+                    }
+                    if let Some(lyric) = selected_attached_lyric(
+                        note,
+                        projection.lanes,
+                        &self.lyrics.replayed,
+                        &self.lyrics.lane_words,
+                        projection.profile,
+                    ) {
+                        bytes = bytes
+                            .saturating_add(lyric.id.len().saturating_mul(2))
+                            .saturating_add(lyric.raw.len())
+                            .saturating_add(lyric.raw_bytes.len())
+                            .saturating_add(lyric.lane.len())
+                            .saturating_add(lyric.time_only.len().saturating_mul(4));
+                        if let midi::LyricState::Text(text) | midi::LyricState::Unsupported(text) =
+                            &lyric.state
+                        {
+                            bytes = bytes.saturating_add(text.len());
+                        }
+                        budget.charge(lyric.fragments.len())?;
+                        for fragment in &lyric.fragments {
+                            let (midi::LyricFragment::Text(text)
+                            | midi::LyricFragment::Elision(text)) = fragment;
+                            bytes = bytes
+                                .saturating_add(std::mem::size_of::<midi::LyricFragment>())
+                                .saturating_add(text.len());
+                        }
+                    }
+                    budget.reserve(projection.source_track_id.len())?;
+                    if let Some(binding) = projection
+                        .performance
+                        .bindings
+                        .get(&(projection.source_track_id.to_owned(), note.source_order))
+                    {
+                        bytes = bytes.saturating_add(binding.source_id.len());
+                        if let crate::engine::performance::PerformanceOwner::Score { voice } =
+                            &binding.owner
+                        {
+                            bytes = bytes
+                                .saturating_add(voice.part.len())
+                                .saturating_add(voice.staff.len())
+                                .saturating_add(voice.voice.len())
+                                .saturating_add(voice.instrument.as_ref().map_or(0, String::len));
+                        }
+                    }
+                    budget.reserve(bytes)?;
+                    selected.insert(index);
+                }
+            }
+        }
+        Ok(selected)
+    }
+}
+
+fn prepare_track_indices(
+    name: &str,
+    notes: &[SourceNote],
+    indices: impl ExactSizeIterator<Item = usize>,
+    context: &TrackLyricContext<'_>,
+    projection: TrackProjection<'_>,
+) -> ProjectedTrack {
+    let mut projected_notes = Vec::with_capacity(indices.len());
     let mut explicit_extension_end = None;
     let mut musicxml_extension_open = false;
-    for (index, source_note) in notes.iter().enumerate() {
+    for index in indices {
+        let source_note = &notes[index];
         let mut lyric_source_id = None;
         let mut lyric_event_id = None;
         let attached = selected_attached_lyric(
             source_note,
             projection.lanes,
-            &replayed,
-            &lane_words,
+            &context.replayed,
+            &context.lane_words,
             projection.profile,
         );
         let lyric = if let Some(attached) = attached {
-            if let Some(ticks) = attached.extend_ticks.filter(|ticks| *ticks > 0) {
+            if let Some(ticks) = attached
+                .extend_ticks
+                .filter(|ticks| *ticks > 0 && source_note.source.continuity.is_none())
+            {
                 explicit_extension_end = u32::try_from(ticks)
                     .ok()
                     .and_then(|ticks| source_note.onset.checked_add(ticks));
@@ -935,12 +1248,6 @@ fn project_track(
             &source_note.source,
             source_note.source_order,
         );
-        domains.push((
-            source_note.source.part_id.clone(),
-            source_note.source.staff_id.clone(),
-            source_note.source.voice.clone(),
-            source_note.source.occurrence,
-        ));
         if projection.profile != PronunciationProfile::Default {
             if let Some(selected) = attached {
                 projection.diagnostics.extend(duplicate_lyric_diagnostics(
@@ -951,24 +1258,15 @@ fn project_track(
                 ));
             }
         }
-        note_ids.push(note_id.clone());
         projected_notes.push(ProjectedNote {
             performance: projection
                 .performance
-                .notes
+                .bindings
                 .get(&(
                     projection.source_track_id.to_string(),
                     source_note.source_order,
                 ))
-                .and_then(|key| {
-                    projection.performance.channels.get(key).map(|timeline| {
-                        crate::engine::performance::PerformanceNote {
-                            source_id: note_id.clone(),
-                            key: *key,
-                            timeline: timeline.clone(),
-                        }
-                    })
-                }),
+                .cloned(),
             onset_ticks: source_note.onset,
             duration_ticks: source_note.duration,
             pitch,
@@ -985,27 +1283,69 @@ fn project_track(
                 ),
                 lyric_id: lyric_source_id,
                 lyric_event_id,
+                origin: Some(NoteOrigin {
+                    track_id: projection.source_track_id.to_string(),
+                    note_on_order: source_note.source_order,
+                    note_off_order: source_note.end_order,
+                    source: source_note.source.clone(),
+                    lyric_conflict: attached.is_some_and(|selected| {
+                        eligible_attached_lyrics(source_note, &selected.lane)
+                            .iter()
+                            .any(|other| conflicting_lyric(other, selected))
+                    }),
+                    continuation: None,
+                }),
             }),
         });
-        if let Some(attached) = attached {
-            if let Some(hint) = projection.contextual_french.get(&(
-                projection.source_track_id.to_string(),
-                source_note.source_order,
-                attached.id.clone(),
+    }
+    ProjectedTrack {
+        name: name.to_string(),
+        source_track_id: projection.source_track_id.to_string(),
+        muted: false,
+        notes: projected_notes,
+    }
+}
+
+/// Linguistic transforms run only after the source continuity plan has moved
+/// complete notes to their proven predecessor's lane.
+fn finish_track(
+    mut track: ProjectedTrack,
+    target: ExportTarget,
+    profile: PronunciationProfile,
+    contextual_french: &HashMap<(String, u32, String), String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> ProjectedTrack {
+    let projected_notes = &mut track.notes;
+    let mut note_ids = Vec::with_capacity(projected_notes.len());
+    let mut domains = Vec::with_capacity(projected_notes.len());
+    for note in projected_notes.iter_mut() {
+        let evidence = note.source_evidence.as_ref().expect("prepared source note");
+        let origin = evidence.origin.as_ref().expect("prepared source origin");
+        let source = &origin.source;
+        domains.push((
+            source.part_id.clone(),
+            source.staff_id.clone(),
+            source.voice.clone(),
+            source.occurrence,
+        ));
+        note_ids.push(evidence.note_id.clone());
+        if let ProjectedLyric::Source(lyric) = &note.lyric {
+            if let Some(hint) = contextual_french.get(&(
+                origin.track_id.clone(),
+                origin.note_on_order,
+                lyric.id.clone(),
             )) {
-                projection.diagnostics.push(
-                    crate::engine::target::french::apply_contextual_reading(
-                        projected_notes.last_mut().unwrap(),
-                        hint,
-                        note_ids.last().unwrap(),
-                    ),
-                );
+                diagnostics.push(crate::engine::target::french::apply_contextual_reading(
+                    note,
+                    hint,
+                    note_ids.last().unwrap(),
+                ));
             }
         }
     }
     // Before anything is diagnosed: the syllables a score spreads over several
     // notes are the word it writes, and it is that word the file will state.
-    let words = if projection.profile != PronunciationProfile::Default {
+    let words = if profile != PronunciationProfile::Default {
         // A source voice or repeat occurrence boundary must not supply lexical
         // context, even when playback makes the two notes touch.
         let mut start = 0;
@@ -1016,7 +1356,7 @@ fn project_track(
             }
             let notes = &mut projected_notes[start..end];
             let ids = &note_ids[start..end];
-            projection.diagnostics.extend(match projection.profile {
+            diagnostics.extend(match profile {
                 PronunciationProfile::FrenchMillefeuille => {
                     crate::engine::target::french::apply(notes, ids)
                 }
@@ -1029,10 +1369,10 @@ fn project_track(
         }
         crate::engine::syllable::JoinedWords::default()
     } else {
-        crate::engine::syllable::join_words(&mut projected_notes)
+        crate::engine::syllable::join_words(projected_notes)
     };
     if !words.joined.is_empty() {
-        projection.diagnostics.push(report_warning(
+        diagnostics.push(report_warning(
             crate::engine::syllable::SYLLABLES_JOINED_INTO_WORDS,
             DiagnosticSeverity::Info,
             format!(
@@ -1056,11 +1396,11 @@ fn project_track(
                     ),
                 }
             ),
-            projection.source_track_id,
+            &track.source_track_id,
         ));
     }
     if !words.separated.is_empty() {
-        projection.diagnostics.push(report_warning(
+        diagnostics.push(report_warning(
             crate::engine::syllable::WORD_NOT_JOINED_ACROSS_A_GAP,
             DiagnosticSeverity::Warning,
             format!(
@@ -1077,7 +1417,7 @@ fn project_track(
                 },
                 examples(&words.separated)
             ),
-            projection.source_track_id,
+            &track.source_track_id,
         ));
     }
     // The file will state this word exactly; the application that opens it may
@@ -1092,10 +1432,8 @@ fn project_track(
         let midi::LyricState::Text(text) = &carried.state else {
             continue;
         };
-        if let Some(message) =
-            crate::engine::target::lyric_reinterpretation(projection.target, text)
-        {
-            projection.diagnostics.push(report_warning(
+        if let Some(message) = crate::engine::target::lyric_reinterpretation(target, text) {
+            diagnostics.push(report_warning(
                 crate::engine::target::LYRIC_REINTERPRETED_BY_TARGET,
                 DiagnosticSeverity::Warning,
                 message,
@@ -1103,15 +1441,7 @@ fn project_track(
             ));
         }
     }
-    ProjectedTrack {
-        name: name.to_string(),
-        source_track_id: projection.source_track_id.to_string(),
-        // A lane the source texts is what the user came to sing. Only the
-        // No projected lane opens silent today; the field exists so both
-        // targets read one decision rather than each inventing mute state.
-        muted: false,
-        notes: projected_notes,
-    }
+    track
 }
 
 /// Splits one projected lane into monophonic lanes, one per simultaneous voice.
@@ -1133,6 +1463,7 @@ fn project_track(
 fn split_simultaneous_voices(track: ProjectedTrack) -> Vec<ProjectedTrack> {
     let mut lanes: Vec<Vec<ProjectedNote>> = Vec::new();
     let mut previous_lane: Option<usize> = None;
+    let mut retained_lanes: HashMap<String, usize> = HashMap::new();
     for note in track.notes {
         // Widened because a lane's last note may end past the tick range.
         let onset = u64::from(note.onset_ticks);
@@ -1153,9 +1484,21 @@ fn split_simultaneous_voices(track: ProjectedTrack) -> Vec<ProjectedTrack> {
         // on its own predecessor. Forcing it there would leave the lane holding
         // two notes at once, which is the one thing this function exists to
         // prevent, so it takes a free lane and the target reports the marker.
-        let free = previous_lane
-            .filter(|lane| held && lanes.get(*lane).is_some_and(fits))
+        let linked = note
+            .source_evidence
+            .as_ref()
+            .and_then(|e| e.origin.as_ref())
+            .and_then(|o| o.continuation.as_ref());
+        let predecessor_lane =
+            linked.and_then(|link| retained_lanes.get(&link.predecessor_id).copied());
+        let free = predecessor_lane
+            .or_else(|| {
+                previous_lane
+                    .filter(|lane| held && lanes.get(*lane).is_some_and(fits))
+                    .filter(|_| linked.is_none())
+            })
             .or_else(|| lanes.iter().position(fits));
+        let source_id = note.source_evidence.as_ref().map(|e| e.note_id.clone());
         previous_lane = Some(match free {
             Some(lane) => {
                 lanes[lane].push(note);
@@ -1166,6 +1509,9 @@ fn split_simultaneous_voices(track: ProjectedTrack) -> Vec<ProjectedTrack> {
                 lanes.len() - 1
             }
         });
+        if let Some(id) = source_id {
+            retained_lanes.insert(id, previous_lane.unwrap());
+        }
     }
     if lanes.len() <= 1 {
         return vec![ProjectedTrack {
@@ -1250,19 +1596,47 @@ fn drop_untexted(track: ProjectedTrack) -> (ProjectedTrack, usize) {
         .notes
         .iter()
         .filter(|note| note.lyric.continues_previous_note())
+        .filter(|note| {
+            note.source_evidence
+                .as_ref()
+                .and_then(|e| e.origin.as_ref())
+                .and_then(|o| o.continuation.as_ref())
+                .is_none()
+        })
         .filter_map(|marker| {
             let after = onsets.partition_point(|onset| *onset < marker.onset_ticks);
             after.checked_sub(1).map(|previous| onsets[previous])
         })
         .collect();
-    let left_out =
-        |note: &ProjectedNote| !note.lyric.is_sung() && !leaned_on.contains(&note.onset_ticks);
+    let linked_predecessors: BTreeSet<&str> = track
+        .notes
+        .iter()
+        .filter_map(|note| {
+            note.source_evidence
+                .as_ref()?
+                .origin
+                .as_ref()?
+                .continuation
+                .as_ref()
+        })
+        .map(|link| link.predecessor_id.as_str())
+        .collect();
+    let left_out = |note: &ProjectedNote| {
+        !note.lyric.is_sung()
+            && !leaned_on.contains(&note.onset_ticks)
+            && !note
+                .source_evidence
+                .as_ref()
+                .is_some_and(|e| linked_predecessors.contains(e.note_id.as_str()))
+    };
     let count = track.notes.iter().filter(|note| left_out(note)).count();
     if count == 0 || count == track.notes.len() {
         return (track, 0);
     }
+    let keep: Vec<bool> = track.notes.iter().map(|note| !left_out(note)).collect();
     let mut track = track;
-    track.notes.retain(|note| !left_out(note));
+    let mut keep = keep.into_iter();
+    track.notes.retain(|_| keep.next().unwrap());
     (track, count)
 }
 
@@ -1450,6 +1824,7 @@ pub fn convert_midi_with_profile(
     };
 
     let mut projected_tracks: Vec<ProjectedTrack> = Vec::new();
+    let mut pending_tracks: Vec<(usize, Vec<String>, ProjectedTrack)> = Vec::new();
     let mut report: Vec<TrackReport> = Vec::new();
     let mut total_placed = 0usize;
     let mut projection = ProjectionEvidence::default();
@@ -1552,8 +1927,6 @@ pub fn convert_midi_with_profile(
         let explicit_override = overrides.and_then(|map| map.get(&index).copied());
         let sing = explicit_override.unwrap_or(source_vocal);
         let mut placed = 0usize;
-        let mut untexted_left_out = 0usize;
-        let mut simultaneous_voices = 0usize;
         let mut lyric_diagnostics: Vec<Diagnostic> = Vec::new();
         if sing {
             let no_assignment = HashMap::new();
@@ -1592,7 +1965,7 @@ pub fn convert_midi_with_profile(
                     [lane] if lanes.len() > 1 => format!("{name} — lyric lane {lane}"),
                     _ => name.clone(),
                 };
-                let projected_track = project_track(
+                let projected_track = prepare_track(
                     &lane_name,
                     notes,
                     TrackProjection {
@@ -1600,19 +1973,11 @@ pub fn convert_midi_with_profile(
                         performance: &performance,
                         lanes: group,
                         standalone,
-                        target,
                         profile,
-                        contextual_french: &contextual_french,
                         diagnostics: &mut lyric_diagnostics,
                     },
                 );
-                let (sung_track, left_out) = drop_untexted(projected_track);
-                untexted_left_out += left_out;
-                if !sung_track.notes.is_empty() {
-                    let voices = split_simultaneous_voices(sung_track);
-                    simultaneous_voices = simultaneous_voices.max(voices.len());
-                    projected_tracks.extend(voices);
-                }
+                pending_tracks.push((index, group.clone(), projected_track));
             }
         }
         total_placed += placed;
@@ -1692,39 +2057,11 @@ pub fn convert_midi_with_profile(
                 &track.id,
             ));
         }
-        if simultaneous_voices > 1 {
-            warnings.push(report_warning(
-                SIMULTANEOUS_VOICES_SPLIT,
-                DiagnosticSeverity::Info,
-                format!(
-                    "This line sounds up to {simultaneous_voices} notes at once, so it is sung as \
-                     {simultaneous_voices} lanes of one voice each. A vocal track sings one note \
-                     at a time in both targets: Synthesizer V would sing one note of the stack \
-                     and OpenUtau would mark the others as overlapping and sing none. Every note \
-                     keeps its own pitch, instant, length and word."
-                ),
-                &track.id,
-            ));
-        }
         if two_encodings {
             warnings.push(report_warning(
                 TWO_LYRIC_ENCODINGS,
                 DiagnosticSeverity::Info,
                 "This track writes its words twice, once as Soft Karaoke text and once as MIDI                  lyric events. The karaoke stream is the one this file is built around and the                  one carrying its line controls, so it is the one sung; the duplicate stays in                  the preserved source. Where the two disagree, the karaoke text is what you                  will hear.",
-                &track.id,
-            ));
-        }
-        if untexted_left_out > 0 {
-            warnings.push(report_warning(
-                UNTEXTED_NOTES_LEFT_OUT,
-                DiagnosticSeverity::Info,
-                format!(
-                    "{untexted_left_out} note(s) of this track carry no lyric, so they are not \
-                     written into the vocal project: a note with no word is not something a \
-                     singer can be asked to sing, and OpenUtau marks an empty lyric as an error. \
-                     They remain byte-exact in the preserved source and audible in this Part's \
-                     rendered stem."
-                ),
                 &track.id,
             ));
         }
@@ -1831,6 +2168,143 @@ pub fn convert_midi_with_profile(
         });
     }
 
+    let disabled: BTreeSet<_> = overrides
+        .into_iter()
+        .flat_map(|map| map.iter())
+        .filter_map(|(index, sing)| (!*sing).then_some(*index))
+        .collect();
+    let mut candidate_budget = continuity::Budget::default();
+    let candidates = match continuity::candidate_projections(
+        &pending_tracks,
+        &notes_by_track,
+        &disabled,
+        &candidate_budget,
+    ) {
+        Ok(candidates) => candidates,
+        Err(error) => return fail(error),
+    };
+    let candidate_start = pending_tracks.len();
+    let mut candidate_contexts = BTreeMap::new();
+    for (index, group, orders) in candidates {
+        if let std::collections::btree_map::Entry::Vacant(entry) = candidate_contexts.entry(index) {
+            let context =
+                match CandidateTrackContext::new(&notes_by_track[index], &candidate_budget) {
+                    Ok(context) => context,
+                    Err(error) => return fail(error),
+                };
+            entry.insert(context);
+        }
+        let context = &candidate_contexts[&index];
+        let mut diagnostics = Vec::new();
+        let assignment = HashMap::new();
+        let projection = TrackProjection {
+            source_track_id: &midi.tracks[index].id,
+            performance: &performance,
+            lanes: &group,
+            standalone: &assignment,
+            profile,
+            diagnostics: &mut diagnostics,
+        };
+        let indices = match context.selected_indices(
+            &notes_by_track[index],
+            &orders,
+            &projection,
+            &candidate_budget,
+        ) {
+            Ok(indices) => indices,
+            Err(error) => return fail(error),
+        };
+        let track = prepare_track_indices(
+            &midi.tracks[index].name,
+            &notes_by_track[index],
+            indices.into_iter(),
+            &context.lyrics,
+            projection,
+        );
+        report[index].warnings.extend(diagnostics);
+        pending_tracks.push((index, group, track));
+    }
+    if let Err(error) = continuity::resolve_bounded(
+        &mut pending_tracks,
+        &notes_by_track,
+        &mut report,
+        &performance,
+        &mut candidate_budget,
+    ) {
+        return fail(error);
+    }
+    // Recovery moves admitted atoms to an existing sung owner. Unresolved
+    // candidate frames never create vocals or empty technical output lanes.
+    for (_, _, track) in &mut pending_tracks[candidate_start..] {
+        track.notes.clear();
+    }
+    if let Err(error) = crate::engine::performance::bind_selected_score_attacks(
+        midi,
+        &performance,
+        &mut pending_tracks,
+    ) {
+        return fail(error);
+    }
+    let mut left_out_by_track = vec![0usize; midi.tracks.len()];
+    let mut voices_by_track = vec![0usize; midi.tracks.len()];
+    for (index, _, track) in pending_tracks {
+        let track = finish_track(
+            track,
+            target,
+            profile,
+            &contextual_french,
+            &mut report[index].warnings,
+        );
+        let (sung_track, left_out) = drop_untexted(track);
+        left_out_by_track[index] += left_out;
+        if !sung_track.notes.is_empty() {
+            let voices = split_simultaneous_voices(sung_track);
+            voices_by_track[index] = voices_by_track[index].max(voices.len());
+            projected_tracks.extend(voices);
+        }
+    }
+    for (index, track) in midi.tracks.iter().enumerate() {
+        let warnings = &mut report[index].warnings;
+        let simultaneous_voices = voices_by_track[index];
+        let untexted_left_out = left_out_by_track[index];
+        if simultaneous_voices > 1 {
+            warnings.push(report_warning(
+                SIMULTANEOUS_VOICES_SPLIT,
+                DiagnosticSeverity::Info,
+                format!(
+                    "This line sounds up to {simultaneous_voices} notes at once, so it is sung as \
+                     {simultaneous_voices} lanes of one voice each. A vocal track sings one note \
+                     at a time in both targets: Synthesizer V would sing one note of the stack \
+                     and OpenUtau would mark the others as overlapping and sing none. Every note \
+                     keeps its own pitch, instant, length and word."
+                ),
+                &track.id,
+            ));
+        }
+        if untexted_left_out > 0 {
+            warnings.push(report_warning(
+                UNTEXTED_NOTES_LEFT_OUT,
+                DiagnosticSeverity::Info,
+                format!(
+                    "{untexted_left_out} note(s) of this track carry no lyric, so they are not \
+                     written into the vocal project: a note with no word is not something a \
+                     singer can be asked to sing, and OpenUtau marks an empty lyric as an error. \
+                     They remain byte-exact in the preserved source and audible in this Part's \
+                     rendered stem."
+                ),
+                &track.id,
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        warnings.retain(|diagnostic| {
+            seen.insert((
+                diagnostic.code.clone(),
+                diagnostic.source_id.clone(),
+                diagnostic.message.clone(),
+            ))
+        });
+    }
+
     // Only final editable notes establish note/lyric ownership. Union retained
     // records across every lyric lane; an exclusion in one lane cannot erase a
     // representation in another. The existing retention predicate is authoritative.
@@ -1853,6 +2327,49 @@ pub fn convert_midi_with_profile(
         tempos: tempo,
         tracks: projected_tracks,
     };
+    // A target's refusal to represent this timing is observable behaviour, not
+    // an export detail: `convert_files(write=false)` is the analysis path, and
+    // its verdict is what the frontend reports as "convertible". Letting the
+    // refusal wait until a file is written would make Verse call an
+    // unprojectable source fine and then fail at export. So the target is asked
+    // now and its answer discarded; the write boundary rebuilds it
+    // deterministically from the same projection.
+    //
+    // The target asked is the caller's, and it is the single place the seam is
+    // not one-directional. It has to be the caller's: Synthesizer V positions a
+    // quarter note at 705_600_000 blicks while OpenUtau fixes 480 integer ticks,
+    // and 705_600_000 / 480 is exact, so the set of sources OpenUtau can
+    // represent is a strict subset — `480 = 2^5 * 3 * 5` cannot express a
+    // septuplet. Asking one target on behalf of another would clear a source the
+    // other must refuse, and the refusal would resurface at export, which is the
+    // very thing the paragraph above exists to prevent.
+    // A complete bundle now carries the chosen target's own project, so its
+    // availability follows that target too. It was asked of Synthesizer V while a
+    // bundle could only hold a `.svp`; keeping that would offer a bundle button for
+    // a source the bundle then refuses, which is the failure this whole block
+    // exists to prevent.
+    // Asked before any target, and with its own wording, because a lane that
+    // sounds two notes at once is neither target's doing: both are monophonic,
+    // and the adapters decompose simultaneity into lanes so this cannot reach
+    // them. Only Synthesizer V would accept it, and it would sing one note of
+    // the stack.
+    if let Some(violation) = projected.monophony_violation() {
+        return fail(format!("a projection lane is not monophonic: {violation}"));
+    }
+    if let Err(error) = crate::engine::target::validate_for(target, &projected) {
+        // Synthesizer V keeps 0.4.9's wording verbatim, because every refusal it
+        // can raise really is a timing refusal. OpenUtau also refuses a syllable
+        // split, a chord in one monophonic lane and a held syllable across a gap,
+        // none of which is about timing, so telling the user to fix timing would
+        // send them after the wrong thing.
+        return fail(match target {
+            ExportTarget::Svp => format!("source timing cannot be projected safely: {error}"),
+            ExportTarget::Ustx => format!(
+                "the source cannot be projected safely to {}: {error}",
+                target.display_name()
+            ),
+        });
+    }
     let mut transfers = match crate::engine::target::performance_report(target, &projected) {
         Ok(transfers) => transfers,
         Err(error) => {
@@ -1865,6 +2382,64 @@ pub fn convert_midi_with_profile(
     let mut performance_budget = crate::engine::target::performance::Budget::default();
     let accounting = (|| -> Result<(), String> {
         use crate::engine::performance::{Dimension, PerformanceTransfer, TransferStatus};
+        let source_issues = crate::engine::target::performance::source_only_issue_reports(
+            &performance,
+            &transfers,
+            midi.ticks_per_beat,
+            &mut performance_budget,
+        )?;
+        transfers.extend(source_issues);
+        if transfers
+            .iter()
+            .any(|transfer| transfer.intensity.is_some())
+        {
+            for (target_track, track) in projected.tracks.iter().enumerate() {
+                performance_budget.work(track.notes.len())?;
+                for note in &track.notes {
+                    let Some(evidence) = &note.source_evidence else {
+                        continue;
+                    };
+                    let Some(origin) = &evidence.origin else {
+                        continue;
+                    };
+                    performance_budget.references(1)?;
+                    performance_budget.text(
+                        evidence
+                            .note_id
+                            .len()
+                            .saturating_add(origin.track_id.len())
+                            .saturating_add(track.source_track_id.len())
+                            .saturating_add(std::mem::size_of::<
+                                crate::engine::projection::IntensityNoteProjection,
+                            >()),
+                    )?;
+                    let intensity_attack_note_id = origin
+                        .continuation
+                        .as_ref()
+                        .filter(|link| {
+                            link.kind == crate::engine::projection::ContinuationKind::Tie
+                        })
+                        .and_then(|link| link.intensity_attack_note_id.as_deref());
+                    if let Some(id) = intensity_attack_note_id {
+                        performance_budget.text(id.len())?;
+                    }
+                    projection.intensity_note_owners.push(
+                        crate::engine::projection::IntensityNoteProjection {
+                            note_id: evidence.note_id.clone(),
+                            intensity_attack_note_id: intensity_attack_note_id.map(str::to_owned),
+                            source_track_id: origin.track_id.clone(),
+                            target_track,
+                            destination_track_id: track.source_track_id.clone(),
+                            start_tick: note.onset_ticks,
+                            end_tick: note
+                                .onset_ticks
+                                .checked_add(note.duration_ticks)
+                                .ok_or("Intensity projection ownership interval overflows")?,
+                        },
+                    );
+                }
+            }
+        }
         let mut accounted = BTreeSet::new();
         for transfer in &transfers {
             performance_budget.ids(&transfer.source_ids)?;
@@ -1887,7 +2462,7 @@ pub fn convert_midi_with_profile(
             entry.2.push(id.clone());
         }
         for ((track_id, dimension), (start_tick, end_tick, source_ids)) in unowned {
-            transfers.push(PerformanceTransfer { track_id, target_track: None, dimension, start_tick, end_tick,
+            transfers.push(PerformanceTransfer { intensity: None, track_id, target_track: None, dimension, start_tick, end_tick,
                 source_ids, note_ids: Vec::new(), status: TransferStatus::Unsupported,
                 message: "Source performance has no eligible editable ownership span. This includes unprojected channels, superseded state and endpoint/post-note events; source/stem retention does not imply an active vocal curve.".into() });
         }
@@ -1948,6 +2523,7 @@ pub fn convert_midi_with_profile(
         projection
             .performance_spans
             .push(crate::engine::performance::PerformanceReference {
+                intensity: transfer.intensity,
                 target: target.extension().into(),
                 target_track: transfer.target_track,
                 source_track_id: transfer.track_id.clone(),
@@ -1988,49 +2564,6 @@ pub fn convert_midi_with_profile(
                 });
             }
         }
-    }
-    // A target's refusal to represent this timing is observable behaviour, not
-    // an export detail: `convert_files(write=false)` is the analysis path, and
-    // its verdict is what the frontend reports as "convertible". Letting the
-    // refusal wait until a file is written would make Verse call an
-    // unprojectable source fine and then fail at export. So the target is asked
-    // now and its answer discarded; the write boundary rebuilds it
-    // deterministically from the same projection.
-    //
-    // The target asked is the caller's, and it is the single place the seam is
-    // not one-directional. It has to be the caller's: Synthesizer V positions a
-    // quarter note at 705_600_000 blicks while OpenUtau fixes 480 integer ticks,
-    // and 705_600_000 / 480 is exact, so the set of sources OpenUtau can
-    // represent is a strict subset — `480 = 2^5 * 3 * 5` cannot express a
-    // septuplet. Asking one target on behalf of another would clear a source the
-    // other must refuse, and the refusal would resurface at export, which is the
-    // very thing the paragraph above exists to prevent.
-    // A complete bundle now carries the chosen target's own project, so its
-    // availability follows that target too. It was asked of Synthesizer V while a
-    // bundle could only hold a `.svp`; keeping that would offer a bundle button for
-    // a source the bundle then refuses, which is the failure this whole block
-    // exists to prevent.
-    // Asked before any target, and with its own wording, because a lane that
-    // sounds two notes at once is neither target's doing: both are monophonic,
-    // and the adapters decompose simultaneity into lanes so this cannot reach
-    // them. Only Synthesizer V would accept it, and it would sing one note of
-    // the stack.
-    if let Some(violation) = projected.monophony_violation() {
-        return fail(format!("a projection lane is not monophonic: {violation}"));
-    }
-    if let Err(error) = crate::engine::target::validate_for(target, &projected) {
-        // Synthesizer V keeps 0.4.9's wording verbatim, because every refusal it
-        // can raise really is a timing refusal. OpenUtau also refuses a syllable
-        // split, a chord in one monophonic lane and a held syllable across a gap,
-        // none of which is about timing, so telling the user to fix timing would
-        // send them after the wrong thing.
-        return fail(match target {
-            ExportTarget::Svp => format!("source timing cannot be projected safely: {error}"),
-            ExportTarget::Ustx => format!(
-                "the source cannot be projected safely to {}: {error}",
-                target.display_name()
-            ),
-        });
     }
     let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
@@ -3206,6 +3739,7 @@ mod tests {
             }
         }
         Midi {
+            score_intensity: None,
             staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
@@ -3615,6 +4149,14 @@ mod tests {
                         attached_lyric_instance_id(lyric, &source.source, source.source_order)
                     }),
                     lyric_event_id: None,
+                    origin: Some(NoteOrigin {
+                        track_id: track.id.clone(),
+                        note_on_order: source.source_order,
+                        note_off_order: source.end_order,
+                        source: source.source.clone(),
+                        lyric_conflict: false,
+                        continuation: None,
+                    }),
                 };
                 assert_eq!(note.source_evidence.as_ref(), Some(&expected));
                 assert_eq!(

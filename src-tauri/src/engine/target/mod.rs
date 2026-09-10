@@ -132,6 +132,9 @@ pub fn lyric_reinterpretation(target: ExportTarget, text: &str) -> Option<String
 /// [`serialize_to`] runs and cannot drift from it, and it stays as cheap as the
 /// gate has always been.
 pub fn validate_for(target: ExportTarget, project: &ProjectedProject) -> Result<(), String> {
+    if let Some(violation) = project.continuity_violation() {
+        return Err(violation);
+    }
     match target {
         ExportTarget::Svp => svp::serialize(project).map(|_| ()),
         ExportTarget::Ustx => ustx::serialize(project).map(|_| ()),
@@ -158,6 +161,9 @@ pub fn serialize_to(
     target: ExportTarget,
     project: &ProjectedProject,
 ) -> Result<Vec<u8>, SerializeError> {
+    if let Some(violation) = project.continuity_violation() {
+        return Err(SerializeError::Unrepresentable(violation));
+    }
     match target {
         ExportTarget::Svp => {
             let model = svp::serialize(project).map_err(SerializeError::Unrepresentable)?;

@@ -24,7 +24,8 @@ fn range(channel: u8, semitones: u8) -> Events {
 fn voice(onset: u32, duration: u32, channel: u8, key: u8) -> Events {
     vec![
         (onset, vec![0xff, 5, 2, b'l', b'a']),
-        (onset, vec![0x90 | channel, key, 73]),
+        // L80 is neutral under EXP003, isolating the original bend/CC protocol assertions.
+        (onset, vec![0x90 | channel, key, 80]),
         (onset + duration, vec![0x80 | channel, key, 12]),
     ]
 }
@@ -241,7 +242,12 @@ fn positive_gain_never_becomes_mute_and_pitch_never_silently_clips() {
     wide.push(bend(0, 0, 0));
     wide.extend(voice(0, 480, 0, 60));
     let (_, result, model) = convert(wide);
-    assert!(model.voice_parts[0].curves.is_empty());
+    assert!(model.voice_parts[0].curves.iter().all(|c| c.abbr != "pitd"));
+    assert_eq!(
+        sample(curve(&model, "dyn"), 0),
+        0,
+        "neutral explicit attack remains independently mapped"
+    );
     assert!(codes(&result).contains("MIDI_PERFORMANCE_REPRESENTATION_LIMIT"));
 }
 
@@ -283,7 +289,8 @@ fn short_pulses_are_reported_and_five_tick_pulses_survive_every_origin() {
         events.extend(voice(0, 480, 0, 60));
         let (_, result, model) = convert(events);
         if width == 2 {
-            assert!(model.voice_parts[0].curves.is_empty());
+            assert!(model.voice_parts[0].curves.iter().all(|c| c.abbr != "pitd"));
+            assert_eq!(sample(curve(&model, "dyn"), 241), 0);
             assert!(codes(&result).contains("MIDI_PERFORMANCE_REPRESENTATION_LIMIT"));
         } else {
             let pitd = curve(&model, "pitd");
@@ -333,9 +340,16 @@ fn terminal_pulses_need_five_ticks_before_the_exclusive_note_endpoint() {
                     && span.note_ids.is_empty()
                     && span.start_tick == 480));
             } else if width < 5 {
-                assert!(model.voice_parts[0].curves.is_empty());
+                let abbr = if gain { "dyn" } else { "pitd" };
+                if let Some(c) = model.voice_parts[0].curves.iter().find(|c| c.abbr == abbr) {
+                    assert!(
+                        (0..=480).all(|t| sample(c, t) == 0),
+                        "short pulse must not claim an active mapped pulse"
+                    );
+                }
                 assert!(codes(&result).contains("MIDI_PERFORMANCE_REPRESENTATION_LIMIT"));
-                assert!(result.projection.performance_mapped.is_empty());
+                assert!(result.projection.performance_spans.iter().any(|s| s.status
+                    == verse_lib::engine::performance::TransferStatus::RepresentationLimit));
                 assert!(
                     (0..5).any(|origin| !(0..96).any(|i| {
                         let tick = origin + 5 * i;
@@ -424,7 +438,7 @@ fn port_channel_and_polyphonic_ownership_survive_karaoke_projection() {
         model
             .voice_parts
             .iter()
-            .filter(|part| !part.curves.is_empty())
+            .filter(|part| part.curves.iter().any(|c| c.abbr == "pitd"))
             .count(),
         2
     );
@@ -433,7 +447,11 @@ fn port_channel_and_polyphonic_ownership_survive_karaoke_projection() {
             assert_eq!(sample(&part.curves[0], 240), 100);
             assert!(!part.notes[0].pitch.snap_first);
         } else {
-            assert!(part.curves.is_empty());
+            assert!(part.curves.iter().all(|c| c.abbr != "pitd"));
+            assert!(
+                part.curves.iter().any(|c| c.abbr == "dyn"),
+                "explicit native attack remains owned by this port/channel"
+            );
             assert!(part.notes[0].pitch.snap_first);
         }
     }
@@ -512,7 +530,7 @@ fn saved_ledger_distinguishes_mapped_curves_from_raw_retention_and_svp() {
 }
 
 #[test]
-fn no_authored_curve_keeps_legacy_pitch_vibrato_and_yaml_bytes() {
+fn unsupported_pressure_keeps_pitch_vibrato_and_attack_yaml_bytes() {
     let (_, _, plain) = convert(voice(0, 480, 0, 60));
     let mut with_pressure = voice(0, 480, 0, 60);
     with_pressure.push((10, vec![0xd0, 64]));
@@ -655,7 +673,7 @@ fn mpe_requires_applicable_rpn_and_an_actual_data_entry() {
         assert!(result.ok, "{:?}", result.msg);
         let model = ustx::serialize(result.svp.as_ref().unwrap()).unwrap();
         assert_eq!(
-            model.voice_parts[0].curves.is_empty(),
+            model.voice_parts[0].curves.iter().all(|c| c.abbr != "pitd"),
             blocked,
             "msb={msb:?} entry={entry}"
         );
@@ -735,7 +753,10 @@ fn short_rest_boundary_uses_milliseconds_and_the_tempo_change() {
             codes(&result).contains("MIDI_PERFORMANCE_REPRESENTATION_LIMIT"),
             limited
         );
-        assert_eq!(model.voice_parts[0].curves.is_empty(), limited);
+        assert_eq!(
+            model.voice_parts[0].curves.iter().all(|c| c.abbr != "pitd"),
+            limited
+        );
         assert_eq!(model.voice_parts[0].notes[1].position, 500);
         assert!(model.voice_parts[0].notes[1].pitch.snap_first);
     }
@@ -749,12 +770,21 @@ fn past_issues_and_future_svp_events_do_not_name_unaffected_notes() {
         let source = midi::parse(&file(480, vec![events])).unwrap();
         let result = convert_midi_with_target(&source, "english", None, target);
         assert!(result.ok);
-        assert!(result
-            .projection
-            .performance_spans
-            .iter()
-            .all(|span| span.note_ids.is_empty() && span.target_track.is_none()));
-        assert!(result.projection.performance_mapped.is_empty());
+        for track in &source.tracks {
+            for event in &track.events {
+                if matches!(
+                    event.kind,
+                    midi::Kind::ChannelPressure { .. } | midi::Kind::ControlChange { .. }
+                ) {
+                    let id = format!("event:{}:{}", track.id, event.order);
+                    assert!(!result.projection.performance_mapped.contains_key(&id));
+                    for index in &result.projection.performance_refs[&id] {
+                        let span = &result.projection.performance_spans[*index];
+                        assert!(span.note_ids.is_empty() && span.target_track.is_none());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -865,7 +895,9 @@ fn mixed_success_ledger_bytes_keep_versioned_lane_note_and_span_references() {
 #[test]
 fn adapter_refuses_overflow_and_bounds_alternating_ownership_work() {
     use std::sync::Arc;
-    use verse_lib::engine::performance::{ChannelKey, ChannelPerformance, PerformanceNote};
+    use verse_lib::engine::performance::{
+        ChannelKey, ChannelPerformance, PerformanceNote, PerformanceOwner,
+    };
     let (_, result, _) = convert(voice(0, 480, 0, 60));
     let mut project = result.svp.unwrap();
     let mut note = project.tracks[0].notes[0].clone();
@@ -873,11 +905,14 @@ fn adapter_refuses_overflow_and_bounds_alternating_ownership_work() {
     note.duration_ticks = 4;
     note.performance = Some(PerformanceNote {
         source_id: "overflow".into(),
-        key: ChannelKey {
-            port: 0,
-            channel: 0,
+        intensity: None,
+        owner: PerformanceOwner::Midi {
+            key: ChannelKey {
+                port: 0,
+                channel: 0,
+            },
+            timeline: Arc::new(ChannelPerformance::default()),
         },
-        timeline: Arc::new(ChannelPerformance::default()),
     });
     project.tracks[0].notes = vec![note.clone()];
     for target in [ExportTarget::Ustx, ExportTarget::Svp] {
@@ -890,7 +925,9 @@ fn adapter_refuses_overflow_and_bounds_alternating_ownership_work() {
             let mut n = note.clone();
             n.onset_ticks = i * 10;
             n.duration_ticks = 5;
-            n.performance.as_mut().unwrap().key.channel = (i % 2) as u8;
+            if let PerformanceOwner::Midi { key, .. } = &mut n.performance.as_mut().unwrap().owner {
+                key.channel = (i % 2) as u8;
+            }
             n
         })
         .collect();
@@ -908,17 +945,16 @@ fn repeated_issues_share_note_references_instead_of_a_note_times_event_product()
         events.push((i * 10 + 1, vec![0xd0, 64]));
     }
     let (_, result, _) = convert(events);
-    assert_eq!(result.projection.performance_spans.len(), 1);
-    assert_eq!(result.projection.performance_spans[0].note_ids.len(), 2000);
-    assert_eq!(
-        result
-            .projection
-            .performance_refs
-            .values()
-            .map(Vec::len)
-            .sum::<usize>(),
-        2000
-    );
+    let pressure: Vec<_> = result
+        .projection
+        .performance_spans
+        .iter()
+        .filter(|s| s.dimension == verse_lib::engine::performance::Dimension::Other)
+        .collect();
+    assert_eq!(pressure.len(), 1);
+    assert_eq!(pressure[0].note_ids.len(), 2000);
+    assert_eq!(result.projection.performance_refs.values().map(Vec::len).sum::<usize>(),4000,
+        "one reference per pressure event plus one per newly interpreted attack; no note-times-event growth");
 }
 
 #[test]
@@ -947,14 +983,81 @@ fn later_controller_in_the_same_owner_run_never_names_an_earlier_note() {
         let source = midi::parse(&file(480, vec![events])).unwrap();
         let result = convert_midi_with_target(&source, "english", None, target);
         assert!(result.ok);
-        let spans: Vec<_> = result
-            .projection
-            .performance_spans
+        let controller = source
+            .tracks
             .iter()
-            .filter(|r| r.target_track.is_some())
+            .find_map(|track| {
+                track.events.iter().find_map(|event| {
+                    matches!(event.kind, midi::Kind::ControlChange { controller: 11, .. })
+                        .then(|| format!("event:{}:{}", track.id, event.order))
+                })
+            })
+            .unwrap();
+        let spans: Vec<_> = result.projection.performance_refs[&controller]
+            .iter()
+            .map(|i| &result.projection.performance_spans[*i])
+            .filter(|s| s.target_track.is_some())
             .collect();
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].start_tick, spans[0].end_tick), (600, 1080));
         assert_eq!(spans[0].note_ids.len(), 1);
+    }
+}
+
+#[test]
+fn explicit_native_velocity_has_one_owned_gain_contributor() {
+    for (velocity, controller, expected) in [
+        (73, None, -18),
+        (100, None, 50),
+        (80, Some(64), -60),
+        (100, Some(64), -10),
+    ] {
+        let mut events = voice(0, 480, 0, 60);
+        for (_, bytes) in &mut events {
+            if bytes[0] & 0xf0 == 0x90 {
+                bytes[2] = velocity;
+            }
+        }
+        if let Some(value) = controller {
+            events.push(cc(0, 0, 7, value));
+        }
+        let (source, result, model) = convert(events);
+        assert_eq!(sample(curve(&model, "dyn"), 0), expected);
+        let project = result.svp.as_ref().unwrap();
+        let note = &project.tracks[0].notes[0];
+        let binding = note.performance.as_ref().unwrap();
+        assert_eq!(
+            binding.source_id,
+            note.source_evidence.as_ref().unwrap().note_id
+        );
+        let attack = source
+            .tracks
+            .iter()
+            .find_map(|t| {
+                t.events.iter().find_map(|e| {
+                    matches!(&e.kind,midi::Kind::NoteOn(n) if n.velocity==Some(velocity))
+                        .then(|| verse_lib::engine::performance::attack_field_id(&t.id, e.order))
+                })
+            })
+            .unwrap();
+        assert!(result.projection.performance_mapped.contains_key(&attack));
+        let provenance = binding
+            .intensity
+            .as_ref()
+            .unwrap()
+            .provenance
+            .as_ref()
+            .unwrap();
+        assert!(provenance
+            .evidence
+            .iter()
+            .any(|e| e.source_ids.contains(&attack)));
+        assert!(matches!(
+            provenance.scope,
+            verse_lib::engine::score_intensity::Scope::Midi {
+                port: 0,
+                channel: 0
+            }
+        ));
     }
 }

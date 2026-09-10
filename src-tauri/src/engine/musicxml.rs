@@ -2,10 +2,10 @@
 //! Produces the same intermediate `Midi` structure as the MIDI parser, so the
 //! whole multi-track conversion logic can be reused.
 use crate::engine::midi::{
-    merge_measure_marks, unroll, Event, InstrumentInfo, Jump, Kind, Lyric, LyricExtension,
-    LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource,
-    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, Syllabic, TimeBase, Track,
-    TrackRoleHint, TrackSource, UnpitchedInfo,
+    merge_measure_marks, unroll_with_passes, Event, InstrumentInfo, Jump, Kind, Lyric,
+    LyricExtension, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff,
+    NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice,
+    Syllabic, TimeBase, Track, TrackRoleHint, TrackSource, UnpitchedInfo,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -872,7 +872,7 @@ fn mark_unresolved_ties_source_only(
 /// straight through, silently desynchronising the projection.
 fn score_playback_order_mxl(
     part_measures: &[Vec<roxmltree::Node>],
-) -> Result<Vec<(usize, u32)>, String> {
+) -> Result<Vec<(usize, u32, u32)>, String> {
     let Some(first) = part_measures.first() else {
         return Ok(Vec::new());
     };
@@ -893,7 +893,7 @@ fn score_playback_order_mxl(
         }
     }
     resolve_jump_targets(&mut merged);
-    unroll(&merged)
+    unroll_with_passes(&merged)
 }
 
 /// Repeat and navigation marks a single Part writes: repeats (<repeat>),
@@ -1118,6 +1118,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         }
     }
 
+    let mut score_expression = super::score_intensity::source::ScoreInput::default();
     let mut tracks = Vec::new();
     let mut global_events = Vec::new();
     let mut declared_parts = Vec::new();
@@ -1177,6 +1178,29 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 declared_staff_ids.insert(staff.clone());
                 declared_voices.insert((staff, voice));
             }
+            // A direction may explicitly name a voice on a rest-only staff.
+            // Retain that declared owner without inventing a note-bearing lane.
+            for direction in measure
+                .children()
+                .filter(|node| node.has_tag_name("direction"))
+            {
+                let value = |tag| {
+                    direction
+                        .children()
+                        .find(|n| n.has_tag_name(tag))
+                        .and_then(|n| n.text())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                };
+                if let Some(staff) = value("staff") {
+                    declared_staff_ids.insert(staff.to_string());
+                }
+                if let Some(voice) = value("voice") {
+                    let staff = value("staff").unwrap_or("1").to_string();
+                    declared_staff_ids.insert(staff.clone());
+                    declared_voices.insert((staff, voice.to_string()));
+                }
+            }
         }
         for staff in 1..=declared_staff_count {
             declared_staff_ids.insert(staff.to_string());
@@ -1232,13 +1256,39 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         let mut previous_measure = None;
         let mut mstart: i64 = 0;
 
-        for &(mi, pass) in playback_order.iter() {
+        // A written-coordinate pass uses the same validated cursor and note parser.
+        // Its nominal events are discarded before the unchanged playback traversal.
+        let global_before = global_events.len();
+        let written_count = measures.len();
+        let traversal: Vec<_> = (0..written_count)
+            .map(|i| (i, 0, 1))
+            .chain(playback_order.iter().copied())
+            .collect();
+        let mut written_memberships = Vec::with_capacity(written_count);
+        for (visit, &(mi, pass, repeat_pass)) in traversal.iter().enumerate() {
+            let recording = visit < written_count;
+            if visit == written_count {
+                voice_events.clear();
+                active_ties.clear();
+                previous_measure = None;
+                mstart = 0;
+                global_events.truncate(global_before);
+            }
+            let forward = previous_measure.is_some_and(|previous| mi == previous + 1);
             if previous_measure.is_some_and(|previous| mi != previous + 1) {
                 mark_unresolved_ties_source_only(&mut voice_events, &active_ties);
                 active_ties.clear();
             }
             previous_measure = Some(mi);
             let measure = measures[mi];
+            if recording {
+                written_memberships.push(score_expression.begin_written_measure(
+                    &part_id,
+                    None,
+                    mi,
+                    super::score_intensity::source::time(mstart, tpb)?,
+                )?);
+            }
             let mut local_div = divisions_at_measure[mi];
             let mut pos: i64 = mstart;
             let mut maxpos: i64 = mstart;
@@ -1273,6 +1323,11 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                         }
                     }
                     "direction" | "sound" => {
+                        if recording {
+                            score_expression.xml_direction(node,
+                                &format!("expression:musicxml:{part_id}:measure:{mi}:element:{element_index}"),
+                                &part_id, super::score_intensity::source::time(pos, tpb)?, local_div)?;
+                        }
                         if let Some(micros) = direction_tempo(node)? {
                             let tick = if node.has_tag_name("direction") {
                                 direction_tick(node, pos, tpb, local_div)?
@@ -1320,6 +1375,19 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                 last_chord_id = format!(
                                     "musicxml:{part_id}:measure:{mi}:chord:{element_index}"
                                 );
+                            }
+                            if recording && node.attribute("dynamics").is_some() {
+                                score_expression.xml_note_owned(
+                                    node,
+                                    &source_id,
+                                    &super::score_intensity::ScoreVoice {
+                                        part: part_id.clone(),
+                                        staff: staff.clone(),
+                                        voice: voice.clone(),
+                                        instrument: None,
+                                    },
+                                    super::score_intensity::source::time(onset, tpb)?,
+                                )?;
                             }
                             let instrument_id = node
                                 .children()
@@ -1449,6 +1517,13 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                             // An unmerged tail keeps its pitch: nothing sustained
                             // it, so it is a note of its own and staying silent
                             // would drop it.
+                            if merged && !recording {
+                                if let Some(head) = &continued_source {
+                                    score_expression
+                                        .ties
+                                        .insert((source_id.clone(), pass, on), head.clone());
+                                }
+                            }
                             let playback_pitch = if merged { None } else { pitch };
                             push_event(
                                 events,
@@ -1468,6 +1543,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                         measure: u32::try_from(mi).ok(),
                                         grace: is_grace,
                                         unpitched,
+                                        continuity: None,
                                     },
                                     lyrics: note_lyrics(node, &source_id),
                                 }),
@@ -1519,6 +1595,22 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 }
                 if pos > maxpos {
                     maxpos = pos;
+                }
+            }
+            if recording {
+                score_expression
+                    .end_written_measure(super::score_intensity::source::time(maxpos, tpb)?)?;
+            } else {
+                // Part-wide cursor mapping is shared by every actual staff in that part.
+                for staff in &declared_parts.last().unwrap().staves {
+                    score_expression.record_measure_run(
+                        written_memberships[mi],
+                        &part_id,
+                        &staff.id,
+                        super::score_intensity::source::time(mstart, tpb)?,
+                        repeat_pass,
+                        forward,
+                    )?;
                 }
             }
             mstart = maxpos;
@@ -1602,6 +1694,90 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         }
     }
 
+    score_expression.finish()?;
+    // Source-only intensity has a real declaration owner even when its staff
+    // contains no sounding note. Append metadata lanes after existing tracks so
+    // their event IDs and global-event attachment remain stable.
+    let mut intensity_metadata = Vec::new();
+    let mut metadata_budget = super::score_intensity::ProvenanceBudget::default();
+    metadata_budget.charge(tracks.len().saturating_mul(64), tracks.len())?;
+    let occupied_voices: BTreeSet<_> = tracks
+        .iter()
+        .filter_map(|track| {
+            Some((
+                track.source.part_id.as_deref()?,
+                track.source.staff_id.as_deref()?,
+                track.source.voice.as_deref()?,
+            ))
+        })
+        .collect();
+    for part in &declared_parts {
+        for staff in &part.staves {
+            let voices = staff
+                .voices
+                .iter()
+                .map(|voice| voice.number.as_str())
+                .chain(staff.voices.is_empty().then_some("1"));
+            if !score_expression.has_missing_declaration_owner(
+                &part.id,
+                &staff.id,
+                voices,
+                &occupied_voices,
+                &mut metadata_budget,
+            )? {
+                continue;
+            }
+            if let Some(info) = part_info.get(&part.id) {
+                for instrument in info.instruments.values() {
+                    let bytes = [&instrument.id, &instrument.sound_id, &instrument.name]
+                        .into_iter()
+                        .flatten()
+                        .fold(std::mem::size_of::<InstrumentInfo>(), |n, s| {
+                            n.saturating_add(s.len())
+                        })
+                        .saturating_add(instrument.controllers.len().saturating_mul(2));
+                    // The metadata lane retains the full list and primary copy.
+                    metadata_budget.charge(bytes.saturating_mul(2), 1)?;
+                }
+            }
+            let instruments: Vec<_> = part_info
+                .get(&part.id)
+                .map(|info| info.instruments.values().cloned().collect())
+                .unwrap_or_default();
+            metadata_budget.charge(
+                part.id
+                    .len()
+                    .saturating_mul(3)
+                    .saturating_add(staff.id.len().saturating_mul(2))
+                    .saturating_add(part.name.len())
+                    .saturating_add(512),
+                1,
+            )?;
+            intensity_metadata.push(Track {
+                id: format!("musicxml:{}:staff:{}:intensity-metadata", part.id, staff.id),
+                name: if part.name.is_empty() {
+                    part.id.clone()
+                } else {
+                    part.name.clone()
+                },
+                source: TrackSource {
+                    source_track: tracks.len() + intensity_metadata.len(),
+                    part_id: Some(part.id.clone()),
+                    staff_id: Some(staff.id.clone()),
+                    voice: None,
+                },
+                role_hint: TrackRoleHint::Ambiguous,
+                text_profile: MidiTextProfile::Generic,
+                instrument: instruments.first().cloned(),
+                instruments,
+                chord_reading: None,
+                events: Vec::new(),
+            });
+        }
+    }
+    if tracks.is_empty() {
+        tracks.append(&mut intensity_metadata);
+    }
     if !global_events.is_empty() {
         if tracks.is_empty() {
             tracks.push(Track {
@@ -1619,6 +1795,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         tracks[0].events.extend(global_events);
         sort_and_reindex(&mut tracks[0].events);
     }
+    tracks.extend(intensity_metadata);
     if tracks.is_empty() {
         return Err("no usable part in the MusicXML".into());
     }
@@ -1637,6 +1814,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
     }
     let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
     Ok(Midi {
+        score_intensity: (!score_expression.is_empty()).then_some(score_expression),
         staff_links: Vec::new(),
         ticks_per_beat: tpb,
         time_base: TimeBase::PulsesPerQuarter(tpb),
@@ -2666,6 +2844,34 @@ mod tests {
         assert!(midi.topology.parts[0].staves[0].voices[0]
             .projection_track_ids
             .is_empty());
+    }
+
+    #[test]
+    fn intensity_metadata_retains_empty_staff_owner_without_reindexing_sounding_notes() {
+        let xml = r#"<score-partwise version="4.0"><part-list>
+          <score-part id="P1"><part-name>Empty</part-name></score-part>
+          <score-part id="P2"><part-name>Voice</part-name></score-part></part-list>
+          <part id="P1"><measure number="1"><attributes><divisions>480</divisions></attributes>
+            DIRECTION<note><rest/><duration>480</duration><voice>2</voice></note></measure></part>
+          <part id="P2"><measure number="1"><attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+            <direction><sound tempo="90"/></direction>
+            <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><lyric><text>word</text></lyric></note>
+          </measure></part></score-partwise>"#;
+        let old = parse(xml.replace("DIRECTION", "").as_bytes()).unwrap();
+        let new = parse(xml.replace("DIRECTION", r#"<direction><direction-type><words>unknown intensity</words></direction-type><offset sound="yes">120</offset><staff>1</staff><voice>2</voice></direction>"#).as_bytes()).unwrap();
+        assert_eq!(new.tracks[0].id, old.tracks[0].id);
+        assert_eq!(new.tracks[0].events, old.tracks[0].events);
+        let metadata = new
+            .tracks
+            .iter()
+            .find(|track| track.id == "musicxml:P1:staff:1:intensity-metadata")
+            .unwrap();
+        assert_eq!(metadata.source.part_id.as_deref(), Some("P1"));
+        assert_eq!(metadata.source.staff_id.as_deref(), Some("1"));
+        assert!(metadata.source.voice.is_none() && metadata.events.is_empty());
+        let voice = &new.topology.parts[0].staves[0].voices[0];
+        assert_eq!(voice.number, "2");
+        assert!(voice.projection_track_ids.is_empty());
     }
 
     #[test]

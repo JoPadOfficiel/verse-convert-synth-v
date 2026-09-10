@@ -4,13 +4,15 @@
 //! Staff/Measure/voice, TimeSig, Tempo, Chord (dots, tuplets, graces),
 //! Rest (including full measures), location, and all source lyric lanes.
 use crate::engine::midi::{
-    merge_measure_marks, unroll, ChordReading, Event, InstrumentInfo, Jump, Kind, Lyric,
-    LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn, NoteSource,
-    SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice, StaffLink, Syllabic,
-    TimeBase, Track, TrackRoleHint, TrackSource,
+    merge_measure_marks, unroll_with_passes, ChordReading, Event, InstrumentInfo, Jump, Kind,
+    Lyric, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn,
+    NoteSource, SourceContinuity, SourceContinuityIssue, SourceEvidenceRef, SourceExtension,
+    SourceFormat, SourceNoteRef, SourcePart, SourceStaff, SourceTie, SourceTopology, SourceVoice,
+    StaffLink, Syllabic, TimeBase, Track, TrackRoleHint, TrackSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
+use std::sync::Arc;
 
 pub fn is_musescore_xml(data: &[u8]) -> bool {
     crate::engine::musicxml::xml_bytes_contain_ascii(data, b"<museScore")
@@ -289,6 +291,8 @@ struct TieSide {
     voice_delta: i64,
     staff_delta: i64,
     grace_target: bool,
+    fraction: Option<(i64, i64)>,
+    unsupported: bool,
 }
 
 /// Tie evidence carried by one `<Note>`. MuseScore 3.x nests a
@@ -310,6 +314,240 @@ struct PendingTie {
     off_index: usize,
     end_tick: u32,
     measure_index: usize,
+    /// Independent from the historical bare-tail merge state. Ambiguous source
+    /// starts retain that behavior but cannot authorize new sung recovery.
+    continuity: Option<PendingContinuityTie>,
+}
+
+struct PendingContinuityTie {
+    source: SourceNoteRef,
+    evidence: SourceEvidenceRef,
+    pitch: u8,
+    voice: usize,
+    measure: usize,
+    measure_tick: i64,
+    end_tick: u32,
+    next: Option<TieSide>,
+}
+
+/// Unresolved declarations are tracked independently of bare-tail merging:
+/// a text-bearing tail resolves its source link without consuming the old merge
+/// state. Store event addresses, not another copy of the source XML.
+struct OutgoingTie {
+    bucket: (usize, Option<usize>),
+    on_index: usize,
+    source: SourceNoteRef,
+    start_tick: u32,
+    end_tick: u32,
+}
+
+const MAX_UNRESOLVED_TIE_STARTS: usize = 4096;
+
+fn abandon_tie_start(
+    outgoing: OutgoingTie,
+    voice_events: &mut BTreeMap<(usize, Option<usize>), Vec<Event>>,
+    reason: &str,
+    diagnostic_count: &mut usize,
+) -> Result<(), String> {
+    if *diagnostic_count >= MAX_UNRESOLVED_TIE_STARTS {
+        return Err(format!(
+            "SOURCE_CONTINUITY_LIMIT: MuseScore unresolved tie diagnostics exceed \
+             {MAX_UNRESOLVED_TIE_STARTS}"
+        ));
+    }
+    let event = voice_events
+        .get_mut(&outgoing.bucket)
+        .and_then(|events| events.get_mut(outgoing.on_index))
+        .ok_or_else(|| "MuseScore outgoing tie source event is missing".to_string())?;
+    let Kind::NoteOn(note) = &mut event.kind else {
+        return Err("MuseScore outgoing tie source is not a note-on".into());
+    };
+    let continuity = note
+        .source
+        .continuity
+        .as_mut()
+        .ok_or_else(|| "MuseScore outgoing tie source evidence is missing".to_string())?;
+    let continuity = Arc::make_mut(continuity);
+    continuity.issues.push(SourceContinuityIssue {
+        code: "SOURCE_CONTINUITY_LINK_INVALID",
+        message: format!(
+            "Outgoing tie from {}, occurrence {}, segment {}, interval {}..{}: {reason}; \
+             no source endpoint was validated",
+            outgoing.source.source_id,
+            outgoing.source.occurrence,
+            outgoing.source.playback_segment,
+            outgoing.start_tick,
+            outgoing.end_tick
+        ),
+        evidence: continuity.evidence.clone(),
+    });
+    *diagnostic_count += 1;
+    Ok(())
+}
+
+fn abandon_tie_starts(
+    outgoing: &mut BTreeMap<TieKey, OutgoingTie>,
+    voice_events: &mut BTreeMap<(usize, Option<usize>), Vec<Event>>,
+    reason: &str,
+    diagnostic_count: &mut usize,
+) -> Result<(), String> {
+    for start in std::mem::take(outgoing).into_values() {
+        abandon_tie_start(start, voice_events, reason, diagnostic_count)?;
+    }
+    Ok(())
+}
+
+/// One immutable payload per original XML element. Playback occurrences and
+/// later source/projection clones share these bytes instead of multiplying them.
+/// The cumulative cap also covers newly retained continuity metadata; it is
+/// checked before allocating a new payload or cloning per-note vectors.
+struct ContinuityEvidencePool {
+    xml: BTreeMap<usize, Arc<str>>,
+    source_version: Option<Arc<str>>,
+    program_version: Option<Arc<str>>,
+    bytes: usize,
+    limit: usize,
+}
+const MAX_CONTINUITY_EVIDENCE_BYTES: usize = 128 * 1024 * 1024;
+impl ContinuityEvidencePool {
+    fn new(root: roxmltree::Node) -> Result<Self, String> {
+        let mut pool = Self {
+            xml: BTreeMap::new(),
+            source_version: None,
+            program_version: None,
+            bytes: 0,
+            limit: MAX_CONTINUITY_EVIDENCE_BYTES,
+        };
+        let version = root.attribute("version");
+        let program = child_text(root, "programVersion");
+        pool.charge(
+            version
+                .map_or(0, str::len)
+                .saturating_add(program.map_or(0, str::len)),
+        )?;
+        pool.source_version = version.map(Arc::from);
+        pool.program_version = program.map(Arc::from);
+        Ok(pool)
+    }
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= self.limit)
+            .ok_or("SOURCE_CONTINUITY_LIMIT: source evidence exceeds cumulative memory bound")?;
+        Ok(())
+    }
+    fn evidence(
+        &mut self,
+        node: roxmltree::Node,
+        source_id: &str,
+    ) -> Result<SourceEvidenceRef, String> {
+        self.charge(std::mem::size_of::<SourceEvidenceRef>().saturating_add(source_id.len()))?;
+        let key = node.range().start;
+        if !self.xml.contains_key(&key) {
+            let raw = &node.document().input_text()[node.range()];
+            self.charge(raw.len().saturating_add(64))?;
+            self.xml.insert(key, Arc::from(raw));
+        }
+        Ok(SourceEvidenceRef {
+            source_format: SourceFormat::MuseScore,
+            source_version: self.source_version.clone(),
+            program_version: self.program_version.clone(),
+            source_id: source_id.to_owned(),
+            raw_xml: Arc::clone(&self.xml[&key]),
+        })
+    }
+    fn extension_copies(
+        &mut self,
+        extensions: &[SourceExtension],
+        issues: &[SourceContinuityIssue],
+    ) -> Result<(), String> {
+        for extension in extensions {
+            self.charge(
+                std::mem::size_of::<SourceExtension>()
+                    .saturating_add(extension.lyric_id.len())
+                    .saturating_add(extension.lane.len())
+                    .saturating_add(extension.chord_id.len())
+                    .saturating_add(extension.evidence.source_id.len()),
+            )?;
+        }
+        for issue in issues {
+            self.charge(
+                std::mem::size_of::<SourceContinuityIssue>()
+                    .saturating_add(issue.message.len())
+                    .saturating_add(issue.evidence.source_id.len()),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Both positional declarations must agree with the same exact contact.
+/// Fractions are offsets between positions within their notated measures.
+fn tie_side_matches(
+    side: TieSide,
+    from: (usize, usize, i64),
+    to: (usize, usize, i64),
+    division: i64,
+) -> bool {
+    if side.staff_delta != 0 || side.grace_target || side.unsupported {
+        return false;
+    }
+    let Ok(from_measure) = i64::try_from(from.0) else {
+        return false;
+    };
+    let Ok(to_measure) = i64::try_from(to.0) else {
+        return false;
+    };
+    let Ok(from_voice) = i64::try_from(from.1) else {
+        return false;
+    };
+    let Ok(to_voice) = i64::try_from(to.1) else {
+        return false;
+    };
+    let fraction = side.fraction.unwrap_or((0, 1));
+    let delta = fraction.0.checked_mul(4).and_then(|numerator| {
+        exact_ticks(division, (numerator, fraction.1), "MuseScore tie location").ok()
+    });
+    from_measure.checked_add(side.measure_delta) == Some(to_measure)
+        && from_voice.checked_add(side.voice_delta) == Some(to_voice)
+        && delta.and_then(|delta| from.2.checked_add(delta)) == Some(to.2)
+}
+
+fn validated_incoming_tie(
+    pending: &PendingTie,
+    ties: &NoteTies,
+    tail: &PendingContinuityTie,
+    on: u32,
+    division: i64,
+) -> Option<SourceTie> {
+    let head = pending.continuity.as_ref()?;
+    if head.end_tick != on
+        || head.pitch != tail.pitch
+        || head.source.playback_segment != tail.source.playback_segment
+    {
+        return None;
+    }
+    let head_position = (head.measure, head.voice, head.measure_tick);
+    let tail_position = (tail.measure, tail.voice, tail.measure_tick);
+    // Legacy IDs are already matched by TieKey, but do not waive pitch/contact.
+    if ties.legacy_stop.is_none()
+        && (!ties
+            .stop
+            .is_some_and(|side| tie_side_matches(side, tail_position, head_position, division))
+            || !head
+                .next
+                .is_some_and(|side| tie_side_matches(side, head_position, tail_position, division)))
+    {
+        return None;
+    }
+    Some(SourceTie {
+        head: head.source.clone(),
+        tail: tail.source.clone(),
+        contact_tick: on,
+        pitch: tail.pitch,
+        evidence: vec![head.evidence.clone(), tail.evidence.clone()],
+    })
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -337,6 +575,34 @@ fn tie_location(side: roxmltree::Node) -> Result<TieSide, String> {
         voice_delta: signed("voices")?,
         staff_delta: signed("staves")?,
         grace_target: child(location, "grace").is_some(),
+        fraction: child_text(location, "fractions")
+            .map(|text| {
+                frac(text).ok_or_else(|| format!("MuseScore tie fraction is invalid: {text:?}"))
+            })
+            .transpose()?,
+        unsupported: side
+            .children()
+            .filter(|node| node.has_tag_name("location"))
+            .count()
+            != 1
+            || ["measures", "voices", "staves", "fractions", "grace"]
+                .iter()
+                .any(|tag| {
+                    location
+                        .children()
+                        .filter(|node| node.has_tag_name(*tag))
+                        .count()
+                        > 1
+                })
+            || location
+                .children()
+                .filter(|node| node.is_element())
+                .any(|node| {
+                    !matches!(
+                        node.tag_name().name(),
+                        "measures" | "voices" | "staves" | "fractions" | "grace"
+                    )
+                }),
     })
 }
 
@@ -380,6 +646,18 @@ fn note_ties(note: roxmltree::Node) -> Result<NoteTies, String> {
             // `<Note>` also carries TextLine and Glissando spanners in real
             // scores, so the type filter is required rather than cosmetic.
             "Spanner" if element.attribute("type") == Some("Tie") => {
+                if child(element, "next").is_none() && child(element, "prev").is_none() {
+                    return Err("MuseScore tie spanner has neither source endpoint".into());
+                }
+                if ["next", "prev"].iter().any(|tag| {
+                    element
+                        .children()
+                        .filter(|node| node.has_tag_name(*tag))
+                        .count()
+                        > 1
+                }) {
+                    return Err("MuseScore tie spanner declares duplicate endpoints".into());
+                }
                 if let Some(next) = child(element, "next") {
                     if ties.start.is_some() {
                         return Err("MuseScore Note declares two tie starts".into());
@@ -395,10 +673,30 @@ fn note_ties(note: roxmltree::Node) -> Result<NoteTies, String> {
             }
             // MuseScore 2.x encoding; `<Tie>` is never a direct child of
             // `<Note>` in 3.x, where it sits inside the `<Spanner>`.
-            "Tie" => ties.legacy_start = element.attribute("id").map(str::to_string),
-            "endSpanner" => ties.legacy_stop = element.attribute("id").map(str::to_string),
+            "Tie" | "endSpanner" => {
+                let destination = if element.has_tag_name("Tie") {
+                    &mut ties.legacy_start
+                } else {
+                    &mut ties.legacy_stop
+                };
+                if destination.is_some() {
+                    return Err("MuseScore Note declares duplicate legacy tie endpoints".into());
+                }
+                *destination = Some(
+                    element
+                        .attribute("id")
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or_else(|| "MuseScore legacy tie endpoint has no id".to_string())?
+                        .to_string(),
+                );
+            }
             _ => {}
         }
+    }
+    if (ties.start.is_some() && ties.legacy_start.is_some())
+        || (ties.stop.is_some() && ties.legacy_stop.is_some())
+    {
+        return Err("MuseScore Note mixes positional and legacy tie endpoints".into());
     }
     Ok(ties)
 }
@@ -1054,6 +1352,111 @@ fn chord_lyrics(
         .collect()
 }
 
+/// Retains both numeric statements rather than silently preferring ticks when
+/// the fraction contradicts it. Legacy lyric parsing remains unchanged; only
+/// independently validated bounds authorize the continuity planner.
+#[allow(clippy::too_many_arguments)]
+fn chord_extensions(
+    chord: roxmltree::Node,
+    lyrics: &[Lyric],
+    chord_id: &str,
+    occurrence: u32,
+    playback_segment: u32,
+    start_tick: u32,
+    division: i64,
+    pool: &mut ContinuityEvidencePool,
+) -> Result<(Vec<SourceExtension>, Vec<SourceContinuityIssue>), String> {
+    let mut extensions = Vec::new();
+    let mut issues = Vec::new();
+    for (node, lyric) in chord
+        .children()
+        .filter(|node| node.has_tag_name("Lyrics"))
+        .zip(lyrics)
+    {
+        if child(node, "ticks").is_none() && child(node, "ticks_f").is_none() {
+            continue;
+        }
+        let evidence = pool.evidence(node, &lyric.id)?;
+        pool.charge(
+            std::mem::size_of::<SourceExtension>()
+                + lyric.id.len()
+                + lyric.lane.len()
+                + chord_id.len(),
+        )?;
+        let raw_ticks = child_text(node, "ticks").and_then(|text| text.parse().ok());
+        let fraction_ticks = lyric.extend_fraction.map(|(numerator, denominator)| {
+            numerator.checked_mul(4).and_then(|numerator| {
+                exact_ticks(
+                    division,
+                    (numerator, denominator),
+                    "MuseScore lyric extension",
+                )
+                .ok()
+            })
+        });
+        // Repeated declarations may be redundant, but the first child cannot
+        // hide a conflicting or malformed later statement. Compare fractions
+        // numerically while preserving every original spelling in raw XML.
+        let repeated_fields_agree =
+            node.children()
+                .filter(|child| child.is_element())
+                .all(|child| match child.tag_name().name() {
+                    "ticks" => child
+                        .text()
+                        .and_then(|text| text.trim().parse::<i64>().ok())
+                        .is_some_and(|ticks| Some(ticks) == raw_ticks),
+                    "ticks_f" => child
+                        .text()
+                        .and_then(frac)
+                        .zip(lyric.extend_fraction)
+                        .is_some_and(|((left_n, left_d), (right_n, right_d))| {
+                            i128::from(left_n) * i128::from(right_d)
+                                == i128::from(right_n) * i128::from(left_d)
+                        }),
+                    _ => true,
+                });
+        let contradictory = !repeated_fields_agree
+            || match (lyric.extend_ticks, fraction_ticks) {
+                (_, Some(None)) => true,
+                (Some(ticks), Some(Some(fraction))) => ticks != fraction,
+                _ => false,
+            };
+        let ticks = lyric.extend_ticks.or_else(|| fraction_ticks.flatten());
+        let end_tick = (!contradictory)
+            .then_some(ticks)
+            .flatten()
+            .and_then(|ticks| u32::try_from(ticks).ok())
+            .and_then(|ticks| start_tick.checked_add(ticks));
+        if end_tick.is_none() {
+            issues.push(SourceContinuityIssue {
+                code: "SOURCE_CONTINUITY_LINK_INVALID",
+                message: format!(
+                    "Lyric {} on chord {chord_id}, occurrence {occurrence}, segment \
+                     {playback_segment}, start {start_tick}: extension ticks {:?} and \
+                     fraction {:?} have invalid or contradictory exact bounds \
+                     (including repeated ticks/ticks_f declarations)",
+                    lyric.id, lyric.extend_ticks, lyric.extend_fraction
+                ),
+                evidence: evidence.clone(),
+            });
+        }
+        extensions.push(SourceExtension {
+            lyric_id: lyric.id.clone(),
+            lane: lyric.lane.clone(),
+            chord_id: chord_id.to_string(),
+            occurrence,
+            playback_segment,
+            start_tick,
+            end_tick,
+            extend_ticks: lyric.extend_ticks,
+            extend_fraction: lyric.extend_fraction,
+            raw_ticks,
+            evidence,
+        });
+    }
+    Ok((extensions, issues))
+}
+
 /// Playback order of the measures: repeats, voltas, D.S./D.C., Coda, Fine.
 /// Playback structure is a property of the score, not of one staff: MuseScore
 /// normally writes repeat barlines on the first staff only, and a few scores
@@ -1063,7 +1466,7 @@ fn chord_lyrics(
 /// mark is a contradiction we refuse rather than arbitrate.
 fn score_playback_order(
     staff_measures: &[Vec<roxmltree::Node>],
-) -> Result<Vec<(usize, u32)>, String> {
+) -> Result<Vec<(usize, u32, u32)>, String> {
     let Some(first) = staff_measures.first() else {
         return Ok(Vec::new());
     };
@@ -1083,7 +1486,7 @@ fn score_playback_order(
             merge_measure_marks(target, marks, "MuseScore staves")?;
         }
     }
-    unroll(&merged)
+    unroll_with_passes(&merged)
 }
 
 fn measure_marks(measures: &[roxmltree::Node]) -> Result<Vec<MeasureMarks>, String> {
@@ -1515,6 +1918,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     };
     let doc = roxmltree::Document::parse_with_options(xml, opts)
         .map_err(|e| format!("invalid XML: {}", e))?;
+    let mut continuity_evidence = ContinuityEvidencePool::new(doc.root_element())?;
     let score = doc
         .descendants()
         .find(|n| n.has_tag_name("Score"))
@@ -1777,6 +2181,13 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         }
     }
 
+    let mut score_expression = super::score_intensity::source::ScoreInput::default();
+    let modern_expression = doc
+        .root_element()
+        .attribute("version")
+        .and_then(|v| v.split('.').next())
+        .and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|v| v >= 4);
     let mut tracks = Vec::new();
     let mut global_events = Vec::new();
     let mut local_meter_fallbacks = Vec::new();
@@ -1799,6 +2210,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         })
         .collect();
     let score_order = score_playback_order(&staff_measures)?;
+    let mut unresolved_tie_diagnostics = 0usize;
 
     for (staff_index, &staff) in score_staves.iter().enumerate() {
         let staff_id = staff
@@ -1842,27 +2254,88 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         // Scoped with `voice_events`, so tie state is per staff without needing
         // a staff component in the key.
         let mut active_ties: BTreeMap<TieKey, PendingTie> = BTreeMap::new();
+        let mut outgoing_ties: BTreeMap<TieKey, OutgoingTie> = BTreeMap::new();
         let mut previous_measure: Option<usize> = None;
+        let mut playback_segment = 0u32;
 
         let mut measure_start: i64 = 0;
         let mut measure_len: i64 = 4 * div; // 4/4 by default
         let mut time_stretch = (1i64, 1i64);
 
         let measures = &staff_measures[staff_index];
-        for &(mi, pass) in score_order.iter() {
+        let global_before = global_events.len();
+        let local_before = local_meter_fallbacks.len();
+        let tie_diagnostics_before = unresolved_tie_diagnostics;
+        let written_count = measures.len();
+        let traversal: Vec<_> = (0..written_count)
+            .map(|i| (i, 0, 1))
+            .chain(score_order.iter().copied())
+            .collect();
+        let mut written_bounds = Vec::with_capacity(written_count);
+        let mut written_memberships = Vec::with_capacity(written_count);
+        let mut expression_tempo = super::score_intensity::Fraction::integer(120);
+        for (visit, &(mi, pass, repeat_pass)) in traversal.iter().enumerate() {
+            let recording = visit < written_count;
+            if visit == written_count {
+                score_expression.finish_staff(&written_bounds, source_division as u16)?;
+                voice_events.clear();
+                active_ties.clear();
+                // The first traversal only captures written expression intent.
+                // Its outgoing addresses refer to the discarded event buffers;
+                // playback creates and diagnoses its own source occurrences.
+                outgoing_ties.clear();
+                unresolved_tie_diagnostics = tie_diagnostics_before;
+                playback_segment = 0;
+                unassigned_chord_lyrics.clear();
+                previous_measure = None;
+                measure_start = 0;
+                measure_len = 4 * div;
+                time_stretch = (1, 1);
+                global_events.truncate(global_before);
+                local_meter_fallbacks.truncate(local_before);
+            }
+            let forward = previous_measure.is_some_and(|previous| mi == previous + 1);
             // A repeat, volta or jump has just broken notated continuity. A tie
             // location points at the next NOTATED measure, which is no longer
             // the next PLAYED one, so open chains cannot be proven any more.
             if previous_measure.is_some_and(|previous| mi != previous + 1) {
+                abandon_tie_starts(
+                    &mut outgoing_ties,
+                    &mut voice_events,
+                    "playback discontinuity abandoned the source declaration",
+                    &mut unresolved_tie_diagnostics,
+                )?;
                 active_ties.clear();
+                playback_segment = playback_segment
+                    .checked_add(1)
+                    .ok_or_else(|| "MuseScore playback segment overflow".to_string())?;
             }
             previous_measure = Some(mi);
             let measure = measures[mi];
+            if recording {
+                written_memberships.push(score_expression.begin_written_measure(
+                    &info.part_id,
+                    Some(&staff_id),
+                    mi,
+                    super::score_intensity::source::time(measure_start, tpb)?,
+                )?);
+            }
             let mut this_len = measure_len;
             for (voice_index, voice) in measure_voice_containers(measure)?.into_iter().enumerate() {
                 let mut pos = measure_start;
                 let mut tuplet: Option<(i64, i64)> = None; // (normal, actual)
                 for (element_index, el) in voice.children().filter(|n| n.is_element()).enumerate() {
+                    if recording {
+                        let owner = super::score_intensity::ScoreVoice {
+                            part: info.part_id.clone(),
+                            staff: staff_id.clone(),
+                            voice: (voice_index + 1).to_string(),
+                            instrument: info.instruments.first().and_then(|i| i.id.clone()),
+                        };
+                        score_expression.ms_element(el,
+                            &format!("expression:mscx:staff:{staff_id}:measure:{mi}:voice:{voice_index}:element:{element_index}"),
+                            &owner, super::score_intensity::source::time(pos,tpb)?, mi, modern_expression, expression_tempo, time_stretch)?;
+                    }
                     match el.tag_name().name() {
                         "TimeSig" => {
                             let signature = musescore_time_signature(el)?;
@@ -1913,6 +2386,17 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                 .parse::<f64>()
                                 .ok()
                                 .filter(|value| value.is_finite() && *value > 0.0);
+                            if recording {
+                                if let Some(exact) = score_expression.ms_tempo(
+                                    el,
+                                    &format!("expression:tempo:{}", el.id().get()),
+                                    super::score_intensity::source::time(pos, tpb)?,
+                                    tempo_text,
+                                    modern_expression,
+                                )? {
+                                    expression_tempo = exact;
+                                }
+                            }
                             let micros = quarters_per_second
                                 .map(|value| (1_000_000.0 / value).round())
                                 .filter(|value| (1.0..=f64::from(u32::MAX)).contains(value))
@@ -2074,6 +2558,16 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                 );
                                 let lyrics =
                                     chord_lyrics(el, &chord_id, tick_scale, i64::from(tpb))?;
+                                let (extensions, extension_issues) = chord_extensions(
+                                    el,
+                                    &lyrics,
+                                    &chord_id,
+                                    pass,
+                                    playback_segment,
+                                    on,
+                                    div,
+                                    &mut continuity_evidence,
+                                )?;
                                 let notes: Vec<_> = el
                                     .children()
                                     .filter(|child| child.has_tag_name("Note"))
@@ -2143,6 +2637,20 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                             )
                                         })?;
                                     let source_id = format!("{chord_id}:note:{note_index}");
+                                    if recording && child_text(note, "velocity").is_some() {
+                                        score_expression.ms_note_owned(
+                                            note,
+                                            &source_id,
+                                            modern_expression,
+                                            &super::score_intensity::ScoreVoice {
+                                                part: info.part_id.clone(),
+                                                staff: staff_id.clone(),
+                                                voice: (voice_index + 1).to_string(),
+                                                instrument: None,
+                                            },
+                                            super::score_intensity::source::time(pos, tpb)?,
+                                        )?;
+                                    }
                                     let channel = info
                                         .instruments
                                         .first()
@@ -2160,7 +2668,100 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         _ => polyphonic.then_some(note_index),
                                     };
                                     let bucket = (voice_index, chord_member);
-                                    let ties = note_ties(note)?;
+                                    let evidence =
+                                        continuity_evidence.evidence(note, &source_id)?;
+                                    continuity_evidence.charge(
+                                        std::mem::size_of::<SourceContinuity>() + chord_id.len(),
+                                    )?;
+                                    continuity_evidence.extension_copies(
+                                        if sings { &extensions } else { &[] },
+                                        &extension_issues,
+                                    )?;
+                                    let mut issues = extension_issues.clone();
+                                    let ties = match note_ties(note) {
+                                        Ok(ties) => ties,
+                                        Err(message) => {
+                                            continuity_evidence.charge(
+                                                message
+                                                    .len()
+                                                    .saturating_add(source_id.len())
+                                                    .saturating_add(512),
+                                            )?;
+                                            issues.push(SourceContinuityIssue {
+                                                code: "SOURCE_CONTINUITY_LINK_INVALID",
+                                                message: format!(
+                                                    "{source_id}, occurrence {pass}, segment \
+                                                     {playback_segment}, interval {on}..{off}: {message}"
+                                                ),
+                                                evidence: evidence.clone(),
+                                            });
+                                            NoteTies::default()
+                                        }
+                                    };
+                                    let pending_continuity = PendingContinuityTie {
+                                        source: SourceNoteRef {
+                                            source_id: source_id.clone(),
+                                            occurrence: pass,
+                                            playback_segment,
+                                        },
+                                        evidence: evidence.clone(),
+                                        pitch,
+                                        voice: voice_index,
+                                        measure: mi,
+                                        measure_tick: pos.checked_sub(measure_start).ok_or_else(
+                                            || {
+                                                "MuseScore tie measure position overflow"
+                                                    .to_string()
+                                            },
+                                        )?,
+                                        end_tick: off,
+                                        next: ties.start,
+                                    };
+                                    // Resolve before lyric eligibility and independently of
+                                    // whether the historical adapter merges this bare tail.
+                                    let incoming_tie = (!grace)
+                                        .then(|| {
+                                            let key = tie_stop_key(&ties, voice_index, pitch)?;
+                                            validated_incoming_tie(
+                                                active_ties.get(&key)?,
+                                                &ties,
+                                                &pending_continuity,
+                                                on,
+                                                div,
+                                            )
+                                        })
+                                        .flatten();
+                                    if let Some(tie) = &incoming_tie {
+                                        if let Some(key) = tie_stop_key(&ties, voice_index, pitch) {
+                                            if outgoing_ties
+                                                .get(&key)
+                                                .is_some_and(|start| start.source == tie.head)
+                                            {
+                                                outgoing_ties.remove(&key);
+                                            }
+                                        }
+                                    }
+                                    if (ties.stop.is_some() || ties.legacy_stop.is_some())
+                                        && incoming_tie.is_none()
+                                    {
+                                        let candidate = tie_stop_key(&ties, voice_index, pitch)
+                                            .and_then(|key| active_ties.get(&key))
+                                            .and_then(|pending| pending.continuity.as_ref())
+                                            .map(|head| format!("{:?}", head.source))
+                                            .unwrap_or_else(|| {
+                                                "missing or ambiguous head".to_string()
+                                            });
+                                        issues.push(SourceContinuityIssue {
+                                            code: "SOURCE_CONTINUITY_LINK_INVALID",
+                                            message: format!(
+                                                "Tie from {candidate} to {source_id}, occurrence \
+                                                 {pass}, segment {playback_segment}, interval \
+                                                 {on}..{off}, pitch {pitch}: source locations, \
+                                                 exact contact or nominal pitch could not be validated"
+                                            ),
+                                            evidence: evidence.clone(),
+                                        });
+                                    }
                                     // Resolve a tie stop before borrowing this
                                     // note's bucket: the head's note-off can
                                     // live in another bucket of the same staff.
@@ -2207,10 +2808,21 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                         let pending = active_ties.remove(key)?;
                                         let events = voice_events.get_mut(&pending.bucket)?;
                                         let target = events.get_mut(pending.off_index)?;
+                                        if !recording {
+                                            if let Kind::NoteOff(head) = &target.kind {
+                                                if let Some(id) = &head.source_id {
+                                                    score_expression.ties.insert(
+                                                        (source_id.clone(), pass, on),
+                                                        id.clone(),
+                                                    );
+                                                }
+                                            }
+                                        }
                                         target.tick = off;
                                         Some(pending)
                                     });
                                     let events = voice_events.entry(bucket).or_default();
+                                    let on_index = events.len();
                                     push_event(
                                         events,
                                         on,
@@ -2232,6 +2844,18 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                 measure: u32::try_from(mi).ok(),
                                                 grace,
                                                 unpitched: None,
+                                                continuity: Some(Arc::new(SourceContinuity {
+                                                    evidence,
+                                                    chord_id: chord_id.clone(),
+                                                    playback_segment,
+                                                    extensions: if sings {
+                                                        extensions.clone()
+                                                    } else {
+                                                        Vec::new()
+                                                    },
+                                                    incoming_tie,
+                                                    issues,
+                                                })),
                                             },
                                             // MuseScore owns lyrics at Chord level, so which
                                             // note receives one is decided by the reading
@@ -2252,6 +2876,37 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                     );
                                     let off_index = events.len() - 1;
                                     if let Some(key) = tie_start_key(&ties, voice_index, pitch) {
+                                        if let Some(previous) = outgoing_ties.remove(&key) {
+                                            abandon_tie_start(
+                                                previous, &mut voice_events,
+                                                "another outgoing declaration overwrote the unresolved source link",
+                                                &mut unresolved_tie_diagnostics,
+                                            )?;
+                                        }
+                                        if outgoing_ties.len() >= MAX_UNRESOLVED_TIE_STARTS {
+                                            return Err(format!(
+                                                "SOURCE_CONTINUITY_LIMIT: MuseScore pending outgoing ties exceed \
+                                                 {MAX_UNRESOLVED_TIE_STARTS}"
+                                            ));
+                                        }
+                                        outgoing_ties.insert(
+                                            key.clone(),
+                                            OutgoingTie {
+                                                bucket,
+                                                on_index,
+                                                source: pending_continuity.source.clone(),
+                                                start_tick: on,
+                                                end_tick: off,
+                                            },
+                                        );
+                                        // Overlapping starts sharing a positional key cannot
+                                        // select a head by source order. Keep the existing
+                                        // merge path, but withhold new continuity proof.
+                                        let ambiguous = active_ties
+                                            .get(&key)
+                                            .is_some_and(|pending| pending.end_tick > on);
+                                        let continuity =
+                                            (!grace && !ambiguous).then_some(pending_continuity);
                                         // A middle link keeps pointing at the
                                         // head's note-off, which carries the
                                         // whole chain's duration, but advances
@@ -2262,6 +2917,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                 Some(head) => PendingTie {
                                                     end_tick: off,
                                                     measure_index: mi,
+                                                    continuity,
                                                     ..head
                                                 },
                                                 None => PendingTie {
@@ -2269,6 +2925,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                     off_index,
                                                     end_tick: off,
                                                     measure_index: mi,
+                                                    continuity,
                                                 },
                                             },
                                         );
@@ -2304,11 +2961,38 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                     return Err("MuseScore measure len is non-positive".into());
                 }
             }
+            if recording {
+                written_bounds.push((
+                    super::score_intensity::source::time(measure_start, tpb)?,
+                    super::score_intensity::source::time(
+                        measure_start
+                            .checked_add(this_len)
+                            .ok_or("Expression measure overflow")?,
+                        tpb,
+                    )?,
+                ));
+                score_expression.end_written_measure(written_bounds[mi].1)?;
+            } else {
+                score_expression.record_measure_run(
+                    written_memberships[mi],
+                    &info.part_id,
+                    &staff_id,
+                    super::score_intensity::source::time(measure_start, tpb)?,
+                    repeat_pass,
+                    forward,
+                )?;
+            }
             measure_start = measure_start
                 .checked_add(this_len)
                 .ok_or_else(|| "MuseScore measure timeline overflow".to_string())?;
         }
 
+        abandon_tie_starts(
+            &mut outgoing_ties,
+            &mut voice_events,
+            "end of score abandoned the source declaration",
+            &mut unresolved_tie_diagnostics,
+        )?;
         for ((voice_index, chord_member), mut events) in voice_events {
             sort_and_reindex(&mut events);
             if !events
@@ -2423,6 +3107,84 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         tracks[0].events.extend(global_events);
         sort_and_reindex(&mut tracks[0].events);
     }
+    score_expression.finish()?;
+    let mut metadata_budget = super::score_intensity::ProvenanceBudget::default();
+    metadata_budget.charge(tracks.len().saturating_mul(64), tracks.len())?;
+    let occupied_voices: BTreeSet<_> = tracks
+        .iter()
+        .filter_map(|track| {
+            Some((
+                track.source.part_id.as_deref()?,
+                track.source.staff_id.as_deref()?,
+                track.source.voice.as_deref()?,
+            ))
+        })
+        .collect();
+    let mut intensity_metadata = Vec::new();
+    for part in &declared_parts {
+        for staff in &part.staves {
+            let voices = staff
+                .voices
+                .iter()
+                .map(|voice| voice.number.as_str())
+                .chain(staff.voices.is_empty().then_some("1"));
+            if !score_expression.has_missing_declaration_owner(
+                &part.id,
+                &staff.id,
+                voices,
+                &occupied_voices,
+                &mut metadata_budget,
+            )? {
+                continue;
+            }
+            let info = staff_info.get(&staff.id);
+            if let Some(info) = info {
+                for instrument in &info.instruments {
+                    let bytes = [&instrument.id, &instrument.sound_id, &instrument.name]
+                        .into_iter()
+                        .flatten()
+                        .fold(std::mem::size_of::<InstrumentInfo>(), |n, s| {
+                            n.saturating_add(s.len())
+                        })
+                        .saturating_add(instrument.controllers.len().saturating_mul(2));
+                    metadata_budget.charge(bytes.saturating_mul(2), 1)?;
+                }
+            }
+            metadata_budget.charge(
+                part.id
+                    .len()
+                    .saturating_mul(3)
+                    .saturating_add(staff.id.len().saturating_mul(2))
+                    .saturating_add(part.name.len())
+                    .saturating_add(512),
+                1,
+            )?;
+            let instruments = info
+                .map(|info| info.instruments.clone())
+                .unwrap_or_default();
+            intensity_metadata.push(Track {
+                id: format!("mscx:staff:{}:intensity-metadata", staff.id),
+                name: if part.name.is_empty() {
+                    part.id.clone()
+                } else {
+                    part.name.clone()
+                },
+                source: TrackSource {
+                    source_track: tracks.len() + intensity_metadata.len(),
+                    part_id: Some(part.id.clone()),
+                    staff_id: Some(staff.id.clone()),
+                    voice: None,
+                },
+                role_hint: TrackRoleHint::Ambiguous,
+                text_profile: MidiTextProfile::Generic,
+                instrument: instruments.first().cloned(),
+                instruments,
+                chord_reading: None,
+                events: Vec::new(),
+            });
+        }
+    }
+    tracks.extend(intensity_metadata);
     if tracks.is_empty() {
         return Err("no usable staff in the MuseScore file".into());
     }
@@ -2433,6 +3195,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         format: 1,
         source_format: SourceFormat::MuseScore,
         topology,
+        score_intensity: (!score_expression.is_empty()).then_some(score_expression),
         staff_links,
         tracks,
     })
@@ -4252,6 +5015,76 @@ Melodie</trackName>
         )
     }
 
+    #[test]
+    fn repeated_note_xml_and_projection_evidence_share_original_bytes() {
+        let payload = "ignored ".repeat(128 * 1024);
+        let xml = tie_score(&format!(
+            "<Measure><startRepeat/><voice><Chord><durationType>whole</durationType>\
+             <Note><pitch>60</pitch><Unknown>{payload}</Unknown></Note>\
+             </Chord></voice><endRepeat>32</endRepeat></Measure>"
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        let notes: Vec<_> = midi
+            .tracks
+            .iter()
+            .flat_map(|t| &t.events)
+            .filter_map(|e| {
+                if let Kind::NoteOn(note) = &e.kind {
+                    Some(note)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(notes.len(), 32);
+        let first = notes[0].source.continuity.as_ref().unwrap();
+        assert!(first.evidence.raw_xml.contains(&payload));
+        for (occurrence, note) in notes.iter().enumerate() {
+            let proof = note.source.continuity.as_ref().unwrap();
+            assert_eq!(note.source.occurrence, occurrence as u32);
+            assert!(Arc::ptr_eq(
+                &first.evidence.raw_xml,
+                &proof.evidence.raw_xml
+            ));
+            let retained = note.source.clone();
+            assert!(Arc::ptr_eq(proof, retained.continuity.as_ref().unwrap()));
+            let evidence_clone = proof.evidence.clone();
+            assert!(Arc::ptr_eq(
+                &proof.evidence.raw_xml,
+                &evidence_clone.raw_xml
+            ));
+        }
+    }
+
+    #[test]
+    fn continuity_pool_checks_payload_and_metadata_before_allocation() {
+        let xml = "<museScore version=\"3.02\"><Note><pitch>60</pitch></Note></museScore>";
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let node = doc.descendants().find(|n| n.has_tag_name("Note")).unwrap();
+        let mut pool = ContinuityEvidencePool::new(doc.root_element()).unwrap();
+        let first = pool.evidence(node, "note:0").unwrap();
+        let used = pool.bytes;
+        let second = pool.evidence(node, "note:0").unwrap();
+        assert!(Arc::ptr_eq(&first.raw_xml, &second.raw_xml));
+        assert_eq!(
+            pool.bytes - used,
+            std::mem::size_of::<SourceEvidenceRef>() + "note:0".len()
+        );
+        pool.limit = pool.bytes;
+        assert!(pool
+            .evidence(node, "note:0")
+            .is_err_and(|e| e.starts_with("SOURCE_CONTINUITY_LIMIT:")));
+        assert_eq!(pool.xml.len(), 1);
+
+        let mut fresh = ContinuityEvidencePool::new(doc.root_element()).unwrap();
+        fresh.limit =
+            fresh.bytes + std::mem::size_of::<SourceEvidenceRef>() + 6 + node.range().len() + 63;
+        assert!(fresh
+            .evidence(node, "note:0")
+            .is_err_and(|e| e.starts_with("SOURCE_CONTINUITY_LIMIT:")));
+        assert!(fresh.xml.is_empty(), "refuse before retaining a payload");
+    }
+
     /// Played notes with their duration, rebuilt by pairing note-on/note-off the
     /// way the projector does. A merged tie appears here as one longer note; an
     /// unmerged one as two notes.
@@ -4286,6 +5119,274 @@ Melodie</trackName>
         format!(
             "<Chord><durationType>quarter</durationType><Note><pitch>{pitch}</pitch>{spanners}</Note></Chord>"
         )
+    }
+
+    fn source_notes(midi: &Midi) -> Vec<&NoteOn> {
+        midi.tracks
+            .iter()
+            .flat_map(|track| &track.events)
+            .filter_map(|event| match &event.kind {
+                Kind::NoteOn(note) => Some(note),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn continuity_keeps_version_and_exact_chord_lyric_ownership_on_all_members() {
+        let xml = tie_score(
+            "<Measure><voice><Chord><durationType>quarter</durationType>\
+             <Lyrics><text>same</text><ticks>480</ticks><ticks_f>1/4</ticks_f></Lyrics>\
+             <Note><pitch>60</pitch></Note><Note><pitch>64</pitch></Note></Chord>\
+             <Chord><durationType>quarter</durationType><Note><pitch>64</pitch></Note></Chord>\
+             </voice></Measure>",
+        )
+        .replace("<Score>", "<programVersion>3.6.2</programVersion><Score>");
+        let midi = parse_mscx(&xml).unwrap();
+        let notes = source_notes(&midi);
+        assert_eq!(notes.len(), 3);
+        assert!(notes.iter().all(|note| note.source.continuity.is_some()));
+        let owners: Vec<_> = notes
+            .iter()
+            .filter_map(|note| {
+                note.source
+                    .continuity
+                    .as_ref()
+                    .filter(|proof| !proof.extensions.is_empty())
+            })
+            .collect();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(owners[0].chord_id, owners[1].chord_id);
+        assert_eq!(owners[0].extensions, owners[1].extensions);
+        let extension = &owners[0].extensions[0];
+        assert_eq!(extension.start_tick, 0);
+        assert_eq!(extension.end_tick, Some(480));
+        assert_eq!(extension.extend_fraction, Some((1, 4)));
+        assert_eq!(extension.raw_ticks, Some(480));
+        assert_eq!(extension.evidence.source_format, SourceFormat::MuseScore);
+        assert_eq!(extension.evidence.source_version.as_deref(), Some("3.02"));
+        assert_eq!(extension.evidence.program_version.as_deref(), Some("3.6.2"));
+        assert_eq!(extension.evidence.source_id, extension.lyric_id);
+        assert!(extension
+            .evidence
+            .raw_xml
+            .contains("<ticks_f>1/4</ticks_f>"));
+        for note in notes {
+            assert_eq!(
+                note.source.continuity.as_ref().unwrap().evidence.source_id,
+                note.source.id
+            );
+        }
+    }
+
+    #[test]
+    fn typed_extension_bounds_preserve_fractions_sentinels_and_conflicts() {
+        for (raw, expected_end, expected_ticks, expected_raw_ticks) in [
+            ("<ticks_f>1/2</ticks_f>", Some(960), Some(960), None),
+            ("<ticks>0</ticks>", Some(0), Some(0), Some(0)),
+            ("<ticks_f>0/1</ticks_f>", Some(0), None, None),
+            (
+                "<ticks>1</ticks><ticks_f>1/1920</ticks_f>",
+                Some(1),
+                Some(1),
+                Some(1),
+            ),
+            (
+                "<ticks>480</ticks><ticks_f>1/2</ticks_f>",
+                None,
+                Some(480),
+                Some(480),
+            ),
+            ("<ticks>-1</ticks>", None, Some(-1), Some(-1)),
+            (
+                "<ticks>4294967296</ticks>",
+                None,
+                Some(4294967296),
+                Some(4294967296),
+            ),
+        ] {
+            let midi = parse_mscx(&mscx(&format!("<text>word</text>{raw}"))).unwrap();
+            let note = source_notes(&midi)[0];
+            let continuity = note.source.continuity.as_ref().unwrap();
+            let extension = &continuity.extensions[0];
+            assert_eq!(extension.end_tick, expected_end, "{raw}");
+            assert_eq!(extension.extend_ticks, expected_ticks, "{raw}");
+            assert_eq!(extension.raw_ticks, expected_raw_ticks, "{raw}");
+            assert_eq!(
+                continuity.issues.is_empty(),
+                expected_end.is_some(),
+                "{raw}"
+            );
+            assert!(extension.evidence.raw_xml.contains(raw));
+        }
+    }
+
+    #[test]
+    fn lyric_free_notes_have_typed_identity_without_extension_authority() {
+        let midi = parse_mscx(&tie_score(&format!(
+            "<Measure><voice>{}</voice></Measure>",
+            quarter(60, "")
+        )))
+        .unwrap();
+        let proof = source_notes(&midi)[0].source.continuity.as_ref().unwrap();
+        assert!(proof.extensions.is_empty());
+        assert!(proof.incoming_tie.is_none());
+        assert!(proof.issues.is_empty());
+    }
+
+    #[test]
+    fn text_bearing_tie_tails_keep_validated_source_links_on_each_repeat_pass() {
+        let xml = tie_score(&format!(
+            "<Measure><startRepeat/><voice>\
+             <Chord><durationType>quarter</durationType><Lyrics><text>first</text></Lyrics>\
+             <Note><pitch>65</pitch>{TIE_START}</Note></Chord>\
+             <Chord><durationType>quarter</durationType><Lyrics><no>1</no><text>second</text></Lyrics>\
+             <Note><pitch>65</pitch>{TIE_STOP}</Note></Chord>\
+             </voice><endRepeat>2</endRepeat></Measure>"
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(
+            played_notes(&midi),
+            vec![
+                (0, 480, 65),
+                (480, 480, 65),
+                (1920, 480, 65),
+                (2400, 480, 65)
+            ]
+        );
+        let notes = source_notes(&midi);
+        for (pass, pair) in notes.chunks_exact(2).enumerate() {
+            let head = pair[0];
+            let tail = pair[1];
+            let proof = tail.source.continuity.as_ref().unwrap();
+            let tie = proof.incoming_tie.as_ref().unwrap();
+            assert_eq!(proof.playback_segment, pass as u32);
+            assert_eq!(tie.head.source_id, head.source.id);
+            assert_eq!(tie.tail.source_id, tail.source.id);
+            assert_eq!(tie.head.occurrence, pass as u32);
+            assert_eq!(tie.tail.occurrence, pass as u32);
+            assert_eq!(tie.contact_tick, pass as u32 * 1920 + 480);
+            assert_eq!(tie.pitch, 65);
+            assert!(tie.evidence[0].raw_xml.contains(TIE_START));
+            assert!(tie.evidence[1].raw_xml.contains(TIE_STOP));
+            assert!(proof.issues.is_empty());
+        }
+    }
+
+    #[test]
+    fn measure_relative_tie_locations_validate_the_text_bearing_tail() {
+        let start = r#"<Spanner type="Tie"><Tie/><next><location><measures>1</measures><fractions>-7/8</fractions></location></next></Spanner>"#;
+        let stop = r#"<Spanner type="Tie"><prev><location><measures>-1</measures><fractions>7/8</fractions></location></prev></Spanner>"#;
+        let xml = tie_score(&format!(
+            "<Measure><voice><Rest><durationType>half</durationType><dots>2</dots></Rest>\
+             <Chord><durationType>eighth</durationType><Lyrics><text>word</text></Lyrics>\
+             <Note><pitch>64</pitch>{start}</Note></Chord></voice></Measure>\
+             <Measure><voice><Chord><durationType>half</durationType>\
+             <Lyrics><no>1</no><text>other verse</text></Lyrics>\
+             <Note><pitch>64</pitch>{stop}</Note></Chord></voice></Measure>"
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(played_notes(&midi), vec![(1680, 240, 64), (1920, 960, 64)]);
+        let proof = source_notes(&midi)[1].source.continuity.as_ref().unwrap();
+        assert_eq!(proof.incoming_tie.as_ref().unwrap().contact_tick, 1920);
+        assert!(proof.issues.is_empty());
+    }
+
+    #[test]
+    fn merged_bare_tail_chain_keeps_each_immediate_source_relationship() {
+        let midi = parse_mscx(&tie_score(&format!(
+            "<Measure><voice>{}{}{}</voice></Measure>",
+            quarter(65, TIE_START),
+            quarter(65, &format!("{TIE_STOP}{TIE_START}")),
+            quarter(65, TIE_STOP)
+        )))
+        .unwrap();
+        assert_eq!(played_notes(&midi), vec![(0, 1440, 65)]);
+        let notes = source_notes(&midi);
+        assert_eq!(notes.len(), 3);
+        for index in 1..notes.len() {
+            assert_eq!(notes[index].key, None);
+            let proof = notes[index].source.continuity.as_ref().unwrap();
+            assert_eq!(
+                proof.incoming_tie.as_ref().unwrap().head.source_id,
+                notes[index - 1].source.id
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_text_bearing_links_retain_raw_evidence_without_recovery_proof() {
+        for (start, stop, tail_pitch, gap) in [
+            (
+                TIE_START.to_string(),
+                TIE_STOP.replace("-1/4", "-1/2"),
+                65,
+                "",
+            ),
+            (
+                TIE_START.replace("1/4", "1/2"),
+                TIE_STOP.to_string(),
+                65,
+                "",
+            ),
+            (TIE_START.to_string(), TIE_STOP.to_string(), 66, ""),
+            (
+                TIE_START.to_string(),
+                TIE_STOP.to_string(),
+                65,
+                "<Rest><durationType>quarter</durationType></Rest>",
+            ),
+            (
+                TIE_START.to_string(),
+                TIE_STOP.replace("-1/4", "broken"),
+                65,
+                "",
+            ),
+            (
+                TIE_START.to_string(),
+                TIE_STOP.replace("<fractions>", "<staves>1</staves><fractions>"),
+                65,
+                "",
+            ),
+            (
+                TIE_START.to_string(),
+                TIE_STOP.replace("<fractions>", "<notes>1</notes><fractions>"),
+                65,
+                "",
+            ),
+        ] {
+            let midi = parse_mscx(&tie_score(&format!(
+                "<Measure><voice>{}{gap}<Chord><durationType>quarter</durationType>\
+                 <Lyrics><no>1</no><text>tail</text></Lyrics>\
+                 <Note><pitch>{tail_pitch}</pitch>{stop}</Note></Chord></voice></Measure>",
+                quarter(65, &start)
+            )))
+            .unwrap();
+            let proof = source_notes(&midi)[1].source.continuity.as_ref().unwrap();
+            assert!(proof.incoming_tie.is_none(), "{start} {stop}");
+            assert!(proof
+                .issues
+                .iter()
+                .any(|issue| issue.code == "SOURCE_CONTINUITY_LINK_INVALID"));
+            assert!(proof.evidence.raw_xml.contains(&stop));
+            assert_eq!(played_notes(&midi).len(), 2);
+        }
+    }
+
+    #[test]
+    fn overlapping_same_key_tie_heads_do_not_choose_the_last_chord_member() {
+        let xml = tie_score(&format!(
+            "<Measure><voice><Chord><durationType>quarter</durationType>\
+             <Note><pitch>65</pitch>{TIE_START}</Note><Note><pitch>65</pitch>{TIE_START}</Note>\
+             </Chord><Chord><durationType>quarter</durationType><Lyrics><text>tail</text></Lyrics>\
+             <Note><pitch>65</pitch>{TIE_STOP}</Note></Chord></voice></Measure>"
+        ));
+        let midi = parse_mscx(&xml).unwrap();
+        let notes = source_notes(&midi);
+        let tail = notes.iter().find(|note| !note.lyrics.is_empty()).unwrap();
+        let proof = tail.source.continuity.as_ref().unwrap();
+        assert!(proof.incoming_tie.is_none());
+        assert_eq!(proof.issues[0].code, "SOURCE_CONTINUITY_LINK_INVALID");
     }
 
     #[test]

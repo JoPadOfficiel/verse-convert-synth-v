@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <direction><direction-type><dynamics><p/></dynamics></direction-type><sound dynamics="100"/></direction>
+    <note dynamics="120"><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><lyric><text>la</text></lyric></note>
+    <direction><direction-type><wedge type="crescendo" number="1" spread="0"/></direction-type></direction>
+    <note><pitch><step>D</step><octave>4</octave></pitch><duration>480</duration><lyric><text>la</text></lyric></note>
+    <direction><direction-type><wedge type="stop" number="1" spread="15"/></direction-type></direction>
+    <direction><direction-type><dynamics><f/></dynamics></direction-type></direction>
+    <note><rest/><duration>480</duration></note>
+    <note><pitch><step>E</step><octave>4</octave></pitch><duration>480</duration><lyric><text>la</text></lyric></note>
+  </measure></part>
+</score-partwise>

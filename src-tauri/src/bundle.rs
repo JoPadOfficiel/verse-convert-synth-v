@@ -296,10 +296,112 @@ pub struct BundleManifest {
 #[serde(rename_all = "camelCase")]
 pub struct PreservationLedger {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity_context: Option<IntensityContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub performance_spans: Vec<crate::engine::performance::PerformanceReference>,
     pub expected_source_ids: Vec<String>,
     pub entries: Vec<DispositionEntry>,
+}
+
+/// Independent source inventory and final eligible projection ownership. This
+/// context is built from Midi/ProjectionEvidence, never from span assertions.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityContext {
+    pub source_ppq: u16,
+    pub source_tracks: Vec<String>,
+    pub source_notes: Vec<IntensitySourceNote>,
+    pub controllers: Vec<IntensityControllerSource>,
+    pub projected_notes: Vec<crate::engine::projection::IntensityNoteProjection>,
+    #[serde(default)]
+    pub score_owners: Vec<IntensityScoreTrack>,
+    #[serde(default)]
+    pub declarations: Vec<IntensityDeclarationSource>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityScoreOwner {
+    pub part: String,
+    pub staff: String,
+    pub voice: String,
+    pub instrument: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityScoreTrack {
+    pub source_track_id: String,
+    pub owner: IntensityScoreOwner,
+}
+
+/// Original parser declaration plus source-route applicability, shared by all
+/// transfers. These rows never take their scope or occurrence from a report.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityDeclarationSource {
+    pub source_id: String,
+    pub kinds: serde_json::Value,
+    pub scope: serde_json::Value,
+    pub at: serde_json::Value,
+    pub note_source_id: Option<String>,
+    #[serde(default)]
+    pub paired_source_ids: Vec<String>,
+    pub applications: Vec<IntensityDeclarationApplication>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityDeclarationApplication {
+    pub owner: IntensityScoreOwner,
+    pub occurrence: u32,
+    pub repeat_pass: u32,
+    pub start: serde_json::Value,
+    pub end: serde_json::Value,
+    pub active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityMidiChannel {
+    pub port: u8,
+    pub channel: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensitySourceNote {
+    pub note_id: String,
+    pub source_track_id: String,
+    pub midi_channel: Option<IntensityMidiChannel>,
+    pub explicit_attack: bool,
+    #[serde(default)]
+    pub velocity: Option<u8>,
+    #[serde(default)]
+    pub attack_source_id: Option<String>,
+    #[serde(default)]
+    pub original_source_id: String,
+    #[serde(default)]
+    pub score_owner: Option<IntensityScoreOwner>,
+    #[serde(default)]
+    pub start_tick: u32,
+    #[serde(default)]
+    pub source_occurrence: u32,
+    /// Original raw note IDs absorbed into this nominal note by proven ties.
+    #[serde(default)]
+    pub merged_velocity_sources: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityControllerSource {
+    pub source_id: String,
+    pub source_track_id: String,
+    pub tick: u32,
+    pub owner: IntensityMidiChannel,
+    pub controller: u8,
+    pub value: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -349,6 +451,14 @@ pub enum PrimaryDisposition {
 
 impl PreservationLedger {
     pub fn validate(&self, allowed_artifacts: &BTreeSet<String>) -> Result<(), BundleError> {
+        self.validate_with_limits(allowed_artifacts, LedgerValidationLimits::default())
+    }
+
+    fn validate_with_limits(
+        &self,
+        allowed_artifacts: &BTreeSet<String>,
+        limits: LedgerValidationLimits,
+    ) -> Result<(), BundleError> {
         if self.schema_version != SCHEMA_VERSION
             && self.schema_version != PERFORMANCE_LEDGER_SCHEMA_VERSION
         {
@@ -357,8 +467,11 @@ impl PreservationLedger {
                 self.schema_version
             )));
         }
+        let mut budget = LedgerValidationBudget::new(limits);
+        budget.work(self.entries.len())?;
         if self.schema_version == 2
-            && (!self.performance_spans.is_empty()
+            && (self.intensity_context.is_some()
+                || !self.performance_spans.is_empty()
                 || self.entries.iter().any(|entry| {
                     !entry.performance_refs.is_empty()
                         || matches!(
@@ -371,16 +484,41 @@ impl PreservationLedger {
                 "mapped performance requires preservation schema version 3".into(),
             ));
         }
-        let mut reference_count = self.performance_spans.len();
-        let mut text_bytes = 0usize;
+        budget.references(self.performance_spans.len())?;
+        budget.work(self.performance_spans.len())?;
+        if let Some(context) = &self.intensity_context {
+            budget.work(
+                context
+                    .source_notes
+                    .len()
+                    .saturating_add(context.declarations.len()),
+            )?;
+            budget.references(context.reference_count())?;
+            budget.json(context)?;
+        } else if self
+            .performance_spans
+            .iter()
+            .any(|span| span.intensity.is_some())
+        {
+            return Err(BundleError::InvalidLedger(
+                "intensity source context is missing or exceeded bounded storage".into(),
+            ));
+        }
         for span in &self.performance_spans {
-            reference_count = reference_count.saturating_add(span.note_ids.len());
-            text_bytes =
-                text_bytes.saturating_add(span.note_ids.iter().map(String::len).sum::<usize>());
-            text_bytes = text_bytes
-                .saturating_add(span.detail.len())
-                .saturating_add(span.target.len())
-                .saturating_add(span.source_track_id.len());
+            budget.references(span.note_ids.len())?;
+            budget.work(span.note_ids.len())?;
+            if let Some(intensity) = &span.intensity {
+                budget.json(intensity)?;
+            }
+            for id in &span.note_ids {
+                budget.bytes(id.len())?;
+            }
+            budget.bytes(
+                span.detail
+                    .len()
+                    .saturating_add(span.target.len())
+                    .saturating_add(span.source_track_id.len()),
+            )?;
             if span.start_tick > span.end_tick
                 || (span.target_track.is_none() && !span.note_ids.is_empty())
                 || (span.status == crate::engine::performance::TransferStatus::Mapped
@@ -391,8 +529,11 @@ impl PreservationLedger {
                 ));
             }
         }
+        budget.work(self.entries.len())?;
         for entry in &self.entries {
-            reference_count = reference_count.saturating_add(entry.performance_refs.len());
+            // Refuse before walking a potentially adversarial reverse list.
+            budget.references(entry.performance_refs.len())?;
+            budget.work(entry.performance_refs.len().saturating_mul(2))?;
             if entry
                 .performance_refs
                 .iter()
@@ -414,31 +555,67 @@ impl PreservationLedger {
                 ));
             }
         }
-        if reference_count > 250_000 || text_bytes > 32 * 1024 * 1024 {
-            return Err(BundleError::InvalidLedger(
-                "performance evidence exceeds bounded storage".into(),
-            ));
-        }
-        let expected: BTreeSet<_> = self.expected_source_ids.iter().cloned().collect();
-        if expected.len() != self.expected_source_ids.len() {
+        // Borrow identity strings; reserve tree storage and comparison work
+        // before constructing any validation indexes.
+        budget.index(self.expected_source_ids.len(), std::mem::size_of::<&str>())?;
+        let mut expected: Vec<_> = self
+            .expected_source_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        expected.sort_unstable();
+        budget.work(expected.len())?;
+        if expected.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(BundleError::InvalidLedger(
                 "duplicate expected source ID".into(),
             ));
         }
-        let actual: BTreeSet<_> = self
+        budget.index(self.entries.len(), 64)?;
+        let entries: BTreeMap<_, _> = self
             .entries
             .iter()
-            .map(|entry| entry.source_id.clone())
+            .map(|entry| (entry.source_id.as_str(), entry))
             .collect();
-        if actual.len() != self.entries.len() {
+        if entries.len() != self.entries.len() {
             return Err(BundleError::InvalidLedger(
                 "multiple dispositions for one source ID".into(),
             ));
         }
-        if expected != actual {
+        budget.work(expected.len())?;
+        if !expected.iter().copied().eq(entries.keys().copied()) {
             return Err(BundleError::InvalidLedger(
                 "every inventoried item must have exactly one disposition".into(),
             ));
+        }
+        let ownership = self
+            .intensity_context
+            .as_ref()
+            .map(|context| IntensityOwnership::new(context, &entries, &mut budget))
+            .transpose()
+            .map_err(BundleError::InvalidLedger)?;
+        budget.index(
+            self.performance_spans.len(),
+            std::mem::size_of::<BTreeSet<&str>>(),
+        )?;
+        let mut contributors = vec![BTreeSet::new(); self.performance_spans.len()];
+        for entry in &self.entries {
+            budget.index(entry.performance_refs.len(), 64)?;
+            for index in &entry.performance_refs {
+                contributors[*index].insert(entry.source_id.as_str());
+            }
+        }
+        for (index, span) in self.performance_spans.iter().enumerate() {
+            if let Some(intensity) = &span.intensity {
+                validate_intensity_extension(
+                    intensity,
+                    span,
+                    &entries,
+                    ownership.as_ref().expect("required intensity context"),
+                    &contributors[index],
+                    &mut budget,
+                )
+                .map_err(BundleError::InvalidLedger)?;
+            }
         }
         for entry in &self.entries {
             if entry.artifact_paths.is_empty() {
@@ -460,6 +637,1722 @@ impl PreservationLedger {
         }
         Ok(())
     }
+}
+
+/// The persisted reference/text limits and actual validation work share one
+/// pass. Tests lower these limits on the same path used before publication.
+#[derive(Clone, Copy)]
+struct LedgerValidationLimits {
+    references: usize,
+    bytes: usize,
+    work: usize,
+}
+impl Default for LedgerValidationLimits {
+    fn default() -> Self {
+        Self {
+            references: 250_000,
+            bytes: 32 * 1024 * 1024,
+            work: 2_000_000,
+        }
+    }
+}
+struct LedgerValidationBudget {
+    limits: LedgerValidationLimits,
+    references: usize,
+    bytes: usize,
+    work: usize,
+}
+impl LedgerValidationBudget {
+    fn new(limits: LedgerValidationLimits) -> Self {
+        Self {
+            limits,
+            references: 0,
+            bytes: 0,
+            work: 0,
+        }
+    }
+    fn add(value: &mut usize, extra: usize, limit: usize) -> Result<(), String> {
+        *value = value.saturating_add(extra);
+        if *value > limit {
+            return Err("performance evidence exceeds bounded storage".into());
+        }
+        Ok(())
+    }
+    fn references(&mut self, n: usize) -> Result<(), BundleError> {
+        Self::add(&mut self.references, n, self.limits.references)
+            .map_err(BundleError::InvalidLedger)
+    }
+    fn bytes(&mut self, n: usize) -> Result<(), BundleError> {
+        Self::add(&mut self.bytes, n, self.limits.bytes).map_err(BundleError::InvalidLedger)
+    }
+    fn work(&mut self, n: usize) -> Result<(), BundleError> {
+        Self::add(&mut self.work, n, self.limits.work).map_err(BundleError::InvalidLedger)
+    }
+    fn index(&mut self, n: usize, size: usize) -> Result<(), BundleError> {
+        self.work(n.saturating_mul(1 + usize::BITS as usize - n.max(1).leading_zeros() as usize))?;
+        self.bytes(n.saturating_mul(size))
+    }
+    fn visit(&mut self, n: usize) -> Result<(), String> {
+        Self::add(&mut self.work, n, self.limits.work)
+    }
+    fn reference(&mut self, n: usize) -> Result<(), String> {
+        Self::add(&mut self.references, n, self.limits.references)?;
+        self.visit(n)
+    }
+    fn reserve(&mut self, n: usize, size: usize) -> Result<(), String> {
+        self.visit(n.saturating_mul(1 + usize::BITS as usize - n.max(1).leading_zeros() as usize))?;
+        Self::add(&mut self.bytes, n.saturating_mul(size), self.limits.bytes)
+    }
+    fn json<T: Serialize>(&mut self, value: &T) -> Result<(), BundleError> {
+        // Charge bounded byte traversal, not serde's arbitrary write fragment
+        // count: punctuation and escaped strings can use many tiny callbacks.
+        // Every 64-byte block is prepaid, including the final partial block.
+        // Reference and index traversal retain their separate work charges.
+        struct Counter<'a> {
+            budget: &'a mut LedgerValidationBudget,
+            prepaid: usize,
+        }
+        impl Write for Counter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.len() > self.prepaid {
+                    let blocks = bytes.len().saturating_sub(self.prepaid).div_ceil(64);
+                    self.budget.visit(blocks).map_err(io::Error::other)?;
+                    self.prepaid = self.prepaid.saturating_add(blocks.saturating_mul(64));
+                }
+                LedgerValidationBudget::add(
+                    &mut self.budget.bytes,
+                    bytes.len(),
+                    self.budget.limits.bytes,
+                )
+                .map_err(io::Error::other)?;
+                self.prepaid -= bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        self.work(1)?;
+        serde_json::to_writer(
+            Counter {
+                budget: self,
+                prepaid: 64,
+            },
+            value,
+        )
+        .map_err(|_| {
+            BundleError::InvalidLedger("performance evidence exceeds bounded storage".into())
+        })
+    }
+}
+
+// The optional v1 extension has three emitted forms: a USTX gain span,
+// an SVP neutral-segment report, and a scoped issue/terminal point report.
+// Read borrowed JSON throughout so large raw source evidence is never cloned.
+struct IntensityJsonCounter {
+    bytes: usize,
+}
+impl Write for IntensityJsonCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        if self.bytes > 32 * 1024 * 1024 {
+            return Err(io::Error::other("intensity evidence budget exceeded"));
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl IntensityContext {
+    fn reference_count(&self) -> usize {
+        self.source_tracks
+            .len()
+            .saturating_add(self.source_notes.len().saturating_mul(4))
+            .saturating_add(self.controllers.len().saturating_mul(2))
+            .saturating_add(self.projected_notes.len().saturating_mul(4))
+            .saturating_add(self.score_owners.len().saturating_mul(2))
+            .saturating_add(self.declarations.iter().fold(0usize, |n, d| {
+                n.saturating_add(2)
+                    .saturating_add(d.applications.len())
+                    .saturating_add(d.paired_source_ids.len())
+            }))
+            .saturating_add(self.source_notes.iter().fold(0usize, |n, note| {
+                n.saturating_add(note.merged_velocity_sources.len())
+            }))
+    }
+}
+
+fn intensity_charge(count: &mut usize, extra: usize) -> Result<(), String> {
+    *count = count.saturating_add(extra);
+    if *count > 250_000 {
+        return Err("performance evidence exceeds bounded storage".into());
+    }
+    Ok(())
+}
+
+type IntensityProjectionIndex<'a> =
+    BTreeMap<(usize, &'a str), Vec<&'a crate::engine::projection::IntensityNoteProjection>>;
+type IntensityApplicationIndex<'a> =
+    BTreeMap<(&'a str, &'a IntensityScoreOwner, u32, u32), &'a IntensityDeclarationApplication>;
+
+struct IntensityOwnership<'a> {
+    context: &'a IntensityContext,
+    notes: BTreeMap<&'a str, &'a IntensitySourceNote>,
+    projections: IntensityProjectionIndex<'a>,
+    endpoints: BTreeSet<(usize, &'a str, u32)>,
+    controllers: BTreeMap<&'a str, &'a IntensityControllerSource>,
+    tracks: BTreeSet<&'a str>,
+    declarations: BTreeMap<&'a str, &'a IntensityDeclarationSource>,
+    applications: IntensityApplicationIndex<'a>,
+    score_tracks: BTreeMap<&'a str, Vec<&'a IntensityScoreOwner>>,
+    attacks: BTreeMap<&'a str, &'a IntensitySourceNote>,
+}
+impl<'a> IntensityOwnership<'a> {
+    fn new(
+        context: &'a IntensityContext,
+        entries: &BTreeMap<&str, &DispositionEntry>,
+        budget: &mut LedgerValidationBudget,
+    ) -> Result<Self, String> {
+        budget.visit(
+            context
+                .source_notes
+                .len()
+                .saturating_add(context.declarations.len()),
+        )?;
+        let attack_count = context
+            .source_notes
+            .iter()
+            .filter(|note| note.attack_source_id.is_some())
+            .count();
+        let application_count = context.declarations.iter().fold(0usize, |count, row| {
+            count.saturating_add(row.applications.len())
+        });
+        // Each borrowed index is bounded by its own row count. Persistent
+        // identity-field references are not rows in one giant sorted tree.
+        // Include the projection/owner vectors in their map storage allowance.
+        for (rows, bytes) in [
+            (context.source_tracks.len(), 64),
+            (context.source_notes.len(), 64),
+            (attack_count, 64),
+            (context.projected_notes.len(), 128),
+            (context.projected_notes.len(), 64),
+            (context.projected_notes.len(), 64),
+            (context.projected_notes.len(), 64),
+            (context.controllers.len(), 64),
+            (context.score_owners.len(), 128),
+            (context.score_owners.len(), 64),
+            (context.score_owners.len(), 64),
+            (context.declarations.len(), 64),
+            (application_count, 128),
+            (application_count, 96),
+        ] {
+            budget.reserve(rows, bytes)?;
+        }
+        if context.source_ppq == 0 {
+            return Err("invalid intensity source PPQ".into());
+        }
+        let mut tracks = BTreeSet::new();
+        for id in &context.source_tracks {
+            budget.reserve(1, id.len().saturating_add(6))?;
+            if id.is_empty()
+                || !tracks.insert(id.as_str())
+                || !entries
+                    .get(format!("track:{id}").as_str())
+                    .is_some_and(|entry| entry.item_kind == SourceItemKind::Track)
+            {
+                return Err("invalid intensity source track table".into());
+            }
+        }
+        let mut notes = BTreeMap::new();
+        let mut attacks = BTreeMap::new();
+        for note in &context.source_notes {
+            if !tracks.contains(note.source_track_id.as_str())
+                || !entries
+                    .get(note.note_id.as_str())
+                    .is_some_and(|e| e.item_kind == SourceItemKind::Note)
+                || note.midi_channel.is_some_and(|owner| owner.channel >= 16)
+                || notes.insert(note.note_id.as_str(), note).is_some()
+            {
+                return Err("invalid intensity source note table".into());
+            }
+            if note.explicit_attack != note.velocity.is_some()
+                || note.velocity.is_some_and(|v| v == 0 || v > 127)
+                || note.explicit_attack != note.attack_source_id.is_some()
+                || (note.explicit_attack && note.midi_channel.is_none())
+            {
+                return Err("invalid intensity source velocity table".into());
+            }
+            if let Some(id) = &note.attack_source_id {
+                if !entries
+                    .get(id.as_str())
+                    .is_some_and(|e| e.item_kind == SourceItemKind::Event)
+                    || attacks.insert(id.as_str(), note).is_some()
+                {
+                    return Err("invalid intensity source velocity table".into());
+                }
+            }
+        }
+        let mut projections: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut endpoints = BTreeSet::new();
+        let mut destinations = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        for note in &context.projected_notes {
+            if note.start_tick >= note.end_tick
+                || note.destination_track_id.is_empty()
+                || notes
+                    .get(note.note_id.as_str())
+                    .is_none_or(|source| source.source_track_id != note.source_track_id)
+                || !matches!(
+                    entries[note.note_id.as_str()].disposition,
+                    PrimaryDisposition::ProjectedExact
+                )
+                || !seen.insert((
+                    note.target_track,
+                    note.note_id.as_str(),
+                    note.start_tick,
+                    note.end_tick,
+                ))
+            {
+                return Err("invalid intensity eligible projection table".into());
+            }
+            if destinations
+                .insert(note.target_track, note.destination_track_id.as_str())
+                .is_some_and(|previous| previous != note.destination_track_id)
+            {
+                return Err("intensity target track has conflicting destination owners".into());
+            }
+            projections
+                .entry((note.target_track, note.note_id.as_str()))
+                .or_default()
+                .push(note);
+            endpoints.insert((
+                note.target_track,
+                note.source_track_id.as_str(),
+                note.end_tick,
+            ));
+        }
+        for note in &context.projected_notes {
+            if let Some(root) = &note.intensity_attack_note_id {
+                let tail = notes[note.note_id.as_str()];
+                let head = notes
+                    .get(root.as_str())
+                    .ok_or("invalid intensity attack predecessor")?;
+                if root == &note.note_id
+                    || head.start_tick >= tail.start_tick
+                    || head.score_owner != tail.score_owner
+                    || head.midi_channel != tail.midi_channel
+                    || !projections.contains_key(&(note.target_track, root.as_str()))
+                {
+                    return Err("invalid intensity attack predecessor".into());
+                }
+            }
+        }
+        let mut controllers = BTreeMap::new();
+        for controller in &context.controllers {
+            if !tracks.contains(controller.source_track_id.as_str())
+                || !entries
+                    .get(controller.source_id.as_str())
+                    .is_some_and(|entry| entry.item_kind == SourceItemKind::Event)
+                || controller.owner.channel >= 16
+                || !matches!(controller.controller, 7 | 11)
+                || controller.value > 127
+                || controllers
+                    .insert(controller.source_id.as_str(), controller)
+                    .is_some()
+            {
+                return Err("invalid intensity controller source table".into());
+            }
+        }
+        let mut score_tracks = BTreeMap::<_, Vec<_>>::new();
+        let mut seen_owners = BTreeSet::new();
+        for track in &context.score_owners {
+            if !tracks.contains(track.source_track_id.as_str())
+                || track.owner.part.is_empty()
+                || !seen_owners.insert((track.source_track_id.as_str(), &track.owner))
+            {
+                return Err("invalid intensity score owner table".into());
+            }
+            score_tracks
+                .entry(track.source_track_id.as_str())
+                .or_default()
+                .push(&track.owner);
+        }
+        for note in &context.source_notes {
+            if note
+                .score_owner
+                .as_ref()
+                .is_some_and(|owner| !seen_owners.contains(&(note.source_track_id.as_str(), owner)))
+            {
+                return Err("intensity note has no original score owner".into());
+            }
+        }
+        let mut declarations = BTreeMap::new();
+        let mut applications = BTreeMap::new();
+        let mut source_routes = BTreeMap::new();
+        let declared_owners: BTreeSet<_> = context
+            .score_owners
+            .iter()
+            .map(|track| &track.owner)
+            .collect();
+        for row in &context.declarations {
+            if !entries
+                .get(row.source_id.as_str())
+                .is_some_and(|e| e.item_kind == SourceItemKind::Event)
+                || !intensity_scope(&row.scope)
+                || row.kinds.as_array().is_none_or(|kinds| {
+                    kinds.is_empty()
+                        || kinds.iter().any(|k| {
+                            !matches!(
+                                k.as_str(),
+                                Some(
+                                    "Dynamic"
+                                        | "Transition"
+                                        | "Text"
+                                        | "Velocity"
+                                        | "Tempo"
+                                        | "WedgeStart"
+                                        | "WedgeContinue"
+                                        | "WedgeStop"
+                                        | "SpannerEndpoint"
+                                        | "Unsupported"
+                                )
+                            )
+                        })
+                })
+                || declarations.insert(row.source_id.as_str(), row).is_some()
+            {
+                return Err("invalid original intensity declaration table".into());
+            }
+            let at = intensity_fraction(&row.at)?;
+            if at < crate::engine::score_intensity::Time::ZERO
+                || (row
+                    .kinds
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|k| k == "Velocity")
+                    && row.note_source_id.as_ref().is_none_or(String::is_empty))
+            {
+                return Err("invalid original intensity declaration table".into());
+            }
+            for application in &row.applications {
+                budget.visit(1)?;
+                let start = intensity_fraction(&application.start)?;
+                let end = intensity_fraction(&application.end)?;
+                if !declared_owners.contains(&application.owner)
+                    || !score_scope_applies(&row.scope, &application.owner)
+                    || start < crate::engine::score_intensity::Time::ZERO
+                    || end < start
+                    || ((application.occurrence == 0) != (application.repeat_pass == 0))
+                    || (application.occurrence == 0
+                        && (start != at || end != at || application.active))
+                    || (application.occurrence != 0 && start == end)
+                    || applications
+                        .insert(
+                            (
+                                row.source_id.as_str(),
+                                &application.owner,
+                                application.occurrence,
+                                application.repeat_pass,
+                            ),
+                            application,
+                        )
+                        .is_some()
+                {
+                    return Err("invalid intensity declaration occurrence table".into());
+                }
+                if application.occurrence != 0
+                    && source_routes
+                        .insert(
+                            (
+                                &application.owner,
+                                application.occurrence,
+                                application.repeat_pass,
+                            ),
+                            (start, end),
+                        )
+                        .is_some_and(|previous| previous != (start, end))
+                {
+                    return Err("conflicting intensity source route bounds".into());
+                }
+            }
+        }
+        for row in &context.declarations {
+            budget.visit(row.paired_source_ids.len())?;
+            if row
+                .paired_source_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            {
+                return Err("invalid original intensity endpoint relation".into());
+            }
+            for id in &row.paired_source_ids {
+                budget.visit(
+                    1 + usize::BITS as usize - declarations.len().max(1).leading_zeros() as usize,
+                )?;
+                let other = declarations
+                    .get(id.as_str())
+                    .ok_or("invalid original intensity endpoint relation")?;
+                budget.visit(
+                    1 + usize::BITS as usize
+                        - other.paired_source_ids.len().max(1).leading_zeros() as usize,
+                )?;
+                if id == &row.source_id
+                    || other
+                        .paired_source_ids
+                        .binary_search(&row.source_id)
+                        .is_err()
+                {
+                    return Err("invalid original intensity endpoint relation".into());
+                }
+            }
+        }
+        Ok(Self {
+            context,
+            notes,
+            projections,
+            endpoints,
+            controllers,
+            tracks,
+            declarations,
+            applications,
+            score_tracks,
+            attacks,
+        })
+    }
+
+    fn validate_span(
+        &self,
+        span: &crate::engine::performance::PerformanceReference,
+        start: crate::engine::score_intensity::Time,
+        end: crate::engine::score_intensity::Time,
+        terminal: bool,
+        count: &mut LedgerValidationBudget,
+    ) -> Result<(), String> {
+        use crate::engine::score_intensity::Fraction;
+        if !self.tracks.contains(span.source_track_id.as_str()) {
+            return Err("intensity span source track is outside the source table".into());
+        }
+        if crate::engine::performance::exact_source_tick_bounds(
+            start,
+            end,
+            self.context.source_ppq,
+        )? != (span.start_tick, span.end_tick)
+        {
+            return Err("exact intensity bounds disagree with source tick coverage".into());
+        }
+        let Some(target) = span.target_track else {
+            return Ok(());
+        };
+        if span.note_ids.is_empty() {
+            if !terminal
+                || !self.endpoints.contains(&(
+                    target,
+                    span.source_track_id.as_str(),
+                    span.start_tick,
+                ))
+            {
+                return Err("intensity terminal has no eligible destination endpoint".into());
+            }
+            return Ok(());
+        }
+        count.reserve(span.note_ids.len(), 64)?;
+        let mut coverage = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        for id in &span.note_ids {
+            if !ids.insert(id)
+                || self
+                    .notes
+                    .get(id.as_str())
+                    .is_none_or(|note| note.source_track_id != span.source_track_id)
+            {
+                return Err("intensity note does not belong to its source track".into());
+            }
+            let owners = self
+                .projections
+                .get(&(target, id.as_str()))
+                .ok_or("intensity note has no eligible target ownership")?;
+            let mut owned = false;
+            for note in owners {
+                count.reference(1)?;
+                let a = Fraction::new(
+                    i64::from(note.start_tick),
+                    i64::from(self.context.source_ppq),
+                )?;
+                let b =
+                    Fraction::new(i64::from(note.end_tick), i64::from(self.context.source_ppq))?;
+                let intersects = if start == end {
+                    a <= start && start < b
+                } else {
+                    a < end && start < b
+                };
+                if intersects {
+                    owned = true;
+                    count.reserve(1, 96)?;
+                    coverage.insert((a, b));
+                }
+            }
+            if !owned {
+                return Err("intensity note has no eligible interval".into());
+            }
+        }
+        let mut covered = start;
+        for (a, b) in coverage {
+            if a > covered {
+                break;
+            }
+            covered = covered.max(b);
+        }
+        if covered < end {
+            return Err("intensity interval exceeds eligible projected notes".into());
+        }
+        Ok(())
+    }
+
+    fn authenticate_provenance(
+        &self,
+        provenance: &serde_json::Value,
+        span: &crate::engine::performance::PerformanceReference,
+        start: crate::engine::score_intensity::Time,
+        end: crate::engine::score_intensity::Time,
+        count: &mut LedgerValidationBudget,
+    ) -> Result<(), String> {
+        use crate::engine::performance::TransferStatus;
+        use crate::engine::score_intensity::source::time;
+        let occurrence = provenance["occurrence"].as_u64().unwrap() as u32;
+        let pass = provenance["repeat_pass"].as_u64().unwrap() as u32;
+        let scope = &provenance["scope"];
+        let mut scope_witness = false;
+        for evidence in provenance["evidence"].as_array().unwrap() {
+            for id in evidence["source_ids"].as_array().unwrap() {
+                let id = id.as_str().unwrap();
+                count.visit(
+                    2 * (1 + usize::BITS as usize
+                        - self
+                            .declarations
+                            .len()
+                            .max(self.attacks.len())
+                            .max(1)
+                            .leading_zeros() as usize),
+                )?;
+                if let Some(attack) = self.attacks.get(id) {
+                    let owner = attack.midi_channel.unwrap();
+                    if evidence["contract"] != "Midi"
+                        || occurrence != 0
+                        || pass != 0
+                        || scope["Midi"]["port"].as_u64() != Some(u64::from(owner.port))
+                        || scope["Midi"]["channel"].as_u64() != Some(u64::from(owner.channel))
+                        || span.note_ids.is_empty()
+                    {
+                        return Err("intensity velocity has unrelated scope or occurrence".into());
+                    }
+                    for note_id in &span.note_ids {
+                        count.visit(1)?;
+                        let root = self.attack_note(span, note_id, count)?;
+                        if root.note_id != attack.note_id || attack.start_tick > span.start_tick {
+                            return Err(
+                                "intensity velocity does not belong to its source attack".into()
+                            );
+                        }
+                    }
+                    scope_witness = true;
+                    continue;
+                }
+                let row = self
+                    .declarations
+                    .get(id)
+                    .ok_or("intensity contributor is not an original expression declaration")?;
+                let ids = evidence["source_ids"].as_array().unwrap();
+                if ids.len() > 1
+                    && row.kinds.as_array().unwrap().iter().any(|kind| {
+                        matches!(
+                            kind.as_str(),
+                            Some("WedgeContinue" | "WedgeStop" | "SpannerEndpoint")
+                        )
+                    })
+                {
+                    count.visit(ids.len().saturating_mul(
+                        1 + usize::BITS as usize
+                            - row.paired_source_ids.len().max(1).leading_zeros() as usize,
+                    ))?;
+                    if !ids.iter().any(|candidate| {
+                        row.paired_source_ids
+                            .binary_search_by(|paired| {
+                                paired.as_str().cmp(candidate.as_str().unwrap())
+                            })
+                            .is_ok()
+                    }) {
+                        return Err("intensity endpoint has no original paired declaration".into());
+                    }
+                }
+                scope_witness |= row.scope == *scope;
+                let velocity = row
+                    .kinds
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|kind| kind == "Velocity");
+                if span.note_ids.is_empty() {
+                    let owners = self
+                        .score_tracks
+                        .get(span.source_track_id.as_str())
+                        .ok_or("intensity provenance has no original score owner")?;
+                    let mut applicable = false;
+                    for owner in owners {
+                        count.visit(1)?;
+                        if !score_scope_applies(scope, owner) {
+                            continue;
+                        }
+                        if self.declaration_application(
+                            row,
+                            owner,
+                            occurrence,
+                            pass,
+                            start,
+                            end,
+                            span.status == TransferStatus::Mapped,
+                            count,
+                        )? {
+                            applicable = true;
+                            break;
+                        }
+                    }
+                    if !applicable {
+                        return Err(
+                            "intensity declaration has unrelated scope or occurrence".into()
+                        );
+                    }
+                } else {
+                    for note_id in &span.note_ids {
+                        count.visit(1)?;
+                        let note = self.notes[note_id.as_str()];
+                        let owner = note
+                            .score_owner
+                            .as_ref()
+                            .ok_or("score intensity contributor has no original score owner")?;
+                        if !score_scope_applies(scope, owner) {
+                            return Err(
+                                "intensity provenance scope does not apply to its source owner"
+                                    .into(),
+                            );
+                        }
+                        let (lo, hi) = if velocity {
+                            let root = self.attack_note(span, note_id, count)?;
+                            let raw = row.note_source_id.as_deref().unwrap();
+                            count.visit(root.merged_velocity_sources.len())?;
+                            if root.original_source_id != raw
+                                && !(span.status == TransferStatus::Unsupported
+                                    && root.merged_velocity_sources.iter().any(|id| id == raw))
+                                && !(span.status == TransferStatus::Unsupported
+                                    && note.original_source_id == raw)
+                            {
+                                return Err(
+                                    "intensity velocity does not belong to its source attack"
+                                        .into(),
+                                );
+                            }
+                            let at = time(i64::from(root.start_tick), self.context.source_ppq)?;
+                            (at, at)
+                        } else {
+                            (start, end)
+                        };
+                        if occurrence == 0
+                            || pass == 0
+                            || !self.declaration_application(
+                                row,
+                                owner,
+                                occurrence,
+                                pass,
+                                lo,
+                                hi,
+                                span.status == TransferStatus::Mapped,
+                                count,
+                            )?
+                        {
+                            return Err(
+                                "intensity declaration has unrelated scope or occurrence".into()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Combined start/held/endpoint/tempo contributors can have different
+        // applicable scopes. At least one original declaration must witness the
+        // reported scope; a merely nonempty invented scope is insufficient.
+        if !scope_witness {
+            return Err("intensity provenance scope has no original declaration witness".into());
+        }
+        Ok(())
+    }
+
+    fn attack_note(
+        &self,
+        span: &crate::engine::performance::PerformanceReference,
+        id: &str,
+        count: &mut LedgerValidationBudget,
+    ) -> Result<&'a IntensitySourceNote, String> {
+        let note = self
+            .notes
+            .get(id)
+            .ok_or("intensity note is not inventoried")?;
+        let mut root = None;
+        if let Some(projections) = span
+            .target_track
+            .and_then(|target| self.projections.get(&(target, id)))
+        {
+            count.visit(projections.len())?;
+            for projection in projections {
+                if let Some(candidate) = &projection.intensity_attack_note_id {
+                    if root.is_some_and(|previous| previous != candidate.as_str()) {
+                        return Err("conflicting intensity attack predecessors".into());
+                    }
+                    root = Some(candidate.as_str());
+                }
+            }
+        }
+        root.map_or(Ok(*note), |root| {
+            self.notes
+                .get(root)
+                .copied()
+                .ok_or_else(|| "invalid intensity attack predecessor".into())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn declaration_application(
+        &self,
+        row: &IntensityDeclarationSource,
+        owner: &IntensityScoreOwner,
+        occurrence: u32,
+        pass: u32,
+        start: crate::engine::score_intensity::Time,
+        end: crate::engine::score_intensity::Time,
+        active: bool,
+        count: &mut LedgerValidationBudget,
+    ) -> Result<bool, String> {
+        count.visit(
+            1 + usize::BITS as usize - self.applications.len().max(1).leading_zeros() as usize,
+        )?;
+        if !score_scope_applies(&row.scope, owner) {
+            return Ok(false);
+        }
+        let Some(application) =
+            self.applications
+                .get(&(row.source_id.as_str(), owner, occurrence, pass))
+        else {
+            return Ok(false);
+        };
+        let lo = intensity_fraction(&application.start)?;
+        let hi = intensity_fraction(&application.end)?;
+        Ok((!active || application.active) && lo <= start && end <= hi)
+    }
+
+    fn validate_controllers(
+        &self,
+        span: &crate::engine::performance::PerformanceReference,
+        contributors: &BTreeSet<&str>,
+        count: &mut LedgerValidationBudget,
+    ) -> Result<bool, String> {
+        let mut supported = false;
+        for source in contributors {
+            count.visit(
+                1 + usize::BITS as usize - self.controllers.len().max(1).leading_zeros() as usize,
+            )?;
+            if let Some(controller) = self.controllers.get(source) {
+                if span.note_ids.is_empty() || controller.tick > span.start_tick {
+                    return Err(
+                        "intensity controller contributor has unrelated ownership or time".into(),
+                    );
+                }
+                for id in &span.note_ids {
+                    count.visit(
+                        1 + usize::BITS as usize - self.notes.len().max(1).leading_zeros() as usize,
+                    )?;
+                    if self.notes.get(id.as_str()).and_then(|n| n.midi_channel)
+                        != Some(controller.owner)
+                    {
+                        return Err(
+                            "intensity controller contributor has unrelated ownership or time"
+                                .into(),
+                        );
+                    }
+                }
+                supported = true;
+            }
+        }
+        Ok(supported)
+    }
+}
+
+/// Build bounded source identities before copying the eligible projection table.
+/// Physical MIDI order determines ports, exactly as in the source event model;
+/// neither source tracks nor note membership are recovered by parsing IDs.
+fn build_intensity_context(
+    midi: &Midi,
+    projection: &ProjectionEvidence,
+) -> Result<IntensityContext, String> {
+    use crate::engine::target::performance::Budget;
+    if midi.ticks_per_beat == 0
+        || midi.time_base != midi::TimeBase::PulsesPerQuarter(midi.ticks_per_beat)
+    {
+        return Err("invalid intensity source PPQ".into());
+    }
+    let mut budget = Budget::default();
+    let mut context = IntensityContext {
+        source_ppq: midi.ticks_per_beat,
+        source_tracks: Vec::new(),
+        source_notes: Vec::new(),
+        controllers: Vec::new(),
+        projected_notes: Vec::new(),
+        score_owners: Vec::new(),
+        declarations: Vec::new(),
+    };
+    let native_midi = matches!(
+        midi.source_format,
+        midi::SourceFormat::StandardMidi | midi::SourceFormat::KaraokeMidi
+    );
+    let event_count = midi
+        .tracks
+        .iter()
+        .fold(0usize, |n, track| n.saturating_add(track.events.len()));
+    budget
+        .work(event_count.saturating_mul(
+            1 + usize::BITS as usize - event_count.max(1).leading_zeros() as usize,
+        ))?;
+    budget.text(event_count.saturating_mul(std::mem::size_of::<(&midi::Track, &midi::Event)>()))?;
+    let mut events = Vec::with_capacity(event_count);
+    for track in &midi.tracks {
+        budget.references(1)?;
+        budget.text(track.id.len().saturating_add(32))?;
+        context.source_tracks.push(track.id.clone());
+        events.extend(track.events.iter().map(|event| (track, event)));
+    }
+    events.sort_by_key(|(track, event)| (track.source.source_track, event.tick, event.order));
+    let mut physical = None;
+    let mut port = 0;
+    for (track, event) in events {
+        if physical != Some(track.source.source_track) {
+            physical = Some(track.source.source_track);
+            port = 0;
+        }
+        match &event.kind {
+            Kind::Port(value) if native_midi => port = *value,
+            Kind::NoteOn(note) if note.velocity != Some(0) => {
+                budget.references(4)?;
+                budget.text(
+                    track
+                        .id
+                        .len()
+                        .saturating_mul(4)
+                        .saturating_add(note.source.id.len().saturating_mul(2))
+                        .saturating_add(320),
+                )?;
+                context.source_notes.push(IntensitySourceNote {
+                    note_id: note_instance_id(&track.id, &note.source, event.order),
+                    source_track_id: track.id.clone(),
+                    midi_channel: native_midi
+                        .then_some(note.channel)
+                        .flatten()
+                        .map(|channel| IntensityMidiChannel { port, channel }),
+                    explicit_attack: native_midi && note.velocity.is_some(),
+                    velocity: native_midi.then_some(note.velocity).flatten(),
+                    attack_source_id: (native_midi && note.velocity.is_some()).then(|| {
+                        crate::engine::performance::attack_field_id(&track.id, event.order)
+                    }),
+                    original_source_id: note.source.id.clone(),
+                    score_owner: if native_midi {
+                        None
+                    } else {
+                        Some(IntensityScoreOwner::from_source(&note.source, &mut budget)?)
+                    },
+                    start_tick: event.tick,
+                    source_occurrence: note.source.occurrence,
+                    merged_velocity_sources: Vec::new(),
+                });
+            }
+            Kind::ControlChange {
+                channel,
+                controller,
+                value,
+            } if native_midi && matches!(controller, 7 | 11) => {
+                budget.references(2)?;
+                budget.text(track.id.len().saturating_mul(2).saturating_add(160))?;
+                context.controllers.push(IntensityControllerSource {
+                    source_id: format!("event:{}:{}", track.id, event.order),
+                    source_track_id: track.id.clone(),
+                    tick: event.tick,
+                    owner: IntensityMidiChannel {
+                        port,
+                        channel: *channel,
+                    },
+                    controller: *controller,
+                    value: *value,
+                });
+            }
+            _ => {}
+        }
+    }
+    build_score_declaration_context(midi, &mut context, &mut budget)?;
+    for owner in &projection.intensity_note_owners {
+        budget.references(4)?;
+        budget.text(
+            owner
+                .note_id
+                .len()
+                .saturating_add(owner.source_track_id.len())
+                .saturating_add(owner.destination_track_id.len())
+                .saturating_add(
+                    owner
+                        .intensity_attack_note_id
+                        .as_ref()
+                        .map_or(0, String::len),
+                )
+                .saturating_add(192),
+        )?;
+    }
+    // Include the existing performance table in the persistent evidence limit
+    // before cloning the projection ownership records.
+    let mut counter = IntensityJsonCounter { bytes: 0 };
+    serde_json::to_writer(&mut counter, &context).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut counter, &projection.intensity_note_owners)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut counter, &projection.performance_spans)
+        .map_err(|e| e.to_string())?;
+    let mut count = context
+        .reference_count()
+        .saturating_add(projection.intensity_note_owners.len().saturating_mul(4));
+    intensity_charge(&mut count, projection.performance_spans.len())?;
+    for span in &projection.performance_spans {
+        intensity_charge(&mut count, span.note_ids.len())?;
+    }
+    for ids in projection.performance_refs.values() {
+        intensity_charge(&mut count, ids.len())?;
+    }
+    context.projected_notes = projection.intensity_note_owners.clone();
+    Ok(context)
+}
+
+impl IntensityScoreOwner {
+    fn from_source(
+        source: &midi::NoteSource,
+        budget: &mut crate::engine::target::performance::Budget,
+    ) -> Result<Self, String> {
+        Self::copy_fields(
+            source.part_id.as_deref().unwrap_or(""),
+            source.staff_id.as_deref().unwrap_or(""),
+            source.voice.as_deref().unwrap_or(""),
+            source.instrument_id.as_deref(),
+            budget,
+        )
+    }
+    fn copy_fields(
+        part: &str,
+        staff: &str,
+        voice: &str,
+        instrument: Option<&str>,
+        budget: &mut crate::engine::target::performance::Budget,
+    ) -> Result<Self, String> {
+        budget.text(
+            part.len()
+                .saturating_add(staff.len())
+                .saturating_add(voice.len())
+                .saturating_add(instrument.map_or(0, str::len))
+                .saturating_add(128),
+        )?;
+        Ok(Self {
+            part: part.into(),
+            staff: staff.into(),
+            voice: voice.into(),
+            instrument: instrument.map(str::to_owned),
+        })
+    }
+    fn source_voice(
+        &self,
+        budget: &mut crate::engine::target::performance::Budget,
+    ) -> Result<crate::engine::score_intensity::ScoreVoice, String> {
+        let copy = Self::copy_fields(
+            &self.part,
+            &self.staff,
+            &self.voice,
+            self.instrument.as_deref(),
+            budget,
+        )?;
+        Ok(crate::engine::score_intensity::ScoreVoice {
+            part: copy.part,
+            staff: copy.staff,
+            voice: copy.voice,
+            instrument: copy.instrument,
+        })
+    }
+}
+
+fn score_scope_applies(scope: &serde_json::Value, owner: &IntensityScoreOwner) -> bool {
+    if scope == "System" {
+        return true;
+    }
+    if let Some(part) = scope.get("Part") {
+        return part.as_str() == Some(owner.part.as_str());
+    }
+    if let Some(fields) = scope.get("Instrument") {
+        return fields["part"].as_str() == Some(owner.part.as_str())
+            && (fields["instrument"].is_null()
+                || fields["instrument"].as_str() == owner.instrument.as_deref());
+    }
+    if let Some(fields) = scope.get("Staff") {
+        return fields["part"].as_str() == Some(owner.part.as_str())
+            && fields["staff"].as_str() == Some(owner.staff.as_str());
+    }
+    if let Some(fields) = scope.get("Voice") {
+        return fields["part"].as_str() == Some(owner.part.as_str())
+            && fields["voice"].as_str() == Some(owner.voice.as_str())
+            && (fields["staff"].is_null()
+                || fields["staff"].as_str() == Some(owner.staff.as_str()));
+    }
+    scope
+        .get("Unsupported")
+        .is_some_and(|fields| fields["part"].as_str() == Some(owner.part.as_str()))
+}
+
+fn build_score_declaration_context(
+    midi: &Midi,
+    context: &mut IntensityContext,
+    budget: &mut crate::engine::target::performance::Budget,
+) -> Result<(), String> {
+    use crate::engine::score_intensity::Scope;
+    let Some(input) = &midi.score_intensity else {
+        return Ok(());
+    };
+    let mut owners = BTreeMap::<&str, BTreeSet<IntensityScoreOwner>>::new();
+    for note in &context.source_notes {
+        budget.work(1)?;
+        if let Some(owner) = &note.score_owner {
+            let copy = IntensityScoreOwner::copy_fields(
+                &owner.part,
+                &owner.staff,
+                &owner.voice,
+                owner.instrument.as_deref(),
+                budget,
+            )?;
+            budget.references(1)?;
+            owners
+                .entry(&note.source_track_id)
+                .or_default()
+                .insert(copy);
+        }
+    }
+    // Typed metadata lanes cover source-only declarations even without notes.
+    // Track identities remain the original adapter identities.
+    budget.work(midi.tracks.len())?;
+    for track in &midi.tracks {
+        if owners.contains_key(track.id.as_str()) {
+            continue;
+        }
+        let (Some(part), Some(staff)) = (&track.source.part_id, &track.source.staff_id) else {
+            continue;
+        };
+        if let Some(voice) = &track.source.voice {
+            let owner = IntensityScoreOwner::copy_fields(
+                part,
+                staff,
+                voice,
+                track.instrument.as_ref().and_then(|i| i.id.as_deref()),
+                budget,
+            )?;
+            budget.references(1)?;
+            owners.entry(&track.id).or_default().insert(owner);
+        } else {
+            for source_part in &midi.topology.parts {
+                budget.work(1)?;
+                if source_part.id != *part {
+                    continue;
+                }
+                for source_staff in &source_part.staves {
+                    budget.work(1)?;
+                    if source_staff.id != *staff {
+                        continue;
+                    }
+                    if source_staff.voices.is_empty() {
+                        let owner = IntensityScoreOwner::copy_fields(
+                            part,
+                            staff,
+                            "",
+                            track.instrument.as_ref().and_then(|i| i.id.as_deref()),
+                            budget,
+                        )?;
+                        budget.references(1)?;
+                        owners.entry(&track.id).or_default().insert(owner);
+                    }
+                    for voice in &source_staff.voices {
+                        budget.work(1)?;
+                        let owner = IntensityScoreOwner::copy_fields(
+                            part,
+                            staff,
+                            &voice.number,
+                            track.instrument.as_ref().and_then(|i| i.id.as_deref()),
+                            budget,
+                        )?;
+                        budget.references(1)?;
+                        owners.entry(&track.id).or_default().insert(owner);
+                    }
+                }
+            }
+        }
+    }
+    let mut unique = BTreeSet::new();
+    for (track, voices) in owners {
+        for owner in voices {
+            budget.references(2)?;
+            budget.text(track.len())?;
+            unique.insert(IntensityScoreOwner::copy_fields(
+                &owner.part,
+                &owner.staff,
+                &owner.voice,
+                owner.instrument.as_deref(),
+                budget,
+            )?);
+            context.score_owners.push(IntensityScoreTrack {
+                source_track_id: track.into(),
+                owner,
+            });
+        }
+    }
+    // Preserve nominally absorbed tie-tail velocity identities from parser ties.
+    let mut merged = BTreeMap::<(&str, u32), Vec<&str>>::new();
+    budget.work(input.ties.len())?;
+    for ((tail, occurrence, _), head) in &input.ties {
+        budget.references(1)?;
+        budget.text(96)?;
+        merged.entry((head, *occurrence)).or_default().push(tail);
+    }
+    for note in &mut context.source_notes {
+        budget.work(1)?;
+        if let Some(tails) = merged.get(&(note.original_source_id.as_str(), note.source_occurrence))
+        {
+            for id in tails {
+                budget.references(1)?;
+                budget.text(id.len().saturating_add(24))?;
+                note.merged_velocity_sources.push((*id).into());
+            }
+        }
+    }
+    budget.work(input.retained.len())?;
+    for id in input.retained.keys() {
+        let declaration = input
+            .declarations
+            .get(id)
+            .ok_or("missing original intensity declaration")?;
+        let original = input
+            .original_declarations
+            .get(id)
+            .ok_or("missing original intensity declaration kind")?;
+        if original.kinds.is_empty() {
+            return Err("missing original intensity declaration kind".into());
+        }
+        budget.references(2)?;
+        budget.text(
+            id.len()
+                .saturating_add(original.note_source_id.as_ref().map_or(0, String::len))
+                .saturating_add(192),
+        )?;
+        let mut row = IntensityDeclarationSource {
+            source_id: id.clone(),
+            kinds: budget.json(&original.kinds)?,
+            scope: budget.json(&declaration.scope)?,
+            at: budget.json(&declaration.at)?,
+            note_source_id: original.note_source_id.clone(),
+            paired_source_ids: Vec::new(),
+            applications: Vec::new(),
+        };
+        if let Some(pairs) = input.paired_declarations.get(id) {
+            budget.work(pairs.len())?;
+            for paired in pairs {
+                budget.references(1)?;
+                budget.text(paired.len().saturating_add(24))?;
+                row.paired_source_ids.push(paired.clone());
+            }
+        }
+        for owner in &unique {
+            budget.work(1)?;
+            let voice = owner.source_voice(budget)?;
+            if !declaration.scope.applies(&voice)
+                && !matches!(&declaration.scope, Scope::Unsupported { part, .. } if part == &voice.part)
+            {
+                continue;
+            }
+            let runs = input.owner_runs(&voice).unwrap_or(&[]);
+            budget.work(
+                runs.len()
+                    .saturating_add(declaration.time_only.len())
+                    .saturating_add(1),
+            )?;
+            if input.declaration_is_unresolved(id, &voice) {
+                budget.references(1)?;
+                row.applications.push(IntensityDeclarationApplication {
+                    owner: IntensityScoreOwner::copy_fields(
+                        &owner.part,
+                        &owner.staff,
+                        &owner.voice,
+                        owner.instrument.as_deref(),
+                        budget,
+                    )?,
+                    occurrence: 0,
+                    repeat_pass: 0,
+                    start: budget.json(&declaration.at)?,
+                    end: budget.json(&declaration.at)?,
+                    active: false,
+                });
+            } else {
+                for run in runs {
+                    budget.work(
+                        runs.len()
+                            .saturating_add(declaration.time_only.len())
+                            .saturating_add(1),
+                    )?;
+                    let Some(pass) =
+                        input.declaration_route_pass(id, &voice, run.ordinal, run.pass)
+                    else {
+                        continue;
+                    };
+                    let end = run
+                        .performed_start
+                        .checked_add(run.written_end.checked_sub(run.written_start)?)?;
+                    budget.references(1)?;
+                    row.applications.push(IntensityDeclarationApplication {
+                        owner: IntensityScoreOwner::copy_fields(
+                            &owner.part,
+                            &owner.staff,
+                            &owner.voice,
+                            owner.instrument.as_deref(),
+                            budget,
+                        )?,
+                        occurrence: run.ordinal,
+                        repeat_pass: run.pass,
+                        start: budget.json(&run.performed_start)?,
+                        end: budget.json(&end)?,
+                        active: declaration.enabled
+                            && pass > 0
+                            && (declaration.time_only.is_empty()
+                                || declaration.time_only.contains(&pass)),
+                    });
+                }
+            }
+        }
+        // Native/score source notes themselves retain their exact tick position;
+        // declaration coordinates remain exact quarter fractions in this table.
+        context.declarations.push(row);
+    }
+    Ok(())
+}
+
+fn intensity_fraction(
+    value: &serde_json::Value,
+) -> Result<crate::engine::score_intensity::Fraction, String> {
+    let integer = |key: &str| -> Option<i128> {
+        let value = value.get(key)?;
+        value.as_i64().map(i128::from).or_else(|| {
+            let s = value.as_str()?;
+            // Decimal integer strings are the serializer's exact i128 escape.
+            let digits = s.strip_prefix('-').unwrap_or(s);
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse().ok())
+                .flatten()
+        })
+    };
+    let (Some(n), Some(d)) = (integer("numerator"), integer("denominator")) else {
+        return Err("invalid exact intensity fraction".into());
+    };
+    crate::engine::score_intensity::Fraction::wide(n, d)
+}
+
+fn intensity_bounds(
+    value: &serde_json::Value,
+) -> Result<
+    (
+        crate::engine::score_intensity::Time,
+        crate::engine::score_intensity::Time,
+    ),
+    String,
+> {
+    let start = intensity_fraction(&value["start"])?;
+    let end = intensity_fraction(&value["end"])?;
+    if start < crate::engine::score_intensity::Fraction::ZERO || end < start {
+        return Err("invalid exact intensity bounds".into());
+    }
+    Ok((start, end))
+}
+
+fn intensity_scope(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let string = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
+    let optional = |v: &Value| v.is_null() || string(v);
+    if value == "System" {
+        return true;
+    }
+    let Some(object) = value.as_object().filter(|o| o.len() == 1) else {
+        return false;
+    };
+    let (kind, fields) = object.iter().next().unwrap();
+    match kind.as_str() {
+        "Part" => string(fields),
+        "Midi" => {
+            fields["port"].as_u64().is_some_and(|n| n <= 255)
+                && fields["channel"].as_u64().is_some_and(|n| n < 16)
+        }
+        "Instrument" => string(&fields["part"]) && optional(&fields["instrument"]),
+        "Staff" => string(&fields["part"]) && string(&fields["staff"]),
+        "Voice" => {
+            string(&fields["part"]) && optional(&fields["staff"]) && string(&fields["voice"])
+        }
+        "Unsupported" => string(&fields["part"]) && fields["raw"].is_string(),
+        _ => false,
+    }
+}
+
+fn intensity_curve(value: &serde_json::Value) -> Result<(), String> {
+    use crate::engine::score_intensity::Fraction;
+    let level = |v: &serde_json::Value| -> Result<(), String> {
+        if v == "Silence" {
+            return Ok(());
+        }
+        if v.as_object()
+            .is_none_or(|o| o.len() != 1 || !o.contains_key("Positive"))
+        {
+            return Err("invalid intensity level".into());
+        }
+        let n = intensity_fraction(&v["Positive"])?;
+        if n <= Fraction::ZERO || n > Fraction::integer(127) {
+            return Err("invalid intensity level".into());
+        }
+        Ok(())
+    };
+    if value == "Absent" {
+        return Ok(());
+    }
+    let object = value
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .ok_or("invalid intensity curve")?;
+    let (kind, fields) = object.iter().next().unwrap();
+    match kind.as_str() {
+        "Level" => level(fields),
+        "Held" if fields.is_null() || fields == "Silence" => Ok(()),
+        "Held"
+            if fields.as_object().is_some_and(|o| o.len() == 1)
+                && fields["Decibels"].as_f64().is_some_and(f64::is_finite) =>
+        {
+            Ok(())
+        }
+        "Transition" => {
+            let (start, end) = intensity_bounds(fields)?;
+            level(&fields["from"])?;
+            level(&fields["to"])?;
+            if start == end
+                || !matches!(
+                    fields["easing"].as_str(),
+                    Some("Normal" | "EaseIn" | "EaseOut" | "EaseInOut" | "Exponential")
+                )
+                || !matches!(
+                    fields["domain"].as_str(),
+                    Some("RelativeDecibels" | "LinearGain")
+                )
+                || (fields["domain"] == "RelativeDecibels"
+                    && (fields["from"] == "Silence" || fields["to"] == "Silence"))
+            {
+                return Err("invalid intensity transition".into());
+            }
+            Ok(())
+        }
+        _ => Err("invalid intensity curve".into()),
+    }
+}
+
+fn intensity_provenance(
+    value: &serde_json::Value,
+    entries: &BTreeMap<&str, &DispositionEntry>,
+    contributors: &BTreeSet<&str>,
+    count: &mut LedgerValidationBudget,
+) -> Result<(), String> {
+    use crate::engine::score_intensity::POLICY;
+    if value["policy"] != POLICY
+        || !intensity_scope(&value["scope"])
+        || !["occurrence", "repeat_pass"]
+            .iter()
+            .all(|k| value[*k].as_u64().is_some_and(|n| n <= u64::from(u32::MAX)))
+    {
+        return Err("invalid intensity provenance policy/scope/occurrence".into());
+    }
+    let evidence = value["evidence"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or("missing intensity source evidence")?;
+    let mut sources = BTreeSet::new();
+    for e in evidence {
+        if !matches!(
+            e["contract"].as_str(),
+            Some("MusicXml" | "MuseScoreLegacy" | "MuseScoreModern" | "Midi")
+        ) || !(e["saving_version"].is_null() || e["saving_version"].is_string())
+            || !e["layout"].is_string()
+            || e["raw_fields"]
+                .as_object()
+                .is_none_or(|o| !o.values().all(serde_json::Value::is_string))
+        {
+            return Err("invalid intensity source evidence structure".into());
+        }
+        let ids = e["source_ids"]
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .ok_or("missing intensity source IDs")?;
+        for id in ids {
+            count.reference(1)?;
+            let id = id
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("invalid intensity source ID")?;
+            count.visit(
+                2 * (1 + usize::BITS as usize - entries.len().max(1).leading_zeros() as usize),
+            )?;
+            if !entries.contains_key(id) {
+                return Err("intensity source ID is not inventoried".into());
+            }
+            if !contributors.contains(id) {
+                return Err("intensity source ID does not reference its containing span".into());
+            }
+            count.reserve(1, 64)?;
+            sources.insert(id);
+        }
+    }
+    for item in value["interpretations"]
+        .as_array()
+        .ok_or("missing intensity interpretations")?
+    {
+        if !item["field"].is_string()
+            || !item["explanation"].is_string()
+            || !matches!(
+                item["basis"].as_str(),
+                Some(
+                    "ExplicitNumeric"
+                        | "StandardTable"
+                        | "DeclaredDefault"
+                        | "InferredEndpoint"
+                        | "InferredSpan"
+                        | "SourceArithmetic"
+                        | "PortableInterpretation"
+                )
+            )
+        {
+            return Err("invalid intensity interpretation".into());
+        }
+        if !item["exact"].is_null() {
+            intensity_fraction(&item["exact"])?;
+        }
+        for id in item["source_ids"]
+            .as_array()
+            .ok_or("missing interpretation source IDs")?
+        {
+            count.reference(1)?;
+            if id.as_str().is_none_or(|s| !sources.contains(s)) {
+                return Err("intensity interpretation refers outside its source evidence".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_intensity_extension(
+    value: &serde_json::Value,
+    span: &crate::engine::performance::PerformanceReference,
+    entries: &BTreeMap<&str, &DispositionEntry>,
+    ownership: &IntensityOwnership<'_>,
+    contributors: &BTreeSet<&str>,
+    count: &mut LedgerValidationBudget,
+) -> Result<(), String> {
+    use crate::engine::performance::{Dimension, TransferStatus};
+    use crate::engine::score_intensity::POLICY;
+    if value["policy"] != POLICY
+        || span.dimension != Dimension::LinearGain
+        || !matches!(span.target.as_str(), "ustx" | "svp")
+        || !ownership.tracks.contains(span.source_track_id.as_str())
+    {
+        return Err("invalid intensity policy/dimension/source ownership".into());
+    }
+    let (start, end) = intensity_bounds(value)?;
+    for id in &span.note_ids {
+        if entries
+            .get(id.as_str())
+            .is_none_or(|e| e.item_kind != SourceItemKind::Note)
+        {
+            return Err("intensity note ID is not an inventoried note".into());
+        }
+    }
+    let provenance = value
+        .get("provenance")
+        .ok_or("missing intensity provenance")?;
+    if let Some(items) = provenance.as_array() {
+        for item in items {
+            intensity_provenance(item, entries, contributors, count)?;
+        }
+    } else {
+        intensity_provenance(provenance, entries, contributors, count)?;
+    }
+    let terminal = match value.get("terminalEndpoint") {
+        Some(v) => v.as_bool().ok_or("invalid intensity terminal metadata")?,
+        None => false,
+    };
+    if terminal
+        && (start != end
+            || span.start_tick != span.end_tick
+            || !span.note_ids.is_empty()
+            || span.status == TransferStatus::Mapped)
+        || (span.status == TransferStatus::Mapped && start == end)
+    {
+        return Err("intensity terminal metadata conflicts with ownership".into());
+    }
+    ownership.validate_span(span, start, end, terminal, count)?;
+    if let Some(items) = provenance.as_array() {
+        for item in items {
+            ownership.authenticate_provenance(item, span, start, end, count)?;
+        }
+    } else {
+        ownership.authenticate_provenance(provenance, span, start, end, count)?;
+    }
+    // Controller ownership is independent of whether an attack/score field
+    // also contributed. Same-port cross-track controllers are legitimate.
+    let controller_support = ownership.validate_controllers(span, contributors, count)?;
+    let has_provenance = provenance.as_array().is_none_or(|items| !items.is_empty());
+    if !has_provenance {
+        // An empty score provenance list cannot authenticate an authored curve.
+        // MIDI controller-only intervals may use this shape when another note
+        // enabled the common intensity adapter. Authenticate their actual CC
+        // contributors against independently inventoried physical port/channel.
+        let curve = &value["curve"];
+        let neutral_curve = curve.is_null()
+            || curve == "Absent"
+            || curve.as_object().is_some_and(|o| {
+                o.len() == 1 && o.get("Held").is_some_and(serde_json::Value::is_null)
+            });
+        if !neutral_curve
+            || value.get("segments").is_some()
+            || !controller_support
+            || span
+                .note_ids
+                .iter()
+                .any(|id| ownership.notes[id.as_str()].explicit_attack)
+        {
+            return Err(
+                "intensity has no score provenance or inventoried controller support".into(),
+            );
+        }
+    }
+    if let Some(curve) = value.get("curve").filter(|c| !c.is_null()) {
+        intensity_curve(curve)?;
+    }
+    if let Some(segments) = value.get("segments") {
+        if span.target != "svp"
+            || span.status != TransferStatus::Unsupported
+            || !provenance.is_array()
+        {
+            return Err("invalid SVP intensity report".into());
+        }
+        let mut previous_end = None;
+        for segment in segments.as_array().ok_or("invalid intensity segments")? {
+            count.reference(1)?;
+            let (a, b) = intensity_bounds(segment)?;
+            if a == b {
+                return Err("intensity segment must have positive ordinary duration".into());
+            }
+            if previous_end.is_some_and(|previous| a < previous) {
+                return Err("intensity segments overlap or are out of order".into());
+            }
+            previous_end = Some(b);
+            // Reports retain whole source segments which intersect the note;
+            // clipping here would erase the authored transition endpoints.
+            if a >= end || b <= start || !segment["attack_only"].is_boolean() {
+                return Err("intensity segment has no owned interval".into());
+            }
+            intensity_curve(&segment["curve"])?;
+            if !segment["provenance"].is_null() {
+                intensity_provenance(&segment["provenance"], entries, contributors, count)?;
+                ownership.authenticate_provenance(
+                    &segment["provenance"],
+                    span,
+                    a.max(start),
+                    b.min(end),
+                    count,
+                )?;
+            } else if segment["curve"] != "Absent"
+                && !(segment["curve"].as_object().is_some_and(|o| {
+                    o.len() == 1 && o.get("Held").is_some_and(serde_json::Value::is_null)
+                }))
+            {
+                return Err("authored intensity segment has no source provenance".into());
+            }
+            if let Some(transition) = segment["curve"].get("Transition") {
+                let (curve_start, curve_end) = intensity_bounds(transition)?;
+                if a < curve_start || b > curve_end {
+                    return Err("intensity segment exceeds its authored transition".into());
+                }
+            }
+        }
+    } else if value.get("targetStart").is_some() || value.get("targetEnd").is_some() {
+        let a = value["targetStart"]
+            .as_i64()
+            .ok_or("invalid intensity target bounds")?;
+        let b = value["targetEnd"]
+            .as_i64()
+            .ok_or("invalid intensity target bounds")?;
+        if span.target != "ustx"
+            || span.target_track.is_none()
+            || span.note_ids.is_empty()
+            || !provenance.is_array()
+            || a < 0
+            || b < a
+            || b > i64::from(i32::MAX)
+            || start == end
+            || value["rounding"] != "nearest, ties away from zero"
+            || !value["limitedNienteTail"].is_boolean()
+            || value.get("curve").is_none()
+        {
+            return Err("invalid USTX intensity gain report".into());
+        }
+        if span.status == TransferStatus::Mapped && a == b {
+            return Err("mapped intensity requires a positive target interval".into());
+        }
+        if i64::from(crate::engine::performance::exact_target_tick(start)?) != a
+            || i64::from(crate::engine::performance::exact_target_tick(end)?) != b
+        {
+            return Err("exact intensity bounds disagree with target endpoints".into());
+        }
+        if value["limitedNienteTail"] == false {
+            if let Some(transition) = value["curve"].get("Transition") {
+                let (curve_start, curve_end) = intensity_bounds(transition)?;
+                if start < curve_start || end > curve_end {
+                    return Err("intensity gain interval exceeds its authored transition".into());
+                }
+            }
+        }
+        if value["limitedNienteTail"] == true {
+            let curve = &value["curve"]["Transition"];
+            let (a, b) = intensity_bounds(curve)?;
+            if span.status != TransferStatus::RepresentationLimit
+                || curve["domain"] != "LinearGain"
+                || (curve["from"] != "Silence" && curve["to"] != "Silence")
+                || start < a
+                || end > b
+            {
+                return Err("limited intensity floor has no authored niente transition".into());
+            }
+        }
+    } else if !provenance.is_object()
+        || value.get("terminalEndpoint").is_none()
+        || span.status == TransferStatus::Mapped
+        || (value.get("curve").is_some() && !terminal)
+    {
+        return Err("unsupported intensity extension structure".into());
+    }
+    Ok(())
 }
 
 /// Builds a complete disposition for each item retained by the current rich
@@ -606,6 +2499,34 @@ pub fn build_preservation_ledger(
             );
             match &event.kind {
                 Kind::NoteOn(note) if note.velocity != Some(0) => {
+                    if matches!(
+                        midi.source_format,
+                        midi::SourceFormat::StandardMidi | midi::SourceFormat::KaraokeMidi
+                    ) && note.velocity.is_some()
+                    {
+                        let id =
+                            crate::engine::performance::attack_field_id(&track.id, event.order);
+                        let (disposition, mapped) = if let Some(policy) =
+                            projection.performance_mapped.get(&id)
+                        {
+                            (
+                                PrimaryDisposition::ProjectedMapped {
+                                    policy: policy.clone(),
+                                    limitations: projection.performance_unmapped.get(&id).cloned(),
+                                },
+                                true,
+                            )
+                        } else {
+                            (PrimaryDisposition::SourceOnly {reason:projection.performance_unmapped.get(&id).cloned().unwrap_or_else(||"Explicit attack field is retained without an editable target mapping".into())},false)
+                        };
+                        push_entry(
+                            &mut entries,
+                            id,
+                            SourceItemKind::Event,
+                            disposition,
+                            artifact_paths(mapped, None, layout),
+                        );
+                    }
                     let note_id = note_instance_id(&track.id, &note.source, event.order);
                     let note_projected = projection.source_ids.contains(&note_id);
                     push_entry(
@@ -692,6 +2613,29 @@ pub fn build_preservation_ledger(
             artifact_paths(false, None, layout),
         );
     }
+    if let Some(input) = &midi.score_intensity {
+        for id in input.retained.keys() {
+            let (disposition, mapped) = if let Some(policy) = projection.performance_mapped.get(id)
+            {
+                (
+                    PrimaryDisposition::ProjectedMapped {
+                        policy: policy.clone(),
+                        limitations: projection.performance_unmapped.get(id).cloned(),
+                    },
+                    true,
+                )
+            } else {
+                (PrimaryDisposition::SourceOnly { reason:projection.performance_unmapped.get(id).cloned().unwrap_or_else(||"Retained authored score expression without an eligible editable target span".into()) },false)
+            };
+            push_entry(
+                &mut entries,
+                id.clone(),
+                SourceItemKind::Event,
+                disposition,
+                artifact_paths(mapped, None, layout),
+            );
+        }
+    }
     for entry in &mut entries {
         entry.performance_refs = projection
             .performance_refs
@@ -717,6 +2661,17 @@ pub fn build_preservation_ledger(
         .map(|entry| entry.source_id.clone())
         .collect();
     PreservationLedger {
+        intensity_context: if projection
+            .performance_spans
+            .iter()
+            .any(|span| span.intensity.is_some())
+        {
+            // The public builder is infallible; a failed bounded preflight leaves
+            // required context absent, so validation refuses publication.
+            build_intensity_context(midi, projection).ok()
+        } else {
+            None
+        },
         schema_version: if projection.performance_spans.is_empty() {
             SCHEMA_VERSION
         } else {
@@ -2872,6 +4827,7 @@ pub(crate) mod tests {
                 project: empty_project(target),
                 stem_plan,
                 ledger: PreservationLedger {
+                    intensity_context: None,
                     performance_spans: Vec::new(),
                     schema_version: SCHEMA_VERSION,
                     expected_source_ids: vec![entry.source_id.clone()],
@@ -4569,6 +6525,201 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn exact_intensity_bounds_are_validated_without_requiring_the_optional_extension() {
+        use crate::engine::performance::{Dimension, PerformanceReference, TransferStatus};
+        let span = PerformanceReference {
+            intensity: None,
+            target: "ustx".into(),
+            target_track: None,
+            source_track_id: "score-part".into(),
+            dimension: Dimension::LinearGain,
+            start_tick: 0,
+            end_tick: 480,
+            note_ids: vec![],
+            status: TransferStatus::Unsupported,
+            detail: "retained source intent".into(),
+        };
+        let mut ledger = PreservationLedger {
+            intensity_context: None,
+            schema_version: 3,
+            expected_source_ids: vec![],
+            entries: vec![],
+            performance_spans: vec![span],
+        };
+        let allowed = BTreeSet::new();
+        assert!(ledger.validate(&allowed).is_ok());
+        let legacy_bytes = serde_json::to_vec(&ledger).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy_bytes).contains("intensity"));
+        let legacy: PreservationLedger = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert!(legacy.validate(&allowed).is_ok());
+        ledger.expected_source_ids = vec!["track:score-part".into(), "expression:dynamic".into()];
+        ledger.entries = ledger
+            .expected_source_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| DispositionEntry {
+                source_id: id.clone(),
+                item_kind: if i == 0 {
+                    SourceItemKind::Track
+                } else {
+                    SourceItemKind::Event
+                },
+                disposition: PrimaryDisposition::SourceOnly {
+                    reason: "retained".into(),
+                },
+                artifact_paths: vec!["source/source.xml".into()],
+                performance_refs: if i == 0 { vec![] } else { vec![0] },
+            })
+            .collect();
+        let allowed = BTreeSet::from(["source/source.xml".into()]);
+        let owner = IntensityScoreOwner {
+            part: "score-part".into(),
+            staff: "".into(),
+            voice: "".into(),
+            instrument: None,
+        };
+        ledger.intensity_context = Some(IntensityContext {
+            source_ppq: 480,
+            source_tracks: vec!["score-part".into()],
+            source_notes: vec![],
+            controllers: vec![],
+            projected_notes: vec![],
+            score_owners: vec![IntensityScoreTrack {
+                source_track_id: "score-part".into(),
+                owner: owner.clone(),
+            }],
+            declarations: vec![IntensityDeclarationSource {
+                source_id: "expression:dynamic".into(),
+                kinds: serde_json::json!(["Dynamic"]),
+                scope: serde_json::json!({"Part":"score-part"}),
+                at: serde_json::json!({"numerator":0,"denominator":1}),
+                note_source_id: None,
+                paired_source_ids: Vec::new(),
+                applications: vec![IntensityDeclarationApplication {
+                    owner,
+                    occurrence: 1,
+                    repeat_pass: 1,
+                    active: true,
+                    start: serde_json::json!({"numerator":0,"denominator":1}),
+                    end: serde_json::json!({"numerator":8_000_000,"denominator":1}),
+                }],
+            }],
+        });
+        let extension = |bounds: serde_json::Value| {
+            serde_json::json!({
+                "policy":"verse-score-intensity-v1", "start":bounds["start"], "end":bounds["end"],
+                "terminalEndpoint":false, "provenance":{
+                    "policy":"verse-score-intensity-v1", "scope":{"Part":"score-part"},
+                    "occurrence":1,"repeat_pass":1,"interpretations":[],
+                    "evidence":[{"source_ids":["expression:dynamic"],"contract":"MusicXml",
+                        "saving_version":null,"layout":"4.0","raw_fields":{"xml":"<dynamics><p/></dynamics>"}}]
+                }
+            })
+        };
+        for bounds in [
+            serde_json::json!({"start":{"numerator":0,"denominator":1},"end":{"numerator":1,"denominator":3}}),
+            serde_json::json!({"start":{"numerator":0,"denominator":1},"end":{"numerator":"10000333333333333333348","denominator":1000000000000000000i64}}),
+        ] {
+            let value = extension(bounds);
+            let (start, end) = intensity_bounds(&value).unwrap();
+            let (a, b) =
+                crate::engine::performance::exact_source_tick_bounds(start, end, 480).unwrap();
+            ledger.performance_spans[0].start_tick = a;
+            ledger.performance_spans[0].end_tick = b;
+            ledger.performance_spans[0].intensity = Some(value);
+            let bytes = serde_json::to_vec(&ledger).unwrap();
+            let reopened: PreservationLedger = serde_json::from_slice(&bytes).unwrap();
+            assert!(reopened.validate(&allowed).is_ok());
+        }
+        for bad in [
+            serde_json::json!({"start":{"numerator":0,"denominator":1},"end":{"numerator":"999999999999999999999999999999999999999999999","denominator":1}}),
+            serde_json::json!({"start":{"numerator":0,"denominator":0},"end":{"numerator":1,"denominator":1}}),
+            serde_json::json!({"start":{"numerator":2,"denominator":3},"end":{"numerator":1,"denominator":3}}),
+            serde_json::json!({"start":{"numerator":-1,"denominator":1},"end":{"numerator":1,"denominator":1}}),
+            serde_json::json!({"start":0,"end":1}),
+        ] {
+            ledger.performance_spans[0].intensity = Some(extension(bad));
+            assert!(matches!(
+                ledger.validate(&allowed),
+                Err(BundleError::InvalidLedger(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn validation_budget_covers_actual_saved_common_contributor_path() {
+        let body = format!("<direction><direction-type><dynamics><p/></dynamics></direction-type></direction>{}", "<note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><lyric><text>la</text></lyric></note>".repeat(1500));
+        let source = crate::engine::musicxml::parse(format!(r#"<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list><part id="P1"><measure><attributes><divisions>480</divisions></attributes>{body}</measure></part></score-partwise>"#).as_bytes()).unwrap();
+        let outcome = crate::engine::convert::convert_midi_with_target(
+            &source,
+            "english",
+            None,
+            ExportTarget::Ustx,
+        );
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let root = temp_dir("validation-common-contributor");
+        let layout = BundleLayout::new(
+            &root.join("Common.versebundle"),
+            "source.xml",
+            ExportTarget::Ustx,
+        )
+        .unwrap();
+        let stems = StemPlan::from_source(&source, &outcome.tracks).unwrap();
+        let allowed = [
+            layout.source_relative_path.clone(),
+            layout.project_relative_path.clone(),
+        ]
+        .into_iter()
+        .chain(
+            stems
+                .stems
+                .iter()
+                .map(|s| layout.stem_audio_relative_path(s)),
+        )
+        .collect();
+        let ledger = build_preservation_ledger(&source, &outcome.projection, &layout, &stems);
+        assert!(
+            ledger
+                .entries
+                .iter()
+                .any(|e| e.performance_refs.len() >= 1500),
+            "one legitimate held declaration shared by every note"
+        );
+        let path = root.join("preservation.json");
+        fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+        let saved: PreservationLedger = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        saved.validate(&allowed).unwrap();
+        for limits in [
+            LedgerValidationLimits {
+                references: 8,
+                ..LedgerValidationLimits::default()
+            },
+            LedgerValidationLimits {
+                bytes: 512,
+                ..LedgerValidationLimits::default()
+            },
+            LedgerValidationLimits {
+                work: 8,
+                ..LedgerValidationLimits::default()
+            },
+        ] {
+            assert!(
+                matches!(saved.validate_with_limits(&allowed, limits), Err(BundleError::InvalidLedger(message)) if message == "performance evidence exceeds bounded storage")
+            );
+        }
+        // A reverse vector exceeding the real reference ceiling is refused
+        // before iterating it or allocating the reciprocal index.
+        let mut bad = saved;
+        bad.entries[0].performance_refs = vec![0; 250_001];
+        fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        let bad: PreservationLedger = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            matches!(bad.validate(&allowed), Err(BundleError::InvalidLedger(message)) if message == "performance evidence exceeds bounded storage")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn duplicate_source_ids_are_rejected_instead_of_deduplicated() {
         let allowed = BTreeSet::from(["source/source.mid".to_string()]);
         let entry = DispositionEntry {
@@ -4581,6 +6732,7 @@ pub(crate) mod tests {
             artifact_paths: vec!["source/source.mid".into()],
         };
         let ledger = PreservationLedger {
+            intensity_context: None,
             performance_spans: Vec::new(),
             schema_version: SCHEMA_VERSION,
             expected_source_ids: vec!["duplicate".into(), "duplicate".into()],
@@ -4743,6 +6895,7 @@ pub(crate) mod tests {
         ];
         let tracks = vec![metadata];
         let midi = Midi {
+            score_intensity: None,
             staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),
@@ -4835,6 +6988,7 @@ pub(crate) mod tests {
         }
         let tracks = vec![words, melody];
         let midi = Midi {
+            score_intensity: None,
             staff_links: Vec::new(),
             ticks_per_beat: 480,
             time_base: TimeBase::PulsesPerQuarter(480),

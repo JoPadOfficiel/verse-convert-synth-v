@@ -5,5 +5,6 @@ pub mod musescore;
 pub mod musicxml;
 pub mod performance;
 pub mod projection;
+pub mod score_intensity;
 pub mod syllable;
 pub mod target;
