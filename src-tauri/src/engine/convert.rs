@@ -114,6 +114,12 @@ pub struct ProjectionEvidence {
     /// IDs use the exact namespace consumed by the preservation ledger:
     /// `track:…`, `event:…`, `note:…`, and `lyric:…`.
     pub source_ids: BTreeSet<String>,
+    /// Editable expression is a mapped target policy, never `ProjectedExact`.
+    /// Kept separate so a source snapshot/stem cannot imply an active curve.
+    pub performance_mapped: BTreeMap<String, String>,
+    pub performance_unmapped: BTreeMap<String, String>,
+    pub performance_spans: Vec<crate::engine::performance::PerformanceReference>,
+    pub performance_refs: BTreeMap<String, Vec<usize>>,
 }
 
 pub(crate) fn note_instance_id(
@@ -753,6 +759,7 @@ fn french_source_context(
                                     && other.is_none_or(|other| Some(other) == *lyric)))
                     });
                     ProjectedNote {
+                        performance: None,
                         onset_ticks: first.onset,
                         duration_ticks: first.duration,
                         pitch: first.pitch.unwrap_or(60),
@@ -822,6 +829,7 @@ fn french_source_context(
 
 struct TrackProjection<'a> {
     source_track_id: &'a str,
+    performance: &'a crate::engine::performance::PerformanceIndex,
     lanes: &'a [String],
     standalone: &'a HashMap<usize, TimedLyric>,
     evidence: &'a mut ProjectionEvidence,
@@ -947,7 +955,7 @@ fn project_track(
             }
         }
         note_ids.push(note_id.clone());
-        projection.evidence.source_ids.insert(note_id);
+        projection.evidence.source_ids.insert(note_id.clone());
         projection.evidence.source_ids.insert(format!(
             "event:{}:{}",
             projection.source_track_id, source_note.source_order
@@ -957,6 +965,22 @@ fn project_track(
             projection.source_track_id, source_note.end_order
         ));
         projected_notes.push(ProjectedNote {
+            performance: projection
+                .performance
+                .notes
+                .get(&(
+                    projection.source_track_id.to_string(),
+                    source_note.source_order,
+                ))
+                .and_then(|key| {
+                    projection.performance.channels.get(key).map(|timeline| {
+                        crate::engine::performance::PerformanceNote {
+                            source_id: note_id,
+                            key: *key,
+                            timeline: timeline.clone(),
+                        }
+                    })
+                }),
             onset_ticks: source_note.onset,
             duration_ticks: source_note.duration,
             pitch,
@@ -1425,6 +1449,10 @@ pub fn convert_midi_with_profile(
     let mut report: Vec<TrackReport> = Vec::new();
     let mut total_placed = 0usize;
     let mut projection = ProjectionEvidence::default();
+    let performance = match crate::engine::performance::normalize(midi) {
+        Ok(performance) => performance,
+        Err(error) => return fail(error),
+    };
     let notes_by_track: Vec<_> = midi.tracks.iter().map(extract_notes).collect();
     let contextual_french = if profile == PronunciationProfile::FrenchMillefeuille {
         french_source_context(midi, &notes_by_track)
@@ -1565,6 +1593,7 @@ pub fn convert_midi_with_profile(
                     notes,
                     TrackProjection {
                         source_track_id: &track.id,
+                        performance: &performance,
                         lanes: group,
                         standalone,
                         evidence: &mut projection,
@@ -1810,6 +1839,142 @@ pub fn convert_midi_with_profile(
         tempos: tempo,
         tracks: projected_tracks,
     };
+    let mut transfers = match crate::engine::target::performance_report(target, &projected) {
+        Ok(transfers) => transfers,
+        Err(error) => {
+            return fail(format!(
+                "source performance cannot be projected safely to {}: {error}",
+                target.display_name()
+            ))
+        }
+    };
+    let mut performance_budget = crate::engine::target::performance::Budget::default();
+    let accounting = (|| -> Result<(), String> {
+        use crate::engine::performance::{Dimension, PerformanceTransfer, TransferStatus};
+        let mut accounted = BTreeSet::new();
+        for transfer in &transfers {
+            performance_budget.ids(&transfer.source_ids)?;
+            accounted.extend(transfer.source_ids.iter().cloned());
+        }
+        performance_budget.work(performance.events.len())?;
+        let mut unowned =
+            std::collections::BTreeMap::<(String, Dimension), (u32, u32, Vec<String>)>::new();
+        for (id, event) in &performance.events {
+            if accounted.contains(id) {
+                continue;
+            }
+            performance_budget.references(1)?;
+            performance_budget.text(id.len())?;
+            let entry = unowned
+                .entry((event.track_id.clone(), event.dimension))
+                .or_insert((event.tick, event.tick, Vec::new()));
+            entry.0 = entry.0.min(event.tick);
+            entry.1 = entry.1.max(event.tick);
+            entry.2.push(id.clone());
+        }
+        for ((track_id, dimension), (start_tick, end_tick, source_ids)) in unowned {
+            transfers.push(PerformanceTransfer { track_id, target_track: None, dimension, start_tick, end_tick,
+                source_ids, note_ids: Vec::new(), status: TransferStatus::Unsupported,
+                message: "Source performance has no eligible editable ownership span. This includes unprojected channels, superseded state and endpoint/post-note events; source/stem retention does not imply an active vocal curve.".into() });
+        }
+        Ok(())
+    })();
+    if let Err(error) = accounting {
+        return fail(error);
+    }
+    let mut seen_performance = BTreeSet::new();
+    for transfer in transfers {
+        use crate::engine::performance::TransferStatus;
+        let mapped = transfer.status == TransferStatus::Mapped;
+        let code = match transfer.status {
+            TransferStatus::Mapped => "MIDI_PERFORMANCE_MAPPED",
+            TransferStatus::Unsupported => "MIDI_PERFORMANCE_UNSUPPORTED",
+            TransferStatus::RepresentationLimit => "MIDI_PERFORMANCE_REPRESENTATION_LIMIT",
+        };
+        // Charge references and formatted text before constructing strings or
+        // event-to-span links. Structured spans store the note list only once.
+        if let Err(error) = performance_budget
+            .ids(&transfer.note_ids)
+            .and_then(|_| performance_budget.ids(&transfer.source_ids))
+            .and_then(|_| {
+                performance_budget.text(
+                    transfer
+                        .message
+                        .len()
+                        .saturating_mul(transfer.source_ids.len().saturating_add(1)),
+                )
+            })
+        {
+            return fail(error);
+        }
+        let message = format!(
+            "{} {:?}, target track {:?}, source ticks {}..{}, affected notes [{}], source events [{}]: {}",
+            target.display_name(),
+            transfer.dimension,
+            transfer.target_track,
+            transfer.start_tick,
+            transfer.end_tick,
+            transfer.note_ids.join(", "),
+            transfer.source_ids.join(", "),
+            transfer.message
+        );
+        // The diagnostic names all affected notes once. An event-level ledger
+        // entry already has its own source ID; repeating the complete event and
+        // note inventory in every entry would grow quadratically on dense MIDI.
+        // A concise first summary per event; all target/span-specific policies
+        // remain in the shared structured table. Repeated string searching and
+        // concatenation per contributor would be quadratic for dense curves.
+        let policy = format!(
+            "{} {:?}: {}",
+            target.display_name(),
+            transfer.dimension,
+            transfer.message
+        );
+        let span_index = projection.performance_spans.len();
+        projection
+            .performance_spans
+            .push(crate::engine::performance::PerformanceReference {
+                target: target.extension().into(),
+                target_track: transfer.target_track,
+                source_track_id: transfer.track_id.clone(),
+                dimension: transfer.dimension,
+                start_tick: transfer.start_tick,
+                end_tick: transfer.end_tick,
+                note_ids: transfer.note_ids,
+                status: transfer.status,
+                detail: transfer.message,
+            });
+        for source_id in &transfer.source_ids {
+            projection
+                .performance_refs
+                .entry(source_id.clone())
+                .or_default()
+                .push(span_index);
+            let records = if mapped {
+                &mut projection.performance_mapped
+            } else {
+                &mut projection.performance_unmapped
+            };
+            records
+                .entry(source_id.clone())
+                .or_insert_with(|| policy.clone());
+        }
+        if seen_performance.insert((transfer.track_id.clone(), code, message.clone())) {
+            if let Some(track_report) = report.iter_mut().find(|r| r.source_id == transfer.track_id)
+            {
+                track_report.warnings.push(Diagnostic {
+                    code: code.into(),
+                    severity: if mapped {
+                        DiagnosticSeverity::Info
+                    } else {
+                        DiagnosticSeverity::Warning
+                    },
+                    message,
+                    source_id: transfer.source_ids.first().cloned(),
+                });
+            }
+        }
+    }
     // A target's refusal to represent this timing is observable behaviour, not
     // an export detail: `convert_files(write=false)` is the analysis path, and
     // its verdict is what the frontend reports as "convertible". Letting the
@@ -2626,6 +2791,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, (onset, duration, lyric))| ProjectedNote {
+                    performance: None,
                     onset_ticks: *onset,
                     duration_ticks: *duration,
                     pitch: 60 + index as u8,
@@ -2728,18 +2894,21 @@ mod tests {
             muted: false,
             notes: vec![
                 ProjectedNote {
+                    performance: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
                     pitch: 60,
                     lyric: word(),
                 },
                 ProjectedNote {
+                    performance: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
                     pitch: 64,
                     lyric: word(),
                 },
                 ProjectedNote {
+                    performance: None,
                     onset_ticks: 480,
                     duration_ticks: 480,
                     pitch: 67,

@@ -357,6 +357,11 @@ resolves the renderer from whatever singer the user assigns, and naming one
 would assert something about a voicebank Verse has never seen. `expressions`
 need not be authored — `Ustx.Load` calls `AddDefaultExpressions` on every load.
 
+Explicit MIDI/KAR pitch timelines are the exception to the default pitch preset:
+mapped notes use a nonempty flat base (`x: 0`, `y: 0`, `snap_first: false`) and
+disabled vibrato so PITD is applied once. Files without authored timelines keep
+the existing defaults and empty curves byte-for-byte. See the mapping below.
+
 `ustx_version` is emitted as `0.6` and never lower. For a project declaring
 less than `0.6`, `Ustx.Load` replaces the whole `time_signatures` and `tempos`
 lists with one entry each taken from the obsolete `bpm`/`beat_per_bar`/
@@ -405,6 +410,82 @@ export—use the same extension-aware snapshot parser.
 - Lyric meta events (`0x05`).
 - Generic Text meta events (`0x01`) as metadata.
 - UTF-8 text with Windows-1252 fallback while retaining raw bytes.
+
+### Editable MIDI performance in USTX (EXP-002)
+
+Native MIDI/KAR performance is normalized once in source ticks, with held values
+and original event/note IDs. State belongs to the original MIDI port/channel;
+physical tracks and polyphonic projection siblings share the applicable state.
+Nominal pitch, timing, lyrics, rests, tempo and velocity are unchanged.
+
+| Source | Editable USTX mapping |
+| --- | --- |
+| Explicit RPN 0 via CC101/100 and CC6/38 | Sensitivity in semitones plus cents; null selection is respected |
+| Pitch bend | `(raw14-8192)*(100*semitones+cents)/8192` cents, recomputed when sensitivity changes; center needs no range assumption |
+| CC7 and CC11 | Linear gain `(CC7/127)*(CC11/127)`, each absent contributor neutral |
+| Nonzero gain | DYN `round(200*log10(gain))`, at most 0.05 dB value rounding |
+| Gain zero | DYN `-240`, the consumer's exact-mute sentinel, with subsequent restoration retained |
+
+The linear gain law is an explicit conversion policy. It is **not** a universal
+GM response or a promise of identical soundfont acoustics. MIDI velocity is not
+OpenUtau VEL and is not mapped by this increment. Numeric score dynamics,
+hairpins, fades and score playback belong to subsequent work.
+
+PITD rounds to integer cents (at most 0.5 cent error) within `[-1200,1200]`.
+Positive gains that round to the mute sentinel or fall outside usable DYN range
+are reported, never clipped or changed to mute. Target event times must land
+exactly on the 480-PPQ grid, using the same refusal as notes and tempos.
+
+Guard points retain the old value at `t-1` and the new value at `t`; they prevent
+long invented ramps. The final held value covers the region endpoint. OpenUtau
+samples every five ticks from a phonemizer-dependent phrase origin. Transitions
+can therefore shift by one sample interval; its flat nominal-note base can step
+up to four ticks early. A positive held span shorter than five ticks, including
+the final span before a region/part endpoint, is a representation limit. Sounding
+spans are half-open: a controller exactly at the exclusive endpoint does not
+invalidate the preceding curve; its raw evidence is accounted for separately.
+
+Unknown sensitivity, conflicting same-tick physical-track state, unknown
+parameter entry, MPE, tuning/reset ambiguity, source portamento, SysEx, and
+14-bit CC39/43 are conservatively diagnosed. Selecting an RPN/NRPN alone is not
+a parameter write. MPE requires applicable RPN 0/6 selection plus data entry;
+unknown NRPN writes block both pitch and gain. Later unambiguous writes can
+resolve the particular conflicting controller or establish a new explicit
+sensitivity/bend state. Opaque protocol hazards remain unsupported.
+
+Unknown state divides an owner run into local spans, allowing valid earlier and
+explicitly recovered later state to transfer. A range or sampling failure omits
+its continuous known-state segment; this is deliberately conservative, not a
+promise of maximal transfer. Neutral state is restored at omitted/ownership
+boundaries. Different owners whose default pitch templates overlap, including
+short rests, receive a pitch limit. The check integrates the tempo map and
+uses the actual -40/+40 ms template extents; it preserves the other owner's
+defaults.
+
+Diagnostics distinguish `MIDI_PERFORMANCE_MAPPED`,
+`MIDI_PERFORMANCE_UNSUPPORTED`, and `MIDI_PERFORMANCE_REPRESENTATION_LIMIT`,
+with source event/note IDs, affected source spans and mapping policy. SVP retains
+raw evidence and reports unsupported editable transfer; it receives no USTX
+parameter assumptions. References intersect each event's held interval and the
+actual affected notes. Historical/future events and channels with no eligible
+editable ownership receive source-level accounting with an empty note list;
+they do not acquire invented vocal ownership. Raw source and reference audio are
+not editable curves.
+
+Indexed interval traversal avoids repeated whole-channel scans. Each adaptation
+and accounting pass has explicit work/reference/text budgets (two million work
+units, 250,000 reference charges and 32 MiB of text); exceeding them refuses
+conversion with `MIDI_PERFORMANCE_LIMIT` before a partial report is published.
+Structured ledger span tables avoid copying every affected note ID per event.
+
+The native verification pins OpenUtau Core revision
+`3f213e8993ca792c3e6f8958c92ab27eae78eac5` by assembly metadata and SHA-256.
+The [native probe](../scripts/probe-midi-performance-consumer.py) verifies real
+`Ustx.Load`, synchronous validation and the generated 0.6 migration, checks
+saved note/curve data, and rejects empty/missing-curve fixtures. It also executes
+native curve sampling and an extracted, hash-checked flat-base calculation.
+Full renderer pitch composition remains source-inspected: the probe does not
+claim an acoustic render or executed protection against double application.
 
 ### Two encodings on one track
 
@@ -768,6 +849,7 @@ lyrics from another Part or changes the source classification.
 Each item represented in the current rich source model receives one of:
 
 - `projectedExact`
+- `projectedMapped` (explicit performance conversion policy and optional limits)
 - `renderedStem`
 - `sourceOnly`
 - `metadataOnly`

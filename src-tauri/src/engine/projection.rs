@@ -128,6 +128,10 @@ pub struct ProjectedTrack {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectedNote {
+    /// Original channel ownership and a shared held performance timeline.
+    /// Travels with the note through filtering and lane splitting; never joined
+    /// back by pitch, time or display name. No target units live here.
+    pub performance: Option<crate::engine::performance::PerformanceNote>,
     pub onset_ticks: u32,
     pub duration_ticks: u32,
     pub pitch: u8,
@@ -208,6 +212,7 @@ mod tests {
 
     fn note(onset_ticks: u32, duration_ticks: u32, pitch: u8) -> ProjectedNote {
         ProjectedNote {
+            performance: None,
             onset_ticks,
             duration_ticks,
             pitch,

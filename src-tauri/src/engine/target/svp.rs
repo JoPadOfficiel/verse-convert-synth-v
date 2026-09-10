@@ -15,6 +15,65 @@ use std::collections::BTreeMap;
 /// One quarter note. A compatibility contract, not a tuning constant.
 pub const BLICKS_PER_QUARTER: u64 = 705_600_000;
 
+/// The source-owned timeline survives projection, but no verified SVP
+/// expression adapter exists in EXP-002. Empty parameters must not imply that
+/// the source supplied no performance or that a preservation stem transferred it.
+pub fn performance_report(
+    project: &ProjectedProject,
+) -> Result<Vec<crate::engine::performance::PerformanceTransfer>, String> {
+    use super::performance::{self as traversal, Budget};
+    use crate::engine::performance::{Dimension, PerformanceTransfer, TransferStatus};
+    let mut budget = Budget::default();
+    let mut reports = Vec::new();
+    for (target_track, track) in project.tracks.iter().enumerate() {
+        if !track.notes.iter().any(|n| n.performance.is_some()) {
+            continue;
+        }
+        let regions = traversal::regions(track, &mut budget)?;
+        for region in &regions.spans {
+            budget.work(128)?;
+            let notes = &regions.notes[region.notes.clone()];
+            let Some(owner) = notes[0].1.performance.as_ref() else {
+                continue;
+            };
+            let timeline = &owner.timeline;
+            for (dimension, points) in [
+                (Dimension::PitchCents, &timeline.pitch_cents),
+                (Dimension::LinearGain, &timeline.linear_gain),
+            ] {
+                let points = traversal::points_in_span(points, region.start, region.end);
+                budget.work(points.len())?;
+                for (point_index, point) in points.iter().enumerate() {
+                    let start = point.tick.max(region.start);
+                    let end = points
+                        .get(point_index + 1)
+                        .map_or(region.end, |p| p.tick.min(region.end));
+                    if start >= end {
+                        continue;
+                    }
+                    budget.references(1)?;
+                    budget.ids(&point.source_ids)?;
+                    budget.text(200 + track.source_track_id.len())?;
+                    reports.push(PerformanceTransfer {
+                    track_id: track.source_track_id.clone(), target_track: Some(target_track), dimension,
+                    start_tick: start, end_tick: end, source_ids: point.source_ids.clone(),
+                    note_ids: traversal::note_ids(notes, start, end, &mut budget)?, status: TransferStatus::Unsupported,
+                    message: "Synthesizer V editable performance transfer is unsupported; the raw source remains retained, but no pitchDelta or loudness automation was transferred.".into(),
+                });
+                }
+            }
+            reports.extend(traversal::issue_reports(
+                track,
+                target_track,
+                notes,
+                traversal::issues_in_span(&timeline.issues, region.start, region.end),
+                &mut budget,
+            )?);
+        }
+    }
+    Ok(reports)
+}
+
 #[derive(Serialize)]
 pub struct SvpProject {
     pub version: i32,
@@ -241,6 +300,9 @@ pub fn serialize(project: &ProjectedProject) -> Result<SvpProject, String> {
     if project.ticks_per_beat == 0 {
         return Err("MIDI PPQ division must be non-zero".into());
     }
+    // Keep direct writes inside the same bounded performance/refusal contract
+    // as analysis, even though SVP receives no active automation in EXP-002.
+    performance_report(project)?;
     // Note timing is refused before tempo timing, because the converter has
     // always reached its track loop before it reads the tempo map.
     let mut tracks = Vec::with_capacity(project.tracks.len());
@@ -478,30 +540,35 @@ mod tests {
                 muted: false,
                 notes: vec![
                     ProjectedNote {
+                        performance: None,
                         onset_ticks: 0,
                         duration_ticks: 480,
                         pitch: 60,
                         lyric: ProjectedLyric::Source(Box::new(Lyric::text("word", "sing".into()))),
                     },
                     ProjectedNote {
+                        performance: None,
                         onset_ticks: 480,
                         duration_ticks: 240,
                         pitch: 62,
                         lyric: ProjectedLyric::Source(Box::new(held)),
                     },
                     ProjectedNote {
+                        performance: None,
                         onset_ticks: 720,
                         duration_ticks: 240,
                         pitch: 64,
                         lyric: ProjectedLyric::Source(Box::new(split)),
                     },
                     ProjectedNote {
+                        performance: None,
                         onset_ticks: 960,
                         duration_ticks: 480,
                         pitch: 65,
                         lyric: ProjectedLyric::Extension,
                     },
                     ProjectedNote {
+                        performance: None,
                         onset_ticks: 1440,
                         duration_ticks: 480,
                         pitch: 67,
@@ -511,6 +578,7 @@ mod tests {
                         ))),
                     },
                     ProjectedNote {
+                        performance: None,
                         onset_ticks: 1920,
                         duration_ticks: 480,
                         pitch: 69,

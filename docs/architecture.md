@@ -46,6 +46,7 @@ files, build manifests, launch processes, or commit output.
 | Orchestration | `src-tauri/src/lib.rs` | Input validation, snapshot read, parse/project/export workflow |
 | Shared musical model | `engine/midi.rs` | Events, source evidence, topology, timing, repeats/navigation |
 | Projection policy | `engine/convert.rs` | Classification, lyric ownership, vocal projection, diagnostics |
+| MIDI performance | `engine/performance.rs` | Source-owned port/channel timelines in cents and linear gain; original event/note IDs and held interpolation |
 | Input adapters | `engine/midi.rs`, `musicxml.rs`, `musescore.rs` | Format-specific parsing into the shared model |
 | Projection seam | `engine/projection.rs` | Target-neutral projection in source-exact IR ticks |
 | Word reassembly | `engine/syllable.rs` | One word per run of syllables, target-neutral |

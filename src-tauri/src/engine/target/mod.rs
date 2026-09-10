@@ -8,6 +8,7 @@
 pub mod english;
 pub mod french;
 pub(crate) mod lexical;
+pub(crate) mod performance;
 pub mod svp;
 pub mod ustx;
 
@@ -137,6 +138,18 @@ pub fn validate_for(target: ExportTarget, project: &ProjectedProject) -> Result<
     }
 }
 
+/// Report editable performance using the same adaptation as the writer.
+/// Source retention and exact nominal-note evidence are separate contracts.
+pub fn performance_report(
+    target: ExportTarget,
+    project: &ProjectedProject,
+) -> Result<Vec<crate::engine::performance::PerformanceTransfer>, String> {
+    match target {
+        ExportTarget::Svp => svp::performance_report(project),
+        ExportTarget::Ustx => ustx::performance_report(project),
+    }
+}
+
 /// The write boundary: one neutral projection in, one target's file bytes out.
 ///
 /// The only place a caller needs to name a target is when it chooses one, so
@@ -214,6 +227,7 @@ mod tests {
                 source_track_id: "voice".into(),
                 muted: false,
                 notes: vec![ProjectedNote {
+                    performance: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
                     pitch: 60,
@@ -230,6 +244,7 @@ mod tests {
         lyric: ProjectedLyric,
     ) -> ProjectedNote {
         ProjectedNote {
+            performance: None,
             onset_ticks,
             duration_ticks,
             pitch,

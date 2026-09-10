@@ -40,6 +40,7 @@ pub const STEM_AUDIO_DIRECTORY: &str = "audio/stems";
 pub const PRESERVATION_RELATIVE_PATH: &str = "preservation.json";
 pub const MANIFEST_RELATIVE_PATH: &str = "manifest.json";
 const SCHEMA_VERSION: u32 = 2;
+const PERFORMANCE_LEDGER_SCHEMA_VERSION: u32 = 3;
 const MAX_TOTAL_AUDIO_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// How a project file inside `project/` names one of the bundle's own audio
@@ -295,6 +296,8 @@ pub struct BundleManifest {
 #[serde(rename_all = "camelCase")]
 pub struct PreservationLedger {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub performance_spans: Vec<crate::engine::performance::PerformanceReference>,
     pub expected_source_ids: Vec<String>,
     pub entries: Vec<DispositionEntry>,
 }
@@ -306,6 +309,8 @@ pub struct DispositionEntry {
     pub item_kind: SourceItemKind,
     pub disposition: PrimaryDisposition,
     pub artifact_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub performance_refs: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -322,6 +327,13 @@ pub enum SourceItemKind {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PrimaryDisposition {
     ProjectedExact,
+    /// Editable performance exists under a documented target conversion policy.
+    /// This is never byte/semantic exactness of the raw controller event.
+    ProjectedMapped {
+        policy: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limitations: Option<String>,
+    },
     /// The source item belongs to a source-owned Part rendered as an isolated
     /// audio stem.
     RenderedStem {
@@ -337,11 +349,75 @@ pub enum PrimaryDisposition {
 
 impl PreservationLedger {
     pub fn validate(&self, allowed_artifacts: &BTreeSet<String>) -> Result<(), BundleError> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != SCHEMA_VERSION
+            && self.schema_version != PERFORMANCE_LEDGER_SCHEMA_VERSION
+        {
             return Err(BundleError::InvalidLedger(format!(
                 "unsupported preservation schema version {}",
                 self.schema_version
             )));
+        }
+        if self.schema_version == 2
+            && (!self.performance_spans.is_empty()
+                || self.entries.iter().any(|entry| {
+                    !entry.performance_refs.is_empty()
+                        || matches!(
+                            entry.disposition,
+                            PrimaryDisposition::ProjectedMapped { .. }
+                        )
+                }))
+        {
+            return Err(BundleError::InvalidLedger(
+                "mapped performance requires preservation schema version 3".into(),
+            ));
+        }
+        let mut reference_count = self.performance_spans.len();
+        let mut text_bytes = 0usize;
+        for span in &self.performance_spans {
+            reference_count = reference_count.saturating_add(span.note_ids.len());
+            text_bytes =
+                text_bytes.saturating_add(span.note_ids.iter().map(String::len).sum::<usize>());
+            text_bytes = text_bytes
+                .saturating_add(span.detail.len())
+                .saturating_add(span.target.len())
+                .saturating_add(span.source_track_id.len());
+            if span.start_tick > span.end_tick
+                || (span.target_track.is_none() && !span.note_ids.is_empty())
+                || (span.status == crate::engine::performance::TransferStatus::Mapped
+                    && (span.target_track.is_none() || span.start_tick == span.end_tick))
+            {
+                return Err(BundleError::InvalidLedger(
+                    "invalid performance ownership span".into(),
+                ));
+            }
+        }
+        for entry in &self.entries {
+            reference_count = reference_count.saturating_add(entry.performance_refs.len());
+            if entry
+                .performance_refs
+                .iter()
+                .any(|index| *index >= self.performance_spans.len())
+            {
+                return Err(BundleError::InvalidLedger(
+                    "performance reference points outside the span table".into(),
+                ));
+            }
+            if matches!(
+                entry.disposition,
+                PrimaryDisposition::ProjectedMapped { .. }
+            ) && !entry.performance_refs.iter().any(|index| {
+                self.performance_spans[*index].status
+                    == crate::engine::performance::TransferStatus::Mapped
+            }) {
+                return Err(BundleError::InvalidLedger(
+                    "mapped disposition has no mapped target span".into(),
+                ));
+            }
+        }
+        if reference_count > 250_000 || text_bytes > 32 * 1024 * 1024 {
+            return Err(BundleError::InvalidLedger(
+                "performance evidence exceeds bounded storage".into(),
+            ));
         }
         let expected: BTreeSet<_> = self.expected_source_ids.iter().cloned().collect();
         if expected.len() != self.expected_source_ids.len() {
@@ -443,6 +519,21 @@ pub fn build_preservation_ledger(
             let event_id = format!("event:{}:{}", track.id, event.order);
             let projected = projection.source_ids.contains(&event_id);
             let (disposition, project, include_stem) = match &event.kind {
+                _ if projection.performance_mapped.contains_key(&event_id) => (
+                    PrimaryDisposition::ProjectedMapped {
+                        policy: projection.performance_mapped[&event_id].clone(),
+                        limitations: projection.performance_unmapped.get(&event_id).cloned(),
+                    },
+                    true,
+                    stem.is_some(),
+                ),
+                _ if projection.performance_unmapped.contains_key(&event_id) => (
+                    PrimaryDisposition::SourceOnly {
+                        reason: projection.performance_unmapped[&event_id].clone(),
+                    },
+                    false,
+                    stem.is_some(),
+                ),
                 Kind::NoteOn(_) | Kind::NoteOff(_) if projected => {
                     (PrimaryDisposition::ProjectedExact, true, true)
                 }
@@ -592,6 +683,13 @@ pub fn build_preservation_ledger(
             }
         }
     }
+    for entry in &mut entries {
+        entry.performance_refs = projection
+            .performance_refs
+            .get(&entry.source_id)
+            .cloned()
+            .unwrap_or_default();
+    }
     entries.sort_by(|left, right| left.source_id.cmp(&right.source_id));
     // One source lyric can be reached by more than one projection lane: a chord
     // carrying a lyric is split into several monophonic lanes, and each lane
@@ -610,7 +708,12 @@ pub fn build_preservation_ledger(
         .map(|entry| entry.source_id.clone())
         .collect();
     PreservationLedger {
-        schema_version: SCHEMA_VERSION,
+        schema_version: if projection.performance_spans.is_empty() {
+            SCHEMA_VERSION
+        } else {
+            PERFORMANCE_LEDGER_SCHEMA_VERSION
+        },
+        performance_spans: projection.performance_spans.clone(),
         expected_source_ids,
         entries,
     }
@@ -624,6 +727,7 @@ fn push_entry(
     artifact_paths: Vec<String>,
 ) {
     entries.push(DispositionEntry {
+        performance_refs: Vec::new(),
         source_id,
         item_kind,
         disposition,
@@ -2739,6 +2843,7 @@ pub(crate) mod tests {
             }],
         };
         let entry = DispositionEntry {
+            performance_refs: Vec::new(),
             source_id: "track:midi-track-0".into(),
             item_kind: SourceItemKind::Track,
             disposition: PrimaryDisposition::RenderedStem {
@@ -2758,6 +2863,7 @@ pub(crate) mod tests {
                 project: empty_project(target),
                 stem_plan,
                 ledger: PreservationLedger {
+                    performance_spans: Vec::new(),
                     schema_version: SCHEMA_VERSION,
                     expected_source_ids: vec![entry.source_id.clone()],
                     entries: vec![entry],
@@ -2905,6 +3011,7 @@ pub(crate) mod tests {
             .stem_audio_relative_path(&second);
         request.input.stem_plan.stems.push(second.clone());
         let entry = DispositionEntry {
+            performance_refs: Vec::new(),
             source_id: "track:piano".into(),
             item_kind: SourceItemKind::Track,
             disposition: PrimaryDisposition::RenderedStem {
@@ -4092,7 +4199,7 @@ pub(crate) mod tests {
     fn unknown_ledger_schema_is_blocking() {
         let root = temp_dir("ledger-schema");
         let mut request = request(&root, FakeMode::Success);
-        request.input.ledger.schema_version = SCHEMA_VERSION + 1;
+        request.input.ledger.schema_version = 4;
         assert!(matches!(
             export_bundle(request),
             Err(BundleError::InvalidLedger(_))
@@ -4105,6 +4212,7 @@ pub(crate) mod tests {
     fn duplicate_source_ids_are_rejected_instead_of_deduplicated() {
         let allowed = BTreeSet::from(["source/source.mid".to_string()]);
         let entry = DispositionEntry {
+            performance_refs: Vec::new(),
             source_id: "duplicate".into(),
             item_kind: SourceItemKind::Event,
             disposition: PrimaryDisposition::SourceOnly {
@@ -4113,6 +4221,7 @@ pub(crate) mod tests {
             artifact_paths: vec!["source/source.mid".into()],
         };
         let ledger = PreservationLedger {
+            performance_spans: Vec::new(),
             schema_version: SCHEMA_VERSION,
             expected_source_ids: vec!["duplicate".into(), "duplicate".into()],
             entries: vec![entry.clone(), entry],
