@@ -109,9 +109,11 @@ See [worker evidence](fid-003/review-1/verification.md),
 [accepted findings](fid-003/review-1/accepted-review-items.md) and
 [main integration evidence](fid-003/review-1/integrated-verification.md).
 The worker evidence deliberately excludes the later parent anonymous-ID fix;
-the integrated gate covers it. Final combined private/public corpus and real
-render sampling after EXP-003/FID-002 remain parent release gates, not claims of
-this increment. No acoustic or live UI fidelity is asserted. The 12 deliberate
+the integrated gate covers it. The current integrated real MuseScore4 4.7.4 render sample also passes: one
+full-score WAV and both expected Part stems. The first sandboxed probe aborted
+on unavailable macOS services; the isolated retry outside sandbox passed. Final
+combined private/public corpus and render sampling after EXP-003/FID-002 remain
+parent release gates. No DiffSinger acoustic or live UI fidelity is asserted. The 12 deliberate
 nonrepresentable grid cases remain refusals; no rhythm rounding is authorized.
 
 ## Isolated implementation workspace

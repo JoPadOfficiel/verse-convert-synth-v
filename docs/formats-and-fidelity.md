@@ -427,9 +427,9 @@ Nominal pitch, timing, lyrics, rests, tempo and velocity are unchanged.
 | Gain zero | DYN `-240`, the consumer's exact-mute sentinel, with subsequent restoration retained |
 
 The linear gain law is an explicit conversion policy. It is **not** a universal
-GM response or a promise of identical soundfont acoustics. MIDI velocity is not
-OpenUtau VEL and is not mapped by this increment. Numeric score dynamics,
-hairpins, fades and score playback belong to subsequent work.
+GM response or a promise of identical soundfont acoustics. EXP-003 adds nonzero
+MIDI NoteOn velocity through the shared intensity contributor described below;
+it never writes velocity into OpenUtau VEL. The CC interpretation above is unchanged.
 
 PITD rounds to integer cents (at most 0.5 cent error) within `[-1200,1200]`.
 Positive gains that round to the mute sentinel or fall outside usable DYN range
@@ -486,6 +486,62 @@ saved note/curve data, and rejects empty/missing-curve fixtures. It also execute
 native curve sampling and an extracted, hash-checked flat-base calculation.
 Full renderer pitch composition remains source-inspected: the probe does not
 claim an acoustic render or executed protection against double application.
+
+### Score and attack intensity (EXP-003)
+
+MusicXML/XML/MXL and MuseScore MSCX/MSCZ use the portable policy
+`verse-score-intensity-v1`. Standard dynamics use the declared legacy table
+(pppppp=1, p=49, mf=80, f=96, fff=126, ffff and stronger aliases=127), with
+positive level L mapped to `(L-80)/4` dB. Numeric MusicXML dynamics uses the exact
+written decimal times 0.9; a numeric sound value replaces its printed level,
+while an authored compound retains its transition or next-attack behavior.
+Explicit note velocity is an absolute attack anchor, including native MIDI/KAR
+NoteOn velocity, and preserves subsequent relative score motion. Score mute
+wins over a positive anchor. This is a relative musical interpretation, not
+MuseScore playback emulation or an acoustic velocity law.
+
+Matched wedges and HairPins produce continuous ramps in musical time. The
+resolver honors held levels, endpoint dynamics, instance velocity changes,
+known easing methods, attack-only transition settings, compound dynamics and
+an exact allowlist of crescendo/diminuendo/fade text. Missing endpoints use a
+following same-scope dynamic or one adjacent table rung with policy provenance.
+An ordinary diminuendo does not become silence. Explicit niente/fades interpolate
+linear gain to/from zero. Their positive tail uses DYN -239 only below the
+smallest positive target value, with a localized representation-limit record;
+the authored zero endpoint is DYN -240. Other range failures retain their intent
+and report the affected span without compression or clipping.
+
+Ownership follows source part/staff/voice, never invented MIDI channels.
+MuseScore 3 dynType and MuseScore 4 voiceAssignment retain their distinct source
+contracts; absent Dynamic assignment uses a declared part/instrument default.
+Recognized StaffText defaults to its staff and SystemText to the system; explicit
+assignments take precedence and retain their provenance. Unknown
+scopes remain unsupported locally. Written score timing comes from the actual
+loaders, including divisions, backups, tuplets and measure stretch. MusicXML
+sound offsets and time-only repeat passes affect playback; visual-only offsets
+do not. Each repeat destination re-evaluates written state for its pass. Ties
+retain their head's attack context, and ordinary rests preserve held score state.
+Optional exact expression-tempo decoding preserves the nominal parser's tempo
+acceptance. Unsupported exact precision limits only the timed expression that
+needs it. An attack-only transition keeps one reference throughout a sustain
+and its held endpoint. A prior velocity anchor can reuse the transition's
+already-declared L80 start; an unknown or muted reference is never guessed.
+
+The target composes intensity with the existing CC7/CC11 gain once. Manual
+master volume remains separate. Smooth DYN curves use deterministic rounding
+(nearest, ties away from zero), exact authored bounds in evidence, and integer
+target samples for the five-tick consumer phases. Supported smooth values have
+at most 0.1 dB error; short spans and range limits are explicit. Nominal notes,
+lyrics, pronunciation, pitch templates and vibrato remain unchanged. SVP retains
+source intent and reports unsupported expression transfer without assigning DYN
+numbers to SVP loudness. Authored score pitch/tuning/vibrato import remains a
+separate follow-up.
+
+Every derived span retains the policy, source version/layout, original field
+IDs, scope, occurrence, raw fields and explicit-versus-derived interpretation.
+Velocity has a separate field reference linked to the original NoteOn, so an
+unsupported expression mapping cannot override nominal-note preservation evidence.
+No newly interpreted instruction means no new score automation.
 
 ### Two encodings on one track
 

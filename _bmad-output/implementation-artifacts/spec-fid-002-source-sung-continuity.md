@@ -2,8 +2,12 @@
 title: "FID-002: Preserve source-proven sung continuity across chord lanes and verses"
 type: bugfix
 created: 2026-09-09
-status: ready-for-dev
-implementation_status: not-started
+status: in-review
+review_loop_iteration: 6
+baseline_commit: 1fa489fab16bf7b7f2fde2e63d663d41546202bf
+initial_review_baseline_commit: 28abaea44e20951a32d26a61de68c10139d34712
+execution_root: /private/tmp/verse-fid-002-sung-continuity
+implementation_status: paused-review-limit
 depends_on:
   - spec-fid-001-projected-note-evidence.md
 integration_contracts:
@@ -36,8 +40,16 @@ the bounded contract. Ready-for-dev describes the specification, not completed
 implementation or acceptance. Integrate against the parent's final FID001 metadata
 seam and current EXP work; do not independently redesign either.
 
-This turn creates this specification only. No production changes, Cargo, rendering,
-app operations, commits, or updates to other artifacts are part of this deliverable.
+The initial authoring turn produced this specification only. Implementation is
+authorized after the reviewed FID001 metadata seam is available. The parent
+coordinates the isolated worktree, serial compiler slot, integration and commits;
+workers must preserve concurrent EXP changes and must not edit original projects.
+
+## Execution coordination
+
+Implement in `/private/tmp/verse-fid-002-sung-continuity` only. This worktree contains the reviewed FID001 retention patch on top of EXP002 commit28abaea; `fid-002/integration-baseline.json` pins these pre-existing files. Preserve them and package only FID002 changes relative to that snapshot. The parent is verifying/committing FID001 in main; do not duplicate its patch or change its policy.
+
+Do not edit main production, run Cargo, compile the whole engine, render, commit, or modify original source projects without the parent allocating the appropriate integration/compiler slot. Independent light checks and read-only source inspection are permitted. Request the serial compiler slot when ready. The parent handles integration and commits. EXP003 is independently extending PerformanceNote to typed MIDI/score ownership; preserve original ownership/Arc identity and coordinate that seam with the parent. FID003 is adding source-level staff-link metadata in an isolated worktree; do not overwrite it on integration.
 
 ## Evidence and exact reproduction
 
@@ -355,3 +367,141 @@ Current source contracts inspected for this specification (SHA-256):
 
 These hashes document the integration seam read; they are not a claim that the
 parent must freeze those files or that implementation verification has passed.
+
+## Review clarification — iteration 1
+
+Apply [independent review triage](fid-002/review-triage.md), preserving the frozen
+source-fidelity contract and already passing repairs. Admit untexted endpoints
+only under typed compatible source ownership; resolve row inventories consistently.
+Independent proven tie chains must survive parallel lyrics or unison endpoints,
+while contradictory fields, missing links and conflicting same-owner claims are
+diagnosed. Verify complete lyric/predecessor/destination ownership at the final
+gate and performance source attribution through actual serialization and ledger
+construction. Bound planner work/diagnostics. Add legacy-tie and scaled-timebase
+coverage plus a real pre-change private-master comparison, keeping the current
+metadata-disabled comparison only as supplemental evidence.
+
+The user requires preserving implemented corrections. KEEP: exact two PB/one
+chant additions, five exclusions, source bytes/identities and original performance
+payloads, source-first verse eligibility, inclusive bounds, no invented singing,
+existing native positives/negatives and both targets. No destructive code reset.
+The separately diagnosed old Cabaret corpus assertions are parent-owned; they do
+not authorize changing the released harmony policy in this increment.
+
+## Combined integration review
+
+The current review covers the integrated EXP003 and FID002 source changes
+against commit1fa489fab16bf7b7f2fde2e63d663d41546202bf. Historical review artifacts
+and independent baseline goldens remain unchanged. See
+`combined-exp003-fid002/parent-integration.md` for source attribution, typed tie
+intensity adoption, bounded copying and the written-expression prepass reset.
+Current integrated verification is tracked there; status is not done until
+review findings and final available-file gates have been resolved.
+
+## Spec Change Log — combined review iteration 2
+
+The combined review and public corpus exposed interactions detailed in
+`combined-exp003-fid002/review-1/triage.md` (C01–C12). Amend the implementation
+requirements to enforce selected-attack accent ownership, complete proven tie
+reference ranges, precise source-only/terminal diagnostic ownership, active
+recognized HairPin fades, conservative duplicate wedge handling, localized
+invalid-state recovery and pre-allocation resource bounds. Final linguistic
+rewriting must preserve the meaning of proven continuity, not freeze obsolete
+pre-transform syllable ownership. Keep strict invalid-chain rejection.
+
+Reproduce each accepted finding through actual conversion or a focused resource
+fixture, rerun the public/private aggregate and pinned native gates, and record
+remaining differences explicitly. KEEP all working source geometry/identity,
+FR/EN pronunciation, original ownership, two PB/one chant restorations, five
+exclusions, intensity policy and native sampling guarantees. Preserve prior
+code and evidence per explicit user instruction; no destructive reset.
+
+### Iteration 2 corpus amendment — merged final endpoint
+
+C13: the source adapter can absorb the final covered tied chord into a later, untexted continuation chord within an authored melisma. Endpoint existence must follow the validated original tie references to that retained chord, including original occurrence, pitch and contact, rather than require the lyric owner’s own chord. This does not establish ownership by geometry: every retained intermediate still needs the existing unique touching predecessor and selected-word/gap checks. Actual loader tests cover changing-pitch intermediates, both writers and explicit pronunciation profiles, with rest/new-word negatives. The seven original notes from the a01 private source must remain in the aggregate; they must never become a baseline exception. KEEP: every frozen policy, the two PB/one chant restorations and the five explicit PB exclusions.
+
+### Iteration 2 diagnostic capacity
+
+C08 public replay exposed a legitimate multi-verse report reaching245 warnings and131115 charged bytes. Keep the1024-warning and4096-byte per-record bounds, with a512KiB total report budget so ordinary hundreds-of-note scores are not refused for their source-scoped diagnostics alone. Exceeding any boundary remains a stable SOURCE_CONTINUITY_LIMIT error with actual count/bytes. Do not drop warnings, suppress ambiguous ownership, or change the public corpus baseline. Test ordinary512-record output and each hard refusal independently.
+
+## Verification — combined iteration2 review candidate
+
+Implementation gate:732 Rust tests passed,0 failed,18 private/process helpers ignored by default; strict Clippy, formatting and diff checks passed. The affected bounded-negative assertion was rerun after a mechanical lint change. Frontend45 passed/1 optional skip, build and version0.6.3 passed on unchanged frontend sources. Public OpenScore pin6b2dc542ce2e8aa4b78c8ee62103b210efc07015:1352 discovered,1343 parsed,1277 projected,75 expected refusals,0 unexpected,0 evidence invariant failures.
+
+Configured acceptance passed: original PB/chant against independent nominal goldens and exact+2/+1 continuity identities/exclusions;22-case score intensity inventory; actual This Little924-note and Help percussion source-fidelity; complete fake-render bundles. Fresh fixtures passed the installed exact OpenUtau0.1.569.0 consumer:9 expression fixtures through real Ustx.Load/Validate and3 negative inputs;6 continuity fixtures through native validation/grouping plus6 mutated negatives. No acoustic/model fidelity claim.
+
+Evidence directory: [combined iteration2](combined-exp003-fid002/review-2/amendment-evidence.md). Root library SHA256 a0640002131209934c6858581d930af671d2830240a21a3d676de159efb3e2cf. Supplemental264-case final private aggregate and deterministic real MuseScore render are running against frozen production; neither is claimed passed here. The known corrupt Iko external fixture remains unavailable, with its pinned failure receipt. Independent review, final aggregate, new sibling preview publication and commits remain to complete the parent task.
+
+## Spec Change Log — combined review iteration 3
+
+All three iteration2 reviews were collected before triage. The non-frozen implementation/verification requirements are amended by [iteration2 triage](combined-exp003-fid002/review-2/triage.md), R2-01 through R2-15. Apply only the relevant ownership slice specified by the amendment handoff. Preserve every frozen interpretation and original baseline. KEEP all working geometry, original IDs, source bytes, pronunciation, MIDI behavior, PB+2/chant+1, a01+7 and the five PB exclusions. The user explicitly requires preserving prior corrections; amend in place without reverting them. Avoid skipped-ending dynamics, lost repeated diagnostics, unbounded evidence copies and false-positive validation. Previous gate receipts describe the frozen iteration2 candidate; rerun affected checks and final aggregate after these amendments. No new baseline exceptions.
+
+## Verification — combined iteration3 frozen review candidate
+
+All-targets Rust763passed0failed18ignored. Strict Clippy and final formatting/diff checksPASS after equivalent mechanical lint cleanup (no behavior/expectation changes). Frontend45passed1optional skip/build/version0.6.3 passed earlier on unchanged frontend. Actual source/private gatesPASS: PB/chant independently pinned historical golden manifest and generator; source-proven+2PB/+1chant holds and five exclusions;22-score intensity inventory; ThisLittle924-note/Help source fidelity; actual fake-render bundles.
+
+Fresh exact OpenUtau0.1.569.0 native gatePASS:9 expression realLoad positives,3 standard negatives and53 score-oracle negatives;6 continuity native fixtures and6 mutated negatives. Full-domain gain oracles reject truncation and unauthorized floors. This is native schema/validation/sampling evidence, not DiffSinger acoustic equivalence.
+
+Public OpenScore pin6b2dc542ce2e8aa4b78c8ee62103b210efc07015:1352discovered1343parsed1277projected75expectedineligible0unexpected0evidence-invariant failures. Actual MuseScore4.7.4 render of deterministic Holmès lc5661740 sample succeeded: full score64059702bytes and2/2Partstems,0render errors.
+
+Final264-case private aggregate completed:252serialized12expectedexact-grid refusals0discrepancies; all73source/reference hashes unchanged and66SVPprofile comparisons identical. No baseline exceptions added. RootrlibSHA25605145dd14d1947eb83ac1da2e0ac91411385da2c3590ead36139d4ef5827bdd9; exact helper/acceptance pins unchanged. Receipt: corpus-2026-09-09/final-aggregate/run-final-1788992628123088000/summary.json. Full evidence: combined-exp003-fid002/review-3/.
+
+Only independent review, new sibling preview publication and commits remain. Known corrupt external Iko fixture remains unavailable; no acoustic/model equivalence or unsupported numeric score pitch/vibrato transfer claimed.
+
+
+## Spec Change Log — combined review iteration 4
+
+All three iteration3 reviews were collected and independently triaged before editing. [Iteration3 triage](combined-exp003-fid002/review-3/triage.md), R3-01–R3-16, now adds the missing non-frozen implementation and verification requirements. Resolve performed-route tempo and simultaneous ramps without written-order winners; isolate malformed sibling instructions; use exact shared rounding; bound candidate and note-off work; preserve typed diagnostic/ledger ownership even without sounding notes; independently reject lost tie inheritance and corrupt source attribution. Keep all frozen musical interpretation and original baseline. The user explicitly requires preserving previous successful corrections: amend in place, never revert those fixes. KEEP PB+2/chant+1/a01+7, five PB exclusions, all IDs/geometry/raw bytes, FR/EN pronunciation, MIDI/no-expression behavior, native/historical pins and fixed corpus acceptance. Worker handoffs under combined-exp003-fid002/review-4 specify disjoint tasks and acceptance. Iteration3 passing receipts remain historical; rerun affected checks and final aggregate before acceptance. No new baseline exceptions.
+
+
+### Iteration4 integration clarification
+
+For source declarations in a zero-width written measure whose performed occurrence cannot be proved, retain one diagnostic per original raw identity at its exact written position and actual typed owner. Preserve the existing occurrence0/repeat_pass0 encoding with an explicit unresolved-performed-scope interpretation; no target track, no note IDs and no active expression claim. Exclude those ambiguous declarations and affected tempo candidates before performed state resolution. Do not create nominal measure duration or infer repeated occurrences. This bounded fallback is separate from positively proven performed runs and preserves compatibility.
+
+The optional intensityContext ledger extension derives its source PPQ, original note/controller ownership and final eligible note placement independently of reported spans. It is required only for new intensity-bearing evidence; legacy schema2 and no-intensity schema3 reads remain supported. Exact outward source coverage and exact nearest target rounding share the engine arithmetic without changing Time serialization. Missing or invalid required context blocks publication.
+
+
+## Verification — combined iteration4 frozen review candidate
+
+Final shared implementation: Rust all-targets798passed/0failed/18ignored; strict Clippy, fmt and diff-check pass. One test-only initializer cleanup was followed by its focused regression and all-target Clippy. Frontend remains unchanged since its45pass/1optional-skip build/version0.6.3 gate. All prepared iteration4 regressions executed, including corrected valid source fixtures; no production acceptance rule was relaxed.
+
+Configured original PB/chant against independent pinned historical goldens, exact+2/+1 holds and five PB exclusions pass. Score inventory22 cases, This Little924-note and Help source-fidelity, complete fake-render bundles pass. Native exact OpenUtau0.1.569.0:13 expression/load/sampling fixtures,3 standard negatives,107 score-oracle negatives,2 floor-free positive controls;6 continuity fixtures and6 negatives pass. Short fades use valid10-tick notes; no unsupported5-tick note is admitted.
+
+Final264-case private aggregate:252serialized12expectedexact-grid refusals0discrepancies; all73 original/reference hashes intact and66 SVP profile comparisons identical. Fixed checker/acceptance pins unchanged. Receipt: corpus-2026-09-09/final-aggregate/run-final-1788996312931194000/summary.json. Root rlib SHA2565c34bf0afba2bf0180651930506bc2d4e793183affdd09da7d5f8606b290b4fa.
+
+Pinned OpenScore1352discovered1343parsed1277projected75expectedineligible,0unexpected0evidence failures. MuseScore4.7.4 deterministic Holmès lc5661740 real render: full score64059702bytes plus2/2Partstems,0errors. These structural, target-consumer and renderer checks do not establish acoustic equivalence for every DiffSinger voice.
+
+New PB/chant sibling previews prepared and validated against the exact final candidate, original metadata and all original backing audio. No original replaced. Independent combined review, exclusive publication and commits remain. Known unavailable corrupt Iko fixture, two ambiguous3.Et readings and unsupported broader numeric score pitch/vibrato remain explicitly tracked. Evidence: combined-exp003-fid002/review-4/final-execution-evidence.json and worker/parent result documents.
+
+
+## Spec Change Log — combined review iteration 5
+
+All three iteration4 reviews were collected before independent parent triage. [Iteration4 triage](combined-exp003-fid002/review-4/triage.md), R4-01–R4-16, clarifies the non-frozen implementation and verification requirements: parser-owned written declaration membership and silent/unplayed owners; pass-aware wedge pairing; reconciled exact tempo candidates and incompatible symbol behavior; real cumulative pre-allocation accounting; independent expression/controller applicability and occurrence validation; shared export rejection of lost proven tie intensity; exact native floor checking. The generic native probe remains backward compatible; final acceptance still enumerates the complete generated fixture set.
+
+The user explicitly requires keeping existing corrections: amend in place, never revert successful changes. KEEP all original source bytes, IDs and geometry, PB+2/chant+1/a01+7, five exclusions, FR/EN pronunciation, original MIDI and no-expression behavior, all historical/native/public/private pins and passing positives/negatives. Never regenerate baselines or add acceptance exceptions. Do not change the frozen musical interpretation, nominal tempo ordering, wide rational encoding, schema2/no-intensity compatibility, or invent performed occurrences. Missing proof remains honest source-only evidence. Iteration4 passing results are historical; final integrated checks are required after these edits.
+
+Ownership and executable regression requirements are detailed in the source, performance, verification and parent amendment specs under combined-exp003-fid002/review-5. All workers edit disjoint files; parent alone owns compilation and final integration. No staging/commits until accepted review.
+
+### Iteration5 integration clarification
+
+The continuity planner records a typed Tie versus Extension relation and the original attack-root note ID only after source tie proof. Final intensity ownership context may carry this root, independently of PerformanceNote and transfer spans, so a recovered tail may truthfully attribute its head velocity. The shared target gate checks the source contact/pitch/root chain and actual inherited attack fields with a cumulative bounded read-only comparison. An extension-only melisma cannot claim a tie attack. Legitimate issue lists, tail end and permitted attack-reference refresh remain separate from immutable inherited attack context. No target geometry or musical interpretation changes follow from this bookkeeping.
+
+
+## Verification — combined iteration5 frozen review candidate
+
+The final integrated all-target Rust gate passes 834 tests, zero failed, 18 conditional tests ignored. After an equivalent short-circuit Clippy cleanup, all46 actual bundle unit tests and21 saved-ledger integration tests pass. Strict Clippy, rustfmt and whitespace checks pass. Frontend45passed/1optional-skip, production build and version0.6.3 check pass. Narrow pre-review integration fixes preserve acceptance and are documented in combined-exp003-fid002/review-5/parent-integration-fixes.md; no temporary tracing remains.
+
+Independent pinned private PB/chant nominal goldens, source-proven+2/+1 holds and five PB exclusions pass. The22-score inventory, This Little/Help source fidelity and complete fake-render bundles pass. Native OpenUtau0.1.569.0 at commit3f213e8993ca792c3e6f8958c92ab27eae78eac5 passes13 distinct expression fixtures,107 corrupted score-oracle negatives,3 actual wrong-floor target mutations,3 standard negatives,2 floor-free positives,6 continuity fixtures and6 continuity negatives. Python oracle tests8passed.
+
+Final private matrix264cases:252serialized,12expected exact-grid refusals,0discrepancies; all73original/reference hashes intact and66SVP profile comparisons identical. No checker or acceptance pin changed. Root rlib SHA2566ca72919c8b7f2cdf4fc93ff23578ad94afa9889b6294ab0ba9f735a69798c87. Compile receipt: corpus-2026-09-09/final-aggregate/compile-final-1789002943962644000/receipt.json. Matrix summary: corpus-2026-09-09/final-aggregate/run-final-1789002947752276000/summary.json; its hash matches the prior accepted checked-field results.
+
+Pinned OpenScore1352discovered/1343parsed/1277projected/75expectedineligible,0unexpected errors and0evidence failures. Final MuseScore4.7.4 Holmès lc5661740 real render passes: full score64059702bytes and2/2Partstems,0render errors. These tests do not establish acoustic equivalence across DiffSinger voices.
+
+Fresh PB/chant sibling previews are prepared and validated with1561/1566notes,5vocal lanes each and10/6unchanged original backing parts. Their bytes match the prior prepared output. Originals are untouched. Independent review, exclusive sibling publication and commits remain. Known ambiguous3.Et readings, corrupt unavailable Iko fixture and broader numeric score pitch/vibrato limitations remain tracked. Durable evidence: combined-exp003-fid002/review-5/final-execution-evidence.json, amendment-evidence.md and the worker/parent result files.
+
+
+## Review5 decision — review limit reached
+
+All three independent reviews were collected and triaged together. The decision is recorded in [iteration5 triage](combined-exp003-fid002/review-5/triage.md): 15 non-frozen implementation/verification corrections, one patch-only boundary adoption fix and two rejected findings. Parent replay against the exact tested library confirms the missing source-head check, lost inherited attack provenance and bundle-constructor validation bypass. Other retained findings document static evidence and required executable coverage; no acoustic failure is inferred from these probes.
+
+A spec-level loopback advances review_loop_iteration from5 to6. The rendered BMAD step04 requires escalation when the counter exceeds5, so implementation is paused awaiting a human decision on another bounded iteration. The tested code, full frozen patch and all existing corrections are preserved under the user's explicit KEEP instruction. No revert, staging, commit or sibling preview publication is performed at this boundary. The passing iteration5 receipts remain historical evidence for those exact bytes; they do not establish acceptance of the newly identified cases. Preserve all frozen musical interpretation, schema2/no-intensity compatibility, original source hashes and fixed private/public/native baselines.
