@@ -37,7 +37,8 @@ runs:
 ```sh
 npm ci
 node scripts/check-version.mjs
-npm run test:frontend
+npm test
+npm run test:openutau:compat
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
@@ -118,6 +119,12 @@ The normal release path is:
 Do not move, delete, or recreate a published release tag. If a released build
 is wrong, correct the source and publish a new version.
 
+Keep the release in draft until the build workflow publishes it. GitHub's
+automatic source archives do not establish that installers were built. A
+prematurely published release with zero uploaded assets can be returned to
+draft by its maintainer before recovery; never use this procedure to replace
+binaries that have already been published.
+
 ## Reusable release build
 
 [`.github/workflows/build.yml`](../.github/workflows/build.yml) is the single
@@ -127,11 +134,24 @@ manually with:
 - `tag`: a strict `vMAJOR.MINOR.PATCH` value;
 - `commit_sha`: the full lowercase 40-character commit SHA;
 - `publish_release`: whether the verified draft may become public.
+- `recover_browser_harness`: manual-only, default `false`; use the browser
+  launcher from the workflow revision when an immutable historical tag's
+  launcher fails during Chromium startup or shutdown.
 
 A manual dispatch defaults `publish_release` to `false`. This permits an
 operator to build or update a draft before a tag exists. Publication is
 stricter: the tag must already exist on `origin` and resolve to the requested
 commit.
+
+For historical browser-launcher recovery, dispatch the reviewed workflow ref
+with the original tag and its exact `commit_sha`, and set
+`recover_browser_harness: true`. Validation logs both revisions and retrieves
+only `scripts/test-pronunciation-browser.mjs` and `scripts/browser-lifecycle.mjs`
+from `github.workflow_sha`. It still runs the historical application's full
+test suite and all normal gates. Each of the six packaging jobs independently
+checks out the untouched historical application commit. This does not repair
+application bugs or authorize tag movement, asset replacement, or skipped
+assertions.
 
 ### Identity validation
 
