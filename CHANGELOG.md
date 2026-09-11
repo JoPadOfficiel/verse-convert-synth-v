@@ -5,6 +5,15 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.7.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.1...v0.7.2) (2026-09-11)
+
+
+### Bug Fixes
+
+* **bundle:** preserve decodable MuseScore audio ([dc07495](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/dc0749520d0d2edd10498916fa034aac77a5d3c4))
+* preserve MuseScore part timing in bundles ([ac88163](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/ac88163447f70fa94681ddb1f3f5b082dce4192d))
+* preserve MuseScore parts and playable stem audio ([70a688f](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/70a688fc25b23608377474735498e5eebcb2a528))
+
 ## [0.7.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.0...v0.7.1) (2026-09-11)
 
 
