@@ -263,12 +263,18 @@ bundles, recording source hashes, source Part identities, and track counts.
 Without `VERSE_BUNDLE_OUTPUT_DIR`, successful outputs are removed after testing.
 Keep scores, audio, bundles, and verification receipts in ignored local paths.
 
-MuseScore can make an isolated `--score-parts` render longer than the full
-score by inserting a silent boundary block, including when the excerpt uses a
-multi-measure rest. Verse removes only the measured excess when every removed
-frame is below the renderer's bounded silence threshold; any audible excess
-still fails the timeline check. This protects source timing and prevents a
-longer or incorrectly mapped stem from being accepted by tolerance alone.
+Native MuseScore Part renders may retain a quiet overrun of at most two seconds
+at the actual, matching sample rate. Verse checks every excess sample strictly
+after the full-score reference end: floats must be finite with absolute value
+at most `1e-4`, and integer PCM must be zero. Audible, oversized, wrong-rate,
+and other-source overruns fail. Tail inspection uses bounded memory and the
+configured output byte limit. Renderer hashes are always verified before any
+allowance; WAV headers and samples remain byte-identical, including opening
+rests and ordinary float format tag 3 required by OpenUtau's audio reader. No
+samples are removed, shifted, rewritten, or padded. Accepted tails produce a
+`MUSESCORE_QUIET_TAIL` diagnostic; length and tail checks do not establish exact
+musical alignment. Deterministic `bundle::tests::quiet_tail_` tests cover these
+checks through WAV inspection and transactional SVP/USTX bundle publication.
 
 ## Interpreting a failure
 
