@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.7.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.0...v0.7.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* harden phonetic export and OpenUtau compatibility ([b2eb0ef](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/b2eb0ef4cbf4cafa60965704003a12c7e195ea46))
+* preserve pronunciation preferences and validate phonetic exports ([db91fdf](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/db91fdf75692169ae627d9c9b50a2b07798e7346))
+
 ## [0.7.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.6.3...v0.7.0) (2026-09-10)
 
 
