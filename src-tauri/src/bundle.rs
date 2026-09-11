@@ -3669,9 +3669,14 @@ fn export_bundle_with_hook_and_progress(
             &published_path,
             "publish rendered stem into staging",
         )?;
+        let tail_normalized = if request.input.source_format == "museScore" {
+            normalize_musescore_part_tail(&published_path, &reference_wav)?
+        } else {
+            false
+        };
         let wav =
             validate_wav_allowing_silence(&published_path, request.render_limits.max_output_bytes)?;
-        if wav.sha256 != rendered_part.wav.sha256 {
+        if !tail_normalized && wav.sha256 != rendered_part.wav.sha256 {
             return Err(BundleError::Integrity(format!(
                 "stem {} changed after validation",
                 stem.stem_id
@@ -3923,6 +3928,124 @@ fn ensure_same_timeline(
     Ok(())
 }
 
+/// MuseScore can leave a small boundary difference when rendering an isolated
+/// `--score-parts` excerpt compared with the full score render. Remove the
+/// excess only when it is an entirely silent block in the isolated stem. This
+/// preserves every non-zero sample and keeps the strict timeline check active.
+fn normalize_musescore_part_tail(path: &Path, reference: &WavInfo) -> Result<bool, BundleError> {
+    const MAX_TAIL_FRAMES: u64 = 44_100 * 2;
+
+    let info = validate_wav_allowing_silence(path, u64::MAX)?;
+    if info.sample_rate != reference.sample_rate || info.frames <= reference.frames {
+        return Ok(false);
+    }
+
+    let extra = info.frames - reference.frames;
+    if extra > MAX_TAIL_FRAMES {
+        return Ok(false);
+    }
+
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|error| BundleError::Integrity(format!("cannot inspect stem tail: {error}")))?;
+    let spec = reader.spec();
+    let tmp = path.with_extension("trimmed.wav");
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            let samples = reader
+                .samples::<f32>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    BundleError::Integrity(format!("cannot read stem tail: {error}"))
+                })?;
+            let Some(remove) =
+                silent_frame_range(&samples, spec.channels as usize, extra as usize, |sample| {
+                    sample.abs() <= 1.0e-4
+                })
+            else {
+                return Ok(false);
+            };
+            let mut writer = hound::WavWriter::create(&tmp, spec).map_err(|error| {
+                BundleError::Integrity(format!("cannot create normalized stem: {error}"))
+            })?;
+            for (index, sample) in samples.into_iter().enumerate() {
+                if remove.contains(&(index / spec.channels as usize)) {
+                    continue;
+                }
+                writer.write_sample(sample).map_err(|error| {
+                    BundleError::Integrity(format!("cannot write normalized stem: {error}"))
+                })?;
+            }
+            writer.finalize().map_err(|error| {
+                BundleError::Integrity(format!("cannot finalize normalized stem: {error}"))
+            })?;
+        }
+        hound::SampleFormat::Int => {
+            let samples = reader
+                .samples::<i32>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    BundleError::Integrity(format!("cannot read stem tail: {error}"))
+                })?;
+            let Some(remove) =
+                silent_frame_range(&samples, spec.channels as usize, extra as usize, |sample| {
+                    sample == 0
+                })
+            else {
+                return Ok(false);
+            };
+            let mut writer = hound::WavWriter::create(&tmp, spec).map_err(|error| {
+                BundleError::Integrity(format!("cannot create normalized stem: {error}"))
+            })?;
+            for (index, sample) in samples.into_iter().enumerate() {
+                if remove.contains(&(index / spec.channels as usize)) {
+                    continue;
+                }
+                writer.write_sample(sample).map_err(|error| {
+                    BundleError::Integrity(format!("cannot write normalized stem: {error}"))
+                })?;
+            }
+            writer.finalize().map_err(|error| {
+                BundleError::Integrity(format!("cannot finalize normalized stem: {error}"))
+            })?;
+        }
+    }
+    fs::rename(tmp, path).map_err(|error| {
+        BundleError::Integrity(format!("cannot replace normalized stem: {error}"))
+    })?;
+    Ok(true)
+}
+
+fn silent_frame_range<T: Copy, F: Fn(T) -> bool>(
+    samples: &[T],
+    channels: usize,
+    frames_to_remove: usize,
+    is_silent: F,
+) -> Option<std::ops::Range<usize>> {
+    if channels == 0 || frames_to_remove == 0 || !samples.len().is_multiple_of(channels) {
+        return None;
+    }
+    let frames = samples.len() / channels;
+    let mut run_start = None;
+    for frame in 0..=frames {
+        let silent = frame < frames
+            && samples[frame * channels..(frame + 1) * channels]
+                .iter()
+                .copied()
+                .all(&is_silent);
+        if silent && run_start.is_none() {
+            run_start = Some(frame);
+        }
+        if !silent {
+            if let Some(start) = run_start.take() {
+                if frame - start >= frames_to_remove {
+                    return Some(start..start + frames_to_remove);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug)]
 struct RenderedStem {
     descriptor: StemDescriptor,
@@ -4007,8 +4130,9 @@ fn midi_source_parts(
         .collect()
 }
 
-/// Where each source Part sits in `parts`, in source Part order, or `None`
-/// when the containers do not say which Part they hold.
+/// Where each source Part's standalone container sits in `parts`, in source
+/// Part order. An empty slot preserves a Part seen only in combined excerpts;
+/// an absent ordering retains compatibility with wholly unidentified containers.
 ///
 /// `--score-parts` returns the excerpts already saved in the score alongside
 /// the one-per-instrument parts it can cut, so a score whose author saved a
@@ -4016,27 +4140,42 @@ fn midi_source_parts(
 /// source Part and must never be rendered as one. MuseScore stamps each Part it
 /// writes with the id that Part has in the score, which both says which Part a
 /// container holds and orders the containers the way the score does.
-fn single_source_part_container_order(parts: &[ExtractedScorePart]) -> Option<Vec<usize>> {
-    let mut kept: Vec<(u64, usize)> = Vec::with_capacity(parts.len());
-    let mut seen = BTreeSet::new();
+fn single_source_part_container_order(
+    parts: &[ExtractedScorePart],
+) -> Result<Option<Vec<Option<usize>>>, BundleError> {
+    let mut source_parts = BTreeMap::<u64, Option<usize>>::new();
+    let mut unidentified = false;
+    let mut combined = false;
     for (index, part) in parts.iter().enumerate() {
-        let ids = crate::engine::musescore::container_part_ids(&part.mscz)?;
-        match ids.as_slice() {
-            [Some(id)] => {
-                let order = id.parse::<u64>().ok()?;
-                if seen.insert(order) {
-                    kept.push((order, index));
-                }
+        let Some(ids) = crate::engine::musescore::container_part_ids(&part.mscz) else {
+            unidentified = true;
+            continue;
+        };
+        let standalone = ids.len() == 1;
+        combined |= ids.len() > 1;
+        for id in ids {
+            let Some(order) = id.and_then(|id| id.parse::<u64>().ok()) else {
+                unidentified = true;
+                continue;
+            };
+            // Combined excerpts establish identity slots, never stem audio.
+            let slot = source_parts.entry(order).or_default();
+            if standalone && slot.is_none() {
+                *slot = Some(index);
             }
-            // A Part written without an id names nothing, so no container can
-            // be placed and the whole answer is unusable.
-            [None] => return None,
-            // Zero Parts, or several: not one source Part.
-            _ => {}
         }
     }
-    kept.sort_by_key(|(order, _)| *order);
-    Some(kept.into_iter().map(|(_, index)| index).collect())
+    if unidentified {
+        // Partial identity evidence cannot establish source order. In particular,
+        // an exact container count must not turn a combined excerpt into a stem.
+        if !source_parts.is_empty() || combined {
+            return Err(BundleError::Integrity(
+                "MuseScore returned incomplete source Part identities".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(source_parts.into_values().collect()))
 }
 
 fn align_extracted_parts(
@@ -4065,7 +4204,7 @@ fn align_extracted_parts(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let selection = single_source_part_container_order(&ordered);
+    let selection = single_source_part_container_order(&ordered)?;
     let mut slots: Vec<Option<ExtractedScorePart>> = ordered.into_iter().map(Some).collect();
     let Some(selection) = selection else {
         // Containers that do not name their Part: the count is the only evidence
@@ -4075,15 +4214,18 @@ fn align_extracted_parts(
         }
         return Ok(slots.into_iter().flatten().collect());
     };
-    if selection.len() < stems.len() {
-        return Err(topology_count_mismatch(selection.len(), stems.len()));
+    let standalone_count = selection.iter().flatten().count();
+    if standalone_count < stems.len() {
+        return Err(topology_count_mismatch(standalone_count, stems.len()));
     }
     stems
         .iter()
         .map(|stem| {
             selection
                 .get(stem.source_part_index)
-                .and_then(|index| slots[*index].take())
+                .copied()
+                .flatten()
+                .and_then(|index| slots[index].take())
                 .ok_or_else(|| {
                     BundleError::Integrity(format!(
                         "MuseScore extracted no Part for source Part {} of stem {}",
@@ -5773,6 +5915,132 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn combined_only_note_free_part_preserves_later_source_positions() {
+        let descriptors = vec![
+            part_descriptor("first", 0),
+            part_descriptor("second", 1),
+            part_descriptor("third", 2),
+            part_descriptor("fifth", 4),
+        ];
+        let parts = vec![
+            extracted(0, &["1"]),
+            extracted(1, &["2"]),
+            extracted(2, &["3"]),
+            extracted(3, &["5"]),
+            extracted(4, &["3", "4"]),
+        ];
+
+        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
+
+        assert_eq!(aligned.len(), 4);
+        for (part, id) in aligned.iter().zip(["1", "2", "3", "5"]) {
+            assert_eq!(part.mscz, part_container(&[id]));
+        }
+    }
+
+    #[test]
+    fn combined_only_note_free_part_alignment_is_independent_of_extraction_order() {
+        let descriptors = vec![part_descriptor("first", 0), part_descriptor("fifth", 4)];
+        let parts = vec![
+            extracted(3, &["2", "3", "4"]),
+            extracted(1, &["5"]),
+            extracted(4, &["1"]),
+            extracted(0, &["3", "4"]),
+            extracted(2, &["1", "5"]),
+        ];
+
+        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
+
+        assert_eq!(aligned.len(), 2);
+        assert_eq!(aligned[0].mscz, part_container(&["1"]));
+        assert_eq!(aligned[1].mscz, part_container(&["5"]));
+    }
+
+    #[test]
+    fn combined_only_required_part_cannot_use_a_later_standalone() {
+        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
+        let parts = vec![
+            extracted(0, &["1"]),
+            extracted(1, &["2", "3"]),
+            extracted(2, &["3"]),
+        ];
+
+        let error = align_extracted_parts("museScore", &descriptors, parts).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BundleError::Integrity(message) if message.contains("no Part for source Part 2")
+        ));
+    }
+
+    #[test]
+    fn combined_only_required_part_blocks_publication_for_both_targets() {
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let root = temp_dir("combined-only-required-part");
+            let mut request = request_for(&root, FakeMode::Success, target);
+            request.input.source_format = "museScore".into();
+            request.renderer = Arc::new(FakeRenderer::with_extracted_parts(
+                FakeMode::Success,
+                vec![extracted(0, &["1", "2"]), extracted(1, &["2"])],
+            ));
+            let destination = request.destination.clone();
+
+            assert!(matches!(
+                export_bundle(request),
+                Err(BundleError::Integrity(message))
+                    if message.contains("no Part for source Part 1")
+            ));
+            assert!(!destination.exists());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn combined_part_with_incomplete_identity_never_uses_ordinal_fallback() {
+        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
+        let parts = vec![extracted(0, &["1"]), extracted(1, &["2", "unknown"])];
+
+        assert!(align_extracted_parts("museScore", &descriptors, parts).is_err());
+    }
+
+    #[test]
+    fn part_alignment_rejects_duplicate_and_out_of_range_ordinals() {
+        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
+        for ordinal in [0, 2] {
+            let parts = vec![extracted(0, &["1"]), extracted(ordinal, &["2"])];
+            assert!(matches!(
+                align_extracted_parts("museScore", &descriptors, parts),
+                Err(BundleError::Integrity(message))
+                    if message.contains("duplicated or out-of-range Part ordinals")
+            ));
+        }
+    }
+
+    #[test]
+    fn unidentified_legacy_parts_still_require_an_exact_count() {
+        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
+        let legacy_part = |ordinal| ExtractedScorePart {
+            ordinal,
+            name: "Same".into(),
+            metadata: serde_json::Value::Null,
+            mscz: vec![ordinal as u8],
+        };
+        let aligned = align_extracted_parts(
+            "museScore",
+            &descriptors,
+            vec![legacy_part(1), legacy_part(0)],
+        )
+        .unwrap();
+        assert_eq!(aligned[0].mscz, [0]);
+        assert_eq!(aligned[1].mscz, [1]);
+        assert!(matches!(
+            align_extracted_parts("museScore", &descriptors, vec![legacy_part(0)]),
+            Err(BundleError::Integrity(message)) if message.contains("source topology")
+        ));
+    }
+
+    #[test]
     fn a_source_part_musescore_never_cut_is_still_refused() {
         let descriptors = vec![
             part_descriptor("first", 0),
@@ -5930,6 +6198,24 @@ pub(crate) mod tests {
             ..test_wav_info()
         };
         assert!(ensure_same_timeline(&reference, &resampled, "part-001").is_err());
+    }
+
+    #[test]
+    fn silent_frame_range_removes_only_the_requested_silent_block() {
+        let samples = [1_i32, 0, 0, 0, 0, 0, 2];
+        assert_eq!(
+            silent_frame_range(&samples, 1, 3, |sample| sample == 0),
+            Some(1..4)
+        );
+        assert_eq!(
+            silent_frame_range(&samples, 1, 6, |sample| sample == 0),
+            None
+        );
+        let stereo = [1_i32, 1, 0, 0, 0, 0, 2, 2];
+        assert_eq!(
+            silent_frame_range(&stereo, 2, 2, |sample| sample == 0),
+            Some(1..3)
+        );
     }
 
     #[test]
@@ -7874,57 +8160,113 @@ pub(crate) mod tests {
         let source_path = PathBuf::from(score);
         let source_bytes = fs::read(&source_path).unwrap();
         let midi = crate::engine::musescore::parse(&source_bytes).unwrap();
-        let outcome = crate::engine::convert::convert_midi(&midi, "english");
-        assert!(outcome.ok);
-        let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
-        let expected_stems = stem_plan.stems.len();
-        let vocal_tracks = crate::engine::target::svp::serialize(outcome.svp.as_ref().unwrap())
-            .expect("exactly representable")
-            .tracks
-            .len();
-        let root = temp_dir("real-bundle-gate");
-        let destination = root.join("Real.versebundle");
+        let retained_root = std::env::var_os("VERSE_BUNDLE_OUTPUT_DIR").map(PathBuf::from);
+        let root = if let Some(path) = &retained_root {
+            fs::create_dir(path).expect("the retained bundle directory must be new");
+            path.clone()
+        } else {
+            temp_dir("real-bundle-gate")
+        };
         let original_name = source_path
             .file_name()
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let layout = BundleLayout::new(&destination, &original_name, ExportTarget::Svp).unwrap();
-        let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
-        let renderer = MuseScoreRenderer::probe(Path::new(&executable)).unwrap();
-        let result = export_bundle(BundleRequest {
-            destination,
-            input: BundleInput {
-                original_name,
-                source_format: "museScore".into(),
-                source_bytes,
-                project: BundleProject::Svp(
-                    crate::engine::target::svp::serialize(&outcome.svp.unwrap())
-                        .expect("exactly representable"),
-                ),
-                stem_plan,
-                ledger,
-                warnings: vec![],
-            },
-            renderer: Arc::new(renderer),
-            render_limits: RenderLimits {
-                timeout: std::time::Duration::from_secs(5 * 60),
-                max_output_bytes: 2 * 1024 * 1024 * 1024,
-            },
-        })
-        .unwrap();
-        assert_eq!(result.stem_count, expected_stems);
-        let manifest: BundleManifest =
-            serde_json::from_slice(&fs::read(result.manifest_path).unwrap()).unwrap();
-        assert!(manifest.audio.coverage.complete);
-        assert_eq!(manifest.audio.stems.len(), expected_stems);
-        let project: serde_json::Value =
-            serde_json::from_slice(&fs::read(result.project_path).unwrap()).unwrap();
-        assert_eq!(
-            project["tracks"].as_array().unwrap().len(),
-            vocal_tracks + expected_stems + 1
-        );
-        fs::remove_dir_all(root).unwrap();
+        let renderer = Arc::new(MuseScoreRenderer::probe(Path::new(&executable)).unwrap());
+        for (name, target) in [("ustx", ExportTarget::Ustx), ("svp", ExportTarget::Svp)] {
+            let outcome = crate::engine::convert::convert_midi_with_profile(
+                &midi,
+                "english",
+                None,
+                target,
+                crate::engine::target::PronunciationProfile::EnglishArpabet,
+            );
+            assert!(outcome.ok, "{name}: {:?}", outcome.msg);
+            let projected = outcome.svp.as_ref().unwrap();
+            let vocal_tracks = projected.tracks.len();
+            let direct = crate::engine::target::serialize_to(target, projected).unwrap();
+            let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+            let expected_stems = stem_plan.stems.clone();
+            let destination = root.join(format!("Real-{name}.versebundle"));
+            let layout = BundleLayout::new(&destination, &original_name, target).unwrap();
+            let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
+            let result = export_bundle(BundleRequest {
+                destination: destination.clone(),
+                input: BundleInput {
+                    original_name: original_name.clone(),
+                    source_format: "museScore".into(),
+                    source_bytes: source_bytes.clone(),
+                    project: BundleProject::from_projection(target, projected).unwrap(),
+                    stem_plan,
+                    ledger,
+                    warnings: vec![],
+                },
+                renderer: renderer.clone(),
+                render_limits: RenderLimits {
+                    timeout: std::time::Duration::from_secs(5 * 60),
+                    max_output_bytes: 2 * 1024 * 1024 * 1024,
+                },
+            })
+            .unwrap();
+            assert_eq!(result.stem_count, expected_stems.len());
+            assert_eq!(fs::read(&result.source_path).unwrap(), source_bytes);
+            let manifest: BundleManifest =
+                serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
+            assert!(manifest.audio.coverage.complete);
+            assert_eq!(manifest.audio.stems.len(), expected_stems.len());
+            assert_eq!(manifest.source.sha256, sha256_bytes(&source_bytes));
+            verify_bundle(&destination, &layout).unwrap();
+            let saved = fs::read(&result.project_path).unwrap();
+            match target {
+                ExportTarget::Svp => {
+                    let project: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                    let direct: serde_json::Value = serde_json::from_slice(&direct).unwrap();
+                    let tracks = project["tracks"].as_array().unwrap();
+                    assert_eq!(tracks.len(), vocal_tracks + expected_stems.len() + 1);
+                    assert_eq!(
+                        &tracks[..vocal_tracks],
+                        direct["tracks"].as_array().unwrap()
+                    );
+                }
+                ExportTarget::Ustx => {
+                    let saved = std::str::from_utf8(&saved).unwrap();
+                    let audited = ustx::audit(saved).unwrap();
+                    assert_eq!(audited.wave_parts.len(), expected_stems.len() + 1);
+                    assert_eq!(
+                        audited.track_mutes.len(),
+                        vocal_tracks + expected_stems.len() + 1
+                    );
+                    assert_eq!(
+                        voice_parts_block(saved),
+                        voice_parts_block(std::str::from_utf8(&direct).unwrap())
+                    );
+                }
+            }
+            let receipt = serde_json::json!({
+                "target": name,
+                "pronunciationProfile": "englishArpabet",
+                "sourceSha256": manifest.source.sha256,
+                "sourcePartCount": midi.topology.parts.len(),
+                "vocalTracks": vocal_tracks,
+                "audioTracks": expected_stems.len() + 1,
+                "stems": expected_stems,
+                "manifestVerified": true,
+                "sourceBytesPreserved": true,
+                "vocalContentPreserved": true,
+                "bundlePath": destination,
+            });
+            write_new(
+                &root.join(format!("verification-{name}.json")),
+                &serde_json::to_vec_pretty(&receipt).unwrap(),
+                "write complete-bundle gate receipt",
+            )
+            .unwrap();
+            eprintln!("{receipt}");
+        }
+        assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+        if retained_root.is_none() {
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
