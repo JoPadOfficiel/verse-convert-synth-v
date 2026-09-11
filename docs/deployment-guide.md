@@ -148,7 +148,9 @@ with the original tag and its exact `commit_sha`, and set
 `recover_browser_harness: true`. Validation logs both revisions and retrieves
 only `scripts/test-pronunciation-browser.mjs` and `scripts/browser-lifecycle.mjs`
 from `github.workflow_sha`. It still runs the historical application's full
-test suite and all normal gates. Each of the six packaging jobs independently
+test suite and all normal gates. Recovery requires a compatible browser suite
+(24 passing cases and three reloads); an incompatible receipt fails closed.
+Each of the six packaging jobs independently
 checks out the untouched historical application commit. This does not repair
 application bugs or authorize tag movement, asset replacement, or skipped
 assertions.

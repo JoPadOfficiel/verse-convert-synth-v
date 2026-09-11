@@ -150,6 +150,9 @@ try {
     `--user-data-dir=${profile}`,
     "about:blank",
   ]);
+  // An IPC-connected test supervisor can clean this separately owned group if
+  // the harness itself stalls. Normal CLI runs have no IPC channel.
+  if (process.connected) process.send({ type: "verse-browser-owned", pid: browser.child.pid });
 
   let stage = "DevToolsActivePort";
   await withDeadline((signal) => browser.guard((async () => {
