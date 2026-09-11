@@ -724,6 +724,25 @@ fn bind_intensity(
                     continue;
                 }
                 for (i, run) in runs.iter().enumerate() {
+                    let ids = issue.provenance.evidence.iter().flat_map(|e| &e.source_ids);
+                    provenance_budget.charge(
+                        0,
+                        ids.clone().fold(0usize, |work, id| {
+                            work.saturating_add(runs.len().saturating_mul(3).saturating_add(16))
+                                .saturating_add(
+                                    input.declarations.get(id).map_or(0, |d| d.time_only.len()),
+                                )
+                        }),
+                    )?;
+                    // A ranged parser diagnostic still belongs to its original
+                    // declaration. An overlapping range cannot prove that the
+                    // measure which authored it was visited on this route.
+                    if !ids
+                        .filter(|id| input.declarations.contains_key(*id))
+                        .all(|id| input.declaration_on_route(id, owner, run.ordinal, run.pass))
+                    {
+                        continue;
+                    }
                     // A pass-filter diagnostic describes the excluded pass;
                     // applying that same time-only filter would erase it. Only
                     // a parser-pinned nonzero pass can bypass field membership.
@@ -2258,6 +2277,111 @@ fn source_voice(
 mod second_review_tests {
     use super::*;
     use crate::engine::score_intensity::{ProvenanceBudget, MAX_RESOLUTION_WORK};
+
+    fn review5_ranged_issue_source(ending: u32) -> Midi {
+        let sung = "<Chord><durationType>quarter</durationType><Lyrics><text>la</text></Lyrics><Note><pitch>60</pitch></Note></Chord>";
+        let xml = format!(
+            r#"<museScore version="4.70"><programVersion>4.6.5</programVersion><Score><Division>480</Division>
+            <Part><trackName>Voice</trackName><Staff id="1"/><Instrument id="voice"><instrumentId>voice.vocals</instrumentId></Instrument></Part><Staff id="1">
+            <Measure len="1/4"><startRepeat/><voice>{sung}</voice></Measure>
+            <Measure len="1/4"><Spanner type="Volta"><Volta><endings>{ending}</endings></Volta><next><location><measures>1</measures></location></next></Spanner><voice>
+              <Spanner type="HairPin"><HairPin><subtype>0</subtype><ticks>1440</ticks><veloChange>20</veloChange></HairPin><next><location><measures>99</measures></location></next></Spanner>{sung}
+            </voice><endRepeat>2</endRepeat></Measure>
+            <Measure len="1/4"><Spanner type="Volta"><Volta><endings>2</endings></Volta><next><location><measures>1</measures></location></next></Spanner><voice>{sung}</voice></Measure>
+            <Measure len="1/4"><voice>{sung}</voice></Measure>
+            </Staff></Score></museScore>"#
+        );
+        crate::engine::musescore::parse(xml.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn source_review5_ranged_parser_issue_does_not_replay_from_a_skipped_ending() {
+        use crate::engine::score_intensity::{IssueKind, Time};
+        let source = review5_ranged_issue_source(1);
+        let before = source.tracks.clone();
+        let input = source.score_intensity.as_ref().unwrap();
+        let parser_issue = input
+            .issues
+            .iter()
+            .find(|i| i.message.contains("outside the written score"))
+            .unwrap();
+        assert_eq!(
+            (parser_issue.start, parser_issue.end),
+            (Time::ONE, Time::integer(4))
+        );
+        let index = normalize(&source).unwrap();
+        let replayed: BTreeSet<_> = index
+            .bindings
+            .values()
+            .filter_map(|b| b.intensity.as_ref())
+            .flat_map(|i| &i.timeline.issues)
+            .filter(|i| i.kind == IssueKind::UnresolvedSpan && i.message == parser_issue.message)
+            .map(|i| {
+                (
+                    i.start,
+                    i.end,
+                    i.provenance.occurrence,
+                    i.provenance.repeat_pass,
+                )
+            })
+            .collect();
+        assert_eq!(
+            replayed,
+            BTreeSet::from([(Time::ONE, Time::integer(2), 1, 1)])
+        );
+        assert_eq!(
+            source.tracks, before,
+            "diagnostic filtering must preserve nominal notes and timing"
+        );
+    }
+
+    #[test]
+    fn source_review5_issue_replay_preserves_pass_filtered_and_unresolved_zero_ownership() {
+        use crate::engine::score_intensity::{IssueKind, Time};
+        let source = crate::engine::musicxml::parse(br#"<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list><part id="P1"><measure><attributes><divisions>480</divisions></attributes><barline location="left"><repeat direction="forward"/></barline><direction><direction-type><wedge type="crescendo"/></direction-type><sound time-only="2"/></direction><note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><lyric><text>la</text></lyric></note><barline location="right"><repeat direction="backward" times="2"/></barline></measure></part></score-partwise>"#).unwrap();
+        let index = normalize(&source).unwrap();
+        assert!(index
+            .bindings
+            .values()
+            .filter_map(|b| b.intensity.as_ref())
+            .flat_map(|i| &i.timeline.issues)
+            .any(|i| i.kind == IssueKind::PassFiltered
+                && i.start == Time::ZERO
+                && i.provenance.occurrence == 1
+                && i.provenance.repeat_pass == 1));
+
+        let skipped = review5_ranged_issue_source(3);
+        let input = skipped.score_intensity.as_ref().unwrap();
+        let parser_issue = input
+            .issues
+            .iter()
+            .find(|i| i.message.contains("outside the written score"))
+            .unwrap();
+        let id = &parser_issue.provenance.evidence[0].source_ids[0];
+        let index = normalize(&skipped).unwrap();
+        assert!(index
+            .score_issues
+            .iter()
+            .flat_map(|owner| &owner.timeline.issues)
+            .any(|i| {
+                i.provenance.occurrence == 0
+                    && i.provenance.repeat_pass == 0
+                    && i.provenance
+                        .evidence
+                        .iter()
+                        .any(|e| e.source_ids.contains(id))
+            }));
+        assert!(index
+            .bindings
+            .values()
+            .filter_map(|b| b.intensity.as_ref())
+            .flat_map(|i| &i.timeline.issues)
+            .all(|i| !i
+                .provenance
+                .evidence
+                .iter()
+                .any(|e| e.source_ids.contains(id))));
+    }
 
     #[test]
     fn parser_only_issue_replay_refuses_before_copy_under_small_budget() {

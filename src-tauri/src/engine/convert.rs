@@ -1873,8 +1873,11 @@ pub fn convert_midi_with_profile(
                 track,
                 &lyric_status,
                 source_role,
-                source_note_count,
-                0,
+                TrackNoteCounts {
+                    source: source_note_count,
+                    projectable: 0,
+                    merged_ties: 0,
+                },
                 !own_tokens.is_empty(),
                 overrides.and_then(|map| map.get(&index).copied()),
             );
@@ -2005,8 +2008,41 @@ pub fn convert_midi_with_profile(
             track,
             &lyric_status,
             source_role,
-            source_note_count,
-            projectable_notes,
+            TrackNoteCounts {
+                source: source_note_count,
+                projectable: projectable_notes,
+                merged_ties: if sing {
+                    notes
+                        .iter()
+                        .filter(|note| {
+                            if note.pitch.is_some()
+                                || note.duration == 0
+                                || note.source.unpitched.is_some()
+                            {
+                                return false;
+                            }
+                            let typed_tie = note.source.continuity.as_ref().is_some_and(|proof| {
+                                proof.incoming_tie.as_ref().is_some_and(|tie| {
+                                    tie.tail.source_id == note.source.id
+                                        && tie.tail.occurrence == note.source.occurrence
+                                        && tie.tail.playback_segment == proof.playback_segment
+                                        && tie.contact_tick == note.onset
+                                })
+                            });
+                            typed_tie
+                                || midi.score_intensity.as_ref().is_some_and(|input| {
+                                    input.ties.contains_key(&(
+                                        note.source.id.clone(),
+                                        note.source.occurrence,
+                                        note.onset,
+                                    ))
+                                })
+                        })
+                        .count()
+                } else {
+                    0
+                },
+            },
             source_vocal,
             explicit_override,
         );
@@ -3115,12 +3151,17 @@ fn staff_link_warnings(midi: &Midi) -> Vec<Diagnostic> {
     }).collect()
 }
 
+struct TrackNoteCounts {
+    source: usize,
+    projectable: usize,
+    merged_ties: usize,
+}
+
 fn track_warnings(
     track: &Track,
     status: &LyricStatus,
     source_role: SourceRole,
-    source_notes: usize,
-    projectable_notes: usize,
+    notes: TrackNoteCounts,
     source_vocal: bool,
     explicit_override: Option<bool>,
 ) -> Vec<Diagnostic> {
@@ -3138,19 +3179,34 @@ fn track_warnings(
             "UNSUPPORTED_LYRIC_CONTENT",
             DiagnosticSeverity::Warning,
             format!(
-                "{} source lyric item(s) cannot be represented as Synthesizer V text.",
+                "{} source lyric item(s) cannot be represented as vocal-project text.",
                 status.unsupported_count
             ),
             &track.id,
         ));
     }
-    if source_notes > projectable_notes {
+    if notes.merged_ties > 0 {
         warnings.push(report_warning(
+            "SOURCE_TIE_TAILS_MERGED",
+            DiagnosticSeverity::Info,
+            format!(
+                "{} source tie continuation(s) are represented by the sustained duration of their original attack, without a new attack. Original note identities remain in the source inventory.",
+                notes.merged_ties
+            ),
+            &track.id,
+        ));
+    }
+    let unprojectable = notes
+        .source
+        .saturating_sub(notes.projectable)
+        .saturating_sub(notes.merged_ties);
+    if unprojectable > 0 {
+        warnings.push(report_warning(
+            // Retain the historical code consumed by existing diagnostic clients.
             "SOURCE_NOTES_NOT_IN_VOCAL_SVP",
             DiagnosticSeverity::Info,
             format!(
-                "{} source note(s) have no source-owned pitched/duration representation for a vocal SVP track; they remain in the source and full-score mix.",
-                source_notes - projectable_notes
+                "{unprojectable} source note(s) are not separate pitched, positive-duration vocal attacks. Their notation remains in the source and applicable reference audio; no merge is inferred without retained source evidence."
             ),
             &track.id,
         ));
@@ -3362,6 +3418,99 @@ pub(crate) const RETAINED_SPLIT_FIXTURE: &str = r#"<?xml version="1.0"?>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_tie_diagnostics_distinguish_source_only_notes_in_both_targets() {
+        let head = r#"<note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><tie type="start"/><lyric><text>hold</text></lyric></note>"#;
+        let middle = r#"<note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><tie type="stop"/><tie type="start"/></note>"#;
+        let tail = r#"<note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><tie type="stop"/></note>"#;
+        let unmapped = "<note><unpitched><display-step>C</display-step><display-octave>5</display-octave></unpitched><duration>480</duration></note>";
+        for extra in ["", unmapped] {
+            let xml = format!(
+                r#"<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list><part id="P1"><measure><attributes><divisions>480</divisions></attributes><direction><direction-type><dynamics><p/></dynamics></direction-type></direction>{head}{middle}{tail}{extra}</measure></part></score-partwise>"#
+            );
+            let source = crate::engine::musicxml::parse(xml.as_bytes()).unwrap();
+            for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+                let outcome = convert_midi_with_target(&source, "english", None, target);
+                assert!(outcome.ok, "{:?}", outcome.msg);
+                let project = outcome.svp.as_ref().unwrap();
+                assert_eq!(project.tracks[0].notes.len(), 1);
+                assert_eq!(project.tracks[0].notes[0].duration_ticks, 1440);
+                let warnings: Vec<_> = outcome.tracks.iter().flat_map(|t| &t.warnings).collect();
+                let merged = warnings
+                    .iter()
+                    .find(|w| w.code == "SOURCE_TIE_TAILS_MERGED")
+                    .unwrap();
+                assert!(merged.message.starts_with("2 source tie continuation(s)"));
+                let missing = warnings
+                    .iter()
+                    .find(|w| w.code == "SOURCE_NOTES_NOT_IN_VOCAL_SVP");
+                assert_eq!(missing.is_some(), !extra.is_empty());
+                if let Some(missing) = missing {
+                    assert!(missing.message.starts_with("1 source note(s)"));
+                    assert!(!missing.message.contains("SVP"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_tie_diagnostic_requires_an_actual_vocal_projection() {
+        let head = r#"<note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><tie type="start"/></note>"#;
+        let tail = r#"<note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><tie type="stop"/></note>"#;
+        let xml = format!(
+            r#"<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Instrument</part-name></score-part></part-list><part id="P1"><measure><attributes><divisions>480</divisions></attributes>{head}{tail}</measure></part></score-partwise>"#
+        );
+        let source = crate::engine::musicxml::parse(xml.as_bytes()).unwrap();
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let outcome = convert_midi_with_target(&source, "instrumental", None, target);
+            assert!(outcome.ok, "{:?}", outcome.msg);
+            let warnings: Vec<_> = outcome.tracks.iter().flat_map(|t| &t.warnings).collect();
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|warning| warning.code == "SOURCE_TIE_TAILS_MERGED"),
+                "source tie evidence must not claim a vocal merge when no vocal track was projected"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_free_diagnostics_use_retained_tie_proof_without_guessing() {
+        let score = r#"<museScore version="2.06"><Score><Division>480</Division><Part><trackName>Voice</trackName><Staff id="1"/></Part><Staff id="1"><Measure len="2/4"><Chord><durationType>quarter</durationType><Lyrics><text>hold</text></Lyrics><Note><pitch>60</pitch><Tie id="t"/></Note></Chord><Chord><durationType>quarter</durationType><Note><pitch>60</pitch><endSpanner id="t"/></Note></Chord></Measure></Staff></Score></museScore>"#;
+        let mut source = crate::engine::musescore::parse(score.as_bytes()).unwrap();
+        source.score_intensity = None;
+        for proof in [true, false] {
+            if !proof {
+                for track in &mut source.tracks {
+                    for event in &mut track.events {
+                        if let Kind::NoteOn(note) = &mut event.kind {
+                            note.source.continuity = None;
+                        }
+                    }
+                }
+            }
+            for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+                let outcome = convert_midi_with_target(&source, "english", None, target);
+                assert!(outcome.ok, "{:?}", outcome.msg);
+                let warnings: Vec<_> = outcome.tracks.iter().flat_map(|t| &t.warnings).collect();
+                assert_eq!(
+                    warnings.iter().any(|w| w.code == "SOURCE_TIE_TAILS_MERGED"),
+                    proof
+                );
+                assert_eq!(
+                    warnings
+                        .iter()
+                        .any(|w| w.code == "SOURCE_NOTES_NOT_IN_VOCAL_SVP"),
+                    !proof
+                );
+                assert_eq!(
+                    outcome.svp.as_ref().unwrap().tracks[0].notes[0].duration_ticks,
+                    960
+                );
+            }
+        }
+    }
 
     /// One lane, built directly, so the split can be exercised on shapes no
     /// parser needs to be talked into producing — above all a wordless note a

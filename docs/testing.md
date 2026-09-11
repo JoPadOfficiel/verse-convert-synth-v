@@ -30,15 +30,19 @@ Run the following commands from the repository root:
 npm ci
 npm run version:check
 npm test
+npm run test:openutau:compat
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-These are the same core gates used by CI. The CI environment uses Node 22,
-Rust 1.93.0, an immutable npm install, the locked Cargo dependency graph, and
-Ubuntu 22.04 native Tauri dependencies.
+These are the same core gates used by CI. `npm test` includes the rendered
+pronunciation regression and therefore needs Chrome or Chromium. The separate
+OpenUtau compatibility gate needs .NET SDK 10 and network access to fetch the
+exact pinned OpenUtau revision before applying the repository patch. The CI
+environment uses Node 22, .NET 10, Rust 1.93.0, an immutable npm install, the
+locked Cargo dependency graph, and Ubuntu 22.04 native Tauri dependencies.
 
 `npm run version:check` verifies that the strict SemVer value is synchronized
 across:

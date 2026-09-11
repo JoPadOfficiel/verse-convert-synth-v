@@ -33,6 +33,7 @@ import {
   type RendererStatus,
 } from "@/lib/tauri";
 import { applyTrackOverrides } from "@/lib/vocal-overrides";
+import { storedPronunciationProfile, storePronunciationProfile } from "@/lib/pronunciation-preference";
 import { useTheme } from "@/components/theme-provider";
 import {
   failedExportProgress,
@@ -69,7 +70,7 @@ export default function App() {
   // never seen the voice database the user will assign. Lyrics never depended on
   // it, in any language.
   const language: Language = "english";
-  const [pronunciationProfile, setPronunciationProfile] = useState<PronunciationProfile>("default");
+  const [pronunciationProfile, setPronunciationProfile] = useState<PronunciationProfile>(storedPronunciationProfile);
   const [exportTarget, setExportTarget] = useState<ExportTarget>("ustx");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [overrides, setOverrides] = useState<Overrides>({});
@@ -221,6 +222,7 @@ export default function App() {
       if (!beginBusy()) return;
       setExportTarget(nextTarget);
       setPronunciationProfile(nextProfile);
+      storePronunciationProfile(nextProfile);
       endBusy();
       return;
     }
@@ -238,6 +240,7 @@ export default function App() {
       );
       setExportTarget(nextTarget);
       setPronunciationProfile(nextProfile);
+      storePronunciationProfile(nextProfile);
       setItems(results);
       // An export failure names the format it was written for, so a message from
       // the previous target would contradict the new selection. The results are
@@ -477,7 +480,7 @@ export default function App() {
     // The cap keeps long lines readable on a very wide screen, and the padding
     // tightens on a small one so nothing is cut off.
     <div className="mx-auto flex h-full w-full max-w-[min(100%,120rem)] flex-col gap-3 p-3 sm:gap-4 sm:p-5 lg:p-6">
-      <header className="flex items-center justify-between gap-2">
+      <header className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0">
           <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
             Verse
@@ -487,7 +490,23 @@ export default function App() {
             mix
           </p>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex flex-wrap items-center gap-1">
+          {exportTarget === "ustx" && (
+            <label className="mr-2 flex items-center gap-2 text-xs text-muted-foreground">
+              Pronunciation
+              <select
+                aria-label="OpenUtau pronunciation"
+                disabled={busy}
+                value={pronunciationProfile}
+                onChange={(event) => void changeTarget(exportTarget, event.target.value as PronunciationProfile)}
+                className="max-w-56 rounded-md border bg-background px-2 py-1 text-foreground disabled:opacity-50"
+              >
+                <option value="default">Default — no pronunciation fixes</option>
+                <option value="frenchMillefeuille">French Millefeuille</option>
+                <option value="englishArpabet">English ARPAbet</option>
+              </select>
+            </label>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -554,11 +573,6 @@ export default function App() {
                 Synthesizer V
               </button>
             </div>
-            {exportTarget === "ustx" && (
-              <span className="text-xs text-muted-foreground">
-                Pronunciation: {pronunciationProfile === "frenchMillefeuille" ? "French Millefeuille" : pronunciationProfile === "englishArpabet" ? "English ARPAbet" : "Default"}
-              </span>
-            )}
             <div className="flex-1" />
             {items.length > 0 && (
               <Button

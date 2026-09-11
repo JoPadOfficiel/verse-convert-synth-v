@@ -1,0 +1,94 @@
+--- a/OpenUtau/Controls/NotesCanvas.cs
++++ b/OpenUtau/Controls/NotesCanvas.cs
+@@ -645,7 +645,7 @@
+                     }
+                 }
+             }
+-            string displayLyric = note.lyric;
++            string displayLyric = NoteLyricDisplay.GetText(note.lyric);
+             int txtsize = 12;
+             var textLayout = TextLayoutCache.Get(displayLyric, Brushes.White, txtsize);
+             if (txtsize > size.Height) {
+--- /dev/null
++++ b/OpenUtau/Controls/NoteLyricDisplay.cs
+@@ -0,0 +1,25 @@
++using System.Text.RegularExpressions;
++
++namespace OpenUtau.App.Controls {
++    /// <summary>
++    /// The readable caption of a note. Its stored lyric and pronunciation input
++    /// remain available in the lyric editor and to the phonemizer.
++    /// </summary>
++    public static class NoteLyricDisplay {
++        // Match UNote.ToPhonemizerNote's greedy, line-local bracket syntax.
++        // NonBacktracking keeps repeated painting linear for malformed input.
++        static readonly Regex PhoneticHint = new Regex(
++            @"\[(.*)\]", RegexOptions.NonBacktracking);
++
++        public static string GetText(string lyric) {
++            string text = PhoneticHint.Replace(lyric, string.Empty);
++            if (text.Length == lyric.Length) {
++                return lyric;
++            }
++            text = text.Trim();
++            // A phoneme-only note still needs a visible, selectable caption.
++            // It also protects the canvas's narrow-note abbreviation at [0].
++            return text.Length == 0 ? lyric : text;
++        }
++    }
++}
+--- /dev/null
++++ b/OpenUtau.Test/App/NoteLyricDisplayTest.cs
+@@ -0,0 +1,52 @@
++using System;
++using System.Linq;
++using System.Reflection;
++using OpenUtau.App.Controls;
++using Xunit;
++
++namespace OpenUtau.App {
++    public class NoteLyricDisplayTest {
++        [Theory]
++        [InlineData("rêves[fr/r fr/ae fr/v]", "rêves")]
++        [InlineData("la[fr/l fr/ah]", "la")]
++        [InlineData("hello[hh ah l ow]", "hello")]
++        [InlineData("rêves',[fr/r fr/ae fr/v]", "rêves',")]
++        [InlineData("j'irai[fr/j fr/i fr/r fr/ae]", "j'irai")]
++        [InlineData("laisse, se,[fr/l fr/ae fr/s fr/s fr/ee]", "laisse, se,")]
++        [InlineData("+~", "+~")]
++        [InlineData("+", "+")]
++        [InlineData(" [fr/ah] ", " [fr/ah] ")]
++        [InlineData("[hh ah l ow]", "[hh ah l ow]")]
++        [InlineData("", "")]
++        [InlineData(" word ", " word ")]
++        [InlineData("[open", "[open")]
++        [InlineData("close]", "close]")]
++        [InlineData("first[a]middle[b]last", "firstlast")]
++        [InlineData("first[a]\nsecond[b]", "first\nsecond")]
++        [InlineData("word[open\nclose]", "word[open\nclose]")]
++        public void ReadableCaptionPreservesNativeHintSyntax(string stored, string expected) {
++            Assert.Equal(expected, NoteLyricDisplay.GetText(stored));
++        }
++
++        [Fact]
++        public void RepeatedUnclosedBracketsRemainVisible() {
++            string stored = new string('[', 32768) + "word";
++            Assert.Same(stored, NoteLyricDisplay.GetText(stored));
++        }
++
++        [Fact]
++        public void NativeCanvasCallsReadableCaptionHelper() {
++            var assembly = typeof(NoteLyricDisplay).Assembly;
++            var canvas = assembly.GetType("OpenUtau.App.Controls.NotesCanvas", true)!;
++            var method = canvas.GetMethod(
++                "RenderNoteBody", BindingFlags.Instance | BindingFlags.NonPublic)!;
++            var helper = typeof(NoteLyricDisplay).GetMethod(
++                nameof(NoteLyricDisplay.GetText), BindingFlags.Public | BindingFlags.Static)!;
++            var il = method.GetMethodBody()!.GetILAsByteArray()!;
++            Assert.True(
++                Enumerable.Range(0, Math.Max(0, il.Length - 4)).Any(i =>
++                    il[i] == 0x28 && BitConverter.ToInt32(il, i + 1) == helper.MetadataToken),
++                "NotesCanvas.RenderNoteBody must call NoteLyricDisplay.GetText");
++        }
++    }
++}

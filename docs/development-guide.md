@@ -123,6 +123,7 @@ Run these before committing implementation changes:
 ```sh
 npm run version:check
 npm test
+npm run test:openutau:compat
 npm run build
 
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -138,12 +139,14 @@ cargo test \
   --all-targets
 ```
 
-`npm run build` runs strict TypeScript compilation before Vite bundling. The
-frontend suite currently contains utility, version, and atomic override tests;
-there is no configured ESLint, Prettier, React component, or desktop E2E gate.
+`npm run build` runs strict TypeScript compilation before Vite bundling.
+`npm test` includes utility tests, a dedicated TypeScript check for the browser
+harness, and a real Chromium regression for the rendered pronunciation/theme
+controls. `npm run test:openutau:compat` separately checks the pinned OpenUtau
+patch with .NET 10. There is no configured ESLint or Prettier gate.
 
-GitHub CI runs the same frontend gates, Rust formatting, strict Clippy over all
-targets, and locked Rust tests on Ubuntu.
+GitHub CI runs those gates, Rust formatting, strict Clippy over all targets, and
+locked Rust tests on Ubuntu.
 
 ## Optional supplied-score gates
 

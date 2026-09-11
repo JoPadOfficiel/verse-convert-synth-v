@@ -498,6 +498,43 @@ impl ProvenanceBudget {
         self.work = work;
         Ok(())
     }
+    /// Preflight nested equality incrementally, without copying the evidence or
+    /// walking an unbounded metadata collection before checking the shared cap.
+    fn compare_provenance(&mut self, provenance: &Provenance) -> Result<()> {
+        self.charge(0, scope_size(&provenance.scope) / 8 + 16)?;
+        for evidence in &provenance.evidence {
+            self.charge(
+                0,
+                evidence
+                    .layout
+                    .len()
+                    .saturating_add(evidence.saving_version.as_ref().map_or(0, String::len))
+                    / 8
+                    + 16,
+            )?;
+            for id in &evidence.source_ids {
+                self.charge(0, id.len() / 8 + 1)?;
+            }
+            for (key, value) in &evidence.raw_fields {
+                self.charge(0, key.len().saturating_add(value.len()) / 8 + 2)?;
+            }
+        }
+        for interpretation in &provenance.interpretations {
+            self.charge(
+                0,
+                interpretation
+                    .field
+                    .len()
+                    .saturating_add(interpretation.explanation.len())
+                    / 8
+                    + 16,
+            )?;
+            for id in &interpretation.source_ids {
+                self.charge(0, id.len() / 8 + 1)?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn reserve_issue(&mut self, issue: &Issue) -> Result<()> {
         let bytes = provenance_size(&issue.provenance).saturating_add(issue.message.len());
         self.charge(bytes, bytes / 8 + 1)
@@ -898,8 +935,46 @@ pub struct Timeline {
     pub segments: Vec<Segment>,
     pub accents: Vec<Accent>,
     pub issues: Vec<Issue>,
+    /// Performed runs retain the start of their uninterrupted forward route.
+    /// A pass-label change alone does not consume or reset a pending accent.
+    accent_routes: Vec<AccentRoute>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccentRoute {
+    start: Time,
+    end: Time,
+    forward_start: Time,
+    occurrence: u32,
+    pass: u32,
+}
+
 impl Timeline {
+    fn accent_applies(&self, accent: &Accent, chain: &NoteChain) -> bool {
+        if self.accent_routes.is_empty() {
+            return accent.provenance.repeat_pass == chain.pass
+                && (accent.provenance.occurrence == 0
+                    || accent.provenance.occurrence == chain.occurrence);
+        }
+        let route_at = |at| {
+            self.accent_routes
+                .partition_point(|route| route.start <= at)
+                .checked_sub(1)
+                .map(|index| &self.accent_routes[index])
+                .filter(|route| at < route.end)
+        };
+        let Some(attack) = route_at(chain.start) else {
+            return false;
+        };
+        let Some(origin) = route_at(accent.at) else {
+            return false;
+        };
+        attack.occurrence == chain.occurrence
+            && attack.pass == chain.pass
+            && origin.occurrence == accent.provenance.occurrence
+            && origin.pass == accent.provenance.repeat_pass
+            && accent.at >= attack.forward_start
+    }
     pub fn segment_at(&self, at: Time) -> Option<&Segment> {
         // Resolver/overlay/occurrence construction maintains ascending starts
         // with disjoint positive spans and explicit terminal point segments.
@@ -2289,6 +2364,12 @@ impl ScoreIntensity {
         }
         self.occurrence_work(owner, runs)?;
         let mut result = Timeline::default();
+        budget.charge(
+            runs.len()
+                .saturating_mul(std::mem::size_of::<AccentRoute>()),
+            runs.len(),
+        )?;
+        result.accent_routes.reserve(runs.len());
         let mut previous_end = None;
         // The prefix is the route actually played, with its suffix discarded at
         // a backward jump. A forward skip leaves a hole; written declarations in
@@ -2304,10 +2385,33 @@ impl ScoreIntensity {
             {
                 return Err("Performed occurrence spans overlap or start before zero.".into());
             }
+            let forward = if let Some(previous) = index.checked_sub(1).map(|i| &runs[i]) {
+                match input {
+                    Some(input) => input.forward_route_boundary(owner, previous, run, budget)?,
+                    None => {
+                        previous.written_end == run.written_start
+                            && previous_end == Some(run.performed_start)
+                    }
+                }
+            } else {
+                false
+            };
+            let forward_start = if forward {
+                result.accent_routes.last().unwrap().forward_start
+            } else {
+                run.performed_start
+            };
             previous_end = Some(
                 run.performed_start
                     .checked_add(run.written_end.checked_sub(run.written_start)?)?,
             );
+            result.accent_routes.push(AccentRoute {
+                start: run.performed_start,
+                end: previous_end.unwrap(),
+                forward_start,
+                occurrence: run.ordinal,
+                pass: run.pass,
+            });
             let backward = path.last().is_some_and(|last| run.written_start < last.end);
             let keep = path.partition_point(|span| span.start < run.written_start);
             path.truncate(keep);
@@ -2369,6 +2473,9 @@ impl ScoreIntensity {
                 result.segments.push(segment);
             }
             for mut accent in timeline.accents {
+                // Prefix accents were emitted by their original performed run.
+                // Keep that identity and let accent_routes prove forward carry;
+                // re-emitting them here would replay an already consumed accent.
                 if accent.at < run.written_start || accent.at >= run.written_end {
                     continue;
                 }
@@ -2650,6 +2757,17 @@ impl NoteIntensity {
         {
             return Ok(false);
         }
+        match (&self.provenance, &head.provenance) {
+            (Some(tail), Some(head)) => {
+                budget.compare_provenance(tail)?;
+                budget.compare_provenance(head)?;
+                if tail != head {
+                    return Ok(false);
+                }
+            }
+            (None, None) => {}
+            _ => return Ok(false),
+        }
         if head.score_at_attack == Evaluation::Absent {
             let depth =
                 usize::BITS as usize - head.timeline.segments.len().leading_zeros() as usize + 1;
@@ -2810,16 +2928,22 @@ impl NoteIntensity {
         // These sorted source attack and accent arrays are built once per owner.
         // Only accents since the previous distinct attack can belong to this one.
         let range = note.timeline.accent_range(attacks, chain.start);
+        let route_depth =
+            usize::BITS as usize - note.timeline.accent_routes.len().leading_zeros() as usize + 1;
+        budget.charge(
+            range.len().saturating_mul(std::mem::size_of::<&Accent>()),
+            range
+                .len()
+                .saturating_mul(route_depth.saturating_mul(2).saturating_add(8)),
+        )?;
         // Transient accents affect the next attack (all chord members share that
         // attack), then disappear. They never replace persistent score context.
         let accents: Vec<_> = note.timeline.accents[range]
             .iter()
             .filter(|accent| {
                 accent.at <= chain.start
-                    && accent.provenance.repeat_pass == chain.pass
                     && accent.provenance.scope.applies(&chain.owner)
-                    && (accent.provenance.occurrence == 0
-                        || accent.provenance.occurrence == chain.occurrence)
+                    && note.timeline.accent_applies(accent, chain)
             })
             .collect();
         if let Some(accent) = accents.last() {
@@ -3623,6 +3747,98 @@ mod tests {
                 .unwrap());
         }
         assert_eq!((budget.bytes, budget.work), (0, small.work * 1000));
+    }
+
+    #[test]
+    fn continuation_preserves_original_attack_provenance_independently_of_tail_issues() {
+        let timeline = Arc::new(resolve(vec![mark(0, "p")]));
+        let head =
+            NoteIntensity::resolve(&note(Some(AttackVelocity::Midi(100))), timeline, &[t(0)])
+                .unwrap();
+        let original_provenance = head.provenance.clone();
+        // Build the expected binding directly. Using continued_from here would
+        // make a defect in that function alter both the result and the oracle.
+        let mut inherited = head.clone();
+        inherited.end = t(6);
+        inherited.issues.push(Issue {
+            start: t(4),
+            end: t(6),
+            kind: IssueKind::ContinuationVelocity,
+            provenance: Provenance::from_event(&mark(4, "tail-velocity"), 1),
+            message: "A retained tail diagnostic is not an attack contributor.".into(),
+        });
+        assert!(inherited.is_continuation_of(&head));
+        assert_eq!(inherited.provenance, original_provenance);
+        for field in 0..7 {
+            let mut changed = inherited.clone();
+            if field == 0 {
+                changed.provenance = None;
+            } else {
+                let provenance = changed.provenance.as_mut().unwrap();
+                match field {
+                    1 => provenance.evidence[0].source_ids[0].push_str("-unrelated"),
+                    2 => {
+                        provenance.evidence[0]
+                            .raw_fields
+                            .insert("source".into(), "changed".into());
+                    }
+                    3 => provenance.interpretations[0]
+                        .explanation
+                        .push_str(" altered"),
+                    4 => provenance.scope = Scope::Part("other-part".into()),
+                    5 => provenance.occurrence += 1,
+                    _ => provenance.repeat_pass += 1,
+                }
+            }
+            assert_eq!(
+                changed.evaluate(t(5)),
+                inherited.evaluate(t(5)),
+                "provenance-only mutation must leave the numeric control unchanged"
+            );
+            assert!(
+                !changed.is_continuation_of(&head),
+                "provenance field {field}"
+            );
+        }
+        assert_eq!(head.provenance, original_provenance);
+    }
+
+    #[test]
+    fn continuation_provenance_comparisons_charge_nested_bytes_and_shared_work() {
+        let timeline = Arc::new(resolve(vec![mark(0, "p")]));
+        let mut head =
+            NoteIntensity::resolve(&note(Some(AttackVelocity::Midi(100))), timeline, &[t(0)])
+                .unwrap();
+        let mut small = ProvenanceBudget::with_limits(0, MAX_RESOLUTION_WORK);
+        assert!(head.is_continuation_of_bounded(&head, &mut small).unwrap());
+        let provenance = head.provenance.as_mut().unwrap();
+        provenance.evidence[0]
+            .raw_fields
+            .insert("large-source".into(), "x".repeat(65_536));
+        provenance.interpretations[0]
+            .source_ids
+            .extend((0..256).map(|i| format!("witness-{i}")));
+        let inherited = head.clone();
+        let mut measured = ProvenanceBudget::with_limits(0, MAX_RESOLUTION_WORK);
+        assert!(inherited
+            .is_continuation_of_bounded(&head, &mut measured)
+            .unwrap());
+        assert_eq!(measured.bytes, 0, "comparison must not copy evidence");
+        assert!(measured.work >= small.work + 2 * (65_536 / 8 + 256));
+        let mut denied = ProvenanceBudget::with_limits(0, measured.work - 1);
+        assert!(inherited
+            .is_continuation_of_bounded(&head, &mut denied)
+            .is_err_and(|error| error.contains("SCORE_INTENSITY_LIMIT")));
+        let mut cumulative = ProvenanceBudget::with_limits(0, measured.work * 2);
+        for _ in 0..2 {
+            assert!(inherited
+                .is_continuation_of_bounded(&head, &mut cumulative)
+                .unwrap());
+        }
+        assert!(inherited
+            .is_continuation_of_bounded(&head, &mut cumulative)
+            .is_err_and(|error| error.contains("SCORE_INTENSITY_LIMIT")));
+        assert_eq!(inherited, head);
     }
 
     #[test]
@@ -4532,6 +4748,165 @@ mod tests {
         next.end = t(4);
         let next = NoteIntensity::resolve(&next, timeline, &[t(0), t(2), t(3)]).unwrap();
         close(note_db(&next, t(3)), -7.75);
+    }
+
+    #[test]
+    fn pending_accent_crosses_forward_pass_boundaries_once_per_chord_and_tie() {
+        let mut input = source::ScoreInput::default();
+        let mut accent = mark(1, "sfz");
+        accent.time_only = vec![2];
+        input.score.events = vec![mark(0, "p"), accent];
+        for (start, end, pass) in [(0, 2, 2), (2, 3, 1), (3, 7, 3)] {
+            input
+                .record_run("P1", "1", (t(start), t(end)), t(start), pass, start > 0)
+                .unwrap();
+        }
+        let runs = input.owner_runs(&owner()).unwrap();
+        assert_eq!(
+            runs.len(),
+            3,
+            "pass changes really split the performed route"
+        );
+        let timeline = input
+            .occurrences_bounded(
+                &owner(),
+                runs,
+                &[t(2), t(3), t(7)],
+                &mut ProvenanceBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            timeline.accents.len(),
+            1,
+            "prefix accents must not be re-emitted"
+        );
+        let original = timeline.accents[0].provenance.clone();
+        assert_eq!((original.occurrence, original.repeat_pass), (1, 2));
+        assert_eq!(original.evidence[0].source_ids, ["sfz"]);
+        let mut chain = note(None);
+        chain.start = t(4);
+        chain.end = t(5);
+        chain.occurrence = 3;
+        chain.pass = 3;
+        let attacks = [t(0), t(4), t(4), t(6)];
+        let first = NoteIntensity::resolve(&chain, timeline.clone(), &attacks).unwrap();
+        close(note_db(&first, t(4)), 8.0);
+        assert_eq!(first.provenance.as_ref(), Some(&original));
+        chain.source_id = "other-chord-member".into();
+        let sibling = NoteIntensity::resolve(&chain, timeline.clone(), &attacks).unwrap();
+        close(note_db(&sibling, t(4)), 8.0);
+        assert_eq!(sibling.provenance.as_ref(), Some(&original));
+
+        chain.start = t(5);
+        chain.end = t(6);
+        let raw_tail = NoteIntensity::resolve(&chain, timeline.clone(), &attacks).unwrap();
+        let continued = NoteIntensity::continued_from(&first, Some(&raw_tail));
+        close(note_db(&continued, q(11, 2)), 8.0);
+        assert_eq!(continued.provenance.as_ref(), Some(&original));
+        chain.start = t(6);
+        chain.end = t(7);
+        let next = NoteIntensity::resolve(&chain, timeline.clone(), &attacks).unwrap();
+        close(note_db(&next, t(6)), -7.75);
+        assert!(next.provenance.is_none());
+
+        // An attack before the boundary consumes the accent there; forwarding
+        // the route must not create a second next-attack application.
+        chain.start = t(4);
+        chain.end = t(5);
+        let consumed = NoteIntensity::resolve(&chain, timeline, &[t(0), q(3, 2), t(4)]).unwrap();
+        close(note_db(&consumed, t(4)), -7.75);
+        assert!(consumed.provenance.is_none());
+    }
+
+    #[test]
+    fn pending_accent_resets_at_explicit_breaks_jumps_and_route_gaps() {
+        for (label, written_start, performed_start, forward) in [
+            ("touching explicit break", 2, 2, false),
+            ("backward jump", 0, 2, false),
+            ("skipped written passage", 3, 2, true),
+            ("performed gap", 2, 3, true),
+        ] {
+            let mut input = source::ScoreInput::default();
+            let mut accent = mark(1, "sfz");
+            accent.time_only = vec![2];
+            input.score.events = vec![mark(0, "p"), accent];
+            input
+                .record_run("P1", "1", (t(0), t(2)), t(0), 2, false)
+                .unwrap();
+            input
+                .record_run(
+                    "P1",
+                    "1",
+                    (t(written_start), t(written_start + 4)),
+                    t(performed_start),
+                    1,
+                    forward,
+                )
+                .unwrap();
+            let runs = input.owner_runs(&owner()).unwrap();
+            let timeline = input
+                .occurrences_bounded(
+                    &owner(),
+                    runs,
+                    &[t(2), t(written_start + 4)],
+                    &mut ProvenanceBudget::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                timeline.accents.len(),
+                1,
+                "{label}: original accent is retained"
+            );
+            let mut chain = note(None);
+            chain.start = t(performed_start + 1);
+            chain.end = t(performed_start + 2);
+            chain.pass = 1;
+            chain.occurrence = 2;
+            let note = NoteIntensity::resolve(&chain, timeline, &[t(0), chain.start]).unwrap();
+            assert!(
+                note.provenance.is_none(),
+                "{label}: a discontinuity must reset pending accents"
+            );
+            close(note_db(&note, chain.start), -7.75);
+        }
+    }
+
+    #[test]
+    fn inactive_or_skipped_accents_do_not_reappear_in_forward_prefixes() {
+        for scenario in 0..3 {
+            let mut accent = mark(1, "sfz");
+            let second_start = if scenario == 2 { 3 } else { 2 };
+            match scenario {
+                0 => accent.enabled = false,
+                1 => accent.time_only = vec![1],
+                _ => accent.at = q(5, 2),
+            }
+            let mut input = source::ScoreInput::default();
+            input.score.events = vec![mark(0, "p"), accent];
+            input
+                .record_run("P1", "1", (t(0), t(2)), t(0), 2, false)
+                .unwrap();
+            input
+                .record_run("P1", "1", (t(second_start), t(6)), t(2), 1, true)
+                .unwrap();
+            let timeline = input
+                .occurrences_bounded(
+                    &owner(),
+                    input.owner_runs(&owner()).unwrap(),
+                    &[t(2), t(6)],
+                    &mut ProvenanceBudget::default(),
+                )
+                .unwrap();
+            assert!(timeline.accents.is_empty(), "scenario {scenario}");
+            let mut chain = note(None);
+            chain.start = t(3);
+            chain.end = t(4);
+            chain.pass = 1;
+            chain.occurrence = 2;
+            let note = NoteIntensity::resolve(&chain, timeline, &[t(0), t(3)]).unwrap();
+            close(note_db(&note, t(3)), -7.75);
+            assert!(note.provenance.is_none());
+        }
     }
 
     #[test]

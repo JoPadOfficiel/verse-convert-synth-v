@@ -245,6 +245,9 @@ fn lyric_text(lyric: &ProjectedLyric) -> String {
 /// The single entry point of this target: one neutral projection in, one
 /// Synthesizer V v113 project out.
 pub fn serialize(project: &ProjectedProject) -> Result<SvpProject, String> {
+    if let Some(violation) = project.continuity_violation() {
+        return Err(violation);
+    }
     // Unreachable from `convert_midi_with`, which refuses a zero PPQ before it
     // ever projects, but `serialize` is public and a hand-built projection must
     // not silently produce a file whose every position went unvalidated.

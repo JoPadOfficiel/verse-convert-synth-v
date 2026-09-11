@@ -229,6 +229,27 @@ original written-measure membership and the loader's performed route, including
 held prefix state, tempo and endpoint evidence. Transfer reports never supply
 these fields. An unresolved application uses only `0/0`, its exact original
 written point, and `active: false`.
+New applications also record exact written `writtenStart`, so the performed
+route origin can authenticate the timing of a contributing declaration.
+The optional context `dependencies` table records source-resolved interval or
+original-attack ownership for legitimate future endpoints and tempo evidence.
+Each dependency contains typed `owner`, source `scope`, performed
+`occurrence`/`repeatPass`, exact performed `start`/`end`, a sorted non-empty
+`sourceIds` list, `segment`, and optional `attackNoteId`. `segment: true` means
+the row is an authored source-timeline segment that an SVP report must preserve
+as a whole when it intersects the owned span; zero-width endpoint rows remain
+valid source evidence. `attackNoteId` instead binds attack-local evidence to the
+inventoried original attack at the dependency coordinate. Every dependency
+source ID must resolve to a declaration application with matching owner,
+occurrence, pass and scope, and the dependency interval must stay inside that
+application's performed route bounds.
+Previously emitted schema-3 intensity contexts omit both additions. They retain
+their existing contributor, scope, route, endpoint and interval validation;
+they cannot provide the newer declaration-timing proof. New contexts must have
+`writtenStart` on every application: partial omission or malformed fractions
+are rejected. Removing the complete optional timing-evidence layer is
+indistinguishable from the historical shape; this is not a tamper-proof format
+or a new schema capability marker.
 An endpoint at the end of its own positive written measure can use that
 measure's proved route membership; a skipped measure at the same coordinate
 cannot. Pass-filtered diagnostics may cite an inactive application, while

@@ -108,6 +108,60 @@ fn emitted_intensity_variants_roundtrip_with_legacy_absence() {
 }
 
 #[test]
+fn saved_schema3_intensity_contexts_without_route_origins_remain_readable() {
+    let sources = [
+        musicxml::parse(include_bytes!("score-intensity-fixtures/contour.musicxml")).unwrap(),
+        musicxml::parse(include_bytes!("score-intensity-fixtures/niente.musicxml")).unwrap(),
+        xml(&format!("{P}{NOTE}{NOTE}{F}{NOTE}")),
+        xml(&format!(
+            "<barline location=\"left\"><repeat direction=\"forward\"/></barline>{P}{NOTE}{F}{NOTE}<barline location=\"right\"><repeat direction=\"backward\"/></barline>"
+        )),
+    ];
+    for source in &sources {
+        for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+            let (current, allowed) = ledger(source, target);
+            current.validate(&allowed).unwrap();
+            let mut saved = serde_json::to_value(&current).unwrap();
+            let context = saved["intensityContext"].as_object_mut().unwrap();
+            context.remove("dependencies");
+            for declaration in context["declarations"].as_array_mut().unwrap() {
+                for application in declaration["applications"].as_array_mut().unwrap() {
+                    assert!(application
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("writtenStart")
+                        .is_some());
+                }
+            }
+            // This is the prior serialized context shape, with the intensity
+            // extension still present. Do not substitute no-intensity3 coverage.
+            let legacy: PreservationLedger = serde_json::from_value(saved.clone()).unwrap();
+            assert_eq!(legacy.schema_version, 3);
+            assert!(legacy
+                .performance_spans
+                .iter()
+                .any(|span| span.intensity.is_some()));
+            reopened(&legacy).validate(&allowed).unwrap();
+            assert_eq!(serde_json::to_value(&legacy).unwrap(), saved);
+
+            // Legacy compatibility does not discard existing source ownership.
+            let mut bad = legacy.clone();
+            bad.intensity_context.as_mut().unwrap().declarations[0].applications[0]
+                .owner
+                .part = "unrelated-part".into();
+            assert!(reopened(&bad).validate(&allowed).is_err());
+
+            for corruption in [Value::Null, json!({"numerator":0,"denominator":0})] {
+                let mut bad = current.clone();
+                bad.intensity_context.as_mut().unwrap().declarations[0].applications[0]
+                    .written_start = corruption;
+                assert!(reopened(&bad).validate(&allowed).is_err());
+            }
+        }
+    }
+}
+
+#[test]
 fn malformed_emitted_intensity_structure_and_nested_references_are_rejected() {
     let source =
         musicxml::parse(include_bytes!("score-intensity-fixtures/contour.musicxml")).unwrap();
@@ -1121,6 +1175,427 @@ fn saved_large_retained_inventory_preserves_one_authenticated_attack() {
         value["entries"].as_array_mut().unwrap().reverse();
     });
     reordered.validate(&allowed).unwrap();
+}
+
+#[test]
+fn legacy_sixty_thousand_entry_inventory_has_no_expression_work_charge() {
+    use verse_lib::bundle::{DispositionEntry, PrimaryDisposition, SourceItemKind};
+    let ids: Vec<String> = (0..60_000)
+        .map(|n| format!("original-metadata-{n}"))
+        .collect();
+    let entries = ids
+        .iter()
+        .map(|id| DispositionEntry {
+            source_id: id.clone(),
+            item_kind: SourceItemKind::Event,
+            disposition: PrimaryDisposition::MetadataOnly,
+            artifact_paths: vec!["source/score.xml".into()],
+            performance_refs: vec![],
+        })
+        .collect();
+    let mut valid = PreservationLedger {
+        schema_version: 2,
+        intensity_context: None,
+        performance_spans: vec![],
+        expected_source_ids: ids,
+        entries,
+    };
+    let allowed = BTreeSet::from(["source/score.xml".to_string()]);
+    for schema in [2, 3] {
+        valid.schema_version = schema;
+        let mut copy = reopened(&valid);
+        copy.expected_source_ids.reverse();
+        copy.entries.reverse();
+        copy.validate(&allowed).unwrap();
+    }
+    for mutation in 0..3 {
+        let mut bad = valid.clone();
+        match mutation {
+            0 => bad
+                .expected_source_ids
+                .push(bad.expected_source_ids[0].clone()),
+            1 => {
+                bad.entries.pop();
+            }
+            _ => bad.entries.push(bad.entries[0].clone()),
+        }
+        assert!(
+            reopened(&bad).validate(&allowed).is_err(),
+            "inventory mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn every_extra_intensity_backlink_needs_an_authenticated_contributor_role() {
+    use verse_lib::bundle::{PrimaryDisposition, SourceItemKind};
+    for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+        let (valid, allowed) = ledger(&two_parts(), target);
+        reopened(&valid).validate(&allowed).unwrap();
+        let index = valid
+            .performance_spans
+            .iter()
+            .position(|s| s.intensity.is_some() && !s.note_ids.is_empty())
+            .unwrap();
+        let other_declaration = valid
+            .intensity_context
+            .as_ref()
+            .unwrap()
+            .declarations
+            .iter()
+            .find(|d| d.scope == json!({"Part":"P2"}))
+            .unwrap();
+        let extra: Vec<String> = [
+            SourceItemKind::Note,
+            SourceItemKind::Lyric,
+            SourceItemKind::Track,
+        ]
+        .iter()
+        .map(|kind| {
+            valid
+                .entries
+                .iter()
+                .find(|e| &e.item_kind == kind)
+                .unwrap()
+                .source_id
+                .clone()
+        })
+        .chain([other_declaration.source_id.clone()])
+        .collect();
+        for id in extra {
+            let mut bad = valid.clone();
+            let entry = bad.entries.iter_mut().find(|e| e.source_id == id).unwrap();
+            assert!(!entry.performance_refs.contains(&index));
+            entry.performance_refs.push(index);
+            if target == ExportTarget::Ustx {
+                entry.disposition = PrimaryDisposition::ProjectedMapped {
+                    policy: verse_lib::engine::score_intensity::POLICY.into(),
+                    limitations: None,
+                };
+            }
+            assert!(
+                reopened(&bad).validate(&allowed).is_err(),
+                "accepted extra backlink {id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn later_same_route_dynamic_cannot_replace_a_held_contributor_on_any_repeat() {
+    for repeated in [false, true] {
+        let start = if repeated {
+            r#"<barline location="left"><repeat direction="forward"/></barline>"#
+        } else {
+            ""
+        };
+        let end = if repeated {
+            r#"<barline location="right"><repeat direction="backward"/></barline>"#
+        } else {
+            ""
+        };
+        let source = xml(&format!("{start}{P}{NOTE}{NOTE}{F}{NOTE}{end}"));
+        for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+            let (valid, allowed) = ledger(&source, target);
+            reopened(&valid).validate(&allowed).unwrap();
+            let context = valid.intensity_context.as_ref().unwrap();
+            let early = context
+                .declarations
+                .iter()
+                .find(|d| d.at == json!({"numerator":0,"denominator":1}))
+                .unwrap();
+            let later = context
+                .declarations
+                .iter()
+                .find(|d| d.at == json!({"numerator":2,"denominator":1}))
+                .unwrap();
+            let indices: Vec<usize> = valid
+                .entries
+                .iter()
+                .find(|e| e.source_id == early.source_id)
+                .unwrap()
+                .performance_refs
+                .iter()
+                .copied()
+                .filter(|i| !valid.performance_spans[*i].note_ids.is_empty())
+                .collect();
+            assert!(indices.len() >= if repeated { 4 } else { 2 });
+            for index in indices {
+                let bad = saved_mutation(&valid, |value| {
+                    replace_contributor(value, index, &early.source_id, &later.source_id)
+                });
+                assert!(
+                    bad.validate(&allowed).is_err(),
+                    "accepted future dynamic: {target:?}, repeat={repeated}, span={index}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn future_transition_endpoint_cannot_escape_its_source_resolved_interval() {
+    let ramp_start = r#"<direction><direction-type><wedge type="crescendo" number="8"/></direction-type></direction>"#;
+    let ramp_end = r#"<direction><direction-type><wedge type="stop" number="8"/><dynamics><f/></dynamics></direction-type></direction>"#;
+    let source = xml(&format!("{P}{NOTE}{ramp_start}{NOTE}{ramp_end}{NOTE}"));
+    for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+        let (valid, allowed) = ledger(&source, target);
+        reopened(&valid).validate(&allowed).unwrap();
+        let context = valid.intensity_context.as_ref().unwrap();
+        let early = context
+            .declarations
+            .iter()
+            .find(|d| d.at == json!({"numerator":0,"denominator":1}))
+            .unwrap();
+        let future = context
+            .declarations
+            .iter()
+            .find(|d| {
+                d.at == json!({"numerator":2,"denominator":1})
+                    && d.kinds
+                        .as_array()
+                        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "Dynamic"))
+            })
+            .unwrap();
+        assert!(context.dependencies.iter().any(|dependency| {
+            dependency.source_ids.contains(&future.source_id)
+                && dependency.attack_note_id.is_none()
+                && dependency.start == json!({"numerator":1,"denominator":1})
+        }));
+        let index = valid
+            .entries
+            .iter()
+            .find(|entry| entry.source_id == early.source_id)
+            .unwrap()
+            .performance_refs
+            .iter()
+            .copied()
+            .find(|index| {
+                valid.performance_spans[*index].start_tick == 0
+                    && !valid.performance_spans[*index].note_ids.is_empty()
+            })
+            .unwrap();
+        let bad = saved_mutation(&valid, |value| {
+            replace_contributor(value, index, &early.source_id, &future.source_id)
+        });
+        assert!(
+            bad.validate(&allowed).is_err(),
+            "accepted future endpoint outside its source-resolved interval: {target:?}"
+        );
+    }
+}
+
+#[test]
+fn earlier_same_route_dynamic_cannot_replace_a_later_contributor_on_any_repeat() {
+    for repeated in [false, true] {
+        let start = if repeated {
+            r#"<barline location="left"><repeat direction="forward"/></barline>"#
+        } else {
+            ""
+        };
+        let end = if repeated {
+            r#"<barline location="right"><repeat direction="backward"/></barline>"#
+        } else {
+            ""
+        };
+        let source = xml(&format!("{start}{P}{NOTE}{NOTE}{F}{NOTE}{NOTE}{end}"));
+        for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+            let (valid, allowed) = ledger(&source, target);
+            reopened(&valid).validate(&allowed).unwrap();
+            let context = valid.intensity_context.as_ref().unwrap();
+            let early = context
+                .declarations
+                .iter()
+                .find(|d| d.at == json!({"numerator":0,"denominator":1}))
+                .unwrap();
+            let later = context
+                .declarations
+                .iter()
+                .find(|d| d.at == json!({"numerator":2,"denominator":1}))
+                .unwrap();
+            let indices: Vec<usize> = valid
+                .entries
+                .iter()
+                .find(|e| e.source_id == later.source_id)
+                .unwrap()
+                .performance_refs
+                .iter()
+                .copied()
+                .filter(|i| !valid.performance_spans[*i].note_ids.is_empty())
+                .collect();
+            assert!(!indices.is_empty());
+            for index in indices {
+                let bad = saved_mutation(&valid, |value| {
+                    replace_contributor(value, index, &later.source_id, &early.source_id)
+                });
+                assert!(
+                    bad.validate(&allowed).is_err(),
+                    "accepted superseded dynamic: {target:?}, repeat={repeated}, span={index}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_unused_dependency_rows_are_rejected() {
+    let source =
+        musicxml::parse(include_bytes!("score-intensity-fixtures/contour.musicxml")).unwrap();
+    for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+        let (valid, allowed) = ledger(&source, target);
+        reopened(&valid).validate(&allowed).unwrap();
+        let template = valid
+            .intensity_context
+            .as_ref()
+            .unwrap()
+            .dependencies
+            .iter()
+            .find(|d| d.attack_note_id.is_none())
+            .unwrap()
+            .clone();
+        for mutation in 0..3 {
+            let mut bad = valid.clone();
+            let context = bad.intensity_context.as_mut().unwrap();
+            let mut dependency = template.clone();
+            match mutation {
+                0 => {
+                    dependency.occurrence = dependency.occurrence.saturating_add(99);
+                    dependency.repeat_pass = dependency.repeat_pass.saturating_add(99);
+                }
+                1 => {
+                    dependency.start = json!({"numerator":9999,"denominator":1});
+                    dependency.end = json!({"numerator":10000,"denominator":1});
+                }
+                _ => dependency.source_ids.push(dependency.source_ids[0].clone()),
+            }
+            context.dependencies.push(dependency);
+            assert!(
+                reopened(&bad).validate(&allowed).is_err(),
+                "accepted invalid unused dependency {mutation}: {target:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn authored_svp_segments_cannot_disappear_behind_attack_summary() {
+    let (valid, allowed) = ledger(&xml(&format!("{P}{NOTE}")), ExportTarget::Svp);
+    reopened(&valid).validate(&allowed).unwrap();
+    let index = valid
+        .performance_spans
+        .iter()
+        .position(|span| {
+            span.intensity
+                .as_ref()
+                .and_then(|value| value.get("segments"))
+                .and_then(Value::as_array)
+                .is_some_and(|segments| !segments.is_empty())
+        })
+        .unwrap();
+    let bad = saved_mutation(&valid, |value| {
+        value["performanceSpans"][index]["intensity"]["segments"] = json!([]);
+    });
+    assert!(
+        bad.validate(&allowed).is_err(),
+        "an authored score-intensity segment must not disappear behind its attack summary"
+    );
+}
+
+#[test]
+fn authored_svp_segment_and_matching_summary_cannot_disappear_together() {
+    let source =
+        musicxml::parse(include_bytes!("score-intensity-fixtures/contour.musicxml")).unwrap();
+    let (valid, allowed) = ledger(&source, ExportTarget::Svp);
+    reopened(&valid).validate(&allowed).unwrap();
+    let index = valid
+        .performance_spans
+        .iter()
+        .position(|span| {
+            span.intensity
+                .as_ref()
+                .and_then(|value| value.get("segments"))
+                .and_then(Value::as_array)
+                .is_some_and(|segments| {
+                    segments
+                        .iter()
+                        .any(|segment| !segment["provenance"].is_null())
+                })
+        })
+        .unwrap();
+    let bad = saved_mutation(&valid, |value| {
+        let intensity = &mut value["performanceSpans"][index]["intensity"];
+        let removed = intensity["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|segment| !segment["provenance"].is_null())
+            .unwrap()["provenance"]
+            .clone();
+        intensity["segments"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|segment| segment["provenance"] != removed);
+        intensity["provenance"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|provenance| *provenance != removed);
+    });
+    assert!(
+        bad.validate(&allowed).is_err(),
+        "an authored dependency must remain detectable when its segment and summary are removed together"
+    );
+}
+
+#[test]
+fn merged_repeat_exit_svp_note_authenticates_each_original_segment() {
+    let head = NOTE.replace("<lyric>", "<tie type=\"start\"/><lyric>");
+    let tail = "<note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><tie type=\"stop\"/></note>";
+    let source = musicxml::parse(format!(r#"<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list><part id="P1"><measure><attributes><divisions>480</divisions><time><beats>2</beats><beat-type>4</beat-type></time></attributes><barline location="left"><repeat direction="forward"/></barline>{P}{NOTE}{head}<barline location="right"><repeat direction="backward"/></barline></measure><measure><barline location="left"><repeat direction="forward"/></barline>{F}{tail}{NOTE}<barline location="right"><repeat direction="backward"/></barline></measure></part></score-partwise>"#).as_bytes()).unwrap();
+    for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+        let (valid, allowed) = ledger(&source, target);
+        let spans: Vec<_> = valid
+            .performance_spans
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.start_tick == 1440
+                    && s.end_tick == 2400
+                    && s.intensity
+                        .as_ref()
+                        .is_some_and(|e| e.get("segments").is_some())
+            })
+            .collect();
+        if target == ExportTarget::Svp {
+            assert_eq!(
+                spans.len(),
+                1,
+                "actual loader must merge the [3,4) head with its [4,5) tail"
+            );
+            let (index, span) = spans[0];
+            let segments = span.intensity.as_ref().unwrap()["segments"]
+                .as_array()
+                .unwrap();
+            assert_eq!(segments.len(), 2);
+            assert_ne!(
+                segments[0]["provenance"]["occurrence"],
+                segments[1]["provenance"]["occurrence"]
+            );
+            reopened(&valid).validate(&allowed).unwrap();
+            let bad = saved_mutation(&valid, |value| {
+                let original = value["performanceSpans"][index]["intensity"]["segments"][0]
+                    ["provenance"]
+                    .clone();
+                value["performanceSpans"][index]["intensity"]["segments"][1]["provenance"] =
+                    original;
+            });
+            assert!(
+                bad.validate(&allowed).is_err(),
+                "an earlier occurrence cannot own the later segment"
+            );
+        } else {
+            reopened(&valid).validate(&allowed).unwrap();
+        }
+    }
 }
 
 #[test]

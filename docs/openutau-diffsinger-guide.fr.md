@@ -6,6 +6,48 @@ created: 2026-09-09
 
 # Prononciation et réglages DiffSinger dans OpenUtau
 
+## Activer les corrections dans Verse avant l'export
+
+Avec la cible **OpenUtau**, sélectionner **French Millefeuille** dans
+**Pronunciation**, en haut de la fenêtre à côté du thème et des réglages, puis
+exporter à nouveau depuis la partition source. Le choix est conservé au
+redémarrage de Verse, même s'il est fait avant d'importer une partition. Lorsque
+des fichiers sont déjà chargés, il est mémorisé après acceptation de la nouvelle
+analyse. Le même choix reste accessible et synchronisé dans **Settings**.
+Le profil **Default — no pronunciation fixes** ne génère aucune indication
+phonétique française. Choisir ensuite **DIFFS FR MILLE** ou une voix française
+dans OpenUtau ne réapplique pas les corrections de Verse à cet ancien fichier.
+
+Un export corrigé contient par exemple `rêves[fr/r fr/ae fr/v]` : le `s` écrit
+reste dans le mot, mais aucun phonème `fr/s` n'est ajouté. Un découpage chanté
+comme `rê / ê / ves` conserve ses attaques et son « e » final chanté, avec des
+indications distinctes. Les consonnes réellement prononcées de `trace`,
+`espace` ou `laisse` restent présentes. La partition originale n'est pas modifiée.
+
+Réexporter dans un nouveau fichier pour conserver les retouches déjà faites
+dans OpenUtau. L'ancien projet ne se met pas à jour quand Verse est mis à jour.
+
+## Paroles lisibles sur les notes
+
+OpenUtau conserve les indications de prononciation dans le texte enregistré de
+la note. Sa version standard peut donc afficher `rêves[fr/r fr/ae fr/v]` à la
+fois comme libellé complet et comme phonèmes dans la ligne du bas. Cet affichage
+ne prouve pas que des notes ou des attaques ont été dupliquées.
+
+Le correctif local **OpenUtau Clean Lyrics** affiche seulement `rêves` sur la
+note et laisse les phonèmes dans leur ligne. Les indications complètes restent
+accessibles dans l'éditeur de paroles et sont conservées à l'enregistrement.
+Le comportement est identique pour les paroles anglaises. Une note contenant
+uniquement une indication phonétique garde un libellé visible.
+
+Cette présentation nécessite la version locale corrigée d'OpenUtau, fournie
+séparément : mettre à jour Verse ou réexporter ne change pas l'affichage d'un
+OpenUtau non modifié. Ne pas supprimer les crochets du projet pour nettoyer
+l'affichage, car cela retirerait aussi les corrections de prononciation. Le
+[correctif et ses instructions de compilation](../compat/openutau/README.md)
+sont conservés dans le dépôt. Ouvrir une copie du projet avec cette application
+distincte pour conserver les retouches et l'installation existantes.
+
 ## Choisir un phonémiseur compatible
 
 Un phonémiseur traduit les paroles vers les symboles attendus par une banque.

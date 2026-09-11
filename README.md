@@ -332,12 +332,15 @@ Prerequisites:
 
 - Rust stable (CI uses Rust 1.93.0);
 - Node.js 20.19+ or 22.12+ (CI uses Node.js 22);
+- Chrome or Chromium for the rendered pronunciation regression in `npm test`;
+- .NET SDK 10 for the pinned OpenUtau compatibility gate;
 - either MuseScore Studio 3.6.2+ or 4.x for real audio-rendering gates.
 
 ```sh
 npm ci
 npm run version:check
 npm test
+npm run test:openutau:compat
 npm run build
 npm run tauri dev
 

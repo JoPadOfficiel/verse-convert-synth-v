@@ -190,6 +190,7 @@ Run the complete local gate before requesting review:
 ```sh
 npm run version:check
 npm test
+npm run test:openutau:compat
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings

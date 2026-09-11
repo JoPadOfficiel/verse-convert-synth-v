@@ -570,6 +570,16 @@ pub fn validate_current_performance(
                                 .intensity
                                 .as_deref()
                                 .expect("tie requires a validated head intensity context");
+                            // Independent of continued_from: that helper must
+                            // never be both implementation and provenance oracle.
+                            assert_eq!(
+                                note.performance
+                                    .as_ref()
+                                    .and_then(|p| p.intensity.as_ref())
+                                    .and_then(|i| i.provenance.as_ref()),
+                                head_intensity.provenance.as_ref(),
+                                "original tie attack provenance must be inherited unchanged"
+                            );
                             tail.intensity =
                                 Some(std::sync::Arc::new(NoteIntensity::continued_from(
                                     head_intensity,
@@ -857,8 +867,81 @@ mod tests {
             assert_eq!(project.continuity_violation(), None);
             verse_lib::engine::target::validate_for(target, &project).unwrap();
             verse_lib::engine::target::serialize_to(target, &project).unwrap();
+            verse_lib::bundle::BundleProject::from_projection(target, &project).unwrap();
             let report = validate_current_performance(&midi, &raw, &project);
             assert_eq!(report["proven_tie_inheritances"], 2);
+            let head_origin = project.tracks[0].notes[0]
+                .source_evidence
+                .as_ref()
+                .unwrap()
+                .origin
+                .as_ref()
+                .unwrap();
+            let original_attack = raw.bindings
+                [&(head_origin.track_id.clone(), head_origin.note_on_order)]
+                .intensity
+                .as_ref()
+                .unwrap()
+                .provenance
+                .as_ref()
+                .unwrap();
+            let original_ids: Vec<_> = original_attack
+                .evidence
+                .iter()
+                .flat_map(|e| &e.source_ids)
+                .collect();
+            assert!(!original_ids.is_empty());
+            let transfers =
+                verse_lib::engine::target::performance_report(target, &project).unwrap();
+            for note in &project.tracks[0].notes[1..3] {
+                assert_eq!(
+                    note.performance
+                        .as_ref()
+                        .unwrap()
+                        .intensity
+                        .as_ref()
+                        .unwrap()
+                        .provenance
+                        .as_ref(),
+                    Some(original_attack),
+                    "raw source head, independent of continuation helper"
+                );
+                let id = &note.source_evidence.as_ref().unwrap().note_id;
+                if target == ExportTarget::Ustx {
+                    assert!(
+                        transfers.iter().any(|span| span.status
+                            == verse_lib::engine::performance::TransferStatus::Mapped
+                            && span.note_ids.contains(id)
+                            && original_ids
+                                .iter()
+                                .all(|source_id| span.source_ids.contains(source_id))),
+                        "emitted continuation must retain the original attack contributors: {id}"
+                    );
+                }
+            }
+            let mut missing_provenance = project.clone();
+            std::sync::Arc::make_mut(
+                missing_provenance.tracks[0].notes[2]
+                    .performance
+                    .as_mut()
+                    .unwrap()
+                    .intensity
+                    .as_mut()
+                    .unwrap(),
+            )
+            .provenance = None;
+            assert!(verse_lib::engine::target::serialize_to(target, &missing_provenance).is_err());
+            assert!(
+                verse_lib::bundle::BundleProject::from_projection(target, &missing_provenance)
+                    .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    validate_current_performance(&midi, &raw, &missing_provenance)
+                }))
+                .is_err(),
+                "independent baseline oracle must reject removed attack evidence"
+            );
             let tail = &project.tracks[0].notes[2];
             assert!(matches!(tail.lyric, ProjectedLyric::Extension));
             let origin = tail
@@ -888,6 +971,15 @@ mod tests {
             assert!(corrupt.continuity_violation().is_some());
             assert!(verse_lib::engine::target::validate_for(target, &corrupt).is_err());
             assert!(verse_lib::engine::target::serialize_to(target, &corrupt).is_err());
+            match target {
+                ExportTarget::Svp => {
+                    assert!(verse_lib::engine::target::svp::serialize(&corrupt).is_err())
+                }
+                ExportTarget::Ustx => {
+                    assert!(verse_lib::engine::target::ustx::serialize(&corrupt).is_err())
+                }
+            }
+            assert!(verse_lib::bundle::BundleProject::from_projection(target, &corrupt).is_err());
             let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 validate_current_performance(&midi, &raw, &corrupt)
             }))
@@ -898,7 +990,9 @@ mod tests {
                 .or_else(|| failure.downcast_ref::<&str>().copied())
                 .unwrap();
             assert!(
-                message.contains("current performance changed without exact source proof"),
+                message.contains("current performance changed without exact source proof")
+                    || message
+                        .contains("original tie attack provenance must be inherited unchanged"),
                 "{message}"
             );
             // The second pass owns separate sung syllables, so each keeps its raw attack.

@@ -69,6 +69,11 @@ jobs:
           toolchain: 1.93.0
           components: rustfmt, clippy
 
+      - name: Install .NET 10 for OpenUtau compatibility test
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: "10.0.x"
+
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -123,8 +128,11 @@ jobs:
       - name: Install frontend dependencies reproducibly
         run: npm ci
 
-      - name: Run frontend tests
-        run: npm run test:frontend
+      - name: Run frontend and browser tests
+        run: npm test
+
+      - name: Verify patched OpenUtau clean-note labels
+        run: npm run test:openutau:compat
 
       - name: Build frontend
         run: npm run build
