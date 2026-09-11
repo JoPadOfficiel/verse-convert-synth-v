@@ -1,9 +1,48 @@
 import { spawn } from "node:child_process";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 const stderrLimit = 16 * 1024;
+
+// Call only for a positive PID/group created by us or announced by our harness.
+// On Linux, kill(0) also finds zombies, which cannot write profiles or be killed.
+export async function ownedGroupAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Owned process PID must be positive");
+  const exists = () => {
+    try { process.kill(process.platform === "win32" ? pid : -pid, 0); return true; }
+    catch (error) {
+      if (error.code === "ESRCH") return false;
+      if (error.code === "EPERM") return true;
+      throw error;
+    }
+  };
+  if (!exists()) return false;
+  if (process.platform !== "linux") return true;
+  let foundMember = false;
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat;
+    try { stat = await readFile(`/proc/${entry}/stat`, "utf8"); }
+    catch (error) {
+      if (error.code === "ENOENT" || error.code === "ESRCH") continue;
+      throw new Error(`Cannot inspect process-group membership at /proc/${entry}/stat`, { cause: error });
+    }
+    // comm can contain spaces, parentheses and newlines. Only its final ')' is
+    // the delimiter; the remaining fields start with state, ppid and pgrp.
+    const end = stat.lastIndexOf(")");
+    const fields = stat.slice(end + 1).trim().split(/\s+/);
+    if (!stat.startsWith(`${entry} (`) || end < 0 || fields.length < 3 ||
+        !/^[A-Za-z]$/.test(fields[0]) || !/^\d+$/.test(fields[1]) || !/^\d+$/.test(fields[2])) {
+      throw new Error(`Cannot parse process-group membership at /proc/${entry}/stat`);
+    }
+    if (Number(fields[2]) !== pid) continue;
+    foundMember = true;
+    if (!["Z", "X", "x"].includes(fields[0])) return true;
+  }
+  // An extant group with no visible members cannot safely be declared stopped.
+  return foundMember ? false : exists();
+}
 
 export function timeoutSetting(name, fallback) {
   const value = Number(process.env[name] ?? fallback);
@@ -63,14 +102,9 @@ export function launchBrowserProcess(command, args, { cwd, env, ipc = false } = 
     // 'close' follows exit/spawn failure and closure of the stderr pipe.
     child.once("close", (code, signal) => { closed = true; resolve({ code, signal }); });
   });
-  const groupAlive = () => {
+  const groupAlive = async () => {
     if (!grouped || !child.pid) return false;
-    try { process.kill(-child.pid, 0); return true; }
-    catch (error) {
-      if (error.code === "ESRCH") return false;
-      if (error.code === "EPERM") return true;
-      throw error;
-    }
+    return ownedGroupAlive(child.pid);
   };
   const signalOwned = (signal) => {
     if (!child.pid) return;
@@ -81,7 +115,7 @@ export function launchBrowserProcess(command, args, { cwd, env, ipc = false } = 
   };
   const awaitStopped = async (signal) => {
     await completion;
-    while (groupAlive()) await delay(20, undefined, { signal });
+    while (await groupAlive()) await delay(20, undefined, { signal });
   };
   return {
     child,
@@ -106,6 +140,7 @@ export function launchBrowserProcess(command, args, { cwd, env, ipc = false } = 
           }
           stopped = true;
         } catch (error) {
+          log(`Chromium shutdown state: pid=${child.pid}, closed=${closed}, exit=${JSON.stringify(exit)}`);
           // A descendant may retain the pipe even after the direct child exits.
           // Release our handles, but never claim ownership stopped or delete its profile.
           child.stderr.destroy();

@@ -211,6 +211,23 @@ try {
   process.exitCode = 1;
 } finally {
   const cleanupErrors = [];
+  if (protocol && browser) {
+    let closed;
+    try {
+      // Let Chrome drain/reap its helpers before falling back to OS signals.
+      // https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-close
+      closed = await withDeadline(async () => {
+        // Some versions close the socket before acknowledging Browser.close.
+        try { await protocol.send("Browser.close"); } catch {}
+        return browser.completion;
+      }, stopTimeoutMs, "Chromium DevTools shutdown");
+    } catch (error) {
+      console.error(`${error.message}; falling back to owned-process shutdown`);
+    }
+    if (closed && closed.code !== 0) {
+      cleanupErrors.push(new Error(`Chromium exited unexpectedly during DevTools shutdown (code ${closed.code}, signal ${closed.signal ?? "none"})`));
+    }
+  }
   try {
     protocol?.dispose();
     socket?.close();

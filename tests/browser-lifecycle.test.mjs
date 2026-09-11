@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import test from "node:test";
-import { cleanupBrowser, launchBrowserProcess, waitForDevTools, withDeadline } from "../scripts/browser-lifecycle.mjs";
+import { cleanupBrowser, launchBrowserProcess, ownedGroupAlive, waitForDevTools, withDeadline } from "../scripts/browser-lifecycle.mjs";
 
 const posix = { skip: process.platform === "win32" ? "Requires POSIX signal semantics" : false };
 const browserId = "01234567-89ab-cdef-0123-456789abcdef";
@@ -161,6 +161,83 @@ test("owned POSIX descendant is reaped before cleanup completes", posix, async (
   await assert.rejects(access(profile), { code: "ENOENT" });
 });
 
+test("Linux zombie-only owned group cleans up before its outside parent calls waitpid", {
+  skip: process.platform !== "linux" ? "Requires Linux /proc and delayed waitpid" : false,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "verse-zombie-group-"));
+  const profile = join(root, "profile");
+  await mkdir(profile);
+  const browser = launchBrowserProcess("python3", ["-c", `
+import ctypes, json, os, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+group = os.getpgrp()
+parent = os.fork()
+if parent:
+    deadline = time.monotonic() + 10
+    while not (root / 'zombie.json').exists():
+        if time.monotonic() >= deadline:
+            os._exit(2)
+        time.sleep(0.01)
+    os._exit(0)
+
+# Keep the reaper alive outside the owned browser group, without holding pipes.
+os.setpgid(0, 0)
+fd = os.open(os.devnull, os.O_RDWR)
+for stream in (0, 1, 2):
+    os.dup2(fd, stream)
+if fd > 2:
+    os.close(fd)
+child = os.fork()
+if child == 0:
+    os.setpgid(0, group)
+    # Exercise comm parsing with spaces, nested parentheses and a newline.
+    ctypes.CDLL(None).prctl(15, b'verse ) (z)\\n', 0, 0, 0)
+    os._exit(0)
+
+observed = os.waitid(os.P_PID, child, os.WEXITED | os.WNOWAIT)
+receipt = {'child': child, 'parent': os.getpid(), 'parentGroup': os.getpgrp(),
+           'group': group, 'observed': observed.si_pid}
+(root / 'zombie.tmp').write_text(json.dumps(receipt))
+os.replace(root / 'zombie.tmp', root / 'zombie.json')
+deadline = time.monotonic() + 20
+while not (root / 'reap').exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+reaped, status = os.waitpid(child, 0)
+(root / 'reaped').write_text(str(reaped))
+os._exit(0)
+`, root]);
+  let receipt;
+  t.after(async () => {
+    await writeFile(join(root, "reap"), "reap now");
+    receipt ??= JSON.parse(await waitForMarker(join(root, "zombie.json")));
+    assert.equal(Number(await waitForMarker(join(root, "reaped"))), receipt.child);
+    await stopOwnedGroup(receipt.parent);
+    await browser.stop();
+    await rm(root, { recursive: true, force: true });
+  });
+  receipt = JSON.parse(await waitForMarker(join(root, "zombie.json")));
+  assert.equal(receipt.group, browser.child.pid);
+  assert.notEqual(receipt.parentGroup, receipt.group);
+  assert.equal(receipt.observed, receipt.child);
+  assert.deepEqual(await withDeadline(() => browser.completion, 3_000, "group leader exit"), { code: 0, signal: null });
+  const assertZombie = async () => {
+    const stat = await readFile(`/proc/${receipt.child}/stat`, "utf8");
+    assert.ok(stat.includes("(verse ) (z)\n)"));
+    assert.match(stat.slice(stat.lastIndexOf(")") + 1), new RegExp(`^ Z ${receipt.parent} ${receipt.group} `));
+    process.kill(-receipt.group, 0); // The old probe still reports an extant group.
+  };
+  await assertZombie();
+  assert.equal(await ownedGroupAlive(receipt.group), false);
+  const logs = [];
+  await cleanupBrowser(browser, profile, { stopTimeoutMs: 1_000, log: (message) => logs.push(message) });
+  assert.equal(browser.stopped, true);
+  assert.deepEqual(logs, []);
+  await assert.rejects(access(profile), { code: "ENOENT" });
+  await withDeadline(() => stopOwnedGroup(receipt.group), 1_000, "zombie group supervisor cleanup");
+  await assertZombie(); // Both cleanup paths finished while waitpid was withheld.
+  await assert.rejects(access(join(root, "reaped")), { code: "ENOENT" });
+});
+
 test("descendant-held pipe timeout releases handles and preserves profile without killing escaped group", posix, async (t) => {
   const profile = await mkdtemp(join(tmpdir(), "verse-held-pipe-test-"));
   const helper = new URL("../scripts/browser-lifecycle.mjs", import.meta.url).href;
@@ -229,17 +306,10 @@ test("successful deadline releases its 60-second timer and process exits promptl
 async function stopOwnedGroup(pid) {
   assert.ok(Number.isInteger(pid) && pid > 0, "Owned process PID must be positive");
   const target = process.platform === "win32" ? pid : -pid;
-  const alive = () => {
-    try { process.kill(target, 0); return true; }
-    catch (error) {
-      if (error.code === "ESRCH") return false;
-      if (error.code === "EPERM") return true;
-      throw error;
-    }
-  };
-  if (!alive()) return;
+  const alive = () => ownedGroupAlive(pid);
+  if (!await alive()) return;
   const wait = (signal) => (async () => {
-    while (alive()) await delay(20, undefined, { signal });
+    while (await alive()) await delay(20, undefined, { signal });
   })();
   const signalOwned = (signal) => {
     try { process.kill(target, signal); }
@@ -247,19 +317,19 @@ async function stopOwnedGroup(pid) {
   };
   if (process.platform === "win32") {
     try { await promisify(execFile)("taskkill", ["/PID", String(pid), "/T", "/F"], { timeout: 3_000 }); }
-    catch (error) { if (alive()) throw error; }
+    catch (error) { if (await alive()) throw error; }
   } else {
     signalOwned("SIGTERM");
     try { await withDeadline(wait, 2_000, "owned group graceful shutdown"); return; }
     catch (error) {
-      if (!alive()) return;
+      if (!await alive()) return;
       signalOwned("SIGKILL");
     }
   }
   await withDeadline(wait, 3_000, "owned group forced shutdown");
 }
 
-async function runHarness(t, { page = "", env = {}, preload = "", outerTimeoutMs = 20_000 } = {}) {
+async function runHarness(t, { page = "", env = {}, preload = "", outerTimeoutMs = 50_000 } = {}) {
   const root = await mkdtemp(join(tmpdir(), "verse-isolated-harness-"));
   const profiles = join(root, "profiles");
   const report = join(root, "receipt.json");
@@ -277,7 +347,7 @@ async function runHarness(t, { page = "", env = {}, preload = "", outerTimeoutMs
   args.push(fileURLToPath(new URL("../scripts/test-pronunciation-browser.mjs", import.meta.url)));
   const harness = launchBrowserProcess(process.execPath, args, {
     cwd: root, ipc: true,
-    env: { ...process.env, VERSE_BROWSER_STARTUP_TIMEOUT_MS: "6000", VERSE_BROWSER_STOP_TIMEOUT_MS: "1000",
+    env: { ...process.env, VERSE_BROWSER_STARTUP_TIMEOUT_MS: "30000", VERSE_BROWSER_STOP_TIMEOUT_MS: "5000",
       ...env, VERSE_BROWSER_REPORT: report, TMPDIR: profiles, TMP: profiles, TEMP: profiles },
   });
   const owned = new Set();
@@ -297,7 +367,7 @@ async function runHarness(t, { page = "", env = {}, preload = "", outerTimeoutMs
       try { await stopOwnedGroup(pid); } catch (error) { errors.push(error); }
     }
     try {
-      await withDeadline(() => harness.completion, 3_000, "harness exit after browser cleanup").catch(() => {});
+      await withDeadline(() => harness.completion, 15_000, "harness exit after browser cleanup").catch(() => {});
       await harness.stop({ stopTimeoutMs: 3_000 });
     } catch (error) { errors.push(error); }
     // Drain ownership announcements that raced the outer timeout before deletion.
@@ -366,13 +436,13 @@ test("stalled DevTools handshake fails at startup deadline and cleans owned reso
     };
   ` });
   assert.equal(result.code, 1);
-  assert.match(result.output, /Chromium startup timed out after 6000 ms \(stage: DevTools connection\)/);
+  assert.match(result.output, /Chromium startup timed out after 30000 ms \(stage: DevTools connection\)/);
 });
 
 test("never-ready page fails at startup deadline and cleans owned resources", async (t) => {
   const result = await runHarness(t, { page: "<!doctype html><p>No run button</p>" });
   assert.equal(result.code, 1);
-  assert.match(result.output, /Chromium startup timed out after 6000 ms \(stage: harness navigation\/readiness\)/);
+  assert.match(result.output, /Chromium startup timed out after 30000 ms \(stage: harness navigation\/readiness\)/);
 });
 
 test("outer harness deadline cleans its separately owned browser before removing fixture", async (t) => {

@@ -155,6 +155,10 @@ checks out the untouched historical application commit. This does not repair
 application bugs or authorize tag movement, asset replacement, or skipped
 assertions.
 
+After recovering an older release, verify GitHub's `Latest` marker and keep it
+on the newest intended stable version. Publishing an older draft can move that
+marker even though the version tags remain unchanged.
+
 ### Identity validation
 
 Before any platform build starts, the workflow:
