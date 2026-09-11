@@ -239,6 +239,43 @@ Use a supported MuseScore 3.6.2+ or MuseScore 4 executable that advertises
 `--score-parts`. MuseScore 4 is required when the native input itself is a
 MuseScore 4 score.
 
+### Complete bundles with combined excerpts and note-free Parts
+
+Use the complete-bundle gate to verify Part alignment through rendering and
+transactional publication. Raw excerpt counts are not a substitute: a combined
+excerpt can establish a note-free Part's identity without providing a standalone
+stem. Every note-bearing source Part still requires its own standalone excerpt.
+
+```sh
+VERSE_MUSESCORE_GATE="/path/to/mscore" \
+VERSE_BUNDLE_GATE="/path/to/private-score.mscz" \
+VERSE_BUNDLE_OUTPUT_DIR="$PWD/_bmad-output/bundle-part-gap-verification" \
+cargo test --manifest-path src-tauri/Cargo.toml --locked --lib \
+  configured_real_renderer_exports_one_verified_stem_per_source_part -- --nocapture
+```
+
+The output directory must not exist and its parent must already exist. This
+gate exports both English-profile USTX and SVP bundles, checks the full manifest
+and ledger, verifies byte-identical source snapshots and unchanged vocal content,
+and checks one audio track per required Part plus the full-score reference.
+It writes `verification-ustx.json` and `verification-svp.json` alongside the
+bundles, recording source hashes, source Part identities, and track counts.
+Without `VERSE_BUNDLE_OUTPUT_DIR`, successful outputs are removed after testing.
+Keep scores, audio, bundles, and verification receipts in ignored local paths.
+
+Native MuseScore Part renders may retain a quiet overrun of at most two seconds
+at the actual, matching sample rate. Verse checks every excess sample strictly
+after the full-score reference end: floats must be finite with absolute value
+at most `1e-4`, and integer PCM must be zero. Audible, oversized, wrong-rate,
+and other-source overruns fail. Tail inspection uses bounded memory and the
+configured output byte limit. Renderer hashes are always verified before any
+allowance; WAV headers and samples remain byte-identical, including opening
+rests and ordinary float format tag 3 required by OpenUtau's audio reader. No
+samples are removed, shifted, rewritten, or padded. Accepted tails produce a
+`MUSESCORE_QUIET_TAIL` diagnostic; length and tail checks do not establish exact
+musical alignment. Deterministic `bundle::tests::quiet_tail_` tests cover these
+checks through WAV inspection and transactional SVP/USTX bundle publication.
+
 ## Interpreting a failure
 
 A parser or projection refusal is not automatically a regression. Verse

@@ -186,7 +186,7 @@ fn select_declared_master(container: &str) -> Result<String, String> {
     Err("MuseScore container has ambiguous master .mscx rootfiles".to_string())
 }
 
-fn extract_mscz(data: &[u8]) -> Result<String, String> {
+fn master_mscx_path(data: &[u8]) -> Result<String, String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
 
     let mut container_indices = Vec::new();
@@ -245,19 +245,27 @@ fn extract_mscz(data: &[u8]) -> Result<String, String> {
         .iter()
         .filter(|(_, path)| path == &selected)
         .collect();
-    let entry_index = match matching_entries.as_slice() {
-        [(index, _)] => *index,
-        [] => {
-            return Err(format!(
-                "MuseScore container-declared rootfile is missing: {selected:?}"
-            ))
-        }
-        _ => {
-            return Err(format!(
-                "MuseScore container-declared rootfile is ambiguous: {selected:?}"
-            ))
-        }
-    };
+    match matching_entries.as_slice() {
+        [(_, path)] => Ok(path.clone()),
+        [] => Err(format!(
+            "MuseScore container-declared rootfile is missing: {selected:?}"
+        )),
+        _ => Err(format!(
+            "MuseScore container-declared rootfile is ambiguous: {selected:?}"
+        )),
+    }
+}
+
+fn extract_mscz(data: &[u8]) -> Result<String, String> {
+    let selected = master_mscx_path(data)?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
+    let entry_index = (0..zip.len())
+        .find(|index| {
+            zip.by_index(*index)
+                .ok()
+                .is_some_and(|file| file.name() == selected)
+        })
+        .ok_or_else(|| format!("MuseScore container-declared rootfile is missing: {selected:?}"))?;
 
     let mut score_file = zip
         .by_index(entry_index)
