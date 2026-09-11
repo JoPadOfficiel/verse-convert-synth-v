@@ -44,6 +44,32 @@ exact pinned OpenUtau revision before applying the repository patch. The CI
 environment uses Node 22, .NET 10, Rust 1.93.0, an immutable npm install, the
 locked Cargo dependency graph, and Ubuntu 22.04 native Tauri dependencies.
 
+The browser gate retains all 24 rendered application cases and three full page
+reloads, with native Tauri IPC/dialogs mocked. It requires a complete passing
+receipt; assertion, navigation, receipt, startup, and cleanup failures remain
+blocking. The lifecycle regression tests also exercise slow startup, process
+exit/spawn errors, delayed profile writes, forced shutdown, and timeout release.
+
+Browser environment controls (all durations are positive integer milliseconds):
+
+- `VERSE_BROWSER_STARTUP_TIMEOUT_MS`: total deadline for the DevTools endpoint,
+  connection, and test-page readiness (default `30000`).
+- `VERSE_BROWSER_TIMEOUT_MS`: test receipt deadline after starting the cases
+  (default `60000`).
+- `VERSE_BROWSER_STOP_TIMEOUT_MS`: each graceful/forced process shutdown wait
+  and the Vite shutdown deadline (default `5000`).
+- `VERSE_TEST_CHROME`, `VERSE_BROWSER_BIN`, or `CHROME_BIN`: Chromium executable,
+  in precedence order; otherwise the harness locates the platform default.
+- `VERSE_BROWSER_REPORT`: receipt path (default
+  `src-tauri/target/pronunciation-browser/results.json`).
+
+Chromium keeps its sandbox enabled. Failures include the startup stage and the
+last 16 KiB of browser stderr when available. Cleanup waits for the owned child
+and its stderr pipe to close before removing its isolated profile, retries
+transient filesystem removal errors, and reports any remaining cleanup failure.
+If SIGTERM times out, it logs the escalation, sends SIGKILL only to that child,
+and waits again. If the child cannot be confirmed closed, its profile is retained.
+
 `npm run version:check` verifies that the strict SemVer value is synchronized
 across:
 

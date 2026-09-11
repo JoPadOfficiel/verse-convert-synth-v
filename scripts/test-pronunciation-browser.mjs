@@ -1,19 +1,24 @@
 // Run the real rendered App in an isolated headless Chromium profile. Native
 // Tauri IPC/dialogs remain mocked by tests/pronunciation-browser.tsx.
 import { createServer } from "vite";
-import { execFileSync, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { cleanupBrowser, launchBrowserProcess, timeoutSetting, waitForDevTools, withDeadline } from "./browser-lifecycle.mjs";
 
 const report = resolve(process.env.VERSE_BROWSER_REPORT ?? "src-tauri/target/pronunciation-browser/results.json");
-const timeoutMs = Number(process.env.VERSE_BROWSER_TIMEOUT_MS ?? 60_000);
+const timeoutMs = timeoutSetting("VERSE_BROWSER_TIMEOUT_MS", 60_000);
+const startupTimeoutMs = timeoutSetting("VERSE_BROWSER_STARTUP_TIMEOUT_MS", 30_000);
+const stopTimeoutMs = timeoutSetting("VERSE_BROWSER_STOP_TIMEOUT_MS", 5_000);
 let settleReceipt;
 let rejectReceipt;
 const receipt = new Promise((resolve, reject) => {
   settleReceipt = resolve;
   rejectReceipt = reject;
 });
+receipt.catch(() => {});
 
 function executable() {
   const explicit = process.env.VERSE_TEST_CHROME || process.env.VERSE_BROWSER_BIN || process.env.CHROME_BIN;
@@ -31,41 +36,55 @@ function executable() {
   throw new Error("No Chromium browser found. Set VERSE_TEST_CHROME, VERSE_BROWSER_BIN, or CHROME_BIN.");
 }
 
-async function waitForFile(path, deadline) {
-  while (Date.now() < deadline) {
-    try {
-      return await readFile(path, "utf8");
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  throw new Error(`Timed out waiting for ${path}`);
-}
-
 function cdp(socket) {
   let id = 0;
   const pending = new Map();
-  socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data.toString());
-    if (message.id) {
-      const current = pending.get(message.id);
-      if (!current) return;
-      pending.delete(message.id);
-      if (message.error) current.reject(new Error(message.error.message));
-      else current.resolve(message.result);
-      return;
-    }
-  });
+  let failure;
+  const fail = (error) => {
+    failure ??= error;
+    for (const current of pending.values()) current.reject(failure);
+    pending.clear();
+  };
+  const onClose = () => fail(new Error("Chromium DevTools socket closed"));
+  const onError = () => fail(new Error("Chromium DevTools socket error"));
+  const onMessage = (event) => {
+    try {
+      const message = JSON.parse(event.data.toString());
+      if (message.id) {
+        const current = pending.get(message.id);
+        if (!current) return;
+        pending.delete(message.id);
+        if (message.error) current.reject(new Error(message.error.message));
+        else current.resolve(message.result);
+        return;
+      }
+    } catch (error) { fail(error); }
+  };
+  socket.addEventListener("message", onMessage);
+  socket.addEventListener("close", onClose);
+  socket.addEventListener("error", onError);
   const send = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+    if (failure) { reject(failure); return; }
     const messageId = ++id;
     pending.set(messageId, { resolve, reject });
-    socket.send(JSON.stringify({ id: messageId, method, params, ...(sessionId ? { sessionId } : {}) }));
+    try {
+      socket.send(JSON.stringify({ id: messageId, method, params, ...(sessionId ? { sessionId } : {}) }));
+    } catch (error) {
+      pending.delete(messageId);
+      reject(error);
+    }
   });
-  return { send };
+  return { send, dispose() {
+    fail(new Error("Chromium DevTools session disposed"));
+    socket.removeEventListener("message", onMessage);
+    socket.removeEventListener("close", onClose);
+    socket.removeEventListener("error", onError);
+  } };
 }
 
-async function waitForHarness(send, sessionId, deadline) {
-  while (Date.now() < deadline) {
+async function waitForHarness(send, sessionId, signal) {
+  while (true) {
+    signal.throwIfAborted();
     try {
       const state = await send("Runtime.evaluate", {
         expression: 'document.readyState === "complete" && document.getElementById("run-tests") !== null',
@@ -75,9 +94,8 @@ async function waitForHarness(send, sessionId, deadline) {
     } catch {
       // Navigation may temporarily destroy the execution context.
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await delay(50, undefined, { signal });
   }
-  throw new Error("Timed out waiting for pronunciation browser harness");
 }
 
 await rm(report, { force: true });
@@ -111,10 +129,13 @@ const server = await createServer({
 
 let browser;
 let profile;
+let socket;
+let protocol;
+let testError;
 try {
   await server.listen();
   profile = await mkdtemp(join(tmpdir(), "verse-pronunciation-browser-"));
-  browser = spawn(executable(), [
+  browser = launchBrowserProcess(executable(), [
     "--headless=new",
     "--disable-background-networking",
     "--disable-component-update",
@@ -128,45 +149,100 @@ try {
     "--remote-allow-origins=*",
     `--user-data-dir=${profile}`,
     "about:blank",
-  ], { stdio: "ignore" });
-
-  const activePort = await waitForFile(join(profile, "DevToolsActivePort"), Date.now() + 10_000);
-  const [port, browserPath] = activePort.trim().split(/\r?\n/);
-  const socket = new WebSocket(`ws://127.0.0.1:${port}${browserPath}`);
-  await new Promise((resolve, reject) => {
-    socket.addEventListener("open", resolve, { once: true });
-    socket.addEventListener("error", reject, { once: true });
-  });
-  const { send } = cdp(socket);
-  const { targetId } = await send("Target.createTarget", { url: "about:blank" });
-  const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
-  await send("Page.enable", {}, sessionId);
-  await send("Runtime.enable", {}, sessionId);
-  await send("Page.navigate", { url: "http://127.0.0.1:1428/tests/pronunciation-browser.html" }, sessionId);
-  await waitForHarness(send, sessionId, Date.now() + 10_000);
-  const clicked = await send("Runtime.evaluate", {
-    expression: 'document.getElementById("run-tests")?.click(); true',
-    returnByValue: true,
-  }, sessionId);
-  if (clicked?.result?.value !== true) throw new Error("Could not start pronunciation browser regression");
-
-  const outcome = await Promise.race([
-    receipt,
-    new Promise((_, reject) => setTimeout(
-      () => reject(new Error(`Browser regression timed out after ${timeoutMs} ms`)), timeoutMs
-    )),
   ]);
+  // An IPC-connected test supervisor can clean this separately owned group if
+  // the harness itself stalls. Normal CLI runs have no IPC channel.
+  if (process.connected) process.send({ type: "verse-browser-owned", pid: browser.child.pid });
+
+  let stage = "DevToolsActivePort";
+  await withDeadline((signal) => browser.guard((async () => {
+    const endpoint = await waitForDevTools(browser, profile, signal);
+    signal.throwIfAborted();
+    stage = "DevTools connection";
+    socket = new WebSocket(endpoint);
+    // Keep transport errors observed even while connecting or closing.
+    socket.addEventListener("error", () => {});
+    await new Promise((resolve, reject) => {
+      const finish = (error) => {
+        socket.removeEventListener("open", onOpen);
+        socket.removeEventListener("error", onError);
+        socket.removeEventListener("close", onClose);
+        signal.removeEventListener("abort", onAbort);
+        if (error) reject(error); else resolve();
+      };
+      const onOpen = () => finish();
+      const onError = () => finish(new Error("Could not connect to Chromium DevTools"));
+      const onClose = () => finish(new Error("Chromium DevTools closed before connecting"));
+      const onAbort = () => finish(signal.reason);
+      socket.addEventListener("open", onOpen, { once: true });
+      socket.addEventListener("error", onError, { once: true });
+      socket.addEventListener("close", onClose, { once: true });
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    signal.throwIfAborted();
+    protocol = cdp(socket);
+    const { send } = protocol;
+    stage = "harness navigation/readiness";
+    const { targetId } = await send("Target.createTarget", { url: "about:blank" });
+    const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
+    await send("Page.enable", {}, sessionId);
+    await send("Runtime.enable", {}, sessionId);
+    await send("Page.navigate", { url: "http://127.0.0.1:1428/tests/pronunciation-browser.html" }, sessionId);
+    await waitForHarness(send, sessionId, signal);
+    const clicked = await send("Runtime.evaluate", {
+      expression: 'document.getElementById("run-tests")?.click(); true',
+      returnByValue: true,
+    }, sessionId);
+    if (clicked?.result?.value !== true) throw new Error("Could not start pronunciation browser regression");
+  })()), startupTimeoutMs, "Chromium startup").catch((error) => {
+    throw new Error(`${error.message} (stage: ${stage})`, { cause: error });
+  });
+
+  const outcome = await withDeadline(() => browser.guard(receipt), timeoutMs, "Browser regression");
   console.log(JSON.stringify({ report, passed: outcome.passed, tests: outcome.tests.length, reloads: outcome.reloads ?? null }));
   if (!outcome.passed) {
-    console.error(outcome.error ?? "Pronunciation browser regression failed");
-    process.exitCode = 1;
+    throw new Error(outcome.error ?? "Pronunciation browser regression failed");
   }
-  socket.close();
+  if (outcome.tests.length !== 24 || outcome.tests.some((test) => test.passed !== true) || outcome.reloads !== 3) {
+    throw new Error("Incomplete browser receipt: expected 24 passing cases and 3 reloads");
+  }
 } catch (error) {
-  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  testError = error;
   process.exitCode = 1;
 } finally {
-  if (browser && browser.exitCode === null) browser.kill("SIGTERM");
-  await server.close();
-  if (profile) await rm(profile, { recursive: true, force: true });
+  const cleanupErrors = [];
+  if (protocol && browser) {
+    let closed;
+    try {
+      // Let Chrome drain/reap its helpers before falling back to OS signals.
+      // https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-close
+      closed = await withDeadline(async () => {
+        // Some versions close the socket before acknowledging Browser.close.
+        try { await protocol.send("Browser.close"); } catch {}
+        return browser.completion;
+      }, stopTimeoutMs, "Chromium DevTools shutdown");
+    } catch (error) {
+      console.error(`${error.message}; falling back to owned-process shutdown`);
+    }
+    if (closed && closed.code !== 0) {
+      cleanupErrors.push(new Error(`Chromium exited unexpectedly during DevTools shutdown (code ${closed.code}, signal ${closed.signal ?? "none"})`));
+    }
+  }
+  try {
+    protocol?.dispose();
+    socket?.close();
+  } catch (error) { cleanupErrors.push(error); }
+  try {
+    await cleanupBrowser(browser, profile, { stopTimeoutMs });
+  } catch (error) { cleanupErrors.push(error); }
+  try {
+    server.httpServer?.closeAllConnections();
+    await withDeadline(() => server.close(), stopTimeoutMs, "Vite shutdown");
+  } catch (error) { cleanupErrors.push(error); }
+  if (testError) console.error(testError.stack ?? String(testError));
+  for (const error of cleanupErrors) {
+    console.error("Browser cleanup failed:", error.stack ?? String(error));
+    process.exitCode = 1;
+  }
+  if (process.exitCode) console.error(browser?.diagnostics() ?? "Chromium was not started");
 }

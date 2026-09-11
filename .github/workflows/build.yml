@@ -18,6 +18,11 @@ on:
         type: boolean
   workflow_dispatch:
     inputs:
+      recover_browser_harness:
+        description: Use this workflow revision's browser test launcher to recover an immutable historical release
+        required: false
+        default: false
+        type: boolean
       tag:
         description: Strict release tag name (vMAJOR.MINOR.PATCH)
         required: true
@@ -127,6 +132,28 @@ jobs:
 
       - name: Install frontend dependencies reproducibly
         run: npm ci
+
+      # Historical tags cannot receive a test-launcher fix. Recovery changes
+      # only the launcher in this validation job; every packaging job below
+      # still checks out the untouched, verified release commit.
+      - name: Recover historical browser test launcher
+        if: github.event_name == 'workflow_dispatch' && inputs.recover_browser_harness == true
+        shell: bash
+        env:
+          HARNESS_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Browser launcher revision must be an immutable commit"
+            exit 1
+          fi
+          git fetch --no-tags origin "$HARNESS_SHA"
+          for file in scripts/test-pronunciation-browser.mjs scripts/browser-lifecycle.mjs; do
+            git show "${HARNESS_SHA}:${file}" > "$file"
+          done
+          echo "Browser launcher revision: $HARNESS_SHA"
+          echo "Application source revision: ${{ inputs.commit_sha }}"
+          git diff --stat
 
       - name: Run frontend and browser tests
         run: npm test
