@@ -353,6 +353,7 @@ Optional local gates for the two reported real-world regressions use:
 
 ```sh
 VERSE_MSCZ_GATE="/path/to/score.mscz" \
+VERSE_MULTI_TEMPO_MSCZ_GATE="/path/to/multi-tempo-score.mscz" \
 VERSE_MXL_GATE="/path/to/score.mxl" \
 cargo test \
   --manifest-path src-tauri/Cargo.toml \

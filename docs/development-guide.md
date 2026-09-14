@@ -155,6 +155,7 @@ without adding them to Git:
 
 ```sh
 VERSE_MSCZ_GATE="/absolute/path/to/score.mscz" \
+VERSE_MULTI_TEMPO_MSCZ_GATE="/absolute/path/to/multi-tempo-score.mscz" \
 VERSE_MXL_GATE="/absolute/path/to/score.mxl" \
 cargo test \
   --manifest-path src-tauri/Cargo.toml \

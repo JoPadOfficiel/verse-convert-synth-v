@@ -106,7 +106,7 @@ fn multi_tempo_musicxml() -> &'static str {
     <score-part id="P2"><part-name>Alto</part-name></score-part>
   </part-list>
   <part id="P1"><measure number="1">
-    <attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <attributes><divisions>480</divisions><time><beats>5</beats><beat-type>4</beat-type></time></attributes>
     <direction><sound tempo="90"/></direction>
     <note><pitch><step>C</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>one</text></lyric></note>
     <note><pitch><step>D</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>two</text></lyric></note>
@@ -114,9 +114,10 @@ fn multi_tempo_musicxml() -> &'static str {
     <note><pitch><step>E</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>three</text></lyric></note>
     <direction><sound tempo="90"/></direction>
     <note><pitch><step>F</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>four</text></lyric></note>
+    <note><rest/><duration>480</duration><voice>1</voice></note>
   </measure></part>
   <part id="P2"><measure number="1">
-    <attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <attributes><divisions>480</divisions><time><beats>5</beats><beat-type>4</beat-type></time></attributes>
     <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>one</text></lyric></note>
     <note><pitch><step>D</step><octave>4</octave></pitch><duration>960</duration><voice>1</voice><lyric><text>two</text></lyric></note>
     <note><pitch><step>E</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>three</text></lyric></note>
@@ -128,8 +129,17 @@ fn multi_tempo_musicxml() -> &'static str {
 fn mxl(xml: &str) -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut writer = zip::ZipWriter::new(cursor);
+    let options = zip::write::SimpleFileOptions::default();
     writer
-        .start_file("score.musicxml", zip::write::SimpleFileOptions::default())
+        .start_file("META-INF/container.xml", options)
+        .expect("MXL container entry");
+    writer
+        .write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?><container><rootfiles><rootfile full-path="score.musicxml"/></rootfiles></container>"#,
+        )
+        .expect("MXL container contents");
+    writer
+        .start_file("score.musicxml", options)
         .expect("MXL score entry");
     writer
         .write_all(xml.as_bytes())
@@ -175,7 +185,7 @@ fn multi_tempo_mscx() -> &'static str {
 </museScore>"#
 }
 
-fn assert_openutau_global_multi_tempo(data: &[u8], label: &str) {
+fn assert_global_multi_tempo_across_targets(data: &[u8], label: &str) {
     let outcome = convert_auto(data, "english");
     assert!(outcome.ok, "{label}: {:?}", outcome.msg);
     let projected = outcome
@@ -221,6 +231,22 @@ fn assert_openutau_global_multi_tempo(data: &[u8], label: &str) {
         (alto.notes[1].onset_ticks, alto.notes[1].duration_ticks),
         (480, 960),
         "{label}: Alto sustained note must cross the middle tempo change intact"
+    );
+
+    let svp = target::svp::serialize(&projected)
+        .unwrap_or_else(|error| panic!("{label}: serialize Synthesizer V project: {error}"));
+    assert_eq!(
+        svp.time
+            .tempo
+            .iter()
+            .map(|tempo| (tempo.position, tempo.bpm))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 89.999955),
+            (1_411_200_000, 150.0),
+            (2_116_800_000, 89.999955),
+        ],
+        "{label}: Synthesizer V must receive every global tempo change"
     );
 
     let ustx = target::ustx::serialize(&projected)
@@ -328,7 +354,7 @@ fn every_supported_source_family_keeps_global_tempo_changes_for_openutau() {
         ("MuseScore XML (.mscx)", mscx_data),
         ("compressed MuseScore (.mscz)", mscz_data),
     ] {
-        assert_openutau_global_multi_tempo(&data, label);
+        assert_global_multi_tempo_across_targets(&data, label);
     }
 }
 
@@ -848,59 +874,128 @@ fn supplied_multi_tempo_musescore_gate() {
         );
     }
 
-    let middle_tick = projected.tempos[1].tick;
-    let mut verified_source_tracks = BTreeSet::new();
+    let change_ticks: Vec<_> = projected
+        .tempos
+        .iter()
+        .skip(1)
+        .map(|tempo| tempo.tick)
+        .collect();
+    let mut verified_source_tracks: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for expected_name in ["Soprano", "Alto"] {
-        let lane = projected
+        let matching_lanes: Vec<_> = projected
             .tracks
             .iter()
-            .find(|lane| lane.name.contains(expected_name))
-            .unwrap_or_else(|| panic!("missing projected {expected_name} lane"));
-        let source_track = parsed
-            .tracks
-            .iter()
-            .find(|track| track.id == lane.source_track_id)
-            .expect("projected lane must retain source-track identity");
-        assert!(
-            source_track.name.contains(expected_name),
-            "projected {expected_name} lane must retain its matching source track"
-        );
-        assert!(
-            verified_source_tracks.insert(source_track.id.as_str()),
-            "Soprano and Alto must be distinct source tracks"
-        );
-        let source_note_ticks: Vec<_> = source_track
-            .events
-            .iter()
-            .filter_map(|event| matches!(event.kind, Kind::NoteOn(_)).then_some(event.tick))
+            .filter(|lane| lane.name.contains(expected_name))
             .collect();
-        let source_spans_middle = source_note_ticks.iter().any(|tick| *tick < middle_tick)
-            && source_note_ticks.iter().any(|tick| *tick >= middle_tick);
         assert!(
-            source_spans_middle,
-            "source {expected_name} must contain note onsets before and after the middle tempo change"
+            !matching_lanes.is_empty(),
+            "missing projected {expected_name} lane"
         );
+        for lane in matching_lanes {
+            let source_track = parsed
+                .tracks
+                .iter()
+                .find(|track| track.id == lane.source_track_id)
+                .expect("projected lane must retain source-track identity");
+            assert!(
+                source_track.name.contains(expected_name),
+                "projected {expected_name} lane must retain its matching source track"
+            );
+            verified_source_tracks
+                .entry(expected_name)
+                .or_default()
+                .insert(source_track.id.clone());
 
-        let projected_before = lane.notes.iter().any(|note| note.onset_ticks < middle_tick);
-        let projected_after = lane
-            .notes
-            .iter()
-            .any(|note| note.onset_ticks >= middle_tick);
-        assert!(
-            projected_before && projected_after,
-            "projected {expected_name} lost note onsets across the shared tempo change at tick {middle_tick}"
-        );
+            for note in &lane.notes {
+                let evidence = note
+                    .source_evidence
+                    .as_ref()
+                    .expect("projected source note must retain source evidence");
+                let origin = evidence
+                    .origin
+                    .as_ref()
+                    .expect("projected source note must retain source origin");
+                let origin_track = parsed
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == origin.track_id)
+                    .expect("projected source origin must name a parsed source track");
+                let source_note_on = origin_track
+                    .events
+                    .iter()
+                    .find(|event| event.order == origin.note_on_order)
+                    .expect("projected source origin must name a note-on event");
+                assert!(matches!(source_note_on.kind, Kind::NoteOn(_)));
+                assert_eq!(
+                    note.onset_ticks, source_note_on.tick,
+                    "projected {expected_name} note {} moved from source tick {}",
+                    evidence.note_id, source_note_on.tick
+                );
+            }
+
+            let source_note_ticks: Vec<_> = source_track
+                .events
+                .iter()
+                .filter_map(|event| matches!(event.kind, Kind::NoteOn(_)).then_some(event.tick))
+                .collect();
+            for change_tick in &change_ticks {
+                let source_spans_change = source_note_ticks.iter().any(|tick| tick < change_tick)
+                    && source_note_ticks.iter().any(|tick| tick >= change_tick);
+                if !source_spans_change {
+                    continue;
+                }
+                let projected_before = lane
+                    .notes
+                    .iter()
+                    .any(|note| note.onset_ticks < *change_tick);
+                let projected_after = lane
+                    .notes
+                    .iter()
+                    .any(|note| note.onset_ticks >= *change_tick);
+                assert!(
+                    projected_before && projected_after,
+                    "projected {expected_name} lane {} lost note onsets across the shared tempo change at tick {change_tick}",
+                    lane.name
+                );
+            }
+        }
     }
+    let soprano_sources = verified_source_tracks
+        .get("Soprano")
+        .expect("verified Soprano source tracks");
+    let alto_sources = verified_source_tracks
+        .get("Alto")
+        .expect("verified Alto source tracks");
+    assert!(
+        soprano_sources.is_disjoint(alto_sources),
+        "Soprano and Alto must be distinct source tracks"
+    );
 
     let svp = target::svp::serialize(&projected).expect("serialize supplied multi-tempo SVP");
     let ustx = target::ustx::serialize(&projected).expect("serialize supplied multi-tempo USTX");
     assert_eq!(svp.time.tempo.len(), 3, "SVP must keep all three tempos");
     assert_eq!(ustx.tempos.len(), 3, "USTX must keep all three tempos");
-    for (tempo, expected) in svp.time.tempo.iter().zip([90.0, 150.0, 90.0]) {
-        assert!((tempo.bpm - expected).abs() < 0.001);
+    for (tempo, source) in svp.time.tempo.iter().zip(&projected.tempos) {
+        let numerator = u128::from(source.tick) * u128::from(target::svp::BLICKS_PER_QUARTER);
+        let denominator = u128::from(projected.ticks_per_beat);
+        assert_eq!(
+            numerator % denominator,
+            0,
+            "SVP tempo must be exactly representable"
+        );
+        assert_eq!(tempo.position, (numerator / denominator) as i64);
+        assert!((tempo.bpm - source.bpm).abs() < 0.001);
     }
-    for (tempo, expected) in ustx.tempos.iter().zip([90.0, 150.0, 90.0]) {
-        assert!((tempo.bpm - expected).abs() < 0.001);
+    for (tempo, source) in ustx.tempos.iter().zip(&projected.tempos) {
+        let numerator = u128::from(source.tick) * u128::from(target::ustx::TICKS_PER_QUARTER);
+        let denominator = u128::from(projected.ticks_per_beat);
+        assert_eq!(
+            numerator % denominator,
+            0,
+            "USTX tempo must be exactly representable"
+        );
+        assert_eq!(tempo.position, (numerator / denominator) as i32);
+        assert!((tempo.bpm - source.bpm).abs() < 0.001);
     }
 }
 
