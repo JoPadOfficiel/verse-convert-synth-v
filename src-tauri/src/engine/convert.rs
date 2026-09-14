@@ -3618,6 +3618,75 @@ mod tests {
         assert!(opening.source.is_some(), "the source named this event");
     }
 
+    /// The concrete BPM values used by a regression fixture are examples, not
+    /// a supported-pattern list. Tempo events may speed up, slow down, and be
+    /// discovered on different physical source tracks; one project-level map
+    /// must preserve all of them for both output targets.
+    #[test]
+    fn arbitrary_multi_tempo_sequences_are_project_global_in_both_targets() {
+        let mut first = Track::new("tempo-a", 0);
+        first.events = vec![
+            midi::Event::new(0, 0, Kind::Tempo(800_000)), // 75 BPM
+            midi::Event::new(960, 1, Kind::Tempo(1_000_000)), // 60 BPM
+            midi::Event::new(1_920, 2, Kind::Tempo(625_000)), // 96 BPM
+        ];
+        let mut second = Track::new("tempo-b", 1);
+        second.events = vec![
+            midi::Event::new(480, 0, Kind::Tempo(500_000)), // 120 BPM
+            midi::Event::new(1_440, 1, Kind::Tempo(300_000)), // 200 BPM
+        ];
+        let midi = midi_with(vec![first, second]);
+
+        let outcome = convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let projected = outcome.svp.as_ref().expect("a projection");
+        assert_eq!(
+            projected
+                .tempos
+                .iter()
+                .map(|tempo| (tempo.tick, tempo.bpm))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 75.0),
+                (480, 120.0),
+                (960, 60.0),
+                (1_440, 200.0),
+                (1_920, 96.0),
+            ]
+        );
+
+        let svp = crate::engine::target::svp::serialize(projected).expect("SVP tempo map");
+        assert_eq!(
+            svp.time
+                .tempo
+                .iter()
+                .map(|tempo| (tempo.position, tempo.bpm))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 75.0),
+                (705_600_000, 120.0),
+                (1_411_200_000, 60.0),
+                (2_116_800_000, 200.0),
+                (2_822_400_000, 96.0),
+            ]
+        );
+
+        let ustx = crate::engine::target::ustx::serialize(projected).expect("USTX tempo map");
+        assert_eq!(
+            ustx.tempos
+                .iter()
+                .map(|tempo| (tempo.position, tempo.bpm))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 75.0),
+                (480, 120.0),
+                (960, 60.0),
+                (1_440, 200.0),
+                (1_920, 96.0),
+            ]
+        );
+    }
+
     /// A vocal lane is monophonic in both targets, so a lane that sounds two
     /// notes at once is decomposed into one lane per voice. Nothing about a note
     /// changes: it moves lane, keeping its pitch, instant, length and word.

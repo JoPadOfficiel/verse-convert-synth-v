@@ -4920,6 +4920,90 @@ Melodie</trackName>
     }
 
     #[test]
+    fn tempos_written_on_one_staff_remain_global_for_every_vocal_part() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Soprano</trackName><Staff id="1"/></Part>
+    <Part><trackName>Alto</trackName><Staff id="2"/></Part>
+    <Staff id="1"><Measure><voice>
+      <Tempo><tempo>1.5</tempo></Tempo>
+      <Chord><durationType>quarter</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>72</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>two</text></Lyrics><Note><pitch>74</pitch></Note></Chord>
+      <Tempo><tempo>2.5</tempo></Tempo>
+      <Chord><durationType>quarter</durationType><Lyrics><text>three</text></Lyrics><Note><pitch>76</pitch></Note></Chord>
+      <Tempo><tempo>1.5</tempo></Tempo>
+      <Chord><durationType>quarter</durationType><Lyrics><text>four</text></Lyrics><Note><pitch>77</pitch></Note></Chord>
+    </voice></Measure></Staff>
+    <Staff id="2"><Measure><voice>
+      <Chord><durationType>quarter</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>60</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>two</text></Lyrics><Note><pitch>62</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>three</text></Lyrics><Note><pitch>64</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>four</text></Lyrics><Note><pitch>65</pitch></Note></Chord>
+    </voice></Measure></Staff>
+  </Score>
+</museScore>"#;
+
+        let midi = parse_mscx(xml).unwrap();
+        let parsed_tempos: Vec<_> = midi
+            .tracks
+            .iter()
+            .flat_map(|track| track.events.iter())
+            .filter_map(|event| match event.kind {
+                Kind::Tempo(micros) => Some((event.tick, micros)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            parsed_tempos,
+            vec![(0, 666_667), (960, 400_000), (1_440, 666_667)]
+        );
+
+        let outcome = crate::engine::convert::convert_midi(&midi, "english");
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let project = outcome.svp.expect("a projection");
+        assert_eq!(
+            project
+                .tempos
+                .iter()
+                .map(|tempo| tempo.tick)
+                .collect::<Vec<_>>(),
+            vec![0, 960, 1_440]
+        );
+        for (tempo, expected) in project.tempos.iter().zip([90.0, 150.0, 90.0]) {
+            assert!(
+                (tempo.bpm - expected).abs() < 0.001,
+                "tempo at tick {} was {} BPM",
+                tempo.tick,
+                tempo.bpm
+            );
+        }
+
+        let mut lanes: Vec<_> = project
+            .tracks
+            .iter()
+            .map(|lane| {
+                (
+                    lane.name.as_str(),
+                    lane.notes
+                        .iter()
+                        .map(|note| note.onset_ticks)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        lanes.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            lanes,
+            vec![
+                ("Alto", vec![0, 480, 960, 1_440]),
+                ("Soprano", vec![0, 480, 960, 1_440]),
+            ]
+        );
+    }
+
+    #[test]
     fn musescore_dtd_is_rejected() {
         let xml = mscx("<text>let</text>").replace(
             "<museScore",
