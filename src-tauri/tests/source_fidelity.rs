@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use verse_lib::engine::convert::convert_auto;
 use verse_lib::engine::midi::{self, Kind, LyricState, SourceFormat};
 use verse_lib::engine::{musescore, musicxml, target};
@@ -8,6 +9,327 @@ fn smf(track: &[u8]) -> Vec<u8> {
     data.extend_from_slice(&(track.len() as u32).to_be_bytes());
     data.extend_from_slice(track);
     data
+}
+
+fn smf_tracks(tracks: &[Vec<u8>]) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"MThd");
+    data.extend_from_slice(&6u32.to_be_bytes());
+    data.extend_from_slice(&1u16.to_be_bytes());
+    data.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
+    data.extend_from_slice(&480u16.to_be_bytes());
+    for track in tracks {
+        data.extend_from_slice(b"MTrk");
+        data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        data.extend_from_slice(track);
+    }
+    data
+}
+
+fn push_vlq(out: &mut Vec<u8>, mut value: u32) {
+    let mut bytes = [0u8; 5];
+    let mut len = 0usize;
+    loop {
+        bytes[len] = (value & 0x7f) as u8;
+        len += 1;
+        value >>= 7;
+        if value == 0 {
+            break;
+        }
+    }
+    for index in (0..len).rev() {
+        let mut byte = bytes[index];
+        if index != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+    }
+}
+
+fn push_meta(out: &mut Vec<u8>, delta: u32, kind: u8, payload: &[u8]) {
+    push_vlq(out, delta);
+    out.extend_from_slice(&[0xff, kind, payload.len() as u8]);
+    out.extend_from_slice(payload);
+}
+
+fn push_note(out: &mut Vec<u8>, delta: u32, status: u8, key: u8, velocity: u8) {
+    push_vlq(out, delta);
+    out.extend_from_slice(&[status, key, velocity]);
+}
+
+fn multi_tempo_midi(karaoke: bool) -> Vec<u8> {
+    let mut meta = Vec::new();
+    push_meta(&mut meta, 0, 0x51, &[0x0a, 0x2c, 0x2b]); // 90 BPM
+    if karaoke {
+        push_meta(&mut meta, 0, 0x01, b"@KMIDI KARAOKE FILE");
+    }
+    push_meta(&mut meta, 960, 0x51, &[0x06, 0x1a, 0x80]); // 150 BPM
+    push_meta(&mut meta, 480, 0x51, &[0x0a, 0x2c, 0x2b]); // 90 BPM
+    push_meta(&mut meta, 0, 0x2f, &[]);
+
+    let mut soprano = Vec::new();
+    push_meta(&mut soprano, 0, 0x03, b"Soprano");
+    for (lyric, key) in [
+        (b"one".as_slice(), 72),
+        (b"two", 74),
+        (b"three", 76),
+        (b"four", 77),
+    ] {
+        push_meta(&mut soprano, 0, 0x05, lyric);
+        push_note(&mut soprano, 0, 0x90, key, 100);
+        push_note(&mut soprano, 480, 0x80, key, 0);
+    }
+    push_meta(&mut soprano, 0, 0x2f, &[]);
+
+    let mut alto = Vec::new();
+    push_meta(&mut alto, 0, 0x03, b"Alto");
+    for (lyric, key, duration) in [
+        (b"one".as_slice(), 60, 480),
+        (b"two".as_slice(), 62, 960),
+        (b"three".as_slice(), 64, 480),
+        (b"four".as_slice(), 65, 480),
+    ] {
+        push_meta(&mut alto, 0, 0x05, lyric);
+        push_note(&mut alto, 0, 0x90, key, 100);
+        push_note(&mut alto, duration, 0x80, key, 0);
+    }
+    push_meta(&mut alto, 0, 0x2f, &[]);
+
+    smf_tracks(&[meta, soprano, alto])
+}
+
+fn multi_tempo_musicxml() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list>
+    <score-part id="P1"><part-name>Soprano</part-name></score-part>
+    <score-part id="P2"><part-name>Alto</part-name></score-part>
+  </part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <direction><sound tempo="90"/></direction>
+    <note><pitch><step>C</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>one</text></lyric></note>
+    <note><pitch><step>D</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>two</text></lyric></note>
+    <direction><sound tempo="150"/></direction>
+    <note><pitch><step>E</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>three</text></lyric></note>
+    <direction><sound tempo="90"/></direction>
+    <note><pitch><step>F</step><octave>5</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>four</text></lyric></note>
+  </measure></part>
+  <part id="P2"><measure number="1">
+    <attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>one</text></lyric></note>
+    <note><pitch><step>D</step><octave>4</octave></pitch><duration>960</duration><voice>1</voice><lyric><text>two</text></lyric></note>
+    <note><pitch><step>E</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>three</text></lyric></note>
+    <note><pitch><step>F</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><lyric><text>four</text></lyric></note>
+  </measure></part>
+</score-partwise>"#
+}
+
+fn mxl(xml: &str) -> Vec<u8> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    writer
+        .start_file("score.musicxml", zip::write::SimpleFileOptions::default())
+        .expect("MXL score entry");
+    writer
+        .write_all(xml.as_bytes())
+        .expect("MXL score contents");
+    writer.finish().expect("MXL archive").into_inner()
+}
+
+fn mscz(xml: &str) -> Vec<u8> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    writer
+        .start_file("score.mscx", zip::write::SimpleFileOptions::default())
+        .expect("MSCZ score entry");
+    writer
+        .write_all(xml.as_bytes())
+        .expect("MSCZ score contents");
+    writer.finish().expect("MSCZ archive").into_inner()
+}
+
+fn multi_tempo_mscx() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Part><trackName>Soprano</trackName><Staff id="1"/></Part>
+    <Part><trackName>Alto</trackName><Staff id="2"/></Part>
+    <Staff id="1"><Measure><voice>
+      <Tempo><tempo>1.5</tempo></Tempo>
+      <Chord><durationType>quarter</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>72</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>two</text></Lyrics><Note><pitch>74</pitch></Note></Chord>
+      <Tempo><tempo>2.5</tempo></Tempo>
+      <Chord><durationType>quarter</durationType><Lyrics><text>three</text></Lyrics><Note><pitch>76</pitch></Note></Chord>
+      <Tempo><tempo>1.5</tempo></Tempo>
+      <Chord><durationType>quarter</durationType><Lyrics><text>four</text></Lyrics><Note><pitch>77</pitch></Note></Chord>
+    </voice></Measure></Staff>
+    <Staff id="2"><Measure><voice>
+      <Chord><durationType>quarter</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>60</pitch></Note></Chord>
+      <Chord><durationType>half</durationType><Lyrics><text>two</text></Lyrics><Note><pitch>62</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>three</text></Lyrics><Note><pitch>64</pitch></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>four</text></Lyrics><Note><pitch>65</pitch></Note></Chord>
+    </voice></Measure></Staff>
+  </Score>
+</museScore>"#
+}
+
+fn assert_openutau_global_multi_tempo(data: &[u8], label: &str) {
+    let outcome = convert_auto(data, "english");
+    assert!(outcome.ok, "{label}: {:?}", outcome.msg);
+    let projected = outcome
+        .svp
+        .unwrap_or_else(|| panic!("{label}: missing projected project"));
+    assert_eq!(
+        projected
+            .tempos
+            .iter()
+            .map(|tempo| (tempo.tick, tempo.bpm))
+            .collect::<Vec<_>>(),
+        vec![(0, 89.999955), (960, 150.0), (1_440, 89.999955)],
+        "{label}: shared tempo map changed before OpenUtau serialization"
+    );
+
+    let projected_onsets = |part_name: &str| {
+        projected
+            .tracks
+            .iter()
+            .find(|track| track.name.contains(part_name))
+            .unwrap_or_else(|| panic!("{label}: missing projected {part_name} lane"))
+            .notes
+            .iter()
+            .map(|note| note.onset_ticks)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        projected_onsets("Soprano"),
+        vec![0, 480, 960, 1_440],
+        "{label}: Soprano timeline moved around a tempo change"
+    );
+    assert_eq!(
+        projected_onsets("Alto"),
+        vec![0, 480, 1_440, 1_920],
+        "{label}: Alto timeline must use the same global tempo map"
+    );
+    let alto = projected
+        .tracks
+        .iter()
+        .find(|track| track.name.contains("Alto"))
+        .unwrap_or_else(|| panic!("{label}: missing projected Alto lane"));
+    assert_eq!(
+        (alto.notes[1].onset_ticks, alto.notes[1].duration_ticks),
+        (480, 960),
+        "{label}: Alto sustained note must cross the middle tempo change intact"
+    );
+
+    let ustx = target::ustx::serialize(&projected)
+        .unwrap_or_else(|error| panic!("{label}: serialize OpenUtau project: {error}"));
+    assert_eq!(
+        ustx.tempos
+            .iter()
+            .map(|tempo| (tempo.position, tempo.bpm))
+            .collect::<Vec<_>>(),
+        vec![(0, 89.999955), (960, 150.0), (1_440, 89.999955)],
+        "{label}: OpenUtau must receive every global tempo change"
+    );
+    for (part_name, expected) in [
+        ("Soprano", vec![0, 480, 960, 1_440]),
+        ("Alto", vec![0, 480, 1_440, 1_920]),
+    ] {
+        let track_no = ustx
+            .tracks
+            .iter()
+            .position(|track| track.track_name.contains(part_name))
+            .unwrap_or_else(|| panic!("{label}: missing OpenUtau {part_name} track"))
+            as i32;
+        let part = ustx
+            .voice_parts
+            .iter()
+            .find(|part| part.track_no == track_no)
+            .unwrap_or_else(|| panic!("{label}: missing OpenUtau {part_name} voice part"));
+        assert_eq!(
+            part.notes
+                .iter()
+                .map(|note| part.position + note.position)
+                .collect::<Vec<_>>(),
+            expected,
+            "{label}: OpenUtau {part_name} note positions changed around tempo changes"
+        );
+    }
+
+    let yaml = target::ustx::to_yaml(&ustx);
+    let tempo_line = yaml
+        .lines()
+        .find(|line| line.starts_with("tempos: "))
+        .unwrap_or_else(|| panic!("{label}: emitted USTX has no tempos list"));
+    assert_eq!(
+        tempo_line.matches("bpm:").count(),
+        3,
+        "{label}: emitted USTX must contain all three tempo entries"
+    );
+    assert!(tempo_line.contains("position: 960, bpm: 150"));
+    assert!(tempo_line.contains("position: 1440, bpm: 89.999955"));
+}
+
+#[test]
+fn every_supported_source_family_keeps_global_tempo_changes_for_openutau() {
+    let midi_data = multi_tempo_midi(false);
+    assert_eq!(
+        midi::parse(&midi_data)
+            .expect("parse multi-tempo MIDI")
+            .source_format,
+        SourceFormat::StandardMidi
+    );
+
+    let karaoke_data = multi_tempo_midi(true);
+    assert_eq!(
+        midi::parse(&karaoke_data)
+            .expect("parse multi-tempo KAR")
+            .source_format,
+        SourceFormat::KaraokeMidi
+    );
+
+    let musicxml_data = multi_tempo_musicxml().as_bytes().to_vec();
+    assert_eq!(
+        musicxml::parse(&musicxml_data)
+            .expect("parse multi-tempo MusicXML")
+            .source_format,
+        SourceFormat::MusicXml
+    );
+    let mxl_data = mxl(multi_tempo_musicxml());
+    assert_eq!(
+        musicxml::parse(&mxl_data)
+            .expect("parse multi-tempo MXL")
+            .source_format,
+        SourceFormat::MusicXml
+    );
+
+    let mscx_data = multi_tempo_mscx().as_bytes().to_vec();
+    assert_eq!(
+        musescore::parse(&mscx_data)
+            .expect("parse multi-tempo MSCX")
+            .source_format,
+        SourceFormat::MuseScore
+    );
+    let mscz_data = mscz(multi_tempo_mscx());
+    assert_eq!(
+        musescore::parse(&mscz_data)
+            .expect("parse multi-tempo MSCZ")
+            .source_format,
+        SourceFormat::MuseScore
+    );
+
+    for (label, data) in [
+        ("MIDI (.mid/.midi)", midi_data),
+        ("Karaoke MIDI (.kar)", karaoke_data),
+        ("MusicXML (.xml/.musicxml)", musicxml_data),
+        ("compressed MusicXML (.mxl)", mxl_data),
+        ("MuseScore XML (.mscx)", mscx_data),
+        ("compressed MuseScore (.mscz)", mscz_data),
+    ] {
+        assert_openutau_global_multi_tempo(&data, label);
+    }
 }
 
 #[test]
@@ -258,6 +580,116 @@ fn merging_a_tie_sustains_the_note_without_losing_any_source_identity() {
 }
 
 #[test]
+fn multi_tempo_mscz_preserves_shared_vocal_timeline_in_both_targets() {
+    let data = mscz(multi_tempo_mscx());
+    let parsed = musescore::parse(&data).expect("parse synthetic multi-tempo MSCZ");
+    assert_eq!(parsed.source_format, SourceFormat::MuseScore);
+
+    let outcome = convert_auto(&data, "english");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    let projected = outcome.svp.expect("valid multi-tempo projection");
+    assert_eq!(
+        projected
+            .tempos
+            .iter()
+            .map(|tempo| (tempo.tick, tempo.bpm))
+            .collect::<Vec<_>>(),
+        vec![(0, 89.999955), (960, 150.0), (1_440, 89.999955)]
+    );
+
+    let lane_onsets = |name: &str| {
+        projected
+            .tracks
+            .iter()
+            .find(|lane| lane.name == name)
+            .unwrap_or_else(|| panic!("missing projected {name} lane"))
+            .notes
+            .iter()
+            .map(|note| note.onset_ticks)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(lane_onsets("Soprano"), vec![0, 480, 960, 1_440]);
+    assert_eq!(lane_onsets("Alto"), vec![0, 480, 1_440, 1_920]);
+    let alto = projected
+        .tracks
+        .iter()
+        .find(|lane| lane.name == "Alto")
+        .expect("projected Alto lane");
+    assert_eq!(
+        (alto.notes[1].onset_ticks, alto.notes[1].duration_ticks),
+        (480, 960),
+        "Alto must retain the note that sustains across the middle tempo change"
+    );
+
+    let svp = target::svp::serialize(&projected).expect("serialize multi-tempo SVP");
+    assert_eq!(
+        svp.time
+            .tempo
+            .iter()
+            .map(|tempo| (tempo.position, tempo.bpm))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 89.999955),
+            (1_411_200_000, 150.0),
+            (2_116_800_000, 89.999955),
+        ]
+    );
+    for name in ["Soprano", "Alto"] {
+        let track = svp
+            .tracks
+            .iter()
+            .find(|track| track.name == name)
+            .unwrap_or_else(|| panic!("missing serialized SVP {name} track"));
+        assert_eq!(
+            track
+                .main_group
+                .notes
+                .iter()
+                .map(|note| note.onset)
+                .collect::<Vec<_>>(),
+            if name == "Soprano" {
+                vec![0, 705_600_000, 1_411_200_000, 2_116_800_000]
+            } else {
+                vec![0, 705_600_000, 2_116_800_000, 2_822_400_000]
+            }
+        );
+    }
+
+    let ustx = target::ustx::serialize(&projected).expect("serialize multi-tempo USTX");
+    assert_eq!(
+        ustx.tempos
+            .iter()
+            .map(|tempo| (tempo.position, tempo.bpm))
+            .collect::<Vec<_>>(),
+        vec![(0, 89.999955), (960, 150.0), (1_440, 89.999955)]
+    );
+    for name in ["Soprano", "Alto"] {
+        let track_no = ustx
+            .tracks
+            .iter()
+            .position(|track| track.track_name == name)
+            .unwrap_or_else(|| panic!("missing serialized USTX {name} track"))
+            as i32;
+        let part = ustx
+            .voice_parts
+            .iter()
+            .find(|part| part.track_no == track_no)
+            .unwrap_or_else(|| panic!("missing serialized USTX {name} voice part"));
+        assert_eq!(
+            part.notes
+                .iter()
+                .map(|note| part.position + note.position)
+                .collect::<Vec<_>>(),
+            if name == "Soprano" {
+                vec![0, 480, 960, 1_440]
+            } else {
+                vec![0, 480, 1_440, 1_920]
+            }
+        );
+    }
+}
+
+#[test]
 fn supplied_musescore_gate_when_configured() {
     let Ok(path) = std::env::var("VERSE_MSCZ_GATE") else {
         return;
@@ -362,6 +794,114 @@ fn supplied_musescore_gate_when_configured() {
         projected_la, source_la,
         "every projected `la` must have source provenance"
     );
+}
+
+#[test]
+fn supplied_multi_tempo_musescore_gate() {
+    let Ok(path) = std::env::var("VERSE_MULTI_TEMPO_MSCZ_GATE") else {
+        return;
+    };
+    let data = std::fs::read(path).expect("read supplied multi-tempo MSCZ");
+    let parsed = musescore::parse(&data).expect("parse supplied multi-tempo MSCZ");
+
+    let mut source_tempos = BTreeMap::new();
+    for track in &parsed.tracks {
+        for event in &track.events {
+            if let Kind::Tempo(micros) = event.kind {
+                assert!(micros > 0, "source tempo must be positive");
+                assert!(
+                    source_tempos.insert(event.tick, micros).is_none(),
+                    "the supplied regression score must not contain competing tempo events at one tick"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        source_tempos.len(),
+        3,
+        "the supplied regression score must expose the three authored tempo changes"
+    );
+
+    let outcome = convert_auto(&data, "english");
+    assert!(outcome.ok, "{:?}", outcome.msg);
+    let projected = outcome.svp.expect("valid multi-tempo projection");
+    assert_eq!(
+        projected.tempos.len(),
+        source_tempos.len(),
+        "projection must preserve every source tempo change exactly once"
+    );
+    for (tempo, (&tick, &micros)) in projected.tempos.iter().zip(source_tempos.iter()) {
+        assert_eq!(tempo.tick, tick, "tempo tick must remain source-exact");
+        let source_bpm = 60_000_000.0 / f64::from(micros);
+        assert!(
+            (tempo.bpm - source_bpm).abs() < 0.000_001,
+            "tempo at tick {tick} changed from {source_bpm} to {} BPM",
+            tempo.bpm
+        );
+    }
+    for (tempo, expected) in projected.tempos.iter().zip([90.0, 150.0, 90.0]) {
+        assert!(
+            (tempo.bpm - expected).abs() < 0.001,
+            "expected the supplied 90 -> 150 -> 90 map, got {} BPM at tick {}",
+            tempo.bpm,
+            tempo.tick
+        );
+    }
+
+    let middle_tick = projected.tempos[1].tick;
+    let mut verified_source_tracks = BTreeSet::new();
+    for expected_name in ["Soprano", "Alto"] {
+        let lane = projected
+            .tracks
+            .iter()
+            .find(|lane| lane.name.contains(expected_name))
+            .unwrap_or_else(|| panic!("missing projected {expected_name} lane"));
+        let source_track = parsed
+            .tracks
+            .iter()
+            .find(|track| track.id == lane.source_track_id)
+            .expect("projected lane must retain source-track identity");
+        assert!(
+            source_track.name.contains(expected_name),
+            "projected {expected_name} lane must retain its matching source track"
+        );
+        assert!(
+            verified_source_tracks.insert(source_track.id.as_str()),
+            "Soprano and Alto must be distinct source tracks"
+        );
+        let source_note_ticks: Vec<_> = source_track
+            .events
+            .iter()
+            .filter_map(|event| matches!(event.kind, Kind::NoteOn(_)).then_some(event.tick))
+            .collect();
+        let source_spans_middle = source_note_ticks.iter().any(|tick| *tick < middle_tick)
+            && source_note_ticks.iter().any(|tick| *tick >= middle_tick);
+        assert!(
+            source_spans_middle,
+            "source {expected_name} must contain note onsets before and after the middle tempo change"
+        );
+
+        let projected_before = lane.notes.iter().any(|note| note.onset_ticks < middle_tick);
+        let projected_after = lane
+            .notes
+            .iter()
+            .any(|note| note.onset_ticks >= middle_tick);
+        assert!(
+            projected_before && projected_after,
+            "projected {expected_name} lost note onsets across the shared tempo change at tick {middle_tick}"
+        );
+    }
+
+    let svp = target::svp::serialize(&projected).expect("serialize supplied multi-tempo SVP");
+    let ustx = target::ustx::serialize(&projected).expect("serialize supplied multi-tempo USTX");
+    assert_eq!(svp.time.tempo.len(), 3, "SVP must keep all three tempos");
+    assert_eq!(ustx.tempos.len(), 3, "USTX must keep all three tempos");
+    for (tempo, expected) in svp.time.tempo.iter().zip([90.0, 150.0, 90.0]) {
+        assert!((tempo.bpm - expected).abs() < 0.001);
+    }
+    for (tempo, expected) in ustx.tempos.iter().zip([90.0, 150.0, 90.0]) {
+        assert!((tempo.bpm - expected).abs() < 0.001);
+    }
 }
 
 #[test]
