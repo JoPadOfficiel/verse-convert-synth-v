@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.7.4](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.3...v0.7.4) (2026-09-14)
+
+
+### Bug Fixes
+
+* route mixed French and English lyrics automatically ([9338286](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/93382860256c379132f78922dccaa843988de6ee))
+
 ## [0.7.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.2...v0.7.3) (2026-09-14)
 
 
