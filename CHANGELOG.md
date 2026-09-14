@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.7.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.2...v0.7.3) (2026-09-14)
+
+
+### Bug Fixes
+
+* preserve arbitrary multi-tempo maps across vocal lanes ([9534654](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/9534654fd773b5260e102c709b86b76b640a7a92))
+
 ## [0.7.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.1...v0.7.2) (2026-09-11)
 
 
