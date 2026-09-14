@@ -64,9 +64,51 @@ rendered marker. A target owns its own grid, marker vocabulary, cosmetics and
 schema version, and cannot reach back into the conversion engine or change what
 the other target writes.
 
+### Automatic French + English
+
+Choose **Automatic FR + EN** when one performed lyric lane contains both
+languages or when translated lyric rows are selected on different passes. The
+router runs locally and offline. The application bundles Lingua 1.8 with only
+its English and French models; there is no runtime model download, external
+binary or network classification service. Verse reconstructs complete
+source-attested words first, combines Lingua confidence with the existing
+French/English lexicon evidence and neighboring words, then decodes one
+deterministic language sequence across the passage. A short homograph or neutral
+vocalise therefore cannot switch a phrase solely from its spelling.
+
+Genuinely incomplete syllables are not scored as independent words. A malformed
+syllabic marker on an otherwise complete standalone function word can still be
+recovered from that explicit token; otherwise split-word chains, touching
+continuations and proven holds inherit one language owner. Manual phonetic hints
+stay source-owned. A low-confidence decision still completes automatically and
+emits `AUTOMATIC_LANGUAGE_LOW_CONFIDENCE` for audit; there is no language-review
+dialog in the export path.
+
+After routing, French domains run the existing Millefeuille pronunciation pass
+and English domains run the existing ARPAbet pass. French contextual readings
+and liaison are filtered to the already-selected French domain, so they cannot
+cross an automatic FR/EN boundary. Geometry, source identity, expression and
+stem ownership remain independent of language assignment.
+
+OpenUtau 0.1.569 and newer persist a per-note `phonemizer` override. Verse uses
+that field on complete word heads while retaining one musical lane; split and
+continuation notes inherit their owner's override. The track-level phonemizer is
+kept as a deterministic first-language fallback for older consumers, but older
+OpenUtau versions cannot reproduce mixed per-word switching correctly. Use
+OpenUtau 0.1.569 or newer for Automatic FR+EN. On current OpenUtau every
+classified word receives either the French Millefeuille or English ARPAbet path
+rather than the Default phonemizer. A compatible multilingual singer still has
+to be assigned in OpenUtau.
+
+Synthesizer V shares the same automatic ownership decision for analysis and
+diagnostics but retains the existing SVP lyric/phoneme serialization. Verse does
+not inject OpenUtau `phonemizer`, `fr/…` or `en/…` aliases into SVP, and it does
+not claim that a Synthesizer V singer will switch languages acoustically without
+the corresponding native singer/database configuration.
+
 ### French DiffSinger Millefeuille
 
-Choose **Settings → OpenUtau pronunciation → French DiffSinger Millefeuille**
+Choose **Settings → Pronunciation → French DiffSinger Millefeuille**
 for French lyrics intended for a compatible DiffSinger bank. Every vocal lane,
 including Bass and additional voices, selects
 `OpenUtau.Core.DiffSinger.DiffSingerFrenchMillfeuillePhonemizer` (the spelling

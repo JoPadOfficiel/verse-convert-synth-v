@@ -24,6 +24,14 @@ fn lookup(key: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// Read-only lexical evidence for the automatic FR/EN router. This deliberately
+/// ignores semantic ambiguity: ambiguity is resolved by surrounding text and the
+/// existing pronunciation pass still refuses unsafe dictionary variants.
+pub(crate) fn contains_lexeme(key: &str) -> bool {
+    let key = lexical::normalize(key);
+    !key.is_empty() && lookup(&key).is_some()
+}
+
 fn ambiguous(key: &str) -> bool {
     // Identical vowel counts do not resolve grammar or meaning. Literal CMU
     // numbered keys are explicit requests and deliberately do not match here.
@@ -124,7 +132,11 @@ fn reading(key: &str) -> Result<&'static str, (&'static str, String)> {
 /// Called separately for each source voice and repeat occurrence. A complete
 /// coherent word may use native `+` allocation only when the specified reading
 /// has exactly as many vowels as the source states attacks. Holds consume none.
-pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
+fn apply_inner(
+    notes: &mut [ProjectedNote],
+    note_ids: &[String],
+    automatic_recovery: bool,
+) -> Vec<Diagnostic> {
     assert_eq!(notes.len(), note_ids.len());
     preserve_bracketed_melismas(notes);
     let fragments = lexical::fragments(notes);
@@ -132,8 +144,17 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
     let mut changed = vec![false; notes.len()];
     let mut diagnostics = Vec::new();
 
-    for members in lexical::words(notes) {
-        let key = lexical::joined_key(notes, &members);
+    let words = if automatic_recovery {
+        lexical::automatic_words(notes)
+    } else {
+        lexical::words(notes)
+    };
+    for members in words {
+        let key = if automatic_recovery {
+            lexical::preferred_joined_key(notes, &members, contains_lexeme)
+        } else {
+            lexical::joined_key(notes, &members)
+        };
         let result = reading(&key).and_then(|hint| {
             let vowels = lexical::vowel_count(hint);
             if vowels == members.len() {
@@ -197,9 +218,33 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
     diagnostics
 }
 
+pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
+    apply_inner(notes, note_ids, false)
+}
+
+pub(crate) fn apply_automatic(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
+    apply_inner(notes, note_ids, true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::valid_hint;
+    use super::{apply_automatic, valid_hint};
+    use crate::engine::midi::{Lyric, Syllabic};
+    use crate::engine::projection::{ProjectedLyric, ProjectedNote};
+
+    fn source_note(onset: u32, text: &str, syllabic: Syllabic) -> ProjectedNote {
+        let mut lyric = Lyric::text(onset.to_string(), text.into());
+        lyric.syllabic = Some(syllabic);
+        ProjectedNote {
+            performance: None,
+            pronunciation_language: None,
+            source_evidence: None,
+            onset_ticks: onset,
+            duration_ticks: 480,
+            pitch: 60,
+            lyric: ProjectedLyric::Source(Box::new(lyric)),
+        }
+    }
 
     #[test]
     fn english_reading_validation_rejects_the_entire_invalid_or_vowelless_hint() {
@@ -213,5 +258,35 @@ mod tests {
         ] {
             assert!(!valid_hint(hint), "unsafe complete reading: {hint}");
         }
+    }
+
+    #[test]
+    fn overlap_recovery_changes_only_the_dictionary_lookup_key() {
+        let mut notes = [
+            source_note(0, "Beat", Syllabic::Begin),
+            source_note(480, "tles", Syllabic::End),
+        ];
+        let diagnostics = apply_automatic(&mut notes, &["0".into(), "1".into()]);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == super::APPLIED),
+            "unexpected recovery diagnostics: {diagnostics:?}"
+        );
+        let ProjectedLyric::Pronounced { text, .. } = &notes[0].lyric else {
+            panic!("recovered word head should be pronounced");
+        };
+        assert_eq!(
+            text, "beatles",
+            "recovered spelling renders the complete word"
+        );
+        let ProjectedLyric::Pronounced { source, .. } = &notes[0].lyric else {
+            unreachable!();
+        };
+        assert_eq!(source.raw, "Beat", "raw source evidence stays unchanged");
+        assert!(matches!(
+            &notes[1].lyric,
+            ProjectedLyric::PronouncedSplit { source } if source.raw == "tles"
+        ));
     }
 }

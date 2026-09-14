@@ -98,6 +98,25 @@ fn lexical(key: &str) -> Option<String> {
     None
 }
 
+/// Read-only lexical evidence for the automatic FR/EN router. Membership says
+/// a spelling exists in the French resources; it does not choose a pronunciation
+/// or override ambiguity safeguards used by the actual pronunciation pass.
+pub(crate) fn contains_lexeme(key: &str) -> bool {
+    let key = normalize(key);
+    if key.is_empty() {
+        return false;
+    }
+    if matches!(key.as_str(), "d'un" | "ouh" | "tau" | "rê" | "laisses") {
+        return true;
+    }
+    CURATED_INDEX
+        .get_or_init(|| shared::index(LEXICON))
+        .contains_key(key.as_str())
+        || COMMUNITY_INDEX
+            .get_or_init(|| shared::index(COMMUNITY))
+            .contains_key(key.as_str())
+}
+
 fn standalone_allowed(lyric: &ProjectedLyric, key: &str) -> bool {
     // FR-001 explicitly audited these isolated spellings despite orphan score
     // metadata. New community entries need a complete word or an independent
@@ -748,9 +767,11 @@ fn pronounce(note: &mut ProjectedNote, hint: &str) {
     };
 }
 
-/// Apply once to one source voice / repeat occurrence before default joining.
-/// Original source objects remain immutable. Running again adds nothing.
-pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
+fn apply_inner(
+    notes: &mut [ProjectedNote],
+    note_ids: &[String],
+    automatic_recovery: bool,
+) -> Vec<Diagnostic> {
     assert_eq!(notes.len(), note_ids.len());
     preserve_bracketed_melismas(notes);
     let mut diagnostics = Vec::new();
@@ -802,21 +823,30 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
     }
     // Curated sung layouts take priority. Other complete source words use the
     // native phonemizer's syllable allocation only when every attack has a vowel.
-    for members in shared::words(notes) {
+    let complete_words = if automatic_recovery {
+        shared::automatic_words(notes)
+    } else {
+        shared::words(notes)
+    };
+    for members in complete_words {
         if !members
             .iter()
             .all(|&member| same_lane(&notes[members[0]].lyric, &notes[member].lyric))
         {
             continue;
         }
-        let Some(parts) = members
-            .iter()
-            .map(|&i| candidate(&notes[i].lyric))
-            .collect::<Option<Vec<_>>>()
-        else {
-            continue;
+        let key = if automatic_recovery {
+            shared::preferred_joined_key(notes, &members, contains_lexeme)
+        } else {
+            let Some(parts) = members
+                .iter()
+                .map(|&i| candidate(&notes[i].lyric))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            parts.concat()
         };
-        let key = parts.concat();
         if let Some(hint) = lexical(&key) {
             if shared::vowel_count(&hint) == members.len() {
                 shared::pronounce_word(notes, &members, &key, &hint);
@@ -907,4 +937,14 @@ pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic
         }
     }
     diagnostics
+}
+
+/// Apply once to one source voice / repeat occurrence before default joining.
+/// Original source objects remain immutable. Running again adds nothing.
+pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
+    apply_inner(notes, note_ids, false)
+}
+
+pub(crate) fn apply_automatic(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
+    apply_inner(notes, note_ids, true)
 }

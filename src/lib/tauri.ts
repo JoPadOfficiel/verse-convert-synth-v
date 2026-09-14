@@ -129,7 +129,11 @@ export type FileResult = {
 };
 
 export type Overrides = Record<string, Record<number, boolean>>;
-export type PronunciationProfile = "default" | "frenchMillefeuille" | "englishArpabet";
+export type PronunciationProfile =
+  | "default"
+  | "frenchMillefeuille"
+  | "englishArpabet"
+  | "automaticFrenchEnglish";
 export type Language = "english" | "french";
 /**
  * Which format an export writes. Declared with the path helpers that consume it

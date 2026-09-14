@@ -27,7 +27,7 @@ const api = await load("../src/lib/tauri.ts", {
 });
 
 test("analysis, direct and bundle adapters carry one explicit pronunciation selection", async () => {
-  for (const profile of ["default", "frenchMillefeuille", "englishArpabet"]) {
+  for (const profile of ["default", "automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet"]) {
     calls.length = 0;
     await api.convertFiles(["/tmp/song.mscz"], false, "english", undefined, undefined, "ustx", profile);
     await api.exportVocalsWithDialog({ path: "/tmp/song.mscz" }, "english", undefined, "ustx", profile);
@@ -75,6 +75,7 @@ function reanalysisHarness(convertFiles, initialProfile = "default") {
 }
 
 for (const [profile, unsupported] of [
+  ["automaticFrenchEnglish", "AUTOMATIC_LANGUAGE_LOW_CONFIDENCE"],
   ["frenchMillefeuille", "FRENCH_PRONUNCIATION_UNSUPPORTED"],
   ["englishArpabet", "ENGLISH_PRONUNCIATION_UNSUPPORTED"],
 ]) {
@@ -126,7 +127,7 @@ test(`${profile}: unchanged selection or the active busy guard prevents another 
 }
 
 test("choosing a profile before import is remembered without running an analysis", async () => {
-  for (const profile of ["frenchMillefeuille", "englishArpabet", "default"]) {
+  for (const profile of ["automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet", "default"]) {
     const previous = profile === "default" ? "frenchMillefeuille" : "default";
     const { state, change } = reanalysisHarness(async () => assert.fail("no files to analyse"), previous);
     state.items.length = 0;
@@ -164,7 +165,7 @@ test("pronunciation preference survives restart, rejects stale values and tolera
     } });
     const preference = await load("../src/lib/pronunciation-preference.ts");
     assert.equal(preference.storedPronunciationProfile(), "default");
-    for (const profile of ["frenchMillefeuille", "englishArpabet", "default"]) {
+    for (const profile of ["automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet", "default"]) {
       preference.storePronunciationProfile(profile);
       const restarted = await load("../src/lib/pronunciation-preference.ts");
       assert.equal(restarted.storedPronunciationProfile(), profile);

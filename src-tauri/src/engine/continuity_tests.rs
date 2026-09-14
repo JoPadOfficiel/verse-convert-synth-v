@@ -98,6 +98,7 @@ fn note(id: &str, onset: u32, duration: u32, pitch: u8) -> ProjectedNote {
         pitch,
         lyric: ProjectedLyric::Absent,
         performance: None,
+        pronunciation_language: None,
         source_evidence: Some(NoteEvidence {
             note_id: format!("note:{id}"),
             note_on_event_id: format!("event:{id}:on"),

@@ -67,29 +67,41 @@ export function Settings({
       </div>
 
       <div className="flex flex-col gap-2">
-        <Label htmlFor="pronunciation-profile">OpenUtau pronunciation</Label>
+        <Label htmlFor="pronunciation-profile">Pronunciation</Label>
         <select
           id="pronunciation-profile"
           value={pronunciationProfile}
-          disabled={busy || exportTarget !== "ustx"}
+          disabled={busy}
           onChange={(event) => onPronunciationChange(event.target.value as PronunciationProfile)}
           className="rounded-md border bg-background px-3 py-2 text-sm disabled:opacity-50"
         >
+          <option value="automaticFrenchEnglish">Automatic French + English</option>
           <option value="default">Default — no pronunciation fixes</option>
-          <option value="frenchMillefeuille">French DiffSinger Millefeuille</option>
-          <option value="englishArpabet">English DiffSinger ARPAbet</option>
+          <option value="frenchMillefeuille" disabled={exportTarget !== "ustx"}>
+            French DiffSinger Millefeuille
+          </option>
+          <option value="englishArpabet" disabled={exportTarget !== "ustx"}>
+            English DiffSinger ARPAbet
+          </option>
         </select>
         <p className="text-xs text-muted-foreground">
-          {pronunciationProfile === "englishArpabet"
+          {pronunciationProfile === "automaticFrenchEnglish"
+            ? exportTarget === "ustx"
+              ? "Automatic FR+EN runs fully offline on CPU, classifies complete sung words in phrase context, and routes French through Millefeuille and English through ARPAbet. OpenUtau 0.1.569 or newer is required for per-note phonemizer switching; assign a compatible multilingual singer after export."
+              : "Automatic FR+EN runs fully offline on CPU and classifies complete sung words in phrase context for analysis and diagnostics. Synthesizer V keeps Verse's existing lyric and phoneme serialization; no OpenUtau aliases or phonemizer metadata are injected."
+            : pronunciationProfile === "englishArpabet"
             ? "English pronunciation for compatible DiffSinger banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
             : pronunciationProfile === "frenchMillefeuille"
               ? "French pronunciation for compatible DiffSinger Millefeuille banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
-              : "Default does not apply French or English pronunciation fixes. Choose the matching profile here before exporting; assigning a singer later in OpenUtau does not apply Verse's corrections."}
-          {" "}Assign a compatible singer in OpenUtau. Pronunciation is never
-          detected automatically. Choose here or beside Theme and Settings in the
-          header. Your choice is remembered even before importing a file; with
-          files loaded, it is saved after reanalysis succeeds. Synthesizer V uses
-          Default without discarding your OpenUtau choice.
+              : exportTarget === "ustx"
+                ? "Default does not apply French or English pronunciation fixes. Assigning a singer later in OpenUtau does not apply Verse's corrections."
+                : "Default keeps Synthesizer V's existing lyric and phoneme serialization without automatic language routing."}
+          {" "}Your choice is remembered even before importing a file; with files
+          loaded, it is saved after reanalysis succeeds.
+          {pronunciationProfile === "automaticFrenchEnglish" && (
+            <> Automatic FR+EN uses only bundled local detector data and dictionaries;
+            no network lookup or separate installation is required.</>
+          )}
         </p>
         <a className="text-xs underline" href="/licenses/french-community-dictionary.txt" target="_blank" rel="noreferrer">
           French community dictionary license

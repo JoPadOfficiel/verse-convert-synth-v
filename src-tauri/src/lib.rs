@@ -1344,6 +1344,14 @@ mod output_tests {
         );
     }
 
+    #[test]
+    fn automatic_analysis_batch_direct_and_bundle_exports_share_language_routing() {
+        assert_profile_commands(
+            PronunciationProfile::AutomaticFrenchEnglish,
+            &[("bonjour", None), ("beautiful", None), ("merci", None)],
+        );
+    }
+
     fn assert_profile_commands(profile: PronunciationProfile, words: &[(&str, Option<&str>)]) {
         let root = temp_dir();
         let source = root.join("profile.musicxml");
@@ -1356,14 +1364,15 @@ mod output_tests {
         let (applied, unsupported, phonemizer) = match profile {
             PronunciationProfile::FrenchMillefeuille => (
                 engine::target::french::LIAISON,
-                engine::target::french::UNSUPPORTED,
-                engine::target::french::PHONEMIZER,
+                Some(engine::target::french::UNSUPPORTED),
+                Some(engine::target::french::PHONEMIZER),
             ),
             PronunciationProfile::EnglishArpabet => (
                 engine::target::english::APPLIED,
-                engine::target::english::UNSUPPORTED,
-                engine::target::english::PHONEMIZER,
+                Some(engine::target::english::UNSUPPORTED),
+                Some(engine::target::english::PHONEMIZER),
             ),
+            PronunciationProfile::AutomaticFrenchEnglish => (engine::language::ROUTED, None, None),
             PronunciationProfile::Default => unreachable!(),
         };
         let path = source.to_str().unwrap();
@@ -1393,7 +1402,9 @@ mod output_tests {
         );
         assert_eq!(analysis.warnings, batch.warnings);
         assert!(analysis.warnings.iter().any(|w| w.code == applied));
-        assert!(analysis.warnings.iter().any(|w| w.code == unsupported));
+        if let Some(unsupported) = unsupported {
+            assert!(analysis.warnings.iter().any(|w| w.code == unsupported));
+        }
         let direct = root.join("direct.ustx");
         export_svp(
             path.into(),
@@ -1456,7 +1467,12 @@ mod output_tests {
                 .unwrap()
         }
         assert_eq!(vocal_section(&emitted), vocal_section(&baseline));
-        assert_eq!(emitted.matches(phonemizer).count(), project.tracks.len());
+        if let Some(phonemizer) = phonemizer {
+            assert_eq!(emitted.matches(phonemizer).count(), project.tracks.len());
+        } else {
+            assert!(emitted.contains(engine::target::french::PHONEMIZER));
+            assert!(emitted.contains(engine::target::english::PHONEMIZER));
+        }
         assert!(!engine::target::ustx::audit(&emitted)
             .unwrap()
             .wave_parts

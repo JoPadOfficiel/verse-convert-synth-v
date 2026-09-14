@@ -915,6 +915,7 @@ fn export_synthetic_continuity_for_native_consumer() {
                 PronunciationProfile::Default => "default",
                 PronunciationProfile::FrenchMillefeuille => "french",
                 PronunciationProfile::EnglishArpabet => "english",
+                PronunciationProfile::AutomaticFrenchEnglish => "automatic-fr-en",
             };
             let path = Path::new(&directory)
                 .join(format!("{master}-{profile_name}.{}", target.extension()));

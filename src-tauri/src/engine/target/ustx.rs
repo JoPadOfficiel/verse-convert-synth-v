@@ -154,6 +154,10 @@ pub struct UstxNote {
     pub duration: i32,
     pub tone: u8,
     pub lyric: String,
+    /// OpenUtau 0.1.569+ persists `UNote.PhonemizerOverride` as the YAML member
+    /// `phonemizer` (`OpenUtau.Core/Ustx/UNote.cs:24-25`). Automatic FR+EN writes
+    /// this only on word heads; continuation notes inherit their owner's choice.
+    pub phonemizer: Option<String>,
     pub pitch: UstxPitch,
     pub vibrato: UstxVibrato,
 }
@@ -574,6 +578,15 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
                 super::PronunciationProfile::Default => DEFAULT_PHONEMIZER,
                 super::PronunciationProfile::FrenchMillefeuille => super::french::PHONEMIZER,
                 super::PronunciationProfile::EnglishArpabet => super::english::PHONEMIZER,
+                // Older OpenUtau builds that predate per-note overrides still
+                // get a deterministic passage fallback. On 0.1.569+ every
+                // classified word head below states the exact override.
+                super::PronunciationProfile::AutomaticFrenchEnglish => track
+                    .notes
+                    .iter()
+                    .find_map(|note| note.pronunciation_language)
+                    .map(phonemizer_for_language)
+                    .unwrap_or(DEFAULT_PHONEMIZER),
             }
             .into(),
             track_name: track.name.clone(),
@@ -832,18 +845,44 @@ fn serialize_note(
         position,
         duration,
         tone: note.pitch,
-        lyric: match (&note.lyric, profile) {
-            (ProjectedLyric::Source(source), PronunciationProfile::FrenchMillefeuille) => {
+        lyric: match (&note.lyric, profile, note.pronunciation_language) {
+            (ProjectedLyric::Source(source), PronunciationProfile::FrenchMillefeuille, _) => {
                 match &source.state {
                     LyricState::Text(text) => french_syllable_text(text),
                     _ => lyric_text(&note.lyric),
                 }
             }
+            (
+                ProjectedLyric::Source(source),
+                PronunciationProfile::AutomaticFrenchEnglish,
+                Some(crate::engine::projection::PronunciationLanguage::French),
+            ) => match &source.state {
+                LyricState::Text(text) => french_syllable_text(text),
+                _ => lyric_text(&note.lyric),
+            },
             _ => lyric_text(&note.lyric),
+        },
+        phonemizer: if profile == PronunciationProfile::AutomaticFrenchEnglish
+            && !note.lyric.continues_previous_note()
+        {
+            note.pronunciation_language
+                .map(phonemizer_for_language)
+                .map(str::to_string)
+        } else {
+            None
         },
         pitch: UstxPitch::default(),
         vibrato: UstxVibrato::default(),
     })
+}
+
+fn phonemizer_for_language(
+    language: crate::engine::projection::PronunciationLanguage,
+) -> &'static str {
+    match language {
+        crate::engine::projection::PronunciationLanguage::French => super::french::PHONEMIZER,
+        crate::engine::projection::PronunciationLanguage::English => super::english::PHONEMIZER,
+    }
 }
 
 /// Emits the project as UTF-8 YAML bytes.
@@ -914,6 +953,9 @@ pub fn to_yaml(project: &UstxProject) -> String {
                     out.push_str(&format!("        duration: {}\n", note.duration));
                     out.push_str(&format!("        tone: {}\n", note.tone));
                     out.push_str(&format!("        lyric: {}\n", quoted(&note.lyric)));
+                    if let Some(phonemizer) = &note.phonemizer {
+                        out.push_str(&format!("        phonemizer: {}\n", quoted(phonemizer)));
+                    }
                     out.push_str(&format!("        pitch: {}\n", flow_pitch(&note.pitch)));
                     out.push_str(&format!(
                         "        vibrato: {}\n",
@@ -1288,6 +1330,7 @@ mod tests {
     ) -> ProjectedNote {
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks,
             duration_ticks,

@@ -42,7 +42,7 @@ fn trim_edges(text: &str) -> &str {
 }
 
 /// Preserve literal dictionary variants `word(2)` and internal apostrophes.
-pub(super) fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     let text = trim_edges(text);
     let text =
         if text.chars().count() > 2 && text.starts_with(['\'', '‘']) && text.ends_with(['\'', '’'])
@@ -72,7 +72,7 @@ pub(super) fn normalize(text: &str) -> String {
         .collect()
 }
 
-pub(super) fn source(lyric: &ProjectedLyric) -> Option<&Lyric> {
+pub(crate) fn source(lyric: &ProjectedLyric) -> Option<&Lyric> {
     match lyric {
         ProjectedLyric::Source(source)
         | ProjectedLyric::Pronounced { source, .. }
@@ -81,14 +81,14 @@ pub(super) fn source(lyric: &ProjectedLyric) -> Option<&Lyric> {
     }
 }
 
-pub(super) fn raw_text(lyric: &ProjectedLyric) -> Option<&str> {
+pub(crate) fn raw_text(lyric: &ProjectedLyric) -> Option<&str> {
     match &source(lyric)?.state {
         LyricState::Text(text) => Some(text),
         _ => None,
     }
 }
 
-pub(super) fn candidate(lyric: &ProjectedLyric) -> Option<String> {
+pub(crate) fn candidate(lyric: &ProjectedLyric) -> Option<String> {
     if !matches!(lyric, ProjectedLyric::Source(_)) {
         return None;
     }
@@ -146,7 +146,7 @@ fn next_attack(notes: &[ProjectedNote], head: usize) -> Option<usize> {
 }
 
 /// Even incomplete coherent bindings protect a fragment from whole-word lookup.
-pub(super) fn fragments(notes: &[ProjectedNote]) -> Vec<bool> {
+pub(crate) fn fragments(notes: &[ProjectedNote]) -> Vec<bool> {
     let mut result: Vec<bool> = notes
         .iter()
         .map(|note| {
@@ -217,9 +217,7 @@ pub(super) fn fragments(notes: &[ProjectedNote]) -> Vec<bool> {
     result
 }
 
-/// Complete bilateral Begin/Middle/End (or bilateral dashes), same source row.
-/// Callers isolate score voice and repeat domains before entering this function.
-pub(super) fn words(notes: &[ProjectedNote]) -> Vec<Vec<usize>> {
+fn words_impl(notes: &[ProjectedNote], allow_unmarked_tail: bool) -> Vec<Vec<usize>> {
     let mut result = Vec::new();
     for head in 0..notes.len() {
         if candidate(&notes[head].lyric).is_none()
@@ -248,6 +246,30 @@ pub(super) fn words(notes: &[ProjectedNote]) -> Vec<Vec<usize>> {
                     }
                     current = next;
                 }
+                Some((false, false))
+                    if allow_unmarked_tail
+                        && source(&notes[next].lyric)
+                            .is_some_and(|lyric| lyric.syllabic.is_none())
+                        && source(&notes[current].lyric).is_some_and(|lyric| {
+                            matches!(lyric.syllabic, Some(Syllabic::Begin | Syllabic::Middle))
+                        }) =>
+                {
+                    if next_attack(notes, next).is_some_and(|after| {
+                        binding(&notes[after].lyric).is_some_and(|(left, _)| left)
+                    }) {
+                        // The unmarked token is inside a still-bound fragment run,
+                        // so it is not safe to treat it as the terminal syllable.
+                        break;
+                    }
+                    // Some score writers emit an explicit Begin but omit the
+                    // matching End on the touching tail. The Begin is still
+                    // source evidence that the word continues; automatic
+                    // routing may recover that terminal fragment without
+                    // changing the source lyric objects themselves.
+                    members.push(next);
+                    result.push(members);
+                    break;
+                }
                 _ => break,
             }
         }
@@ -255,11 +277,61 @@ pub(super) fn words(notes: &[ProjectedNote]) -> Vec<Vec<usize>> {
     result
 }
 
-pub(super) fn joined_key(notes: &[ProjectedNote], members: &[usize]) -> String {
+/// Complete bilateral Begin/Middle/End (or bilateral dashes), same source row.
+/// Callers isolate score voice and repeat domains before entering this function.
+pub(crate) fn words(notes: &[ProjectedNote]) -> Vec<Vec<usize>> {
+    words_impl(notes, false)
+}
+
+/// Automatic bilingual routing accepts one narrowly recoverable malformed word:
+/// an explicit Begin/Middle followed immediately by an unmarked touching tail.
+/// Existing explicit monolingual profile behavior keeps the stricter `words`.
+pub(crate) fn automatic_words(notes: &[ProjectedNote]) -> Vec<Vec<usize>> {
+    words_impl(notes, true)
+}
+
+pub(crate) fn joined_key(notes: &[ProjectedNote], members: &[usize]) -> String {
     members
         .iter()
         .map(|&index| normalize(raw_text(&notes[index].lyric).unwrap_or_default()))
         .collect()
+}
+
+fn overlapped_joined_key(notes: &[ProjectedNote], members: &[usize]) -> Option<String> {
+    let mut parts = members
+        .iter()
+        .map(|&index| normalize(raw_text(&notes[index].lyric).unwrap_or_default()));
+    let mut result = parts.next()?;
+    let plain = joined_key(notes, members);
+    for part in parts {
+        let left: Vec<char> = result.chars().collect();
+        let right: Vec<char> = part.chars().collect();
+        let max_overlap = left.len().min(right.len()).min(2);
+        let overlap = (1..=max_overlap)
+            .rev()
+            .find(|&size| left[left.len() - size..] == right[..size])
+            .unwrap_or(0);
+        result.extend(right.into_iter().skip(overlap));
+    }
+    (result != plain).then_some(result)
+}
+
+/// Prefer the literal source-fragment concatenation. Only if it has no known
+/// reading may an overlapping-boundary spelling be used for lookup, e.g. a
+/// score writer's `Beat` + `tles` can resolve to `beatles`. This is a lookup key
+/// recovery only; raw source lyrics and note identities remain unchanged.
+pub(crate) fn preferred_joined_key(
+    notes: &[ProjectedNote],
+    members: &[usize],
+    known: impl Fn(&str) -> bool,
+) -> String {
+    let plain = joined_key(notes, members);
+    if known(&plain) {
+        return plain;
+    }
+    overlapped_joined_key(notes, members)
+        .filter(|candidate| known(candidate))
+        .unwrap_or(plain)
 }
 
 pub(super) fn vowel_count(hint: &str) -> usize {
@@ -332,7 +404,58 @@ pub(super) fn pronounce_word(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::midi::LineBreak;
+    use crate::engine::midi::{LineBreak, Syllabic};
+
+    fn source_note(onset: u32, text: &str, syllabic: Option<Syllabic>) -> ProjectedNote {
+        let mut lyric = Lyric::text(onset.to_string(), text.into());
+        lyric.syllabic = syllabic;
+        ProjectedNote {
+            performance: None,
+            pronunciation_language: None,
+            source_evidence: None,
+            onset_ticks: onset,
+            duration_ticks: 480,
+            pitch: 60,
+            lyric: ProjectedLyric::Source(Box::new(lyric)),
+        }
+    }
+
+    #[test]
+    fn automatic_words_can_recover_explicit_begin_with_unmarked_tail() {
+        let notes = [
+            source_note(0, "At", Some(Syllabic::Begin)),
+            source_note(480, "tlas", None),
+        ];
+        assert!(words(&notes).is_empty());
+        assert_eq!(automatic_words(&notes), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn automatic_words_do_not_stop_before_a_bound_fragment_tail() {
+        let notes = [
+            source_note(0, "At", Some(Syllabic::Begin)),
+            source_note(480, "la", None),
+            source_note(960, "s", Some(Syllabic::End)),
+        ];
+        assert!(automatic_words(&notes).is_empty());
+    }
+
+    #[test]
+    fn overlap_spelling_is_only_used_when_literal_join_has_no_known_reading() {
+        let notes = [
+            source_note(0, "At", Some(Syllabic::Begin)),
+            source_note(480, "tlas", Some(Syllabic::End)),
+        ];
+        assert_eq!(joined_key(&notes, &[0, 1]), "attlas");
+        assert_eq!(
+            preferred_joined_key(&notes, &[0, 1], |key| key == "atlas"),
+            "atlas"
+        );
+        assert_eq!(
+            preferred_joined_key(&notes, &[0, 1], |key| key == "attlas" || key == "atlas"),
+            "attlas"
+        );
+    }
 
     #[test]
     fn encoded_karaoke_fragments_are_not_dictionary_words_even_across_a_gap() {
@@ -346,6 +469,7 @@ mod tests {
                 lyric.line_break = (i == 0).then_some(LineBreak::Line);
                 ProjectedNote {
                     performance: None,
+                    pronunciation_language: None,
                     source_evidence: None,
                     onset_ticks: i as u32 * 480,
                     duration_ticks: 240,
