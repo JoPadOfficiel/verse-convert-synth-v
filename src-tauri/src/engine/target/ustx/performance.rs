@@ -895,6 +895,7 @@ mod fourth_review_tests {
                 lyric: ProjectedLyric::Absent,
                 source_evidence: None,
                 performance: Some(binding),
+                pronunciation_language: None,
             }],
         }
     }

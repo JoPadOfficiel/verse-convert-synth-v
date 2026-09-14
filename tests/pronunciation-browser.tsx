@@ -7,7 +7,7 @@ import { ThemeProvider } from "../src/components/theme-provider";
 import type { FileResult, PronunciationProfile } from "../src/lib/tauri";
 import "../src/index.css";
 
-const profiles: PronunciationProfile[] = ["frenchMillefeuille", "englishArpabet", "default"];
+const profiles: PronunciationProfile[] = ["automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet", "default"];
 const key = "verse.pronunciationProfile";
 const runKey = "verse.pronunciationBrowserTest";
 type TestResult = { name: string; passed: true };
@@ -75,7 +75,7 @@ async function mount() {
   await act(async () => { root.render(<React.StrictMode><ThemeProvider><App /></ThemeProvider></React.StrictMode>); });
 }
 function header() {
-  const select = document.querySelector<HTMLSelectElement>('header select[aria-label="OpenUtau pronunciation"]');
+  const select = document.querySelector<HTMLSelectElement>('header select[aria-label="Pronunciation"]');
   check(select, "Pronunciation selector must be in the header");
   check(select.closest("header")!.querySelector('button[title="Theme"]'), "Theme must remain beside pronunciation");
   return select;
@@ -196,8 +196,17 @@ async function run() {
     stored(next);
     check(last("convert_files").exportTarget === "svp", "SVP target must reach reanalysis");
     await click("Settings");
-    const disabled = document.querySelector<HTMLSelectElement>("#pronunciation-profile")!;
-    check(disabled.disabled && disabled.value === next, "SVP must retain but disable the USTX choice");
+    const svpProfile = document.querySelector<HTMLSelectElement>("#pronunciation-profile")!;
+    check(!svpProfile.disabled && svpProfile.value === next, "SVP must expose the target-neutral Automatic/Default choice");
+    if (next === "automaticFrenchEnglish") {
+      await choose("default", svpProfile);
+      check(last("convert_files").exportTarget === "svp" && last("convert_files").pronunciationProfile === "default",
+        "SVP Default selection must reanalyse as SVP");
+      await choose("automaticFrenchEnglish", svpProfile);
+      check(last("convert_files").exportTarget === "svp" && last("convert_files").pronunciationProfile === "automaticFrenchEnglish",
+        "SVP Automatic FR+EN selection must reanalyse as SVP");
+      stored("automaticFrenchEnglish");
+    }
     await click("Back");
     await click("OpenUtau");
     check(header().value === next, "Returning to USTX must restore the chosen profile");

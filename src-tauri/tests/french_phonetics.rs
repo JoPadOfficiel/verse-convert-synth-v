@@ -85,6 +85,7 @@ fn direct_notes(words: &[&str]) -> Vec<verse_lib::engine::projection::ProjectedN
         .enumerate()
         .map(|(i, word)| ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks: i as u32 * 480,
             duration_ticks: 480,
@@ -1123,6 +1124,7 @@ fn another_source_row_inside_a_melisma_prevents_blank_absorption() {
     .enumerate()
     .map(|(i, lyric)| ProjectedNote {
         performance: None,
+        pronunciation_language: None,
         source_evidence: None,
         onset_ticks: i as u32 * 480,
         duration_ticks: 480,
@@ -1535,6 +1537,7 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
     let mut notes = vec![
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks: 0,
             duration_ticks: 480,
@@ -1543,6 +1546,7 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
         },
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks: 480,
             duration_ticks: 240,
@@ -1551,6 +1555,7 @@ fn dictionary_words_use_native_syllable_allocation_without_losing_source_evidenc
         },
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks: 720,
             duration_ticks: 480,
@@ -1799,6 +1804,7 @@ fn a_dictionary_cannot_invent_a_third_vowel_for_a_three_note_word() {
         lyric.syllabic = Some(syllabic);
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks: i as u32 * 480,
             duration_ticks: 480,

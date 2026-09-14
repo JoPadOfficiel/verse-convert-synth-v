@@ -6,7 +6,12 @@ const PROFILE_KEY = "verse.pronunciationProfile";
 export function storedPronunciationProfile(): PronunciationProfile {
   try {
     const value = localStorage.getItem(PROFILE_KEY);
-    if (value === "frenchMillefeuille" || value === "englishArpabet") return value;
+    if (
+      value === "automaticFrenchEnglish" ||
+      value === "frenchMillefeuille" ||
+      value === "englishArpabet" ||
+      value === "default"
+    ) return value;
   } catch {
     // Unavailable storage must not prevent the application from opening.
   }

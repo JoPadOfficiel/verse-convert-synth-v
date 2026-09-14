@@ -38,14 +38,18 @@ pub enum PronunciationProfile {
     Default,
     FrenchMillefeuille,
     EnglishArpabet,
+    AutomaticFrenchEnglish,
 }
 
 impl PronunciationProfile {
     pub fn for_target(self, target: ExportTarget) -> Self {
-        if target == ExportTarget::Ustx {
-            self
-        } else {
-            Self::Default
+        match (target, self) {
+            // Automatic routing is target-neutral analysis. Synthesizer V keeps
+            // its existing lyric/phoneme serialization while still receiving the
+            // same FR/EN ownership verdict as OpenUtau.
+            (_, Self::AutomaticFrenchEnglish) => Self::AutomaticFrenchEnglish,
+            (ExportTarget::Ustx, profile) => profile,
+            (ExportTarget::Svp, _) => Self::Default,
         }
     }
 }
@@ -197,6 +201,10 @@ mod tests {
                 "\"frenchMillefeuille\"",
             ),
             (PronunciationProfile::EnglishArpabet, "\"englishArpabet\""),
+            (
+                PronunciationProfile::AutomaticFrenchEnglish,
+                "\"automaticFrenchEnglish\"",
+            ),
         ] {
             assert_eq!(serde_json::to_string(&profile).unwrap(), value);
             assert_eq!(
@@ -206,7 +214,11 @@ mod tests {
             assert_eq!(profile.for_target(ExportTarget::Ustx), profile);
             assert_eq!(
                 profile.for_target(ExportTarget::Svp),
-                PronunciationProfile::Default
+                if profile == PronunciationProfile::AutomaticFrenchEnglish {
+                    PronunciationProfile::AutomaticFrenchEnglish
+                } else {
+                    PronunciationProfile::Default
+                }
             );
         }
         assert!(serde_json::from_str::<PronunciationProfile>("\"french\"").is_err());
@@ -234,6 +246,7 @@ mod tests {
                 muted: false,
                 notes: vec![ProjectedNote {
                     performance: None,
+                    pronunciation_language: None,
                     source_evidence: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
@@ -252,6 +265,7 @@ mod tests {
     ) -> ProjectedNote {
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks,
             duration_ticks,

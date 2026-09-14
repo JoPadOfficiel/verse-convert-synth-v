@@ -277,18 +277,31 @@ instrumental WAV in a bundle does not need one.
 3. Choose the **Export target**: Synthesizer V or OpenUtau. Changing it
    re-analyses every loaded file, because the two targets accept different
    timings.
-4. Drop one or more supported files into Verse.
-5. Expand a file to inspect source Parts, staff/voice counts, source roles,
+4. If one vocal line mixes French and English, choose **Automatic FR + EN** in
+   **Pronunciation**. Detection is fully offline: Verse reconstructs complete
+   source-owned words, scores them with its bundled two-language detector and
+   pronunciation lexicons, then smooths ambiguous short words and vocalises
+   from their surrounding passage. French words use the existing Millefeuille
+   pronunciation path and English words use the existing ARPAbet path. No
+   per-song language confirmation or separate model install is required.
+5. Drop one or more supported files into Verse.
+6. Expand a file to inspect source Parts, staff/voice counts, source roles,
    lyric status, stem state and warnings.
-6. Optionally change a Part’s eligible projection lanes with “Vocal SVP” /
+7. Optionally change a Part’s eligible projection lanes with “Vocal SVP” /
    “Vocal USTX”.
-7. Click **Vocals only** for a bare project in the selected format, or
+8. Click **Vocals only** for a bare project in the selected format, or
    **Complete project** (or **Export all complete projects**) for the bundle.
-8. Open the project — from inside a bundle it is under `project/` — and assign a
+9. Open the project — from inside a bundle it is under `project/` — and assign a
    Synthesizer V voice database or an OpenUtau singer to the vocal tracks.
 
-There is no language selector. Lyrics are source text and are written byte for
-byte in any language, with nothing to configure.
+Automatic FR+EN is pronunciation routing, not translation: source words,
+identities, repeats and verse selection remain the source's. With OpenUtau
+0.1.569 or newer, Verse keeps each mixed-language vocal lane intact and writes
+the selected phonemizer on complete word heads; continuations inherit their
+word's choice. Assign a compatible multilingual singer after opening the file.
+Synthesizer V receives the same automatic language ownership diagnostics but
+keeps Verse's existing SVP lyric/phoneme conventions and receives no OpenUtau
+phonemizer metadata.
 
 ### Opening an unsigned build
 

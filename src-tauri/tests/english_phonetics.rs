@@ -453,6 +453,7 @@ fn source_rows_rests_and_manual_boundaries_block_word_allocation() {
             source.syllabic = Some(syllabic);
             ProjectedNote {
                 performance: None,
+                pronunciation_language: None,
                 source_evidence: None,
                 onset_ticks: i as u32 * 480,
                 duration_ticks: 480,
@@ -490,6 +491,7 @@ fn genuine_hold_after_a_whole_word_stays_a_hold() {
     let mut notes = vec![
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks: 0,
             duration_ticks: 480,
@@ -498,6 +500,7 @@ fn genuine_hold_after_a_whole_word_stays_a_hold() {
         },
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks: 480,
             duration_ticks: 480,

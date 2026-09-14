@@ -8,6 +8,25 @@ created: 2026-09-09
 
 ## Activer les corrections dans Verse avant l'export
 
+Pour une partition qui mélange le français et l'anglais, sélectionner
+**Automatic French + English**. Verse reconstitue les mots complets à partir de
+la partition, les classe avec un détecteur anglais/français embarqué et les
+lexiques de prononciation déjà fournis, puis stabilise les mots ambigus avec le
+contexte de la phrase. Tout se fait hors ligne : aucun modèle supplémentaire,
+service web ou validation langue par langue n'est nécessaire.
+
+Les mots français passent ensuite par le profil **French Millefeuille** et les
+mots anglais par **English ARPAbet**. Les syllabes d'un même mot, les tenues et
+les continuations restent ensemble. Une vocalise courte comme `hou` hérite du
+passage auquel elle appartient. En cas de confiance faible, l'export continue de
+façon déterministe et Verse ajoute un diagnostic pour pouvoir auditer le choix.
+
+Avec **OpenUtau 0.1.569 ou plus récent**, Verse conserve une seule piste vocale
+quand la langue change et écrit le champ `phonemizer` directement sur la note qui
+commence chaque mot. Les notes `+` et `+~` qui prolongent ce mot héritent ce
+choix. Il faut tout de même assigner dans OpenUtau une banque multilingue
+compatible avec les phonèmes français Millefeuille et anglais ARPAbet.
+
 Avec la cible **OpenUtau**, sélectionner **French Millefeuille** dans
 **Pronunciation**, en haut de la fenêtre à côté du thème et des réglages, puis
 exporter à nouveau depuis la partition source. Le choix est conservé au
@@ -67,8 +86,9 @@ classique. Son absence ne démontre pas une installation incomplète de DiffSing
 Dans Verse, choisir le profil explicite correspondant à la langue et à la
 convention de la banque. Le profil français écrit des indications `fr/…` ; le
 profil anglais ARPAbet utilise `en/…`. Une banque multilingue doit accepter les
-symboles de la langue sélectionnée : DiffSinger ne garantit pas, à lui seul,
-une détection automatique de toutes les langues.
+symboles des deux conventions lorsque le profil automatique est utilisé.
+La détection automatique de Verse choisit la route de prononciation ; elle ne
+change ni la banque assignée ni les capacités acoustiques du modèle DiffSinger.
 
 Les indications manuelles entre crochets sont conservées. Un mot absent du
 lexique ou un découpage ambigu est signalé ; un dictionnaire plus grand ne

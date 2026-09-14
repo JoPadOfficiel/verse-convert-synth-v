@@ -344,12 +344,26 @@ pub struct ProjectedTrack {
     pub notes: Vec<ProjectedNote>,
 }
 
+/// The pronunciation domain chosen for one projected sung note.
+///
+/// This is derived pronunciation policy, not immutable source evidence. It lives
+/// on the projected note because the same source attack may legitimately appear
+/// in two alternative lyric lanes with different languages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PronunciationLanguage {
+    French,
+    English,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectedNote {
     /// Original channel ownership and a shared held performance timeline.
     /// Travels with the note through filtering and lane splitting; never joined
     /// back by pitch, time or display name. No target units live here.
     pub performance: Option<crate::engine::performance::PerformanceNote>,
+    /// Automatic FR/EN pronunciation ownership. `None` means no complete source
+    /// word was routed for this note (for example an untouched manual hint).
+    pub pronunciation_language: Option<PronunciationLanguage>,
     pub onset_ticks: u32,
     pub duration_ticks: u32,
     pub pitch: u8,
@@ -650,6 +664,7 @@ mod tests {
     fn note(onset_ticks: u32, duration_ticks: u32, pitch: u8) -> ProjectedNote {
         ProjectedNote {
             performance: None,
+            pronunciation_language: None,
             source_evidence: None,
             onset_ticks,
             duration_ticks,

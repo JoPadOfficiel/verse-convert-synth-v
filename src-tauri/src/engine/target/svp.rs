@@ -495,6 +495,7 @@ mod tests {
                 notes: vec![
                     ProjectedNote {
                         performance: None,
+                        pronunciation_language: None,
                         source_evidence: None,
                         onset_ticks: 0,
                         duration_ticks: 480,
@@ -503,6 +504,7 @@ mod tests {
                     },
                     ProjectedNote {
                         performance: None,
+                        pronunciation_language: None,
                         source_evidence: None,
                         onset_ticks: 480,
                         duration_ticks: 240,
@@ -511,6 +513,7 @@ mod tests {
                     },
                     ProjectedNote {
                         performance: None,
+                        pronunciation_language: None,
                         source_evidence: None,
                         onset_ticks: 720,
                         duration_ticks: 240,
@@ -519,6 +522,7 @@ mod tests {
                     },
                     ProjectedNote {
                         performance: None,
+                        pronunciation_language: None,
                         source_evidence: None,
                         onset_ticks: 960,
                         duration_ticks: 480,
@@ -527,6 +531,7 @@ mod tests {
                     },
                     ProjectedNote {
                         performance: None,
+                        pronunciation_language: None,
                         source_evidence: None,
                         onset_ticks: 1440,
                         duration_ticks: 480,
@@ -538,6 +543,7 @@ mod tests {
                     },
                     ProjectedNote {
                         performance: None,
+                        pronunciation_language: None,
                         source_evidence: None,
                         onset_ticks: 1920,
                         duration_ticks: 480,

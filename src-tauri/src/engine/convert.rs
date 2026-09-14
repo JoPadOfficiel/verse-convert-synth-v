@@ -598,7 +598,11 @@ fn pick_attached_lyric<'a>(
 ) -> Option<&'a Lyric> {
     let mut eligible = eligible_attached_lyrics(note, lane).into_iter();
     let first = eligible.next()?;
-    if profile != PronunciationProfile::Default && blank_lyric(first) {
+    if matches!(
+        profile,
+        PronunciationProfile::FrenchMillefeuille | PronunciationProfile::EnglishArpabet
+    ) && blank_lyric(first)
+    {
         eligible.find(|lyric| !blank_lyric(lyric)).or(Some(first))
     } else {
         Some(first)
@@ -630,6 +634,10 @@ fn duplicate_lyric_diagnostics(
         PronunciationProfile::EnglishArpabet => (
             "ENGLISH_DUPLICATE_BLANK_RESOLVED",
             "ENGLISH_DUPLICATE_LYRIC_CONFLICT",
+        ),
+        PronunciationProfile::AutomaticFrenchEnglish => (
+            "AUTOMATIC_DUPLICATE_BLANK_RESOLVED",
+            "AUTOMATIC_DUPLICATE_LYRIC_CONFLICT",
         ),
     };
     let candidates = eligible_attached_lyrics(note, &selected.lane);
@@ -692,6 +700,7 @@ fn selected_attached_lyric<'a>(
 fn french_source_context(
     midi: &Midi,
     notes_by_track: &[Vec<SourceNote>],
+    allowed: Option<&BTreeSet<(String, u32, String)>>,
 ) -> HashMap<(String, u32, String), String> {
     type Domain = (String, String, String, u32);
     type Entry<'a> = (usize, &'a SourceNote);
@@ -733,7 +742,16 @@ fn french_source_context(
                 BTreeMap::<u32, Vec<(usize, &SourceNote, Option<&Lyric>, bool)>>::new();
             for &(track, note) in &domain {
                 let selected =
-                    pick_attached_lyric(note, &row, PronunciationProfile::FrenchMillefeuille);
+                    pick_attached_lyric(note, &row, PronunciationProfile::FrenchMillefeuille)
+                        .filter(|lyric| {
+                            allowed.is_none_or(|allowed| {
+                                allowed.contains(&(
+                                    midi.tracks[track].id.clone(),
+                                    note.source_order,
+                                    lyric.id.clone(),
+                                ))
+                            })
+                        });
                 let conflict = selected.is_some_and(|selected| {
                     eligible_attached_lyrics(note, &row)
                         .iter()
@@ -767,6 +785,7 @@ fn french_source_context(
                     });
                     ProjectedNote {
                         performance: None,
+                        pronunciation_language: None,
                         source_evidence: None,
                         onset_ticks: first.onset,
                         duration_ticks: first.duration,
@@ -1248,7 +1267,10 @@ fn prepare_track_indices(
             &source_note.source,
             source_note.source_order,
         );
-        if projection.profile != PronunciationProfile::Default {
+        if matches!(
+            projection.profile,
+            PronunciationProfile::FrenchMillefeuille | PronunciationProfile::EnglishArpabet
+        ) {
             if let Some(selected) = attached {
                 projection.diagnostics.extend(duplicate_lyric_diagnostics(
                     source_note,
@@ -1267,6 +1289,7 @@ fn prepare_track_indices(
                     source_note.source_order,
                 ))
                 .cloned(),
+            pronunciation_language: None,
             onset_ticks: source_note.onset,
             duration_ticks: source_note.duration,
             pitch,
@@ -1318,7 +1341,7 @@ fn finish_track(
     let projected_notes = &mut track.notes;
     let mut note_ids = Vec::with_capacity(projected_notes.len());
     let mut domains = Vec::with_capacity(projected_notes.len());
-    for note in projected_notes.iter_mut() {
+    for note in projected_notes.iter() {
         let evidence = note.source_evidence.as_ref().expect("prepared source note");
         let origin = evidence.origin.as_ref().expect("prepared source origin");
         let source = &origin.source;
@@ -1329,23 +1352,38 @@ fn finish_track(
             source.occurrence,
         ));
         note_ids.push(evidence.note_id.clone());
-        if let ProjectedLyric::Source(lyric) = &note.lyric {
-            if let Some(hint) = contextual_french.get(&(
-                origin.track_id.clone(),
-                origin.note_on_order,
-                lyric.id.clone(),
-            )) {
-                diagnostics.push(crate::engine::target::french::apply_contextual_reading(
-                    note,
-                    hint,
-                    note_ids.last().unwrap(),
-                ));
+    }
+    if target == ExportTarget::Ustx
+        && matches!(
+            profile,
+            PronunciationProfile::FrenchMillefeuille | PronunciationProfile::AutomaticFrenchEnglish
+        )
+    {
+        for (note, note_id) in projected_notes.iter_mut().zip(&note_ids) {
+            if profile == PronunciationProfile::AutomaticFrenchEnglish
+                && note.pronunciation_language
+                    != Some(crate::engine::projection::PronunciationLanguage::French)
+            {
+                continue;
+            }
+            let evidence = note.source_evidence.as_ref().expect("prepared source note");
+            let origin = evidence.origin.as_ref().expect("prepared source origin");
+            if let ProjectedLyric::Source(lyric) = &note.lyric {
+                if let Some(hint) = contextual_french.get(&(
+                    origin.track_id.clone(),
+                    origin.note_on_order,
+                    lyric.id.clone(),
+                )) {
+                    diagnostics.push(crate::engine::target::french::apply_contextual_reading(
+                        note, hint, note_id,
+                    ));
+                }
             }
         }
     }
     // Before anything is diagnosed: the syllables a score spreads over several
     // notes are the word it writes, and it is that word the file will state.
-    let words = if profile != PronunciationProfile::Default {
+    let words = if target == ExportTarget::Ustx && profile != PronunciationProfile::Default {
         // A source voice or repeat occurrence boundary must not supply lexical
         // context, even when playback makes the two notes touch.
         let mut start = 0;
@@ -1356,15 +1394,47 @@ fn finish_track(
             }
             let notes = &mut projected_notes[start..end];
             let ids = &note_ids[start..end];
-            diagnostics.extend(match profile {
+            match profile {
                 PronunciationProfile::FrenchMillefeuille => {
-                    crate::engine::target::french::apply(notes, ids)
+                    diagnostics.extend(crate::engine::target::french::apply(notes, ids));
                 }
                 PronunciationProfile::EnglishArpabet => {
-                    crate::engine::target::english::apply(notes, ids)
+                    diagnostics.extend(crate::engine::target::english::apply(notes, ids));
                 }
-                PronunciationProfile::Default => Vec::new(),
-            });
+                PronunciationProfile::AutomaticFrenchEnglish => {
+                    let mut language_start = 0;
+                    while language_start < notes.len() {
+                        let Some(language) = notes[language_start].pronunciation_language else {
+                            language_start += 1;
+                            continue;
+                        };
+                        let mut language_end = language_start + 1;
+                        while language_end < notes.len()
+                            && notes[language_end].pronunciation_language == Some(language)
+                        {
+                            language_end += 1;
+                        }
+                        let language_notes = &mut notes[language_start..language_end];
+                        let language_ids = &ids[language_start..language_end];
+                        diagnostics.extend(match language {
+                            crate::engine::projection::PronunciationLanguage::French => {
+                                crate::engine::target::french::apply_automatic(
+                                    language_notes,
+                                    language_ids,
+                                )
+                            }
+                            crate::engine::projection::PronunciationLanguage::English => {
+                                crate::engine::target::english::apply_automatic(
+                                    language_notes,
+                                    language_ids,
+                                )
+                            }
+                        });
+                        language_start = language_end;
+                    }
+                }
+                PronunciationProfile::Default => {}
+            }
             start = end;
         }
         crate::engine::syllable::JoinedWords::default()
@@ -1833,11 +1903,6 @@ pub fn convert_midi_with_profile(
         Err(error) => return fail(error),
     };
     let notes_by_track: Vec<_> = midi.tracks.iter().map(extract_notes).collect();
-    let contextual_french = if profile == PronunciationProfile::FrenchMillefeuille {
-        french_source_context(midi, &notes_by_track)
-    } else {
-        HashMap::new()
-    };
     let tokens_by_track: Vec<_> = midi.tracks.iter().map(track_tokens).collect();
     let external = resolve_external_lyrics(midi, &notes_by_track, &tokens_by_track, tpb);
 
@@ -2281,6 +2346,45 @@ pub fn convert_midi_with_profile(
     ) {
         return fail(error);
     }
+    if profile == PronunciationProfile::AutomaticFrenchEnglish {
+        for (index, _, track) in &mut pending_tracks {
+            report[*index]
+                .warnings
+                .extend(crate::engine::language::route_track(track));
+        }
+    }
+    let automatic_french: BTreeSet<(String, u32, String)> =
+        if profile == PronunciationProfile::AutomaticFrenchEnglish {
+            pending_tracks
+                .iter()
+                .flat_map(|(_, _, track)| &track.notes)
+                .filter(|note| {
+                    note.pronunciation_language
+                        == Some(crate::engine::projection::PronunciationLanguage::French)
+                })
+                .filter_map(|note| {
+                    let evidence = note.source_evidence.as_ref()?;
+                    let origin = evidence.origin.as_ref()?;
+                    let lyric = crate::engine::target::lexical::source(&note.lyric)?;
+                    Some((
+                        origin.track_id.clone(),
+                        origin.note_on_order,
+                        lyric.id.clone(),
+                    ))
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+    let contextual_french = match profile {
+        PronunciationProfile::FrenchMillefeuille => {
+            french_source_context(midi, &notes_by_track, None)
+        }
+        PronunciationProfile::AutomaticFrenchEnglish => {
+            french_source_context(midi, &notes_by_track, Some(&automatic_french))
+        }
+        _ => HashMap::new(),
+    };
     let mut left_out_by_track = vec![0usize; midi.tracks.len()];
     let mut voices_by_track = vec![0usize; midi.tracks.len()];
     for (index, _, track) in pending_tracks {
@@ -3526,6 +3630,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, (onset, duration, lyric))| ProjectedNote {
                     performance: None,
+                    pronunciation_language: None,
                     source_evidence: None,
                     onset_ticks: *onset,
                     duration_ticks: *duration,
@@ -3699,6 +3804,7 @@ mod tests {
             notes: vec![
                 ProjectedNote {
                     performance: None,
+                    pronunciation_language: None,
                     source_evidence: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
@@ -3707,6 +3813,7 @@ mod tests {
                 },
                 ProjectedNote {
                     performance: None,
+                    pronunciation_language: None,
                     source_evidence: None,
                     onset_ticks: 0,
                     duration_ticks: 480,
@@ -3715,6 +3822,7 @@ mod tests {
                 },
                 ProjectedNote {
                     performance: None,
+                    pronunciation_language: None,
                     source_evidence: None,
                     onset_ticks: 480,
                     duration_ticks: 480,

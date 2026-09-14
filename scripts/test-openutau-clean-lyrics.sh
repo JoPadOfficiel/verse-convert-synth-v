@@ -18,6 +18,14 @@ git -C "$WORK" remote add origin "$REPOSITORY"
 git -C "$WORK" fetch -q --depth 1 origin "$REVISION"
 git -C "$WORK" checkout -q --detach FETCH_HEAD
 test "$(git -C "$WORK" rev-parse HEAD)" = "$REVISION"
+grep -Fq '[YamlMember(Alias = "phonemizer", ApplyNamingConventions = false)]' \
+  "$WORK/OpenUtau.Core/Ustx/UNote.cs"
+grep -Fq 'public string? PhonemizerOverride { get; set; } = null;' \
+  "$WORK/OpenUtau.Core/Ustx/UNote.cs"
+grep -Fq 'if (!string.IsNullOrEmpty(note.PhonemizerOverride)) {' \
+  "$WORK/OpenUtau.Core/Ustx/UPart.cs"
+grep -Fq 'PhonemizerFactory.GetAll().FirstOrDefault(f => f.name == note.PhonemizerOverride)' \
+  "$WORK/OpenUtau.Core/Ustx/UPart.cs"
 git -C "$WORK" apply --check --ignore-space-change "$PATCH"
 git -C "$WORK" apply --ignore-space-change "$PATCH"
 dotnet test "$WORK/OpenUtau.Test/OpenUtau.Test.csproj" \

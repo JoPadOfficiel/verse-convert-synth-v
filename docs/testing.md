@@ -22,6 +22,34 @@ Some Rust tests are ignored by design:
 Ignored private tests are not optional once explicitly requested. They fail if
 their required fixtures are missing. Copyrighted fixtures remain outside Git.
 
+The mixed French/English integration gate is
+`src-tauri/tests/mixed_languages.rs`. Its committed fixtures cover MIDI, Soft
+Karaoke, MusicXML and native MuseScore with FR–EN–FR switching, OpenUtau
+per-note phonemizer overrides and track fallback, SynthV split-word/metadata
+isolation, geometry conservation and a French-liaison language boundary. The
+router's focused unit suite in `engine/language.rs` covers ambiguous short
+words, proper names, neutral vocalises, malformed/incomplete fragments,
+continuations and context across source-domain boundaries. The private
+development oracle is ignored because the two supplied MSCZ masters are
+copyrighted and are not checked into the repository.
+
+To run that private gate, point Verse at the directory containing the exact two
+masters and request the ignored test explicitly:
+
+```sh
+VERSE_MIXED_LANGUAGE_CORPUS_DIR=/path/to/private-masters \
+  cargo test --manifest-path src-tauri/Cargo.toml --locked \
+  --test mixed_languages supplied_private_scores_match_the_frozen_automatic_language_oracle \
+  -- --ignored
+```
+
+The private masters are SHA-256 pinned and the gate compares every sung word
+head against a human-readable editorial oracle derived from each master's
+source staff, measure, verse and lyric ownership. Continuation and geometry
+conservation are covered separately by committed structural regressions. Audible
+bilingual quality still requires opening the exported project with a compatible
+multilingual DiffSinger bank and listening across the language boundaries.
+
 ## Required quality gates
 
 Run the following commands from the repository root:
@@ -40,11 +68,14 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 These are the same core gates used by CI. `npm test` includes the rendered
 pronunciation regression and therefore needs Chrome or Chromium. The separate
 OpenUtau compatibility gate needs .NET SDK 10 and network access to fetch the
-exact pinned OpenUtau revision before applying the repository patch. The CI
+exact pinned OpenUtau revision. Before applying the repository patch, the gate
+also asserts that native `UNote` YAML still exposes the per-note `phonemizer`
+override and that `UPart` resolves that override through `PhonemizerFactory`.
+The CI
 environment uses Node 22, .NET 10, Rust 1.93.0, an immutable npm install, the
 locked Cargo dependency graph, and Ubuntu 22.04 native Tauri dependencies.
 
-The browser gate retains all 24 rendered application cases and three full page
+The browser gate retains all 31 rendered application cases and four full page
 reloads, with native Tauri IPC/dialogs mocked. It requires a complete passing
 receipt; assertion, navigation, receipt, startup, and cleanup failures remain
 blocking. The lifecycle regression tests also exercise slow startup, process

@@ -491,22 +491,25 @@ export default function App() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-1">
-          {exportTarget === "ustx" && (
-            <label className="mr-2 flex items-center gap-2 text-xs text-muted-foreground">
-              Pronunciation
-              <select
-                aria-label="OpenUtau pronunciation"
-                disabled={busy}
-                value={pronunciationProfile}
-                onChange={(event) => void changeTarget(exportTarget, event.target.value as PronunciationProfile)}
-                className="max-w-56 rounded-md border bg-background px-2 py-1 text-foreground disabled:opacity-50"
-              >
-                <option value="default">Default — no pronunciation fixes</option>
-                <option value="frenchMillefeuille">French Millefeuille</option>
-                <option value="englishArpabet">English ARPAbet</option>
-              </select>
-            </label>
-          )}
+          <label className="mr-2 flex items-center gap-2 text-xs text-muted-foreground">
+            Pronunciation
+            <select
+              aria-label="Pronunciation"
+              disabled={busy}
+              value={pronunciationProfile}
+              onChange={(event) => void changeTarget(exportTarget, event.target.value as PronunciationProfile)}
+              className="max-w-56 rounded-md border bg-background px-2 py-1 text-foreground disabled:opacity-50"
+            >
+              <option value="automaticFrenchEnglish">Automatic FR + EN</option>
+              <option value="default">Default — no pronunciation fixes</option>
+              <option value="frenchMillefeuille" disabled={exportTarget !== "ustx"}>
+                French Millefeuille
+              </option>
+              <option value="englishArpabet" disabled={exportTarget !== "ustx"}>
+                English ARPAbet
+              </option>
+            </select>
+          </label>
           <Button
             variant="ghost"
             size="icon"
