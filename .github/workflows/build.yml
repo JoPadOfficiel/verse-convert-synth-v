@@ -534,21 +534,32 @@ jobs:
               echo "::error::Published release exists without its expected remote tag"
               exit 1
             fi
-            verify_published_release_assets
-            echo "Release ${RELEASE_TAG} is already published and verified at ${RELEASE_SHA}."
-            exit 0
+
+            if existing_assets="$(
+              gh release view "$RELEASE_TAG" \
+                --json assets \
+                --jq '.assets[].name'
+            )" && [[ -n "$existing_assets" ]]; then
+              verify_published_release_assets
+              echo "Release ${RELEASE_TAG} is already published and verified at ${RELEASE_SHA}."
+              exit 0
+            fi
+
+            echo "Published release ${RELEASE_TAG} has no assets; rebuilding its assets before verification."
           fi
 
           if [[ "$release_exists" == "true" ]]; then
-            if [[ "$tag_exists" == "true" ]]; then
-              gh release edit "$RELEASE_TAG" \
-                --draft \
-                --target "$RELEASE_SHA" \
-                --verify-tag
-            else
-              gh release edit "$RELEASE_TAG" \
-                --draft \
-                --target "$RELEASE_SHA"
+            if [[ "$release_is_draft" == "true" ]]; then
+              if [[ "$tag_exists" == "true" ]]; then
+                gh release edit "$RELEASE_TAG" \
+                  --draft \
+                  --target "$RELEASE_SHA" \
+                  --verify-tag
+              else
+                gh release edit "$RELEASE_TAG" \
+                  --draft \
+                  --target "$RELEASE_SHA"
+              fi
             fi
           elif [[ "$tag_exists" == "true" ]]; then
             gh release create "$RELEASE_TAG" \
