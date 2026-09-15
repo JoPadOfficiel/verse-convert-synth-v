@@ -277,13 +277,20 @@ instrumental WAV in a bundle does not need one.
 3. Choose the **Export target**: Synthesizer V or OpenUtau. Changing it
    re-analyses every loaded file, because the two targets accept different
    timings.
-4. If one vocal line mixes French and English, choose **Automatic FR + EN** in
-   **Pronunciation**. Detection is fully offline: Verse reconstructs complete
-   source-owned words, scores them with its bundled two-language detector and
-   pronunciation lexicons, then smooths ambiguous short words and vocalises
-   from their surrounding passage. French words use the existing Millefeuille
-   pronunciation path and English words use the existing ARPAbet path. No
-   per-song language confirmation or separate model install is required.
+4. **Pronunciation** defaults to **Automatic French + English + Spanish +
+   Portuguese**. Detection is fully offline: Verse reconstructs complete
+   source-owned words, combines its bundled four-language detector with local
+   lexical evidence and passage context, and handles both monolingual songs and
+   language changes inside one vocal lane. French uses Millefeuille, English
+   uses ARPAbet, and Spanish/Portuguese use bundled, pinned Montreal Forced
+   Aligner pronunciation dictionaries for Spain/Latin America and
+   Brazil/Portugal. Verse emits a DiffSinger hint only when every applicable MFA
+   reading maps exactly to the verified OpenUtau base phone inventory and
+   converges on one result; otherwise it preserves the source spelling and
+   reports the unresolved pronunciation. No per-song language confirmation or
+   separate model install is required. Manual French, English, Spanish and
+   Portuguese profiles remain available for OpenUtau when a language should be
+   forced explicitly.
 5. Drop one or more supported files into Verse.
 6. Expand a file to inspect source Parts, staff/voice counts, source roles,
    lyric status, stem state and warnings.
@@ -294,11 +301,16 @@ instrumental WAV in a bundle does not need one.
 9. Open the project — from inside a bundle it is under `project/` — and assign a
    Synthesizer V voice database or an OpenUtau singer to the vocal tracks.
 
-Automatic FR+EN is pronunciation routing, not translation: source words,
+Automatic FR+EN+ES+PT is pronunciation routing, not translation: source words,
 identities, repeats and verse selection remain the source's. With OpenUtau
 0.1.569 or newer, Verse keeps each mixed-language vocal lane intact and writes
 the selected phonemizer on complete word heads; continuations inherit their
-word's choice. Assign a compatible multilingual singer after opening the file.
+word's choice. The bundled Spanish and Portuguese community TSVs are routing
+evidence only; separate MFA-derived TSVs retain external pronunciation readings
+and dialect provenance. Assign a compatible multilingual singer after opening
+the file. Verse does not silently collapse Spain/Latin-America or
+Brazil/Portugal differences: ambiguous or unrepresentable readings keep the
+source word and a diagnostic instead of an approximate phonetic hint.
 Synthesizer V receives the same automatic language ownership diagnostics but
 keeps Verse's existing SVP lyric/phoneme conventions and receives no OpenUtau
 phonemizer metadata.

@@ -1,8 +1,8 @@
-//! Offline automatic French/English routing for sung lyrics.
+//! Offline automatic French/English/Spanish/Portuguese routing for sung lyrics.
 //!
 //! Language is pronunciation policy, never source evidence. The router works on
 //! complete source-attested words, combines Lingua's local statistical model
-//! with Verse's pinned French/English lexicons, and decodes one deterministic
+//! with Verse's pinned French/English/Spanish/Portuguese lexicons, and decodes one deterministic
 //! language sequence so short homographs do not flip a phrase on their own.
 
 use std::collections::HashMap;
@@ -13,16 +13,29 @@ use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 use crate::engine::convert::{Diagnostic, DiagnosticSeverity};
 use crate::engine::projection::{ProjectedNote, ProjectedTrack, PronunciationLanguage};
 use crate::engine::syllable::touches;
-use crate::engine::target::{english, french, lexical};
+use crate::engine::target::{english, french, lexical, portuguese, spanish};
 
 pub const ROUTED: &str = "AUTOMATIC_LANGUAGE_ROUTED";
 pub const LOW_CONFIDENCE: &str = "AUTOMATIC_LANGUAGE_LOW_CONFIDENCE";
 
 impl PronunciationLanguage {
+    const ALL: [Self; 4] = [Self::French, Self::English, Self::Spanish, Self::Portuguese];
+
+    fn index(self) -> usize {
+        match self {
+            Self::French => 0,
+            Self::English => 1,
+            Self::Spanish => 2,
+            Self::Portuguese => 3,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::French => "French",
             Self::English => "English",
+            Self::Spanish => "Spanish",
+            Self::Portuguese => "Portuguese",
         }
     }
 }
@@ -35,6 +48,8 @@ struct Unit {
     boundary_after: bool,
     french_score: f64,
     english_score: f64,
+    spanish_score: f64,
+    portuguese_score: f64,
     local_uncertain: bool,
     inherit_passage: bool,
 }
@@ -63,9 +78,358 @@ fn lingua_scores(text: &str) -> (f64, f64) {
         match language {
             Language::French => french = value,
             Language::English => english = value,
+            Language::Spanish | Language::Portuguese => {}
         }
     }
     (french, english)
+}
+
+fn multilingual_scores(text: &str) -> [f64; 4] {
+    static DETECTOR: OnceLock<LanguageDetector> = OnceLock::new();
+    let detector = DETECTOR.get_or_init(|| {
+        LanguageDetectorBuilder::from_languages(&[
+            Language::French,
+            Language::English,
+            Language::Spanish,
+            Language::Portuguese,
+        ])
+        .with_preloaded_language_models()
+        .build()
+    });
+    let mut scores = [0.0; 4];
+    for (language, confidence) in detector.compute_language_confidence_values(text) {
+        let index = match language {
+            Language::French => 0,
+            Language::English => 1,
+            Language::Spanish => 2,
+            Language::Portuguese => 3,
+        };
+        scores[index] = confidence;
+    }
+    scores
+}
+
+fn lexical_membership(key: &str) -> [bool; 4] {
+    [
+        french::contains_lexeme(key),
+        english::contains_lexeme(key),
+        spanish::contains_lexeme(key),
+        portuguese::contains_lexeme(key),
+    ]
+}
+
+fn known_lexeme(key: &str) -> bool {
+    lexical_membership(key).into_iter().any(|known| known)
+}
+
+/// These tokens are not exclusive FR/EN evidence once Spanish and Portuguese
+/// participate. Their complete word and passage context decide their owner.
+fn shared_romance_word(key: &str) -> bool {
+    matches!(
+        key,
+        "a" | "à"
+            | "e"
+            | "o"
+            | "os"
+            | "as"
+            | "de"
+            | "do"
+            | "da"
+            | "dos"
+            | "das"
+            | "em"
+            | "no"
+            | "na"
+            | "nos"
+            | "nas"
+            | "que"
+            | "se"
+            | "si"
+            | "tu"
+            | "me"
+            | "te"
+            | "un"
+            | "la"
+            | "le"
+            | "les"
+            | "el"
+            | "lo"
+            | "los"
+            | "del"
+            | "al"
+            | "en"
+            | "es"
+            | "son"
+            | "somos"
+            | "mais"
+            | "mas"
+            | "por"
+            | "para"
+            | "con"
+            | "como"
+            | "y"
+            | "eu"
+            | "mes"
+            | "ton"
+            | "ta"
+            | "tes"
+            | "ma"
+    )
+}
+
+fn automatic_anchor(key: &str) -> Option<PronunciationLanguage> {
+    if shared_romance_word(key) {
+        return None;
+    }
+    if matches!(
+        key,
+        "tú" | "usted" | "ustedes" | "vosotros" | "nosotros" | "estáis" | "hola" | "gracias"
+    ) {
+        return Some(PronunciationLanguage::Spanish);
+    }
+    if matches!(
+        key,
+        "você"
+            | "vocês"
+            | "não"
+            | "nós"
+            | "estão"
+            | "também"
+            | "isto"
+            | "isso"
+            | "olá"
+            | "obrigado"
+            | "obrigada"
+    ) {
+        return Some(PronunciationLanguage::Portuguese);
+    }
+    if matches!(key, "bonjour" | "bonsoir" | "merci") {
+        return Some(PronunciationLanguage::French);
+    }
+    function_word_anchor(key)
+}
+
+/// Grammatical clues distinguish closely related ES/PT passages. These are
+/// soft context votes: e.g. French `mis` and `eu` must not force another language.
+fn romance_context_vote(key: &str) -> f64 {
+    if matches!(
+        key,
+        "yo" | "con"
+            | "sin"
+            | "mis"
+            | "tus"
+            | "sus"
+            | "lo"
+            | "los"
+            | "las"
+            | "del"
+            | "una"
+            | "unos"
+            | "unas"
+            | "nuestro"
+            | "nuestra"
+            | "nuestros"
+            | "nuestras"
+            | "vuestro"
+            | "vuestra"
+            | "pero"
+            | "muy"
+            | "más"
+            | "eres"
+            | "soy"
+            | "estoy"
+    ) {
+        1.0
+    } else if matches!(
+        key,
+        "eu" | "com"
+            | "sem"
+            | "meu"
+            | "minha"
+            | "meus"
+            | "minhas"
+            | "seu"
+            | "sua"
+            | "seus"
+            | "suas"
+            | "nosso"
+            | "nossa"
+            | "nossos"
+            | "nossas"
+            | "um"
+            | "uma"
+            | "uns"
+            | "umas"
+            | "do"
+            | "da"
+            | "dos"
+            | "das"
+            | "ao"
+            | "aos"
+            | "pelo"
+            | "pela"
+            | "pelos"
+            | "pelas"
+    ) {
+        -1.0
+    } else {
+        match automatic_anchor(key) {
+            Some(PronunciationLanguage::Spanish) => return 1.0,
+            Some(PronunciationLanguage::Portuguese) => return -1.0,
+            _ => {}
+        }
+        let spanish = spanish::contains_lexeme(key);
+        let portuguese = portuguese::contains_lexeme(key);
+        if spanish && !portuguese {
+            return 0.35;
+        }
+        if portuguese && !spanish {
+            return -0.35;
+        }
+        0.0
+    }
+}
+
+impl Unit {
+    fn scores(&self) -> [f64; 4] {
+        if self.inherit_passage {
+            // A token with no independent language evidence must not pull its
+            // owner toward the old two-language guess during sequence decoding.
+            [0.0; 4]
+        } else {
+            [
+                self.french_score,
+                self.english_score,
+                self.spanish_score,
+                self.portuguese_score,
+            ]
+        }
+    }
+}
+
+/// Preserve the qualified FR/EN conditional scorer and compare that language
+/// family with ES/PT using the bundled four-language model. Subtracting the
+/// same normalizer from both old scores preserves their relative decisions.
+fn extend_language_scores(units: &mut [Unit], notes: &[ProjectedNote]) {
+    let keys: Vec<_> = units.iter().map(|unit| unit.key.clone()).collect();
+    let boundaries: Vec<_> = units.iter().map(|unit| unit.boundary_after).collect();
+    let mut cache = HashMap::new();
+    for (index, unit) in units.iter_mut().enumerate() {
+        let start = (0..index)
+            .rev()
+            .find(|&i| boundaries[i])
+            .map_or(0, |i| i + 1);
+        let end = (index..boundaries.len())
+            .find(|&i| boundaries[i])
+            .map_or(keys.len(), |i| i + 1);
+        let context = keys[index.saturating_sub(2).max(start)..(index + 3).min(end)].join(" ");
+        let phrase = keys[start..end].join(" ");
+        let own = *cache
+            .entry(unit.key.clone())
+            .or_insert_with(|| multilingual_scores(&unit.key));
+        let nearby = *cache
+            .entry(context.clone())
+            .or_insert_with(|| multilingual_scores(&context));
+        let passage = *cache
+            .entry(phrase.clone())
+            .or_insert_with(|| multilingual_scores(&phrase));
+        let neutral = matches!(
+            unit.key.as_str(),
+            "ah" | "aah" | "oh" | "ooh" | "ouh" | "hou" | "uh" | "mm" | "mmm" | "la" | "na"
+        );
+        let membership = lexical_membership(&unit.key);
+        let lexical_match_count = membership.into_iter().filter(|known| *known).count();
+        let mut ranked = own;
+        ranked.sort_by(|left, right| right.total_cmp(left));
+        let ambiguous = shared_romance_word(&unit.key)
+            || lexical_match_count > 1
+            || (ranked[0] - ranked[1] < 0.3)
+            || (starts_capitalized(&notes[unit.members[0]])
+                && french::contains_lexeme(&unit.key)
+                && english::contains_lexeme(&unit.key));
+        let weights = if neutral {
+            [0.0, 1.0, 0.5]
+        } else if ambiguous {
+            [0.25, 1.0, 0.5]
+        } else {
+            [1.4, 0.35, 0.15]
+        };
+        let mut family_odds = -1.2;
+        let mut spanish_odds = 0.0;
+        for (scores, weight) in [own, nearby, passage].into_iter().zip(weights) {
+            family_odds += weight * log_odds(scores[2] + scores[3], scores[0] + scores[1]);
+            spanish_odds += weight * log_odds(scores[2], scores[3]);
+        }
+        match (membership[2], membership[3]) {
+            (true, false) => {
+                family_odds += 0.25;
+                spanish_odds += 0.35;
+            }
+            (false, true) => {
+                family_odds += 0.25;
+                spanish_odds -= 0.35;
+            }
+            _ => {}
+        }
+        if (membership[0] || membership[1]) && !membership[2] && !membership[3] {
+            family_odds -= 0.25;
+        }
+        // Hunspell membership is intentionally soft: its .dic files contain
+        // roots plus affix flags, so an inflected form can be absent even when
+        // its lemma is present. Whole-passage grammatical evidence is stronger
+        // for ES/PT and keeps a monolingual song stable without preventing a
+        // passage that contains clear per-word switches from switching.
+        let passage_romance_vote: f64 = keys[start..end]
+            .iter()
+            .map(|key| romance_context_vote(key))
+            .sum::<f64>()
+            .clamp(-3.0, 3.0);
+        if keys[start..end].len() >= 3 {
+            spanish_odds += 0.8 * passage_romance_vote;
+            family_odds += 0.15 * passage_romance_vote.abs();
+        }
+        for (neighbor, key) in keys
+            .iter()
+            .enumerate()
+            .take((index + 4).min(end))
+            .skip(index.saturating_sub(3).max(start))
+        {
+            let vote = romance_context_vote(key);
+            let strength = 1.0 / (1.0 + index.abs_diff(neighbor) as f64);
+            spanish_odds += 1.5 * vote * strength;
+            family_odds += 0.65 * vote.abs() * strength;
+        }
+        let normalizer = unit.french_score.max(unit.english_score);
+        unit.french_score -= normalizer;
+        unit.english_score -= normalizer;
+        unit.spanish_score = family_odds + (2.0 * spanish_odds).min(0.0);
+        unit.portuguese_score = family_odds + (-2.0 * spanish_odds).min(0.0);
+        // A short Portuguese/Spanish word is not an unknown FR/EN vocalise.
+        if !neutral
+            && family_odds > 1.0
+            && (own[2].max(own[3]) > 0.7 || ambiguous || membership[2] || membership[3])
+        {
+            unit.inherit_passage = false;
+            unit.local_uncertain = ranked[0] - ranked[1] < 0.3;
+        }
+        if let Some(anchor) = automatic_anchor(&unit.key) {
+            let mut scores = [-12.0; 4];
+            scores[anchor.index()] = 12.0;
+            [
+                unit.french_score,
+                unit.english_score,
+                unit.spanish_score,
+                unit.portuguese_score,
+            ] = scores;
+            unit.inherit_passage = false;
+            unit.local_uncertain = false;
+        }
+    }
+}
+
+fn routing_message(counts: [usize; 4]) -> String {
+    let [french, english, spanish, portuguese] = counts;
+    format!("Automatic FR+EN+ES+PT classified {french} French, {english} English, {spanish} Spanish and {portuguese} Portuguese word(s).")
 }
 
 fn log_odds(left: f64, right: f64) -> f64 {
@@ -205,9 +569,7 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
         if members.is_empty() || members.iter().any(|&index| ownership[index].is_some()) {
             continue;
         }
-        let key = lexical::preferred_joined_key(notes, &members, |candidate| {
-            french::contains_lexeme(candidate) || english::contains_lexeme(candidate)
-        });
+        let key = lexical::preferred_joined_key(notes, &members, known_lexeme);
         if key.is_empty() {
             continue;
         }
@@ -259,10 +621,8 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
                 break;
             }
             members.push(next);
-            let key = lexical::preferred_joined_key(notes, &members, |candidate| {
-                french::contains_lexeme(candidate) || english::contains_lexeme(candidate)
-            });
-            if french::contains_lexeme(&key) || english::contains_lexeme(&key) {
+            let key = lexical::preferred_joined_key(notes, &members, known_lexeme);
+            if known_lexeme(&key) {
                 best = Some((members.clone(), key));
             }
             next += 1;
@@ -495,7 +855,7 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
                 french_score = -4.5;
                 english_score = 4.5;
             }
-            None => {}
+            _ => {}
         }
         if shared && !capitalized && unit_anchor.is_none() {
             let previous_anchor = (position > phrase_start && !boundaries[position - 1])
@@ -527,6 +887,7 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
                             french_score = -3.5;
                             english_score = 3.5;
                         }
+                        PronunciationLanguage::Spanish | PronunciationLanguage::Portuguese => {}
                     }
                 }
             }
@@ -557,6 +918,7 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
                             french_score = -3.5;
                             english_score = 3.5;
                         }
+                        PronunciationLanguage::Spanish | PronunciationLanguage::Portuguese => {}
                     }
                 }
             }
@@ -614,11 +976,14 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
             boundary_after: boundaries[position],
             french_score,
             english_score,
+            spanish_score: f64::NEG_INFINITY,
+            portuguese_score: f64::NEG_INFINITY,
             local_uncertain,
             inherit_passage: (neutral_vocalise || short_unknown)
                 && function_word_anchor(&self_text).is_none(),
         });
     }
+    extend_language_scores(&mut units, notes);
     units
 }
 
@@ -634,36 +999,34 @@ fn decode(units: &[Unit]) -> Vec<PronunciationLanguage> {
     if units.is_empty() {
         return Vec::new();
     }
-    let mut dp = vec![[f64::NEG_INFINITY; 2]; units.len()];
-    let mut back = vec![[0usize; 2]; units.len()];
-    dp[0] = [units[0].french_score, units[0].english_score];
+    let mut dp = vec![[f64::NEG_INFINITY; 4]; units.len()];
+    let mut back = vec![[0usize; 4]; units.len()];
+    dp[0] = units[0].scores();
     for index in 1..units.len() {
         let penalty = transition_penalty(&units[index - 1]);
-        for state in 0..2 {
-            let emission = if state == 0 {
-                units[index].french_score
-            } else {
-                units[index].english_score
-            };
-            let same = dp[index - 1][state];
-            let other = dp[index - 1][1 - state] - penalty;
-            if same >= other {
-                dp[index][state] = same + emission;
-                back[index][state] = state;
-            } else {
-                dp[index][state] = other + emission;
-                back[index][state] = 1 - state;
+        for state in 0..4 {
+            let mut best = dp[index - 1][state];
+            let mut predecessor = state;
+            for (previous, previous_score) in dp[index - 1].iter().copied().enumerate() {
+                let candidate = previous_score - if previous == state { 0.0 } else { penalty };
+                if candidate > best {
+                    best = candidate;
+                    predecessor = previous;
+                }
             }
+            dp[index][state] = best + units[index].scores()[state];
+            back[index][state] = predecessor;
         }
     }
-    let mut state = usize::from(dp.last().unwrap()[1] > dp.last().unwrap()[0]);
+    let mut state = 0;
+    for candidate in 1..4 {
+        if dp.last().unwrap()[candidate] > dp.last().unwrap()[state] {
+            state = candidate;
+        }
+    }
     let mut states = vec![PronunciationLanguage::French; units.len()];
     for index in (0..units.len()).rev() {
-        states[index] = if state == 0 {
-            PronunciationLanguage::French
-        } else {
-            PronunciationLanguage::English
-        };
+        states[index] = PronunciationLanguage::ALL[state];
         if index > 0 {
             state = back[index][state];
         }
@@ -701,25 +1064,23 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
     let mut languages = vec![None; notes.len()];
     let mut inherit_passage = vec![false; notes.len()];
     let mut diagnostics = Vec::new();
-    let mut french_count = 0usize;
-    let mut english_count = 0usize;
+    let mut counts = [0usize; 4];
 
     for (unit, language) in units.iter().zip(&decisions) {
         for &member in &unit.members {
             languages[member] = Some(*language);
             inherit_passage[member] = unit.inherit_passage;
         }
-        match language {
-            PronunciationLanguage::French => french_count += 1,
-            PronunciationLanguage::English => english_count += 1,
-        }
-        let margin = (unit.french_score - unit.english_score).abs();
+        counts[language.index()] += 1;
+        let mut scores = unit.scores();
+        scores.sort_by(|left, right| right.total_cmp(left));
+        let margin = scores[0] - scores[1];
         if unit.local_uncertain || margin < 1.0 {
             diagnostics.push(Diagnostic {
                 code: LOW_CONFIDENCE.into(),
                 severity: DiagnosticSeverity::Info,
                 message: format!(
-                    "Automatic FR+EN: {:?} resolves to {} from surrounding phrase context with a low score margin ({margin:.2}); export continues deterministically.",
+                    "Automatic FR+EN+ES+PT: {:?} resolves to {} from surrounding phrase context with a low score margin ({margin:.2}); export continues deterministically.",
                     unit.key,
                     language.label(),
                 ),
@@ -761,7 +1122,7 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
         }
         if let Some(anchor) = lexical::candidate(&notes[index].lyric)
             .as_deref()
-            .and_then(function_word_anchor)
+            .and_then(automatic_anchor)
         {
             languages[index] = Some(anchor);
             inherit_passage[index] = false;
@@ -800,9 +1161,7 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
         diagnostics.push(Diagnostic {
             code: ROUTED.into(),
             severity: DiagnosticSeverity::Info,
-            message: format!(
-                "Automatic FR+EN routed {french_count} French word(s) through Millefeuille and {english_count} English word(s) through ARPAbet; no Default phonemizer is used for classified sung text."
-            ),
+            message: routing_message(counts),
             source_id: note_ids.first().cloned(),
         });
     }
@@ -888,7 +1247,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                 lexical::candidate(&track.notes[previous_index].lyric),
                 track.notes[previous_index].pronunciation_language,
             ) {
-                if function_word_anchor(&previous_key) == Some(previous_language) {
+                if automatic_anchor(&previous_key) == Some(previous_language) {
                     let local_notes = &track.notes[start..end];
                     if let Some(first_word) = lexical::automatic_words(local_notes)
                         .into_iter()
@@ -898,10 +1257,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                             let key = lexical::preferred_joined_key(
                                 local_notes,
                                 &first_word,
-                                |candidate| {
-                                    french::contains_lexeme(candidate)
-                                        || english::contains_lexeme(candidate)
-                                },
+                                known_lexeme,
                             );
                             let fr_lex = french::contains_lexeme(&key);
                             let en_lex = english::contains_lexeme(&key);
@@ -913,9 +1269,23 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                                 && (self_fr - self_en).abs() >= 0.1;
                             let context_dependent =
                                 unknown || (shared && (self_fr - self_en).abs() < 0.5);
-                            if function_word_anchor(&key).is_none()
+                            // The local decoder already combines the complete
+                            // word with its passage. Low isolated ES/PT
+                            // confidence must not discard that evidence.
+                            let explicit_new_language = local_notes[head]
+                                .pronunciation_language
+                                .is_some_and(|language| {
+                                    matches!(
+                                        language,
+                                        PronunciationLanguage::Spanish
+                                            | PronunciationLanguage::Portuguese
+                                    ) && language != previous_language
+                                        && !routed.inherit_passage[head]
+                                });
+                            if automatic_anchor(&key).is_none()
                                 && context_dependent
                                 && !proper_name_anchor
+                                && !explicit_new_language
                             {
                                 for &member in &first_word {
                                     let index = start + member;
@@ -1016,8 +1386,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
             .or(next)
             .and_then(|owner| track.notes[owner].pronunciation_language);
         let row_language = if local_language.is_none() {
-            let mut french = 0usize;
-            let mut english = 0usize;
+            let mut counts = [0usize; 4];
             for (&inherits_passage, note) in inherit_passage.iter().zip(&track.notes) {
                 if inherits_passage
                     || note.lyric.continues_previous_note()
@@ -1027,16 +1396,18 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                 {
                     continue;
                 }
-                match note.pronunciation_language {
-                    Some(PronunciationLanguage::French) => french += 1,
-                    Some(PronunciationLanguage::English) => english += 1,
-                    None => {}
+                if let Some(language) = note.pronunciation_language {
+                    counts[language.index()] += 1;
                 }
             }
-            match french.cmp(&english) {
-                std::cmp::Ordering::Greater => Some(PronunciationLanguage::French),
-                std::cmp::Ordering::Less => Some(PronunciationLanguage::English),
-                std::cmp::Ordering::Equal => None,
+            let highest = *counts.iter().max().unwrap();
+            if highest > 0 && counts.iter().filter(|&&count| count == highest).count() == 1 {
+                Some(
+                    PronunciationLanguage::ALL
+                        [counts.iter().position(|&count| count == highest).unwrap()],
+                )
+            } else {
+                None
             }
         } else {
             None
@@ -1085,7 +1456,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
         let Some(key) = lexical::candidate(&track.notes[index].lyric) else {
             continue;
         };
-        let Some(language) = function_word_anchor(&key) else {
+        let Some(language) = automatic_anchor(&key) else {
             continue;
         };
         if track.notes[index].pronunciation_language != Some(language) {
@@ -1120,30 +1491,25 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
             continue;
         };
         diagnostic.message = format!(
-            "Automatic FR+EN: low-confidence sung text resolves to {} from the surrounding passage; export continues deterministically.",
+            "Automatic FR+EN+ES+PT: low-confidence sung text resolves to {} from the surrounding passage; export continues deterministically.",
             language.label()
         );
     }
 
-    let mut french_count = 0usize;
-    let mut english_count = 0usize;
+    let mut counts = [0usize; 4];
     for note in &track.notes {
         if note.lyric.continues_previous_note() || lexical::candidate(&note.lyric).is_none() {
             continue;
         }
-        match note.pronunciation_language {
-            Some(PronunciationLanguage::French) => french_count += 1,
-            Some(PronunciationLanguage::English) => english_count += 1,
-            None => {}
+        if let Some(language) = note.pronunciation_language {
+            counts[language.index()] += 1;
         }
     }
-    if french_count + english_count > 0 {
+    if counts.iter().any(|&count| count > 0) {
         diagnostics.push(Diagnostic {
             code: ROUTED.into(),
             severity: DiagnosticSeverity::Info,
-            message: format!(
-                "Automatic FR+EN routed {french_count} French word(s) through Millefeuille and {english_count} English word(s) through ARPAbet; no Default phonemizer is used for classified sung text."
-            ),
+            message: routing_message(counts),
             source_id: track
                 .notes
                 .first()
@@ -1183,6 +1549,91 @@ mod tests {
             .collect();
         let ids: Vec<_> = (0..notes.len()).map(|i| format!("n{i}")).collect();
         route(&notes, &ids)
+    }
+
+    #[test]
+    fn automatic_recognizes_monolingual_passages_in_all_four_languages() {
+        for (words, language) in [
+            (
+                vec!["je", "chante", "avec", "mes", "amis"],
+                PronunciationLanguage::French,
+            ),
+            (
+                vec!["I", "sing", "with", "my", "friends"],
+                PronunciationLanguage::English,
+            ),
+            (
+                vec!["yo", "canto", "con", "mis", "amigos"],
+                PronunciationLanguage::Spanish,
+            ),
+            (
+                vec!["eu", "canto", "com", "meus", "amigos"],
+                PronunciationLanguage::Portuguese,
+            ),
+            (
+                vec!["você", "não", "está", "sozinho"],
+                PronunciationLanguage::Portuguese,
+            ),
+            (
+                vec!["nós", "estamos", "aqui", "contigo"],
+                PronunciationLanguage::Portuguese,
+            ),
+        ] {
+            assert_eq!(
+                languages(&words).languages,
+                vec![Some(language); words.len()],
+                "{words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_romance_function_words_follow_their_passage() {
+        for (words, language) in [
+            (
+                vec!["je", "ne", "sais", "pas", "mais", "je", "chante"],
+                PronunciationLanguage::French,
+            ),
+            (
+                vec!["no", "sé", "lo", "que", "quieres"],
+                PronunciationLanguage::Spanish,
+            ),
+            (
+                vec!["eu", "sei", "que", "você", "quer", "mais"],
+                PronunciationLanguage::Portuguese,
+            ),
+        ] {
+            assert_eq!(
+                languages(&words).languages,
+                vec![Some(language); words.len()],
+                "{words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_four_language_switches_keep_individual_word_owners() {
+        assert_eq!(
+            languages(&["bonjour", "beautiful", "hola", "obrigado", "merci"]).languages,
+            [
+                PronunciationLanguage::French,
+                PronunciationLanguage::English,
+                PronunciationLanguage::Spanish,
+                PronunciationLanguage::Portuguese,
+                PronunciationLanguage::French
+            ]
+            .map(Some)
+        );
+    }
+
+    #[test]
+    fn neutral_vocalises_inherit_spanish_and_portuguese_passages() {
+        for (words, expected) in [
+            (["hola", "amigos", "oh"], PronunciationLanguage::Spanish),
+            (["você", "não", "oh"], PronunciationLanguage::Portuguese),
+        ] {
+            assert_eq!(languages(&words).languages[2], Some(expected));
+        }
     }
 
     fn domain_note(onset: u32, text: &str, voice: &str) -> ProjectedNote {
@@ -1283,6 +1734,106 @@ mod tests {
                 Some(PronunciationLanguage::French),
             ]
         );
+    }
+
+    #[test]
+    fn cross_domain_split_portuguese_word_keeps_its_local_passage_owner() {
+        for (previous, passage, expected) in [
+            (
+                "et",
+                ["você", "não", "está", "sozinho"],
+                PronunciationLanguage::Portuguese,
+            ),
+            (
+                "the",
+                ["você", "não", "está", "sozinho"],
+                PronunciationLanguage::Portuguese,
+            ),
+            (
+                "hola",
+                ["você", "não", "está", "sozinho"],
+                PronunciationLanguage::Portuguese,
+            ),
+        ] {
+            let confidence = multilingual_scores("contigo")[expected.index()];
+            assert!(confidence < 0.7, "{expected:?}: {confidence}");
+            let mut notes = vec![
+                domain_note(0, previous, "1"),
+                domain_note(480, "con", "2"),
+                domain_note(960, "tigo", "2"),
+                domain_note(1440, "-", "2"),
+            ];
+            for (index, syllabic) in [(1, Syllabic::Begin), (2, Syllabic::End)] {
+                let ProjectedLyric::Source(source) = &mut notes[index].lyric else {
+                    unreachable!()
+                };
+                source.syllabic = Some(syllabic);
+            }
+            let ProjectedLyric::Source(source) = &mut notes[3].lyric else {
+                unreachable!()
+            };
+            source.state = LyricState::Continuation;
+            notes.extend(
+                passage
+                    .iter()
+                    .enumerate()
+                    .map(|(index, word)| domain_note((index as u32 + 4) * 480, word, "2")),
+            );
+            let ids: Vec<_> = (1..notes.len()).map(|index| format!("n{index}")).collect();
+            let local = route(&notes[1..], &ids);
+            assert_eq!(local.languages, vec![Some(expected); notes.len() - 1]);
+            assert!(!local.inherit_passage[0]);
+            let original = notes.clone();
+            let mut track = ProjectedTrack {
+                source_track_id: "track".into(),
+                name: "Voice".into(),
+                muted: false,
+                notes,
+            };
+            route_track(&mut track);
+            assert_eq!(
+                track.notes[0].pronunciation_language,
+                automatic_anchor(previous)
+            );
+            for (index, (actual, source)) in track.notes.iter().zip(original).enumerate() {
+                if index > 0 {
+                    assert_eq!(
+                        actual.pronunciation_language,
+                        Some(expected),
+                        "{previous}/{index}"
+                    );
+                }
+                let mut restored = actual.clone();
+                restored.pronunciation_language = None;
+                assert_eq!(restored, source);
+            }
+        }
+    }
+
+    #[test]
+    fn hard_automatic_anchors_clear_local_uncertainty() {
+        for key in ["bonjour", "the", "hola", "você"] {
+            let notes = [note(0, key)];
+            let ids = ["anchor".into()];
+            let mut units = build_units(&notes, &ids);
+            assert_eq!(units.len(), 1);
+            // Exercise stale uncertainty from the earlier scoring pass.
+            units[0].local_uncertain = true;
+            units[0].inherit_passage = true;
+            extend_language_scores(&mut units, &notes);
+            assert!(!units[0].local_uncertain, "{key}");
+            assert!(!units[0].inherit_passage, "{key}");
+            assert_eq!(decode(&units), [automatic_anchor(key).unwrap()]);
+            let routed = route(&notes, &ids);
+            assert_eq!(routed.languages, [automatic_anchor(key)]);
+            assert!(
+                !routed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == LOW_CONFIDENCE),
+                "{key}"
+            );
+        }
     }
 
     #[test]

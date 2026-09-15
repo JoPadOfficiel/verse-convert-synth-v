@@ -1,0 +1,15 @@
+Montreal Forced Aligner pronunciation dictionaries bundled by Verse
+
+Source repository: https://github.com/MontrealCorpusTools/mfa-models
+Pinned revision: d6eff86a42c6a90b641e17dfdf7a16555b934483
+License: Creative Commons Attribution 4.0 International (CC BY 4.0)
+Maintainers credited by the model metadata: Michael McAuliffe and Morgan Sonderegger / Montreal Forced Aligner.
+
+Bundled pronunciation sources:
+- Spanish (spain), v3.3.0: dictionary/spanish/spain_mfa/spanish_spain_mfa.dict
+- Spanish (latin-america), v3.3.0: dictionary/spanish/latin_america_mfa/spanish_latin_america_mfa.dict
+- Portuguese (brazil), v2.0.0: dictionary/portuguese/brazil_mfa/portuguese_brazil_mfa.dict
+- Portuguese (portugal), v2.0.0: dictionary/portuguese/portugal_mfa/portuguese_portugal_mfa.dict
+
+Adaptation notice: Verse normalizes dictionary keys to Unicode NFC and casefolded spelling, normalizes curly apostrophes, filters non-lexical entries, normalizes phone-string whitespace and Unicode NFC, removes duplicate readings, and combines identical readings with dialect labels in sorted TSV data. Distinct source pronunciations remain separate.
+At runtime, Verse maps supported MFA phones to DiffSinger symbols only when every source reading maps exactly to the same hint; unsupported or divergent readings receive no explicit hint. These import and runtime adaptations are made by Verse.

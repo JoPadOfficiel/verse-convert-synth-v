@@ -64,17 +64,27 @@ rendered marker. A target owns its own grid, marker vocabulary, cosmetics and
 schema version, and cannot reach back into the conversion engine or change what
 the other target writes.
 
-### Automatic French + English
+### Automatic French + English + Spanish + Portuguese
 
-Choose **Automatic FR + EN** when one performed lyric lane contains both
-languages or when translated lyric rows are selected on different passes. The
-router runs locally and offline. The application bundles Lingua 1.8 with only
-its English and French models; there is no runtime model download, external
-binary or network classification service. Verse reconstructs complete
-source-attested words first, combines Lingua confidence with the existing
-French/English lexicon evidence and neighboring words, then decodes one
+Automatic pronunciation is the default for fresh or invalid preference state.
+It handles monolingual songs as well as language changes inside one performed
+lyric lane. The router runs locally and offline. The application bundles Lingua
+1.8 with English, French, Spanish and Portuguese models; there is no runtime
+model download, external binary or network classification service. Verse
+reconstructs complete source-attested words first, combines Lingua confidence
+with local lexical evidence and neighboring words, then decodes one
 deterministic language sequence across the passage. A short homograph or neutral
 vocalise therefore cannot switch a phrase solely from its spelling.
+
+French and English lexical resources also contain pinned pronunciation data for
+Verse's existing explicit pronunciation passes. The generated Spanish and
+Portuguese community TSVs record only normalized lexical membership
+(`word<TAB>es` and `word<TAB>br|pt|br+pt`) for routing evidence. Separate
+`spanish-pronunciation.tsv` and `portuguese-pronunciation.tsv` retain the pinned
+Montreal Forced Aligner dictionary readings with Spain/Latin-America and
+Brazil/Portugal provenance. They are external phonetic evidence, not
+Verse-authored pronunciations. Portuguese remains one language owner; regional
+readings stay distinct and are never collapsed heuristically.
 
 Genuinely incomplete syllables are not scored as independent words. A malformed
 syllabic marker on an otherwise complete standalone function word can still be
@@ -85,9 +95,16 @@ emits `AUTOMATIC_LANGUAGE_LOW_CONFIDENCE` for audit; there is no language-review
 dialog in the export path.
 
 After routing, French domains run the existing Millefeuille pronunciation pass
-and English domains run the existing ARPAbet pass. French contextual readings
+and English domains run the existing ARPAbet pass. Spanish and Portuguese
+domains query the pinned MFA pronunciation dictionaries, then lower a reading
+only through reviewed one-to-one mappings into OpenUtau's documented base
+Spanish/Portuguese DiffSinger phone inventories. A complete hint is emitted only
+when every applicable source reading is representable and converges on the same
+target sequence. Unknown words, regional disagreements, multiple target
+readings, and richer IPA distinctions that the target inventory cannot express
+preserve the source word and raise a stable warning. French contextual readings
 and liaison are filtered to the already-selected French domain, so they cannot
-cross an automatic FR/EN boundary. Geometry, source identity, expression and
+cross an automatic language boundary. Geometry, source identity, expression and
 stem ownership remain independent of language assignment.
 
 OpenUtau 0.1.569 and newer persist a per-note `phonemizer` override. Verse uses
@@ -95,16 +112,17 @@ that field on complete word heads while retaining one musical lane; split and
 continuation notes inherit their owner's override. The track-level phonemizer is
 kept as a deterministic first-language fallback for older consumers, but older
 OpenUtau versions cannot reproduce mixed per-word switching correctly. Use
-OpenUtau 0.1.569 or newer for Automatic FR+EN. On current OpenUtau every
-classified word receives either the French Millefeuille or English ARPAbet path
-rather than the Default phonemizer. A compatible multilingual singer still has
-to be assigned in OpenUtau.
+OpenUtau 0.1.569 or newer for Automatic FR+EN+ES+PT. On current OpenUtau every
+classified word receives the corresponding French Millefeuille, English,
+Spanish or Portuguese DiffSinger route rather than the Default phonemizer. A
+compatible multilingual singer still has to be assigned in OpenUtau.
 
-Synthesizer V shares the same automatic ownership decision for analysis and
-diagnostics but retains the existing SVP lyric/phoneme serialization. Verse does
-not inject OpenUtau `phonemizer`, `fr/…` or `en/…` aliases into SVP, and it does
-not claim that a Synthesizer V singer will switch languages acoustically without
-the corresponding native singer/database configuration.
+Synthesizer V shares the same four-language automatic ownership decision for
+analysis and diagnostics but retains the existing SVP lyric/phoneme
+serialization. Verse does not inject OpenUtau `phonemizer`, `fr/…`, `en/…` or
+other OpenUtau aliases into SVP, and it does not claim that a Synthesizer V
+singer will switch languages acoustically without the corresponding native
+singer/database configuration.
 
 ### French DiffSinger Millefeuille
 
@@ -904,10 +922,14 @@ French, Spanish, English, Portuguese, German, Polish and Turkish, deliberately
 passing an unrelated legacy language argument to show that it has no effect.
 
 Verse does not fill `database.language` in a `.svp`, and the OpenUtau target
-does not write a language field. The optional French Millefeuille and English
+does not write a language field. The manual French Millefeuille and English
 ARPAbet profiles select a pronunciation convention and supply dictionary hints.
-They do not select a singer or modify source text, role or ownership. No profile
-translates lyrics.
+The manual Spanish and Portuguese profiles select OpenUtau's corresponding
+DiffSinger phonemizers but use the same bundled MFA pronunciation authority and
+strict mapping gate as Automatic. When no exact unique mapping exists, Verse
+keeps the complete source word instead of inventing a pronunciation. None of
+these profiles selects a singer or modifies source text, role or ownership. No
+profile translates lyrics.
 
 The English profile uses `OpenUtau.Core.DiffSinger.DiffSingerEnglishPhonemizer`
 (DIFFS EN) and `en/` CMU ARPAbet symbols. Its pinned corpus has 135,166 keys,
@@ -926,12 +948,22 @@ gaps. Such gaps are preserved. [EN-002](../_bmad-output/implementation-artifacts
 tracks articulation across them; an independent dictionary reading of a fragment
 such as `Li` in `Living` is not accepted as a correction.
 
-Both corpora are offline assets. Reproduce them using
+All lexical assets are offline. Reproduce the French and English pronunciation
+corpora using
 `scripts/import-french-lexicon.py --source SOURCE --check` and
 `scripts/import-english-lexicon.py --source SOURCE --check`; hashes, immutable
 source URLs, accepted/excluded counts and mapping rules are in the corresponding
-`docs/*-lexicon-provenance.json` files. A matching alphabet establishes symbol
-compatibility, not perfect pronunciation or acoustic quality for every bank.
+`docs/*-lexicon-provenance.json` files. Reproduce the Spanish and combined
+Brazil/Portugal Portuguese routing and pronunciation TSVs with
+`scripts/import-romance-lexicons.py --download --check`, or use
+`--routing-source-root` with the pinned `wooorm/dictionaries` checkout together
+with `--mfa-source-root` for the pinned `mfa-models` checkout. Their provenance
+reports record exact source hashes, counts and licenses. The community TSV
+membership columns remain routing-only; the separate pronunciation TSVs retain
+MFA phone strings and dialect membership verbatim after Unicode normalization.
+The runtime mapping accepts only reviewed exact correspondences into OpenUtau's
+base DiffSinger alphabets. A matching alphabet establishes symbol compatibility,
+not perfect pronunciation or acoustic quality for every bank.
 See [the DiffSinger guide](openutau-diffsinger-guide.fr.md) for bank selection,
 GENC, voice colours and the remaining expression-fidelity scope.
 

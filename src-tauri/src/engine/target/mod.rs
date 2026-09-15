@@ -5,10 +5,13 @@
 //! reads [`crate::engine::projection::ProjectedProject`] and nothing else, so
 //! adding a target cannot reach back into the conversion engine and cannot
 //! change what another target writes.
+pub mod diffsinger;
 pub mod english;
 pub mod french;
 pub(crate) mod lexical;
 pub(crate) mod performance;
+pub(crate) mod portuguese;
+pub(crate) mod spanish;
 pub mod svp;
 pub mod ustx;
 
@@ -34,11 +37,15 @@ pub enum ExportTarget {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PronunciationProfile {
-    #[default]
     Default,
     FrenchMillefeuille,
     EnglishArpabet,
-    AutomaticFrenchEnglish,
+    SpanishDiffSinger,
+    PortugueseDiffSinger,
+    /// Offline automatic ownership across the supported languages.
+    #[default]
+    #[serde(alias = "automaticFrenchEnglish")]
+    Automatic,
 }
 
 impl PronunciationProfile {
@@ -46,8 +53,8 @@ impl PronunciationProfile {
         match (target, self) {
             // Automatic routing is target-neutral analysis. Synthesizer V keeps
             // its existing lyric/phoneme serialization while still receiving the
-            // same FR/EN ownership verdict as OpenUtau.
-            (_, Self::AutomaticFrenchEnglish) => Self::AutomaticFrenchEnglish,
+            // same FR/EN/ES/PT ownership verdict as OpenUtau.
+            (_, Self::Automatic) => Self::Automatic,
             (ExportTarget::Ustx, profile) => profile,
             (ExportTarget::Svp, _) => Self::Default,
         }
@@ -192,7 +199,7 @@ mod tests {
     fn pronunciation_profile_is_explicit_and_its_protocol_values_are_stable() {
         assert_eq!(
             PronunciationProfile::default(),
-            PronunciationProfile::Default
+            PronunciationProfile::Automatic
         );
         for (profile, value) in [
             (PronunciationProfile::Default, "\"default\""),
@@ -202,9 +209,14 @@ mod tests {
             ),
             (PronunciationProfile::EnglishArpabet, "\"englishArpabet\""),
             (
-                PronunciationProfile::AutomaticFrenchEnglish,
-                "\"automaticFrenchEnglish\"",
+                PronunciationProfile::SpanishDiffSinger,
+                "\"spanishDiffSinger\"",
             ),
+            (
+                PronunciationProfile::PortugueseDiffSinger,
+                "\"portugueseDiffSinger\"",
+            ),
+            (PronunciationProfile::Automatic, "\"automatic\""),
         ] {
             assert_eq!(serde_json::to_string(&profile).unwrap(), value);
             assert_eq!(
@@ -214,13 +226,17 @@ mod tests {
             assert_eq!(profile.for_target(ExportTarget::Ustx), profile);
             assert_eq!(
                 profile.for_target(ExportTarget::Svp),
-                if profile == PronunciationProfile::AutomaticFrenchEnglish {
-                    PronunciationProfile::AutomaticFrenchEnglish
+                if profile == PronunciationProfile::Automatic {
+                    PronunciationProfile::Automatic
                 } else {
                     PronunciationProfile::Default
                 }
             );
         }
+        assert_eq!(
+            serde_json::from_str::<PronunciationProfile>(r#""automaticFrenchEnglish""#).unwrap(),
+            PronunciationProfile::Automatic
+        );
         assert!(serde_json::from_str::<PronunciationProfile>("\"french\"").is_err());
     }
 

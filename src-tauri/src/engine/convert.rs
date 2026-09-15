@@ -598,11 +598,7 @@ fn pick_attached_lyric<'a>(
 ) -> Option<&'a Lyric> {
     let mut eligible = eligible_attached_lyrics(note, lane).into_iter();
     let first = eligible.next()?;
-    if matches!(
-        profile,
-        PronunciationProfile::FrenchMillefeuille | PronunciationProfile::EnglishArpabet
-    ) && blank_lyric(first)
-    {
+    if profile != PronunciationProfile::Default && blank_lyric(first) {
         eligible.find(|lyric| !blank_lyric(lyric)).or(Some(first))
     } else {
         Some(first)
@@ -635,7 +631,15 @@ fn duplicate_lyric_diagnostics(
             "ENGLISH_DUPLICATE_BLANK_RESOLVED",
             "ENGLISH_DUPLICATE_LYRIC_CONFLICT",
         ),
-        PronunciationProfile::AutomaticFrenchEnglish => (
+        PronunciationProfile::SpanishDiffSinger => (
+            "SPANISH_DUPLICATE_BLANK_RESOLVED",
+            "SPANISH_DUPLICATE_LYRIC_CONFLICT",
+        ),
+        PronunciationProfile::PortugueseDiffSinger => (
+            "PORTUGUESE_DUPLICATE_BLANK_RESOLVED",
+            "PORTUGUESE_DUPLICATE_LYRIC_CONFLICT",
+        ),
+        PronunciationProfile::Automatic => (
             "AUTOMATIC_DUPLICATE_BLANK_RESOLVED",
             "AUTOMATIC_DUPLICATE_LYRIC_CONFLICT",
         ),
@@ -1267,10 +1271,7 @@ fn prepare_track_indices(
             &source_note.source,
             source_note.source_order,
         );
-        if matches!(
-            projection.profile,
-            PronunciationProfile::FrenchMillefeuille | PronunciationProfile::EnglishArpabet
-        ) {
+        if projection.profile != PronunciationProfile::Default {
             if let Some(selected) = attached {
                 projection.diagnostics.extend(duplicate_lyric_diagnostics(
                     source_note,
@@ -1356,11 +1357,11 @@ fn finish_track(
     if target == ExportTarget::Ustx
         && matches!(
             profile,
-            PronunciationProfile::FrenchMillefeuille | PronunciationProfile::AutomaticFrenchEnglish
+            PronunciationProfile::FrenchMillefeuille | PronunciationProfile::Automatic
         )
     {
         for (note, note_id) in projected_notes.iter_mut().zip(&note_ids) {
-            if profile == PronunciationProfile::AutomaticFrenchEnglish
+            if profile == PronunciationProfile::Automatic
                 && note.pronunciation_language
                     != Some(crate::engine::projection::PronunciationLanguage::French)
             {
@@ -1401,7 +1402,23 @@ fn finish_track(
                 PronunciationProfile::EnglishArpabet => {
                     diagnostics.extend(crate::engine::target::english::apply(notes, ids));
                 }
-                PronunciationProfile::AutomaticFrenchEnglish => {
+                PronunciationProfile::SpanishDiffSinger => {
+                    diagnostics.extend(crate::engine::target::diffsinger::apply(
+                        notes,
+                        ids,
+                        crate::engine::projection::PronunciationLanguage::Spanish,
+                        false,
+                    ));
+                }
+                PronunciationProfile::PortugueseDiffSinger => {
+                    diagnostics.extend(crate::engine::target::diffsinger::apply(
+                        notes,
+                        ids,
+                        crate::engine::projection::PronunciationLanguage::Portuguese,
+                        false,
+                    ));
+                }
+                PronunciationProfile::Automatic => {
                     let mut language_start = 0;
                     while language_start < notes.len() {
                         let Some(language) = notes[language_start].pronunciation_language else {
@@ -1427,6 +1444,15 @@ fn finish_track(
                                 crate::engine::target::english::apply_automatic(
                                     language_notes,
                                     language_ids,
+                                )
+                            }
+                            crate::engine::projection::PronunciationLanguage::Spanish
+                            | crate::engine::projection::PronunciationLanguage::Portuguese => {
+                                crate::engine::target::diffsinger::apply(
+                                    language_notes,
+                                    language_ids,
+                                    language,
+                                    true,
                                 )
                             }
                         });
@@ -2346,7 +2372,7 @@ pub fn convert_midi_with_profile(
     ) {
         return fail(error);
     }
-    if profile == PronunciationProfile::AutomaticFrenchEnglish {
+    if profile == PronunciationProfile::Automatic {
         for (index, _, track) in &mut pending_tracks {
             report[*index]
                 .warnings
@@ -2354,7 +2380,7 @@ pub fn convert_midi_with_profile(
         }
     }
     let automatic_french: BTreeSet<(String, u32, String)> =
-        if profile == PronunciationProfile::AutomaticFrenchEnglish {
+        if profile == PronunciationProfile::Automatic {
             pending_tracks
                 .iter()
                 .flat_map(|(_, _, track)| &track.notes)
@@ -2380,7 +2406,7 @@ pub fn convert_midi_with_profile(
         PronunciationProfile::FrenchMillefeuille => {
             french_source_context(midi, &notes_by_track, None)
         }
-        PronunciationProfile::AutomaticFrenchEnglish => {
+        PronunciationProfile::Automatic => {
             french_source_context(midi, &notes_by_track, Some(&automatic_french))
         }
         _ => HashMap::new(),
@@ -5584,6 +5610,9 @@ mod tests {
         for (profile, prefix) in [
             (PronunciationProfile::FrenchMillefeuille, "FRENCH"),
             (PronunciationProfile::EnglishArpabet, "ENGLISH"),
+            (PronunciationProfile::Automatic, "AUTOMATIC"),
+            (PronunciationProfile::SpanishDiffSinger, "SPANISH"),
+            (PronunciationProfile::PortugueseDiffSinger, "PORTUGUESE"),
         ] {
             for state in [
                 midi::LyricState::Continuation,
@@ -5655,6 +5684,9 @@ mod tests {
         for (profile, prefix) in [
             (PronunciationProfile::FrenchMillefeuille, "FRENCH"),
             (PronunciationProfile::EnglishArpabet, "ENGLISH"),
+            (PronunciationProfile::Automatic, "AUTOMATIC"),
+            (PronunciationProfile::SpanishDiffSinger, "SPANISH"),
+            (PronunciationProfile::PortugueseDiffSinger, "PORTUGUESE"),
         ] {
             let mut blank = Lyric::text("blank", String::new());
             blank.time_only = vec![1];

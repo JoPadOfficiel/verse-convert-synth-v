@@ -72,10 +72,7 @@ fn run(
                 "french-millefeuille",
                 PronunciationProfile::FrenchMillefeuille,
             ),
-            (
-                "automatic-fr-en",
-                PronunciationProfile::AutomaticFrenchEnglish,
-            ),
+            ("automatic", PronunciationProfile::Automatic),
         ] {
             let outcome =
                 convert_midi_with_profile(&midi, "english", None, ExportTarget::Ustx, profile);

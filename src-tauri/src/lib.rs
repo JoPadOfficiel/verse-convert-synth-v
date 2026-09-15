@@ -1347,8 +1347,38 @@ mod output_tests {
     #[test]
     fn automatic_analysis_batch_direct_and_bundle_exports_share_language_routing() {
         assert_profile_commands(
-            PronunciationProfile::AutomaticFrenchEnglish,
-            &[("bonjour", None), ("beautiful", None), ("merci", None)],
+            PronunciationProfile::Automatic,
+            &[
+                ("bonjour", None),
+                ("beautiful", None),
+                ("hola", None),
+                ("obrigado", None),
+                ("merci", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn spanish_analysis_batch_direct_and_bundle_exports_share_external_pronunciation() {
+        assert_profile_commands(
+            PronunciationProfile::SpanishDiffSinger,
+            &[
+                ("Hola", None),
+                ("can", Some("begin")),
+                ("ción", Some("end")),
+            ],
+        );
+    }
+
+    #[test]
+    fn portuguese_analysis_batch_direct_and_bundle_exports_share_external_pronunciation() {
+        assert_profile_commands(
+            PronunciationProfile::PortugueseDiffSinger,
+            &[
+                ("Acho", None),
+                ("cora", Some("begin")),
+                ("ção", Some("end")),
+            ],
         );
     }
 
@@ -1372,7 +1402,17 @@ mod output_tests {
                 Some(engine::target::english::UNSUPPORTED),
                 Some(engine::target::english::PHONEMIZER),
             ),
-            PronunciationProfile::AutomaticFrenchEnglish => (engine::language::ROUTED, None, None),
+            PronunciationProfile::Automatic => (engine::language::ROUTED, None, None),
+            PronunciationProfile::SpanishDiffSinger => (
+                engine::target::diffsinger::APPLIED,
+                Some(engine::target::diffsinger::UNMAPPABLE),
+                Some(engine::target::diffsinger::SPANISH_PHONEMIZER),
+            ),
+            PronunciationProfile::PortugueseDiffSinger => (
+                engine::target::diffsinger::APPLIED,
+                Some(engine::target::diffsinger::UNMAPPABLE),
+                Some(engine::target::diffsinger::PORTUGUESE_PHONEMIZER),
+            ),
             PronunciationProfile::Default => unreachable!(),
         };
         let path = source.to_str().unwrap();
@@ -1471,7 +1511,9 @@ mod output_tests {
             assert_eq!(emitted.matches(phonemizer).count(), project.tracks.len());
         } else {
             assert!(emitted.contains(engine::target::french::PHONEMIZER));
-            assert!(emitted.contains(engine::target::english::PHONEMIZER));
+            assert!(emitted.contains(engine::target::diffsinger::ENGLISH_NAME));
+            assert!(emitted.contains(engine::target::diffsinger::SPANISH_NAME));
+            assert!(emitted.contains(engine::target::diffsinger::PORTUGUESE_NAME));
         }
         assert!(!engine::target::ustx::audit(&emitted)
             .unwrap()

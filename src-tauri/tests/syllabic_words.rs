@@ -269,75 +269,102 @@ fn french_does_not_cross_source_lyric_rows_or_override_manual_hints() {
 }
 
 #[test]
-fn french_blank_duplicates_keep_the_text_at_its_original_note() {
-    for native in [false, true] {
-        for blank_first in [false, true] {
-            let blank = if native {
-                "<Lyrics><syllabic>begin</syllabic><text></text></Lyrics>"
-            } else {
-                "<lyric><syllabic>begin</syllabic><text></text></lyric>"
-            };
-            let text = if native {
-                "<Lyrics><text>rêves.</text></Lyrics>"
-            } else {
-                "<lyric><text>rêves.</text></lyric>"
-            };
-            let both = if blank_first {
-                format!("{blank}{text}")
-            } else {
-                format!("{text}{blank}")
-            };
-            let midi = if native {
-                musescore::parse(format!("<museScore version=\"4.0\"><Score><Division>480</Division><Part><Staff id=\"1\"/><trackName>Voice</trackName></Part><Staff id=\"1\"><Measure><voice><Chord><durationType>quarter</durationType><Lyrics><text>mes</text></Lyrics><Note><pitch>60</pitch></Note></Chord><Chord><durationType>quarter</durationType>{both}<Note><pitch>62</pitch></Note></Chord></voice></Measure></Staff></Score></museScore>").as_bytes()).unwrap()
-            } else {
-                musicxml::parse(
-                    score(&format!(
-                        "{}{}",
-                        note("C", None, "mes"),
-                        untexted("D").replace("</note>", &format!("{both}</note>"))
-                    ))
-                    .as_bytes(),
-                )
-                .unwrap()
-            };
-            let result = verse_lib::engine::convert::convert_midi_with_profile(
-                &midi,
-                "english",
-                None,
-                ExportTarget::Ustx,
-                target::PronunciationProfile::FrenchMillefeuille,
-            );
-            assert!(result.ok, "{:?}", result.msg);
-            assert_eq!(result.placed, 2);
-            let output = target::ustx::serialize(result.svp.as_ref().unwrap()).unwrap();
-            assert_eq!(output.voice_parts.len(), 1);
-            let notes = &output.voice_parts[0].notes;
-            assert_eq!(notes.len(), 2);
-            assert_eq!(
-                (notes[1].position, notes[1].duration, notes[1].tone),
-                (480, 480, 62)
-            );
-            assert_eq!(notes[1].lyric, "rêves[fr/r fr/ae fr/v]");
-            assert!(result.tracks[0]
-                .warnings
-                .iter()
-                .any(|w| w.code == "FRENCH_DUPLICATE_BLANK_RESOLVED"));
-            let originals: Vec<_> = midi
-                .tracks
-                .iter()
-                .flat_map(|t| &t.events)
-                .filter_map(|e| match &e.kind {
-                    verse_lib::engine::midi::Kind::NoteOn(n) if n.lyrics.len() == 2 => {
-                        Some(&n.lyrics)
-                    }
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                originals.len(),
-                1,
-                "both lyric records survive in source evidence"
-            );
+fn pronunciation_profiles_blank_duplicates_keep_the_text_at_its_original_note() {
+    for (profile, word, expected, prefix) in [
+        (
+            target::PronunciationProfile::FrenchMillefeuille,
+            "rêves.",
+            "rêves[fr/r fr/ae fr/v]",
+            "FRENCH",
+        ),
+        (
+            target::PronunciationProfile::Automatic,
+            "hola",
+            "hola[o l a]",
+            "AUTOMATIC",
+        ),
+        (
+            target::PronunciationProfile::SpanishDiffSinger,
+            "hola",
+            "hola[o l a]",
+            "SPANISH",
+        ),
+        (
+            target::PronunciationProfile::PortugueseDiffSinger,
+            "acho",
+            "acho[a S u]",
+            "PORTUGUESE",
+        ),
+    ] {
+        for native in [false, true] {
+            for blank_first in [false, true] {
+                let blank = if native {
+                    "<Lyrics><syllabic>begin</syllabic><text></text></Lyrics>"
+                } else {
+                    "<lyric><syllabic>begin</syllabic><text></text></lyric>"
+                };
+                let text = if native {
+                    format!("<Lyrics><text>{word}</text></Lyrics>")
+                } else {
+                    format!("<lyric><text>{word}</text></lyric>")
+                };
+                let both = if blank_first {
+                    format!("{blank}{text}")
+                } else {
+                    format!("{text}{blank}")
+                };
+                let midi = if native {
+                    musescore::parse(format!("<museScore version=\"4.0\"><Score><Division>480</Division><Part><Staff id=\"1\"/><trackName>Voice</trackName></Part><Staff id=\"1\"><Measure><voice><Chord><durationType>quarter</durationType><Lyrics><text>mes</text></Lyrics><Note><pitch>60</pitch></Note></Chord><Chord><durationType>quarter</durationType>{both}<Note><pitch>62</pitch></Note></Chord></voice></Measure></Staff></Score></museScore>").as_bytes()).unwrap()
+                } else {
+                    musicxml::parse(
+                        score(&format!(
+                            "{}{}",
+                            note("C", None, "mes"),
+                            untexted("D").replace("</note>", &format!("{both}</note>"))
+                        ))
+                        .as_bytes(),
+                    )
+                    .unwrap()
+                };
+                let result = verse_lib::engine::convert::convert_midi_with_profile(
+                    &midi,
+                    "english",
+                    None,
+                    ExportTarget::Ustx,
+                    profile,
+                );
+                assert!(result.ok, "{:?}", result.msg);
+                assert_eq!(result.placed, 2);
+                let output = target::ustx::serialize(result.svp.as_ref().unwrap()).unwrap();
+                assert_eq!(output.voice_parts.len(), 1);
+                let notes = &output.voice_parts[0].notes;
+                assert_eq!(notes.len(), 2);
+                assert_eq!(
+                    (notes[1].position, notes[1].duration, notes[1].tone),
+                    (480, 480, 62)
+                );
+                assert_eq!(notes[1].lyric, expected, "{profile:?}");
+                assert!(result.tracks[0]
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == format!("{prefix}_DUPLICATE_BLANK_RESOLVED")));
+                let originals: Vec<_> = midi
+                    .tracks
+                    .iter()
+                    .flat_map(|t| &t.events)
+                    .filter_map(|e| match &e.kind {
+                        verse_lib::engine::midi::Kind::NoteOn(n) if n.lyrics.len() == 2 => {
+                            Some(&n.lyrics)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    originals.len(),
+                    1,
+                    "both lyric records survive in source evidence"
+                );
+            }
         }
     }
 }

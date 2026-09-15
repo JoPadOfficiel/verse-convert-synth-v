@@ -133,7 +133,9 @@ export type PronunciationProfile =
   | "default"
   | "frenchMillefeuille"
   | "englishArpabet"
-  | "automaticFrenchEnglish";
+  | "spanishDiffSinger"
+  | "portugueseDiffSinger"
+  | "automatic";
 export type Language = "english" | "french";
 /**
  * Which format an export writes. Declared with the path helpers that consume it
@@ -244,7 +246,7 @@ export async function exportVocalsWithDialog(
   language: Language,
   overrides?: Record<number, boolean>,
   exportTarget: ExportTarget = "svp",
-  pronunciationProfile: PronunciationProfile = "default",
+  pronunciationProfile: PronunciationProfile = "automatic",
 ): Promise<string | undefined> {
   const target = await save({
     defaultPath: defaultVocalPath(file.path, exportTarget),
@@ -280,7 +282,7 @@ export async function exportBundle(
   rendererPath?: string,
   onProgress?: (event: BundleProgressEvent) => void,
   exportTarget: ExportTarget = "svp",
-  pronunciationProfile: PronunciationProfile = "default",
+  pronunciationProfile: PronunciationProfile = "automatic",
 ): Promise<BundleResult> {
   const progress = new Channel<BundleProgressEvent>();
   progress.onmessage = (event) => onProgress?.(event);
@@ -319,7 +321,7 @@ export async function convertFiles(
   outDir?: string,
   overrides?: Overrides,
   exportTarget: ExportTarget = "svp",
-  pronunciationProfile: PronunciationProfile = "default",
+  pronunciationProfile: PronunciationProfile = "automatic",
 ): Promise<FileResult[]> {
   return await invoke<FileResult[]>("convert_files", {
     paths,

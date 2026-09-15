@@ -500,13 +500,19 @@ export default function App() {
               onChange={(event) => void changeTarget(exportTarget, event.target.value as PronunciationProfile)}
               className="max-w-56 rounded-md border bg-background px-2 py-1 text-foreground disabled:opacity-50"
             >
-              <option value="automaticFrenchEnglish">Automatic FR + EN</option>
+              <option value="automatic">Automatic FR + EN + ES + PT</option>
               <option value="default">Default — no pronunciation fixes</option>
               <option value="frenchMillefeuille" disabled={exportTarget !== "ustx"}>
                 French Millefeuille
               </option>
               <option value="englishArpabet" disabled={exportTarget !== "ustx"}>
                 English ARPAbet
+              </option>
+              <option value="spanishDiffSinger" disabled={exportTarget !== "ustx"}>
+                Spanish DiffSinger
+              </option>
+              <option value="portugueseDiffSinger" disabled={exportTarget !== "ustx"}>
+                Portuguese DiffSinger
               </option>
             </select>
           </label>

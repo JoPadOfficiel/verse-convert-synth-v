@@ -1,0 +1,232 @@
+{
+  "counts": {
+    "accepted_keys": 326827,
+    "brazil_keys": 309743,
+    "portugal_keys": 42254,
+    "shared_keys": 25170
+  },
+  "language": "Portuguese (Brazil + Portugal)",
+  "output": {
+    "bytes": 4928037,
+    "path": "src-tauri/src/engine/target/portuguese-community.tsv",
+    "sha256": "5b56e9ded1d6991c6e1d038ce43ffea963ef10531691b68e275a7b22c3ca07ac"
+  },
+  "pinned_commit": "8cfea406b505e4d7df52d5a19bce525df98c54ab",
+  "pinned_repository": "https://github.com/wooorm/dictionaries",
+  "pronunciation": {
+    "attribution_path": "public/licenses/mfa-pronunciation-attribution.txt",
+    "license": "CC BY 4.0",
+    "license_path": "public/licenses/mfa-pronunciation-dictionaries-cc-by-4.0.txt",
+    "license_sha256": "7e7170e3cebf88a9f60c7b8421418323c09304da1af4d5e90f4da1dc1c8a2661",
+    "output": {
+      "bytes": 4567759,
+      "distinct_readings": 123542,
+      "path": "src-tauri/src/engine/target/portuguese-pronunciation.tsv",
+      "sha256": "dcfcaf1f26c68e73b94e21df0477e7dd343e32c06a97a466e500ad7b08395ab0"
+    },
+    "pinned_commit": "d6eff86a42c6a90b641e17dfdf7a16555b934483",
+    "pinned_repository": "https://github.com/MontrealCorpusTools/mfa-models",
+    "purpose": "lexical pronunciation authority",
+    "sources": [
+      {
+        "bytes": 921575,
+        "counts": {
+          "accepted_readings": 34974,
+          "accepted_words": 32840,
+          "duplicate_rows": 0,
+          "entry_rows": 34978,
+          "rejected_rows": 4
+        },
+        "dialect": "brazil",
+        "meta_bytes": 1476,
+        "meta_path": "dictionary/portuguese/brazil_mfa/v2.0.0/meta.json",
+        "meta_sha256": "716430af00122e0360cad7559a420acd199f054d2db0d1fc826f7b91af37abae",
+        "path": "dictionary/portuguese/brazil_mfa/portuguese_brazil_mfa.dict",
+        "phones": [
+          "a",
+          "b",
+          "c",
+          "d",
+          "dʒ",
+          "e",
+          "ẽ",
+          "f",
+          "i",
+          "ĩ",
+          "j",
+          "j̃",
+          "k",
+          "l",
+          "m",
+          "n",
+          "o",
+          "õ",
+          "p",
+          "s",
+          "t",
+          "tʃ",
+          "u",
+          "ũ",
+          "v",
+          "w",
+          "w̃",
+          "x",
+          "z",
+          "ɐ",
+          "ɐ̃",
+          "ɔ",
+          "ɛ",
+          "ɟ",
+          "ɡ",
+          "ɲ",
+          "ɾ",
+          "ʃ",
+          "ʎ",
+          "ʒ"
+        ],
+        "rejections": [
+          {
+            "line": 1,
+            "reason": "non_lexical_key",
+            "text": "<eps>\tsil"
+          },
+          {
+            "line": 2,
+            "reason": "non_lexical_key",
+            "text": "<unk>\tspn"
+          },
+          {
+            "line": 3,
+            "reason": "non_lexical_key",
+            "text": "[bracketed]\tspn"
+          },
+          {
+            "line": 4,
+            "reason": "non_lexical_key",
+            "text": "[laughter]\tspn"
+          }
+        ],
+        "sha256": "6ec51b884952f1076ad4a3ae17ec7e0c274b8df0dbd681b32e31ee78118f1861",
+        "url": "https://raw.githubusercontent.com/MontrealCorpusTools/mfa-models/d6eff86a42c6a90b641e17dfdf7a16555b934483/dictionary/portuguese/brazil_mfa/portuguese_brazil_mfa.dict",
+        "version": "2.0.0"
+      },
+      {
+        "bytes": 2669618,
+        "counts": {
+          "accepted_readings": 92472,
+          "accepted_words": 91729,
+          "duplicate_rows": 0,
+          "entry_rows": 92476,
+          "rejected_rows": 4
+        },
+        "dialect": "portugal",
+        "meta_bytes": 1565,
+        "meta_path": "dictionary/portuguese/portugal_mfa/v2.0.0/meta.json",
+        "meta_sha256": "d040bad61033b896e3c6aa2e1a354660c61af0fb7cb1c01cafab9ecc023da6bb",
+        "path": "dictionary/portuguese/portugal_mfa/portuguese_portugal_mfa.dict",
+        "phones": [
+          "a",
+          "b",
+          "c",
+          "d",
+          "dʒ",
+          "e",
+          "ẽ",
+          "f",
+          "i",
+          "ĩ",
+          "j",
+          "j̃",
+          "k",
+          "l",
+          "m",
+          "n",
+          "o",
+          "õ",
+          "p",
+          "s",
+          "t",
+          "tʃ",
+          "u",
+          "ũ",
+          "v",
+          "w",
+          "w̃",
+          "z",
+          "ð",
+          "ɐ",
+          "ɐ̃",
+          "ɔ",
+          "ɛ",
+          "ɟ",
+          "ɡ",
+          "ɣ",
+          "ɨ",
+          "ɲ",
+          "ɾ",
+          "ʁ",
+          "ʃ",
+          "ʎ",
+          "ʒ",
+          "β"
+        ],
+        "rejections": [
+          {
+            "line": 1,
+            "reason": "non_lexical_key",
+            "text": "<eps>\tsil"
+          },
+          {
+            "line": 2,
+            "reason": "non_lexical_key",
+            "text": "<unk>\tspn"
+          },
+          {
+            "line": 3,
+            "reason": "non_lexical_key",
+            "text": "[bracketed]\tspn"
+          },
+          {
+            "line": 4,
+            "reason": "non_lexical_key",
+            "text": "[laughter]\tspn"
+          }
+        ],
+        "sha256": "260f08d8d218f1cd8a4675f8ece20e8e239863f262cdc8d0948693f0abac9703",
+        "url": "https://raw.githubusercontent.com/MontrealCorpusTools/mfa-models/d6eff86a42c6a90b641e17dfdf7a16555b934483/dictionary/portuguese/portugal_mfa/portuguese_portugal_mfa.dict",
+        "version": "2.0.0"
+      }
+    ]
+  },
+  "purpose": "automatic language-routing lexical membership; not a pronunciation dictionary",
+  "sources": [
+    {
+      "bytes": 4477692,
+      "counts": {
+        "accepted_keys": 309743,
+        "duplicate_rows": 675,
+        "entry_rows": 312368,
+        "rejected_rows": 1950
+      },
+      "license_path": "public/licenses/portuguese-brazil-community-dictionary.txt",
+      "license_sha256": "bb064f3db7ba5f5536da7d079773f692c5f928822e8aebc3d78259ff6cceb9e5",
+      "path": "dictionaries/pt/index.dic",
+      "sha256": "32e2edd83541d58613bcc83ef731a79aadf85ed57e977a16c6b5f711a7a36cee",
+      "url": "https://raw.githubusercontent.com/wooorm/dictionaries/8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/pt/index.dic"
+    },
+    {
+      "bytes": 1475328,
+      "counts": {
+        "accepted_keys": 42254,
+        "duplicate_rows": 2011,
+        "entry_rows": 44275,
+        "rejected_rows": 10
+      },
+      "license_path": "public/licenses/portuguese-portugal-community-dictionary.txt",
+      "license_sha256": "a5d807381c41a7186b235f17cdf472f53d83831cb05a2bae3c44581cc818570c",
+      "path": "dictionaries/pt-PT/index.dic",
+      "sha256": "fcac21564163586df74ba88cde362bb75560548b35bcaa780558c8f97f43de04",
+      "url": "https://raw.githubusercontent.com/wooorm/dictionaries/8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/pt-PT/index.dic"
+    }
+  ]
+}

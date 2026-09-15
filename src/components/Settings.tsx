@@ -75,7 +75,7 @@ export function Settings({
           onChange={(event) => onPronunciationChange(event.target.value as PronunciationProfile)}
           className="rounded-md border bg-background px-3 py-2 text-sm disabled:opacity-50"
         >
-          <option value="automaticFrenchEnglish">Automatic French + English</option>
+          <option value="automatic">Automatic French + English + Spanish + Portuguese</option>
           <option value="default">Default — no pronunciation fixes</option>
           <option value="frenchMillefeuille" disabled={exportTarget !== "ustx"}>
             French DiffSinger Millefeuille
@@ -83,23 +83,33 @@ export function Settings({
           <option value="englishArpabet" disabled={exportTarget !== "ustx"}>
             English DiffSinger ARPAbet
           </option>
+          <option value="spanishDiffSinger" disabled={exportTarget !== "ustx"}>
+            Spanish DiffSinger
+          </option>
+          <option value="portugueseDiffSinger" disabled={exportTarget !== "ustx"}>
+            Portuguese DiffSinger (Portugal / Brazil)
+          </option>
         </select>
         <p className="text-xs text-muted-foreground">
-          {pronunciationProfile === "automaticFrenchEnglish"
+          {pronunciationProfile === "automatic"
             ? exportTarget === "ustx"
-              ? "Automatic FR+EN runs fully offline on CPU, classifies complete sung words in phrase context, and routes French through Millefeuille and English through ARPAbet. OpenUtau 0.1.569 or newer is required for per-note phonemizer switching; assign a compatible multilingual singer after export."
-              : "Automatic FR+EN runs fully offline on CPU and classifies complete sung words in phrase context for analysis and diagnostics. Synthesizer V keeps Verse's existing lyric and phoneme serialization; no OpenUtau aliases or phonemizer metadata are injected."
+              ? "Automatic FR+EN+ES+PT detects complete sung words in context, including songs in a single language. French uses Millefeuille, English uses ARPAbet, and Spanish and Portuguese use their native DiffSinger phonemizers. Use OpenUtau 0.1.569 or newer and assign a compatible multilingual singer; Portuguese dialect depends on the singer and its pronunciation dictionary."
+              : "Automatic FR+EN+ES+PT runs fully offline and classifies complete sung words in context, including songs in a single language. Synthesizer V keeps Verse's existing lyric and phoneme serialization; no OpenUtau aliases or phonemizer metadata are injected."
+            : pronunciationProfile === "spanishDiffSinger"
+              ? "Spanish words use OpenUtau's native DiffSinger Spanish phonemizer. Assign a compatible Spanish DiffSinger singer after export; incomplete source words appear in diagnostics."
+            : pronunciationProfile === "portugueseDiffSinger"
+              ? "Portuguese lyrics from Portugal and Brazil use OpenUtau's native DiffSinger Portuguese phonemizer. Assign a compatible singer; regional pronunciation depends on its voicebank and dictionary, not automatic dialect detection."
             : pronunciationProfile === "englishArpabet"
             ? "English pronunciation for compatible DiffSinger banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
             : pronunciationProfile === "frenchMillefeuille"
               ? "French pronunciation for compatible DiffSinger Millefeuille banks, including UFR. Words or syllable layouts needing review appear in diagnostics."
               : exportTarget === "ustx"
-                ? "Default does not apply French or English pronunciation fixes. Assigning a singer later in OpenUtau does not apply Verse's corrections."
+                ? "Default does not apply Verse's language routing or pronunciation preparation. Assigning a singer later in OpenUtau does not apply Verse's corrections."
                 : "Default keeps Synthesizer V's existing lyric and phoneme serialization without automatic language routing."}
           {" "}Your choice is remembered even before importing a file; with files
           loaded, it is saved after reanalysis succeeds.
-          {pronunciationProfile === "automaticFrenchEnglish" && (
-            <> Automatic FR+EN uses only bundled local detector data and dictionaries;
+          {pronunciationProfile === "automatic" && (
+            <> Automatic FR+EN+ES+PT uses only bundled local detector data and dictionaries;
             no network lookup or separate installation is required.</>
           )}
         </p>
@@ -108,6 +118,21 @@ export function Settings({
         </a>
         <a className="text-xs underline" href="/licenses/cmudict.txt" target="_blank" rel="noreferrer">
           CMU English dictionary license
+        </a>
+        <a className="text-xs underline" href="/licenses/spanish-community-dictionary.txt" target="_blank" rel="noreferrer">
+          Spanish community dictionary license
+        </a>
+        <a className="text-xs underline" href="/licenses/portuguese-brazil-community-dictionary.txt" target="_blank" rel="noreferrer">
+          Portuguese (Brazil) community dictionary license
+        </a>
+        <a className="text-xs underline" href="/licenses/portuguese-portugal-community-dictionary.txt" target="_blank" rel="noreferrer">
+          Portuguese (Portugal) community dictionary license
+        </a>
+        <a className="text-xs underline" href="/licenses/mfa-pronunciation-dictionaries-cc-by-4.0.txt" target="_blank" rel="noreferrer">
+          MFA Spanish and Portuguese pronunciation dictionaries license (CC BY 4.0)
+        </a>
+        <a className="text-xs underline" href="/licenses/mfa-pronunciation-attribution.txt" target="_blank" rel="noreferrer">
+          MFA pronunciation dictionaries attribution and adaptation notice
         </a>
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
       </div>

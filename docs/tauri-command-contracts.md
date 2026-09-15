@@ -33,41 +33,61 @@ language selector, and nothing about lyric text depends on it.
 ## `pronunciationProfile`
 
 All three conversion/export commands accept the optional `pronunciationProfile`.
-It defaults to `"default"`; unknown values fail deserialization. The legacy
-`language` parameter remains ignored. `"frenchMillefeuille"` and `"englishArpabet"`
-apply only when `exportTarget` is `"ustx"`. `"automaticFrenchEnglish"` is a
-target-neutral analysis profile: the same FR/EN ownership is computed for USTX
-and SVP, while SVP retains its existing lyric/phoneme serialization and receives
-no OpenUtau-only pronunciation metadata.
+It defaults to `"automatic"`; the legacy input alias `"automaticFrenchEnglish"` is still accepted. Automatic means
+automatic French + English + Spanish + Portuguese routing. Unknown values fail
+deserialization. The legacy `language` parameter remains ignored.
+`"frenchMillefeuille"`, `"englishArpabet"`, `"spanishDiffSinger"` and
+`"portugueseDiffSinger"` apply only when `exportTarget` is `"ustx"`.
+`"automatic"` is target-neutral analysis: the same four-language
+ownership is computed for USTX and SVP, while SVP retains its existing
+lyric/phoneme serialization and receives no OpenUtau-only pronunciation
+metadata.
 
-Settings exposes the choice as **Pronunciation**. Automatic FR+EN and Default are
-available for both targets; the explicit French/English DiffSinger profiles are
-OpenUtau-only. Changing the choice reanalyzes all loaded files through the same
+Settings exposes the choice as **Pronunciation**. Automatic FR+EN+ES+PT and
+Default are available for both targets; the explicit French, English, Spanish
+and Portuguese profiles are OpenUtau-only. Changing the choice reanalyzes all
+loaded files through the same
 guarded workflow as a target change. The
 selection is installed when the reanalysis command returns its per-file verdicts,
 including `ok=false` results and unsupported-pronunciation warnings. A rejected
 command preserves the previous selection and diagnostics. Direct, batch and
 bundle exports pass the same selection to `convert_midi_with_profile`.
 
-The profile selects pronunciation policy, never a singer. Automatic FR+EN runs
-fully offline on bundled CPU data: it reconstructs complete source-owned words,
-combines the bundled two-language detector with Verse's French/English lexicons
+The profile selects pronunciation policy, never a singer. Automatic FR+EN+ES+PT
+runs fully offline on bundled CPU data: it reconstructs complete source-owned
+words, combines the bundled four-language detector with local lexical evidence
 and phrase context, and smooths ambiguous short words and vocalises without a
 manual language-confirmation step. Classified French words use
 `OpenUtau.Core.DiffSinger.DiffSingerFrenchMillfeuillePhonemizer`; classified
 English words use `OpenUtau.Core.DiffSinger.DiffSingerEnglishPhonemizer` on
-OpenUtau 0.1.569+ word heads. Split/hold continuations inherit the word choice.
+OpenUtau 0.1.569+ word heads. Spanish and Portuguese use pinned MFA lexical
+pronunciation dictionaries and select `DiffSingerSpanishPhonemizer` or
+`DiffSingerPortuguesePhonemizer`. Verse writes an ES/PT phonetic hint only when
+the complete MFA reading maps exactly to the verified OpenUtau base DiffSinger
+inventory and all bundled regional/variant readings converge. Unknown,
+ambiguous or unmappable readings retain source spelling and emit a stable
+diagnostic rather than an approximation. Split/hold continuations inherit the
+word choice.
 The explicit French profile selects
 `OpenUtau.Core.DiffSinger.DiffSingerFrenchMillfeuillePhonemizer`; English selects
 `OpenUtau.Core.DiffSinger.DiffSingerEnglishPhonemizer` (DIFFS EN, stressless CMU39
-phones in the `en/` namespace). Compatible singer assignment remains manual.
+phones in the `en/` namespace); Spanish and Portuguese select the corresponding
+DiffSinger consumer types while using Verse's bundled MFA readings as lexical
+pronunciation evidence. Compatible singer assignment remains manual. Portuguese
+is one language route for both Portugal and Brazil; Verse retains regional
+readings separately and refuses to pick a dialect-specific reading when the
+source provides no reliable selector.
 
 Diagnostics include `FRENCH_PRONUNCIATION_APPLIED`, `FRENCH_LIAISON_APPLIED`,
 `FRENCH_PRONUNCIATION_UNSUPPORTED`, `FRENCH_DUPLICATE_BLANK_RESOLVED`,
 `FRENCH_DUPLICATE_LYRIC_CONFLICT`, `ENGLISH_PRONUNCIATION_APPLIED`,
 `ENGLISH_PRONUNCIATION_UNSUPPORTED`, `ENGLISH_PRONUNCIATION_AMBIGUOUS`,
 `ENGLISH_PRONUNCIATION_VOWEL_MISMATCH`, `ENGLISH_DUPLICATE_BLANK_RESOLVED`, and
-`ENGLISH_DUPLICATE_LYRIC_CONFLICT`. Automatic routing additionally emits
+`ENGLISH_DUPLICATE_LYRIC_CONFLICT`. Spanish/Portuguese pronunciation additionally
+uses `DIFFSINGER_PRONUNCIATION_APPLIED`, `DIFFSINGER_PRONUNCIATION_UNKNOWN`,
+`DIFFSINGER_PRONUNCIATION_UNMAPPABLE`, `DIFFSINGER_PRONUNCIATION_AMBIGUOUS`,
+`DIFFSINGER_PRONUNCIATION_INCOMPLETE_WORD`, and
+`DIFFSINGER_PRONUNCIATION_SYLLABLE_MISMATCH`. Automatic routing additionally emits
 `AUTOMATIC_LANGUAGE_ROUTED` and, when context had to settle weak local evidence,
 `AUTOMATIC_LANGUAGE_LOW_CONFIDENCE`.
 They retain source note IDs; bundle manifests preserve the same codes,
@@ -92,7 +112,7 @@ request:
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<sourcePath, Record<trackIdString, boolean>>
   exportTarget?: "svp" | "ustx"
-  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet" | "automaticFrenchEnglish"
+  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet" | "spanishDiffSinger" | "portugueseDiffSinger" | "automatic"
 
 response:
   FileResult[]
@@ -115,7 +135,7 @@ request:
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<trackIdString, boolean>
   exportTarget?: "svp" | "ustx"
-  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet" | "automaticFrenchEnglish"
+  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet" | "spanishDiffSinger" | "portugueseDiffSinger" | "automatic"
 
 response:
   string  // committed target path
@@ -145,7 +165,7 @@ request:
   overrides?: Record<trackIdString, boolean>
   rendererPath?: string
   exportTarget?: "svp" | "ustx"
-  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet" | "automaticFrenchEnglish"
+  pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet" | "spanishDiffSinger" | "portugueseDiffSinger" | "automatic"
   onProgress: Channel<BundleProgressEvent>
 
 response:
