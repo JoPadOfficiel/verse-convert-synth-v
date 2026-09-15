@@ -1347,8 +1347,38 @@ mod output_tests {
     #[test]
     fn automatic_analysis_batch_direct_and_bundle_exports_share_language_routing() {
         assert_profile_commands(
-            PronunciationProfile::AutomaticFrenchEnglish,
-            &[("bonjour", None), ("beautiful", None), ("merci", None)],
+            PronunciationProfile::Automatic,
+            &[
+                ("bonjour", None),
+                ("beautiful", None),
+                ("hola", None),
+                ("obrigado", None),
+                ("merci", None),
+            ],
+        );
+    }
+
+    #[test]
+    fn spanish_analysis_batch_direct_and_bundle_exports_share_external_pronunciation() {
+        assert_profile_commands(
+            PronunciationProfile::SpanishDiffSinger,
+            &[
+                ("Hola", None),
+                ("can", Some("begin")),
+                ("ción", Some("end")),
+            ],
+        );
+    }
+
+    #[test]
+    fn portuguese_analysis_batch_direct_and_bundle_exports_share_external_pronunciation() {
+        assert_profile_commands(
+            PronunciationProfile::PortugueseDiffSinger,
+            &[
+                ("Acho", None),
+                ("cora", Some("begin")),
+                ("ção", Some("end")),
+            ],
         );
     }
 
@@ -1372,28 +1402,40 @@ mod output_tests {
                 Some(engine::target::english::UNSUPPORTED),
                 Some(engine::target::english::PHONEMIZER),
             ),
-            PronunciationProfile::AutomaticFrenchEnglish => (engine::language::ROUTED, None, None),
+            PronunciationProfile::Automatic => (engine::language::ROUTED, None, None),
+            PronunciationProfile::SpanishDiffSinger => (
+                engine::target::diffsinger::APPLIED,
+                Some(engine::target::diffsinger::UNMAPPABLE),
+                Some(engine::target::diffsinger::SPANISH_PHONEMIZER),
+            ),
+            PronunciationProfile::PortugueseDiffSinger => (
+                engine::target::diffsinger::APPLIED,
+                Some(engine::target::diffsinger::UNMAPPABLE),
+                Some(engine::target::diffsinger::PORTUGUESE_PHONEMIZER),
+            ),
             PronunciationProfile::Default => unreachable!(),
         };
         let path = source.to_str().unwrap();
-        let analysis = process_one(
-            path,
+        let analysis = convert_files(
+            vec![path.into()],
             false,
             None,
-            "english",
+            Some("english".into()),
             None,
-            ExportTarget::Ustx,
-            profile,
-        );
-        let batch = process_one(
-            path,
+            Some(ExportTarget::Ustx),
+            Some(profile),
+        )
+        .remove(0);
+        let batch = convert_files(
+            vec![path.into()],
             true,
             None,
-            "english",
+            Some("english".into()),
             None,
-            ExportTarget::Ustx,
-            profile,
-        );
+            Some(ExportTarget::Ustx),
+            Some(profile),
+        )
+        .remove(0);
         assert!(
             analysis.ok && batch.ok,
             "{:?} / {:?}",
@@ -1471,7 +1513,9 @@ mod output_tests {
             assert_eq!(emitted.matches(phonemizer).count(), project.tracks.len());
         } else {
             assert!(emitted.contains(engine::target::french::PHONEMIZER));
-            assert!(emitted.contains(engine::target::english::PHONEMIZER));
+            assert!(emitted.contains(engine::target::diffsinger::ENGLISH_NAME));
+            assert!(emitted.contains(engine::target::diffsinger::SPANISH_NAME));
+            assert!(emitted.contains(engine::target::diffsinger::PORTUGUESE_NAME));
         }
         assert!(!engine::target::ustx::audit(&emitted)
             .unwrap()
@@ -1524,5 +1568,468 @@ mod output_tests {
         assert_eq!(result.n_tracks, 2);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    mod automatic_acceptance {
+        use super::*;
+        use engine::projection::{ProjectedLyric, ProjectedProject, PronunciationLanguage};
+        use engine::target::{self, diffsinger, ustx};
+
+        const AUTO: PronunciationProfile = PronunciationProfile::Automatic;
+
+        #[derive(Clone, Copy)]
+        struct Lane {
+            part: usize,
+            verse: u32,
+            octave: u8,
+            words: [&'static str; 3],
+            language: PronunciationLanguage,
+        }
+
+        fn lanes() -> [Lane; 4] {
+            use PronunciationLanguage::*;
+            [
+                (French, ["bonjour", "hou", "merci"]),
+                (English, ["beautiful", "hou", "hello"]),
+                (Spanish, ["hola", "hou", "gracias"]),
+                (Portuguese, ["obrigado", "hou", "você"]),
+            ]
+            .map(|(language, words)| Lane {
+                part: 1,
+                verse: 1,
+                octave: 4,
+                words,
+                language,
+            })
+        }
+
+        fn phonemizers(language: PronunciationLanguage) -> (&'static str, &'static str) {
+            use PronunciationLanguage::*;
+            match language {
+                French => (target::french::PHONEMIZER, diffsinger::FRENCH_NAME),
+                English => (target::english::PHONEMIZER, diffsinger::ENGLISH_NAME),
+                Spanish => (diffsinger::SPANISH_PHONEMIZER, diffsinger::SPANISH_NAME),
+                Portuguese => (
+                    diffsinger::PORTUGUESE_PHONEMIZER,
+                    diffsinger::PORTUGUESE_NAME,
+                ),
+            }
+        }
+
+        // No language tags or language-bearing Part names: ownership must come
+        // from each lyric lane. The shared vocalise needs its own lane's context.
+        fn score(lanes: &[Lane]) -> String {
+            let mut part_ids = Vec::new();
+            let mut part_list = String::new();
+            let mut parts = String::new();
+            for lane in lanes {
+                if part_ids.contains(&lane.part) {
+                    continue;
+                }
+                part_ids.push(lane.part);
+                part_list.push_str(&format!(
+                    "<score-part id=\"P{}\"><part-name>Voice {}</part-name></score-part>",
+                    lane.part, lane.part
+                ));
+                let mut notes = String::new();
+                for (index, step) in ["C", "D", "E"].iter().enumerate() {
+                    let lyrics: String = lanes.iter().filter(|other| other.part == lane.part)
+                        .map(|other| format!(
+                            "<lyric number=\"{}\"><syllabic>single</syllabic><text>{}</text></lyric>",
+                            other.verse, other.words[index]
+                        )).collect();
+                    notes.push_str(&format!(
+                        "<note><pitch><step>{step}</step><octave>{}</octave></pitch>\
+                         <duration>{}</duration><voice>1</voice>{lyrics}</note>",
+                        lane.octave,
+                        index + 1
+                    ));
+                }
+                parts.push_str(&format!(
+                    "<part id=\"P{}\"><measure number=\"1\"><attributes><divisions>2</divisions>\
+                     <time><beats>4</beats><beat-type>4</beat-type></time></attributes>\
+                     <note><rest/><duration>2</duration><voice>1</voice></note>{notes}</measure></part>",
+                    lane.part
+                ));
+            }
+            format!("<score-partwise version=\"4.0\"><part-list>{part_list}</part-list>{parts}</score-partwise>")
+        }
+
+        fn analysis_value(result: &FileResult) -> serde_json::Value {
+            let mut value = serde_json::to_value(result).unwrap();
+            value["out"] = serde_json::Value::Null;
+            value
+        }
+
+        fn assert_projection(project: &ProjectedProject, expected: &[Lane]) {
+            assert_eq!(project.tracks.len(), expected.len());
+            let mut seen = std::collections::BTreeSet::new();
+            for track in &project.tracks {
+                assert_eq!(track.notes.len(), 3);
+                for (index, note) in track.notes.iter().enumerate() {
+                    let source = match &note.lyric {
+                        ProjectedLyric::Source(source)
+                        | ProjectedLyric::Pronounced { source, .. }
+                        | ProjectedLyric::PronouncedSplit { source } => source,
+                        other => panic!("expected source-owned word: {other:?}"),
+                    };
+                    let evidence = note.source_evidence.as_ref().unwrap();
+                    let origin = evidence.origin.as_ref().unwrap();
+                    let lane = expected
+                        .iter()
+                        .find(|lane| {
+                            origin.source.part_id.as_deref()
+                                == Some(format!("P{}", lane.part).as_str())
+                                && source.verse == lane.verse
+                        })
+                        .expect("every output note belongs to an expected Part and verse");
+                    assert_eq!(source.raw, lane.words[index]);
+                    assert_eq!(
+                        note.pronunciation_language,
+                        Some(lane.language),
+                        "{} verse {} word {}",
+                        lane.part,
+                        lane.verse,
+                        source.raw
+                    );
+                    // Evidence IDs include playback occurrence; the raw lyric
+                    // ID identifies notation. Both survive the baseline check.
+                    assert!(evidence.lyric_id.is_some());
+                    assert_eq!(origin.source.voice.as_deref(), Some("1"));
+                    assert!(
+                        seen.insert((lane.part, lane.verse, index)),
+                        "duplicated lyric lane"
+                    );
+                    // Exact fixture geometry, in half-quarter units, including
+                    // the opening rest and unequal durations. No routed oracle.
+                    let ppq = u32::from(project.ticks_per_beat);
+                    assert_eq!(
+                        u64::from(note.onset_ticks) * 2,
+                        u64::from([2, 3, 5][index] * ppq)
+                    );
+                    assert_eq!(
+                        u64::from(note.duration_ticks) * 2,
+                        u64::from((index as u32 + 1) * ppq)
+                    );
+                    assert_eq!(note.pitch, (lane.octave + 1) * 12 + [0, 2, 4][index]);
+                }
+            }
+            assert_eq!(seen.len(), expected.len() * 3);
+        }
+
+        fn assert_command_exports(
+            source: &Path,
+            expected: &[Lane],
+            target: ExportTarget,
+            root: &Path,
+        ) -> (serde_json::Value, Vec<u8>) {
+            let path = source.to_str().unwrap();
+            let original = std::fs::read(source).unwrap();
+            let midi = parse_source_snapshot(&original, "musicxml").unwrap();
+            let converted = convert_midi_with_profile(&midi, "english", None, target, AUTO);
+            assert!(converted.ok, "{:?}", converted.msg);
+            let projection = converted.svp.as_ref().unwrap();
+            assert_projection(projection, expected);
+            let baseline = convert_midi_with_profile(
+                &midi,
+                "english",
+                None,
+                target,
+                PronunciationProfile::Default,
+            );
+            assert!(baseline.ok, "{:?}", baseline.msg);
+            let baseline = baseline.svp.unwrap();
+            assert_eq!(projection.tracks.len(), baseline.tracks.len());
+            for (actual, original) in projection.tracks.iter().zip(&baseline.tracks) {
+                assert_eq!(actual.source_track_id, original.source_track_id);
+                assert_eq!(actual.notes.len(), original.notes.len());
+                for (actual, original) in actual.notes.iter().zip(&original.notes) {
+                    assert_eq!(actual.source_evidence, original.source_evidence);
+                    assert_eq!(
+                        (actual.onset_ticks, actual.duration_ticks, actual.pitch),
+                        (
+                            original.onset_ticks,
+                            original.duration_ticks,
+                            original.pitch
+                        )
+                    );
+                }
+            }
+            let analysis = convert_files(
+                vec![path.into()],
+                false,
+                None,
+                None,
+                None,
+                Some(target),
+                Some(AUTO),
+            )
+            .remove(0);
+            assert!(analysis.ok, "{:?}", analysis.msg);
+            assert!(analysis.out.is_none());
+            // The DTO counts source lanes; stacked verses create additional
+            // target tracks without inventing additional source voices.
+            let source_parts = expected
+                .iter()
+                .map(|lane| lane.part)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            assert_eq!(analysis.n_parts, source_parts);
+            assert_eq!(analysis.n_voices, source_parts);
+            assert_eq!(analysis.n_tracks, source_parts);
+            assert_eq!(analysis.placed, expected.len() * 3);
+            assert_eq!(
+                analysis.warnings,
+                converted
+                    .tracks
+                    .iter()
+                    .flat_map(|track| track.warnings.clone())
+                    .chain(converted.source_warnings.iter().cloned())
+                    .collect::<Vec<_>>()
+            );
+            assert!(analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.code == engine::language::ROUTED));
+
+            let direct = root.join(format!("direct.{}", target.extension()));
+            export_svp(
+                path.into(),
+                direct.to_string_lossy().into_owned(),
+                None,
+                None,
+                Some(target),
+                Some(AUTO),
+            )
+            .unwrap();
+            let bytes = std::fs::read(&direct).unwrap();
+            assert_eq!(bytes, target::serialize_to(target, projection).unwrap());
+            if target == ExportTarget::Ustx {
+                let project = ustx::serialize(projection).unwrap();
+                assert_eq!(project.voice_parts.len(), expected.len());
+                for (track, part) in project.tracks.iter().zip(&project.voice_parts) {
+                    let language = projection.tracks[part.track_no as usize].notes[0]
+                        .pronunciation_language
+                        .unwrap();
+                    let (fallback, per_note) = phonemizers(language);
+                    assert_eq!(track.phonemizer, fallback);
+                    assert_eq!(part.notes.len(), 3);
+                    for (index, note) in part.notes.iter().enumerate() {
+                        assert_eq!(note.phonemizer.as_deref(), Some(per_note));
+                        assert_eq!(part.position + note.position, [480, 720, 1200][index]);
+                        assert_eq!(note.duration, (index as i32 + 1) * 240);
+                        assert_eq!(
+                            note.tone,
+                            projection.tracks[part.track_no as usize].notes[index].pitch
+                        );
+                    }
+                }
+                ustx::audit(std::str::from_utf8(&bytes).unwrap()).unwrap();
+            } else {
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                for (index, track) in json["tracks"].as_array().unwrap().iter().enumerate() {
+                    assert_eq!(track["mainRef"]["database"]["language"], "");
+                    for (note_index, note) in track["mainGroup"]["notes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            note["onset"],
+                            [705_600_000u64, 1_058_400_000, 1_764_000_000][note_index]
+                        );
+                        assert_eq!(note["duration"], (note_index as u64 + 1) * 352_800_000);
+                        assert_eq!(
+                            note["pitch"],
+                            projection.tracks[index].notes[note_index].pitch
+                        );
+                    }
+                }
+                let text = std::str::from_utf8(&bytes).unwrap();
+                for forbidden in ["phonemizer", "fr/", "en/", "es/", "pt/"] {
+                    assert!(!text.contains(forbidden), "SVP leaked {forbidden}");
+                }
+            }
+            let plan = stems::StemPlan::from_source(&midi, &converted.tracks).unwrap();
+            let bundle = export_bundle_blocking(
+                path.into(),
+                root.join("output.versebundle")
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+                None,
+                None,
+                Some(target),
+                Some(AUTO),
+                &|_| {},
+                Some(bundle::tests::successful_renderer(&plan.stems)),
+            )
+            .unwrap();
+            let bundled = std::fs::read(&bundle.project_path).unwrap();
+            if target == ExportTarget::Ustx {
+                let direct = std::str::from_utf8(&bytes).unwrap();
+                let bundled = std::str::from_utf8(&bundled).unwrap();
+                let (header, vocals) = direct.split_once("voice_parts:\n").unwrap();
+                assert!(
+                    bundled.starts_with(header),
+                    "vocal track metadata must survive bundling"
+                );
+                assert_eq!(
+                    bundled
+                        .split_once("voice_parts:\n")
+                        .unwrap()
+                        .1
+                        .split_once("wave_parts:")
+                        .unwrap()
+                        .0,
+                    vocals.split_once("wave_parts:").unwrap().0
+                );
+                assert_eq!(
+                    ustx::audit(bundled).unwrap().wave_parts.len(),
+                    plan.stems.len() + 1
+                );
+            } else {
+                let direct: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let bundled: serde_json::Value = serde_json::from_slice(&bundled).unwrap();
+                let vocals: Vec<_> = bundled["tracks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|track| track["mainRef"]["isInstrumental"] == false)
+                    .cloned()
+                    .collect();
+                assert_eq!(serde_json::json!(vocals), direct["tracks"]);
+            }
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&bundle.manifest_path).unwrap()).unwrap();
+            assert_eq!(manifest["warnings"], serde_json::json!(bundle.warnings));
+            for warning in &analysis.warnings {
+                assert!(bundle
+                    .warnings
+                    .iter()
+                    .any(|text| text.contains(&warning.code) && text.contains(&warning.message)));
+            }
+            assert_eq!(std::fs::read(source).unwrap(), original);
+            (analysis_value(&analysis), bytes)
+        }
+
+        #[test]
+        fn automatic_multifile_dispatch_matches_analysis_direct_and_bundle_in_any_order() {
+            let root = temp_dir();
+            let mut fixtures = lanes();
+            for (index, lane) in fixtures.iter_mut().enumerate() {
+                lane.octave += index as u8;
+            }
+            let paths: Vec<_> = fixtures
+                .iter()
+                .enumerate()
+                .map(|(index, lane)| {
+                    let path = root.join(format!("source-{index}.musicxml"));
+                    std::fs::write(&path, score(&[*lane])).unwrap();
+                    path.to_string_lossy().into_owned()
+                })
+                .collect();
+            for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+                let baselines: Vec<_> = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        let destination =
+                            root.join(format!("baseline-{index}-{}", target.extension()));
+                        std::fs::create_dir(&destination).unwrap();
+                        assert_command_exports(
+                            Path::new(path),
+                            &[fixtures[index]],
+                            target,
+                            &destination,
+                        )
+                    })
+                    .collect();
+                for (run, order) in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1]]
+                    .iter()
+                    .enumerate()
+                {
+                    let destination = root.join(format!("batch-{run}-{}", target.extension()));
+                    std::fs::create_dir(&destination).unwrap();
+                    let ordered: Vec<_> = order.iter().map(|index| paths[*index].clone()).collect();
+                    let analyze = convert_files(
+                        ordered.clone(),
+                        false,
+                        Some(destination.to_string_lossy().into_owned()),
+                        None,
+                        None,
+                        Some(target),
+                        Some(AUTO),
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(&destination).unwrap().count(),
+                        0,
+                        "analysis must not write files"
+                    );
+                    let batch = convert_files(
+                        ordered.clone(),
+                        true,
+                        Some(destination.to_string_lossy().into_owned()),
+                        None,
+                        None,
+                        Some(target),
+                        Some(AUTO),
+                    );
+                    assert_eq!(analyze.len(), 4);
+                    assert_eq!(batch.len(), 4);
+                    for ((analysis, output), index) in analyze.iter().zip(&batch).zip(order) {
+                        assert_eq!(analysis.path, paths[*index]);
+                        assert_eq!(output.path, paths[*index]);
+                        assert!(analysis.out.is_none());
+                        assert!(output.ok, "{:?}", output.msg);
+                        assert_eq!(analysis_value(analysis), baselines[*index].0);
+                        assert_eq!(analysis_value(output), baselines[*index].0);
+                        let expected_path = destination
+                            .join(format!("source-{index}_LYRICS.{}", target.extension()));
+                        assert_eq!(output.out.as_deref(), expected_path.to_str());
+                        assert_eq!(std::fs::read(expected_path).unwrap(), baselines[*index].1);
+                    }
+                    assert_eq!(std::fs::read_dir(destination).unwrap().count(), 4);
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        fn assert_independent_lanes(verses: bool) {
+            let root = temp_dir();
+            let mut fixtures = lanes();
+            for (index, lane) in fixtures.iter_mut().enumerate() {
+                if verses {
+                    lane.verse = index as u32 + 1;
+                } else {
+                    lane.part = index + 1;
+                    lane.octave += index as u8;
+                }
+            }
+            for order in 0..2 {
+                if order == 1 {
+                    fixtures.reverse();
+                }
+                let source = root.join(format!("independent-{order}.musicxml"));
+                std::fs::write(&source, score(&fixtures)).unwrap();
+                for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+                    let destination = root.join(format!("output-{order}-{}", target.extension()));
+                    std::fs::create_dir(&destination).unwrap();
+                    assert_command_exports(&source, &fixtures, target, &destination);
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn automatic_independent_parts_do_not_leak_language_context() {
+            assert_independent_lanes(false);
+        }
+
+        #[test]
+        fn automatic_independent_verses_do_not_leak_language_context() {
+            assert_independent_lanes(true);
+        }
     }
 }

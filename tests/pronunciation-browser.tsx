@@ -7,7 +7,7 @@ import { ThemeProvider } from "../src/components/theme-provider";
 import type { FileResult, PronunciationProfile } from "../src/lib/tauri";
 import "../src/index.css";
 
-const profiles: PronunciationProfile[] = ["automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet", "default"];
+const profiles: PronunciationProfile[] = ["automatic", "frenchMillefeuille", "englishArpabet", "spanishDiffSinger", "portugueseDiffSinger", "default"];
 const key = "verse.pronunciationProfile";
 const runKey = "verse.pronunciationBrowserTest";
 type TestResult = { name: string; passed: true };
@@ -140,6 +140,14 @@ async function run() {
       localStorage.removeItem(key);
       await act(async () => { root.render(null); });
       await mount();
+      check(header().value === "automatic", "Fresh startup must select Automatic FR+EN+ES+PT");
+      check(header().selectedOptions[0].textContent?.includes("ES + PT"), "Automatic must advertise all four languages");
+      await click("Drop your files, or click to choose");
+      check(last("convert_files").pronunciationProfile === "automatic", "First import needs no manual language selection");
+      await click("Clear");
+      calls.length = 0;
+      await choose("default");
+      record("Fresh startup imports automatically in four-language mode");
     }
     const profile = profiles[progress.index];
     if (!progress.restart) {
@@ -198,14 +206,14 @@ async function run() {
     await click("Settings");
     const svpProfile = document.querySelector<HTMLSelectElement>("#pronunciation-profile")!;
     check(!svpProfile.disabled && svpProfile.value === next, "SVP must expose the target-neutral Automatic/Default choice");
-    if (next === "automaticFrenchEnglish") {
+    if (next === "automatic") {
       await choose("default", svpProfile);
       check(last("convert_files").exportTarget === "svp" && last("convert_files").pronunciationProfile === "default",
         "SVP Default selection must reanalyse as SVP");
-      await choose("automaticFrenchEnglish", svpProfile);
-      check(last("convert_files").exportTarget === "svp" && last("convert_files").pronunciationProfile === "automaticFrenchEnglish",
-        "SVP Automatic FR+EN selection must reanalyse as SVP");
-      stored("automaticFrenchEnglish");
+      await choose("automatic", svpProfile);
+      check(last("convert_files").exportTarget === "svp" && last("convert_files").pronunciationProfile === "automatic",
+        "SVP Automatic FR+EN+ES+PT selection must reanalyse as SVP");
+      stored("automatic");
     }
     await click("Back");
     await click("OpenUtau");
@@ -258,7 +266,7 @@ async function run() {
       Storage.prototype.getItem = () => { throw new Error("Storage reads unavailable"); };
       await act(async () => { root.render(null); });
       await mount();
-      check(header().value === "default", "Unavailable storage reads must fall back to Default");
+      check(header().value === "automatic", "Unavailable storage reads must fall back to Automatic");
       await choose("englishArpabet");
       check(header().value === "englishArpabet", "Storage read failure must not prevent session choices");
       record("Storage read failure preserves startup and current-session usability");

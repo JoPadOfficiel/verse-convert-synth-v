@@ -24,7 +24,7 @@ fn lookup(key: &str) -> Option<&'static str> {
         .copied()
 }
 
-/// Read-only lexical evidence for the automatic FR/EN router. This deliberately
+/// Read-only lexical evidence for the automatic FR/EN/ES/PT router. This deliberately
 /// ignores semantic ambiguity: ambiguity is resolved by surrounding text and the
 /// existing pronunciation pass still refuses unsafe dictionary variants.
 pub(crate) fn contains_lexeme(key: &str) -> bool {

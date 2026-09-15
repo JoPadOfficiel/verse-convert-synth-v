@@ -353,6 +353,8 @@ pub struct ProjectedTrack {
 pub enum PronunciationLanguage {
     French,
     English,
+    Spanish,
+    Portuguese,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -361,7 +363,7 @@ pub struct ProjectedNote {
     /// Travels with the note through filtering and lane splitting; never joined
     /// back by pitch, time or display name. No target units live here.
     pub performance: Option<crate::engine::performance::PerformanceNote>,
-    /// Automatic FR/EN pronunciation ownership. `None` means no complete source
+    /// Automatic FR/EN/ES/PT pronunciation ownership. `None` means no complete source
     /// word was routed for this note (for example an untouched manual hint).
     pub pronunciation_language: Option<PronunciationLanguage>,
     pub onset_ticks: u32,

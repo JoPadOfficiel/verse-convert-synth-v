@@ -1,0 +1,221 @@
+{
+  "counts": {
+    "accepted_keys": 54833,
+    "duplicate_rows": 2510,
+    "entry_rows": 57344,
+    "rejected_rows": 1
+  },
+  "language": "Spanish",
+  "output": {
+    "bytes": 698780,
+    "path": "src-tauri/src/engine/target/spanish-community.tsv",
+    "sha256": "9e4155de90b719c178f8fa16babfb8d3adeb407e3be380ed44d9569001a7c3b9"
+  },
+  "pinned_commit": "8cfea406b505e4d7df52d5a19bce525df98c54ab",
+  "pinned_repository": "https://github.com/wooorm/dictionaries",
+  "pronunciation": {
+    "attribution_path": "public/licenses/mfa-pronunciation-attribution.txt",
+    "license": "CC BY 4.0",
+    "license_path": "public/licenses/mfa-pronunciation-dictionaries-cc-by-4.0.txt",
+    "license_sha256": "7e7170e3cebf88a9f60c7b8421418323c09304da1af4d5e90f4da1dc1c8a2661",
+    "output": {
+      "bytes": 5972680,
+      "distinct_readings": 141492,
+      "path": "src-tauri/src/engine/target/spanish-pronunciation.tsv",
+      "sha256": "6f4b11eb098ddfb16e798bd67ec0b94c4b0bee807aa11e62212120ffd958a67a"
+    },
+    "pinned_commit": "d6eff86a42c6a90b641e17dfdf7a16555b934483",
+    "pinned_repository": "https://github.com/MontrealCorpusTools/mfa-models",
+    "purpose": "lexical pronunciation authority",
+    "sources": [
+      {
+        "bytes": 2802535,
+        "counts": {
+          "accepted_readings": 93517,
+          "accepted_words": 87777,
+          "duplicate_rows": 0,
+          "entry_rows": 93521,
+          "rejected_rows": 4
+        },
+        "dialect": "spain",
+        "meta_bytes": 1425,
+        "meta_path": "dictionary/spanish/spain_mfa/v3.3.0/meta.json",
+        "meta_sha256": "aab9abc39ab73c13ee81e1d9d110a068bf853df39d4ffb2393f559e5c7ebf2b3",
+        "path": "dictionary/spanish/spain_mfa/spanish_spain_mfa.dict",
+        "phones": [
+          "a",
+          "ã",
+          "b",
+          "c",
+          "d̪",
+          "e",
+          "ẽ",
+          "f",
+          "h",
+          "i",
+          "ĩ",
+          "j",
+          "k",
+          "l",
+          "m",
+          "n",
+          "o",
+          "õ",
+          "p",
+          "r",
+          "s",
+          "tʃ",
+          "t̪",
+          "u",
+          "ũ",
+          "v",
+          "w",
+          "x",
+          "z",
+          "ç",
+          "ð",
+          "ŋ",
+          "ɟ",
+          "ɟʝ",
+          "ɡ",
+          "ɣ",
+          "ɱ",
+          "ɲ",
+          "ɾ",
+          "ʃ",
+          "ʎ",
+          "ʝ",
+          "β",
+          "θ"
+        ],
+        "rejections": [
+          {
+            "line": 1,
+            "reason": "non_lexical_key",
+            "text": "<cutoff>\tspn"
+          },
+          {
+            "line": 2,
+            "reason": "non_lexical_key",
+            "text": "<unk>\tspn"
+          },
+          {
+            "line": 3,
+            "reason": "non_lexical_key",
+            "text": "[bracketed]\tspn"
+          },
+          {
+            "line": 4,
+            "reason": "non_lexical_key",
+            "text": "[laughter]\tspn"
+          }
+        ],
+        "sha256": "16d5bfc4eabcb96af142e9b369663072da36412ef5c6c7f7f3847e7b92d24668",
+        "url": "https://raw.githubusercontent.com/MontrealCorpusTools/mfa-models/d6eff86a42c6a90b641e17dfdf7a16555b934483/dictionary/spanish/spain_mfa/spanish_spain_mfa.dict",
+        "version": "3.3.0"
+      },
+      {
+        "bytes": 2476178,
+        "counts": {
+          "accepted_readings": 84566,
+          "accepted_words": 51946,
+          "duplicate_rows": 0,
+          "entry_rows": 84570,
+          "rejected_rows": 4
+        },
+        "dialect": "latin-america",
+        "meta_bytes": 1459,
+        "meta_path": "dictionary/spanish/latin_america_mfa/v3.3.0/meta.json",
+        "meta_sha256": "006b749cc1cb08c12407f7841ee10e63047f76c86a94081019e7b4682dfc99e7",
+        "path": "dictionary/spanish/latin_america_mfa/spanish_latin_america_mfa.dict",
+        "phones": [
+          "a",
+          "ã",
+          "b",
+          "c",
+          "d̪",
+          "e",
+          "ẽ",
+          "f",
+          "h",
+          "i",
+          "ĩ",
+          "j",
+          "k",
+          "l",
+          "m",
+          "n",
+          "o",
+          "õ",
+          "p",
+          "r",
+          "s",
+          "tʃ",
+          "t̪",
+          "u",
+          "ũ",
+          "v",
+          "w",
+          "x",
+          "z",
+          "ç",
+          "ð",
+          "ŋ",
+          "ɟ",
+          "ɟʝ",
+          "ɡ",
+          "ɣ",
+          "ɱ",
+          "ɲ",
+          "ɾ",
+          "ʃ",
+          "ʎ",
+          "ʝ",
+          "β"
+        ],
+        "rejections": [
+          {
+            "line": 1,
+            "reason": "non_lexical_key",
+            "text": "<cutoff>\tspn"
+          },
+          {
+            "line": 2,
+            "reason": "non_lexical_key",
+            "text": "<unk>\tspn"
+          },
+          {
+            "line": 3,
+            "reason": "non_lexical_key",
+            "text": "[bracketed]\tspn"
+          },
+          {
+            "line": 4,
+            "reason": "non_lexical_key",
+            "text": "[laughter]\tspn"
+          }
+        ],
+        "sha256": "dc84a3e8e153b5e7e2856f820d0780b6694e5d0a8b515cb90e05bac10615513a",
+        "url": "https://raw.githubusercontent.com/MontrealCorpusTools/mfa-models/d6eff86a42c6a90b641e17dfdf7a16555b934483/dictionary/spanish/latin_america_mfa/spanish_latin_america_mfa.dict",
+        "version": "3.3.0"
+      }
+    ]
+  },
+  "purpose": "automatic language-routing lexical membership; not a pronunciation dictionary",
+  "sources": [
+    {
+      "bytes": 706202,
+      "counts": {
+        "accepted_keys": 54833,
+        "duplicate_rows": 2510,
+        "entry_rows": 57344,
+        "rejected_rows": 1
+      },
+      "license_path": "public/licenses/spanish-community-dictionary.txt",
+      "license_sha256": "a21581497f07b5e550e438d26890ea2b1704492357de67740613bd589b1c652a",
+      "path": "dictionaries/es/index.dic",
+      "sha256": "907f786a8ceb3456722b20ad91dd4dbe99c5c16e45015ea63155e36f26b06d2c",
+      "url": "https://raw.githubusercontent.com/wooorm/dictionaries/8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/es/index.dic"
+    }
+  ]
+}

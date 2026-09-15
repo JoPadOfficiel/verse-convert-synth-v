@@ -8,28 +8,43 @@ created: 2026-09-09
 
 ## Activer les corrections dans Verse avant l'export
 
-Pour une partition qui mélange le français et l'anglais, sélectionner
-**Automatic French + English**. Verse reconstitue les mots complets à partir de
-la partition, les classe avec un détecteur anglais/français embarqué et les
-lexiques de prononciation déjà fournis, puis stabilise les mots ambigus avec le
-contexte de la phrase. Tout se fait hors ligne : aucun modèle supplémentaire,
+Par défaut, Verse sélectionne **Automatic French + English + Spanish +
+Portuguese**. Ce mode convient aussi bien à une chanson entièrement dans une
+seule langue qu'à une piste qui change de langue. Verse reconstitue les mots
+complets à partir de la partition, les classe avec son détecteur local quatre
+langues et ses preuves lexicales embarquées, puis stabilise les mots ambigus avec
+le contexte de la phrase. Tout se fait hors ligne : aucun modèle supplémentaire,
 service web ou validation langue par langue n'est nécessaire.
 
-Les mots français passent ensuite par le profil **French Millefeuille** et les
-mots anglais par **English ARPAbet**. Les syllabes d'un même mot, les tenues et
-les continuations restent ensemble. Une vocalise courte comme `hou` hérite du
-passage auquel elle appartient. En cas de confiance faible, l'export continue de
-façon déterministe et Verse ajoute un diagnostic pour pouvoir auditer le choix.
+Les mots français passent ensuite par **French Millefeuille**, les mots anglais
+par **English ARPAbet**, et les mots espagnols/portugais utilisent des
+dictionnaires de prononciation **Montreal Forced Aligner** épinglés et embarqués
+dans Verse : Espagne + Amérique latine pour l'espagnol, Brésil + Portugal pour
+le portugais. Verse convertit une lecture MFA vers l'alphabet DiffSinger
+d'OpenUtau uniquement quand chaque symbole possède une correspondance exacte et
+que toutes les variantes applicables convergent vers la même séquence. Sinon le
+mot source reste intact et un diagnostic indique pourquoi aucune indication
+phonétique n'a été imposée. Les syllabes d'un même mot, les tenues et les
+continuations restent ensemble. Une vocalise courte comme `hou` hérite du
+passage auquel elle appartient. En cas de confiance faible sur la langue,
+l'export continue de façon déterministe et Verse ajoute également un diagnostic.
 
 Avec **OpenUtau 0.1.569 ou plus récent**, Verse conserve une seule piste vocale
 quand la langue change et écrit le champ `phonemizer` directement sur la note qui
 commence chaque mot. Les notes `+` et `+~` qui prolongent ce mot héritent ce
 choix. Il faut tout de même assigner dans OpenUtau une banque multilingue
-compatible avec les phonèmes français Millefeuille et anglais ARPAbet.
+compatible avec les routes nécessaires aux langues utilisées. Pour le
+portugais, Verse ne choisit pas arbitrairement « Portugal » ou « Brésil » quand
+les dictionnaires donnent des lectures différentes et que la partition ne porte
+pas cette information : il conserve les variantes séparées et refuse de forcer
+une lecture. La banque choisie dans OpenUtau reste responsable de la réalisation
+acoustique des phonèmes qu'elle supporte.
 
-Avec la cible **OpenUtau**, sélectionner **French Millefeuille** dans
-**Pronunciation**, en haut de la fenêtre à côté du thème et des réglages, puis
-exporter à nouveau depuis la partition source. Le choix est conservé au
+Avec la cible **OpenUtau**, il est aussi possible de forcer manuellement
+**French Millefeuille**, **English DiffSinger ARPAbet**, **Spanish DiffSinger**
+ou **Portuguese DiffSinger** dans **Pronunciation**, en haut de la fenêtre à
+côté du thème et des réglages, puis d'exporter à nouveau depuis la partition
+source. Le choix est conservé au
 redémarrage de Verse, même s'il est fait avant d'importer une partition. Lorsque
 des fichiers sont déjà chargés, il est mémorisé après acceptation de la nouvelle
 analyse. Le même choix reste accessible et synchronisé dans **Settings**.
@@ -84,11 +99,17 @@ Le phonémiseur français DiffSinger est intégré à OpenUtau. Le dictionnaire
 classique. Son absence ne démontre pas une installation incomplète de DiffSinger.
 
 Dans Verse, choisir le profil explicite correspondant à la langue et à la
-convention de la banque. Le profil français écrit des indications `fr/…` ; le
-profil anglais ARPAbet utilise `en/…`. Une banque multilingue doit accepter les
-symboles des deux conventions lorsque le profil automatique est utilisé.
-La détection automatique de Verse choisit la route de prononciation ; elle ne
-change ni la banque assignée ni les capacités acoustiques du modèle DiffSinger.
+convention de la banque lorsqu'un forçage manuel est nécessaire. Le profil
+français écrit des indications `fr/…` ; le profil anglais ARPAbet utilise
+`en/…`. Les profils espagnol et portugais s'appuient sur les mêmes lectures MFA
+embarquées que le mode automatique, puis utilisent l'alphabet de base vérifié de
+**DiffSinger Spanish Phonemizer** et **DiffSinger Portuguese Phonemizer**. Une
+indication n'est écrite que si la lecture externe se convertit sans perte ; une
+variante régionale ou un phonème non représentable laisse le mot source intact.
+Une banque multilingue utilisée avec le profil automatique doit prendre en
+charge les routes correspondant aux langues présentes. La détection automatique
+de Verse choisit la route de prononciation ; elle ne change ni la banque assignée
+ni les capacités acoustiques du modèle DiffSinger.
 
 Les indications manuelles entre crochets sont conservées. Un mot absent du
 lexique ou un découpage ambigu est signalé ; un dictionnaire plus grand ne

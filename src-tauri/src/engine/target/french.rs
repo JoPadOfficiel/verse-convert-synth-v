@@ -98,7 +98,7 @@ fn lexical(key: &str) -> Option<String> {
     None
 }
 
-/// Read-only lexical evidence for the automatic FR/EN router. Membership says
+/// Read-only lexical evidence for the automatic FR/EN/ES/PT router. Membership says
 /// a spelling exists in the French resources; it does not choose a pronunciation
 /// or override ambiguity safeguards used by the actual pronunciation pass.
 pub(crate) fn contains_lexeme(key: &str) -> bool {

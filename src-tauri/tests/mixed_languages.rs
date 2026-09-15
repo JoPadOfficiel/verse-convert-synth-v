@@ -1,4 +1,4 @@
-//! Automatic FR/EN routing across the shared projection and output targets.
+//! Automatic FR/EN/ES/PT routing across the shared projection and output targets.
 //! Synthetic fixtures are authored here; private acceptance masters stay outside Git.
 
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use verse_lib::engine::projection::{
 use verse_lib::engine::target::{self, ustx, ExportTarget, PronunciationProfile};
 use verse_lib::engine::{musescore, musicxml};
 
-const AUTO: PronunciationProfile = PronunciationProfile::AutomaticFrenchEnglish;
+const AUTO: PronunciationProfile = PronunciationProfile::Automatic;
 
 fn convert(midi: &Midi, target: ExportTarget) -> ConvertOutcome {
     let result = convert_midi_with_profile(midi, "english", None, target, AUTO);
@@ -89,9 +89,9 @@ fn assert_french_english_french(midi: &Midi) {
             .map(|note| note.phonemizer.as_deref())
             .collect::<Vec<_>>(),
         [
-            Some(target::french::PHONEMIZER),
-            Some(target::english::PHONEMIZER),
-            Some(target::french::PHONEMIZER),
+            Some(target::diffsinger::FRENCH_NAME),
+            Some(target::diffsinger::ENGLISH_NAME),
+            Some(target::diffsinger::FRENCH_NAME),
         ],
         "each complete word head carries its selected OpenUtau phonemizer"
     );
@@ -159,6 +159,134 @@ fn musescore_score(words: &[&str]) -> String {
     )
 }
 
+#[test]
+fn neutral_adapter_chord_member_inherits_sibling_across_gap_through_export() {
+    let musicxml = r#"<score-partwise version="4.0">
+      <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+      <part id="P1"><measure number="1"><attributes><divisions>480</divisions></attributes>
+        <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><staff>1</staff><lyric><text>the</text></lyric></note>
+        <note><rest/><duration>480</duration><voice>1</voice><staff>1</staff></note>
+        <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><staff>1</staff><lyric><text>hou</text></lyric></note>
+        <note><chord/><pitch><step>E</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><staff>1</staff><lyric><text>hou</text></lyric></note>
+      </measure></part></score-partwise>"#;
+    let musescore = r#"<museScore version="4.0"><Score><Division>480</Division>
+      <Part><Staff id="1"/><trackName>Voice</trackName></Part><Staff id="1"><Measure><voice>
+        <TimeSig><sigN>4</sigN><sigD>4</sigD></TimeSig>
+        <Chord><durationType>quarter</durationType><Lyrics><text>the</text></Lyrics><Note><pitch>60</pitch><tpc>14</tpc></Note></Chord>
+        <Rest><durationType>quarter</durationType></Rest>
+        <Chord><durationType>quarter</durationType><Lyrics><text>hou</text></Lyrics><Note><pitch>60</pitch><tpc>14</tpc></Note><Note><pitch>64</pitch><tpc>18</tpc></Note></Chord>
+      </voice></Measure></Staff></Score></museScore>"#;
+    for (adapter, mut source) in [
+        ("MusicXML", musicxml::parse(musicxml.as_bytes()).unwrap()),
+        ("MuseScore", musescore::parse(musescore.as_bytes()).unwrap()),
+    ] {
+        assert!(
+            source.tracks.len() >= 2,
+            "{adapter} must produce real technical chord-member tracks"
+        );
+        assert_eq!(source.topology.part_count(), 1);
+        assert_eq!(source.topology.staff_count(), 1);
+        assert_eq!(source.topology.voice_count(), 1);
+        for reverse in [false, true] {
+            if reverse {
+                source.tracks.reverse();
+            }
+            let baseline = convert_midi_with_profile(
+                &source,
+                "english",
+                None,
+                ExportTarget::Ustx,
+                PronunciationProfile::Default,
+            );
+            assert!(
+                baseline.ok,
+                "{adapter}, reverse={reverse}: {:?}",
+                baseline.msg
+            );
+            for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+                let outcome = convert(&source, target);
+                let project = outcome.svp.as_ref().unwrap();
+                let mut notes: Vec<_> = project
+                    .tracks
+                    .iter()
+                    .flat_map(|track| &track.notes)
+                    .collect();
+                notes.sort_by_key(|note| (note.onset_ticks, note.pitch));
+                let mut original: Vec<_> = baseline
+                    .svp
+                    .as_ref()
+                    .unwrap()
+                    .tracks
+                    .iter()
+                    .flat_map(|track| &track.notes)
+                    .collect();
+                original.sort_by_key(|note| (note.onset_ticks, note.pitch));
+                assert_eq!(notes.len(), 3, "{adapter}, reverse={reverse}");
+                assert_eq!(notes.len(), original.len());
+                assert!(
+                    notes[0].onset_ticks + notes[0].duration_ticks < notes[1].onset_ticks,
+                    "fixture must contain a real performed gap"
+                );
+                for (note, original) in notes.iter().zip(original) {
+                    assert_eq!(
+                        note.pronunciation_language,
+                        Some(PronunciationLanguage::English),
+                        "{adapter}, reverse={reverse}: {:?}",
+                        source_lyric(note).map(|lyric| &lyric.raw)
+                    );
+                    assert_eq!(
+                        (
+                            note.onset_ticks,
+                            note.duration_ticks,
+                            note.pitch,
+                            &note.source_evidence,
+                            &note.performance
+                        ),
+                        (
+                            original.onset_ticks,
+                            original.duration_ticks,
+                            original.pitch,
+                            &original.source_evidence,
+                            &original.performance
+                        )
+                    );
+                    assert_eq!(source_lyric(note), source_lyric(original));
+                }
+                assert!(
+                    project.tracks.iter().any(|track| track.notes.len() == 1
+                        && track.notes[0].pitch == 64
+                        && source_lyric(&track.notes[0]).unwrap().raw == "hou"),
+                    "neutral-only technical lane survives conversion"
+                );
+                if target == ExportTarget::Ustx {
+                    let exported = ustx::serialize(project).unwrap();
+                    let neutral = exported
+                        .voice_parts
+                        .iter()
+                        .flat_map(|part| &part.notes)
+                        .find(|note| note.tone == 64)
+                        .unwrap();
+                    assert_eq!(
+                        neutral.phonemizer.as_deref(),
+                        Some(target::diffsinger::ENGLISH_NAME)
+                    );
+                    assert!(
+                        String::from_utf8(target::serialize_to(target, project).unwrap())
+                            .unwrap()
+                            .contains(target::diffsinger::ENGLISH_NAME)
+                    );
+                } else {
+                    assert!(
+                        !String::from_utf8(target::serialize_to(target, project).unwrap())
+                            .unwrap()
+                            .contains("phonemizer")
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn push_vlq(out: &mut Vec<u8>, mut value: u32) {
     let mut bytes = [0u8; 5];
     let mut len = 0usize;
@@ -214,6 +342,309 @@ fn automatic_routing_agrees_across_midi_karaoke_musicxml_and_musescore() {
     ];
     for source in &sources {
         assert_french_english_french(source);
+    }
+}
+
+#[test]
+fn four_language_routing_preserves_source_notes_across_all_adapters() {
+    let words = ["bonjour", "beautiful", "hola", "obrigado", "merci"];
+    let expected = [
+        PronunciationLanguage::French,
+        PronunciationLanguage::English,
+        PronunciationLanguage::Spanish,
+        PronunciationLanguage::Portuguese,
+        PronunciationLanguage::French,
+    ];
+    let phonemizers = [
+        target::diffsinger::FRENCH_NAME,
+        target::diffsinger::ENGLISH_NAME,
+        target::diffsinger::SPANISH_NAME,
+        target::diffsinger::PORTUGUESE_NAME,
+        target::diffsinger::FRENCH_NAME,
+    ];
+    let sources = [
+        midi::parse(&midi_score(&words, false)).unwrap(),
+        midi::parse_with_karaoke_profile(&midi_score(&words, true)).unwrap(),
+        musicxml::parse(musicxml_score(&words).as_bytes()).unwrap(),
+        musescore::parse(musescore_score(&words).as_bytes()).unwrap(),
+    ];
+    for (source_index, source) in sources.iter().enumerate() {
+        let baseline = convert_midi_with_profile(
+            source,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            PronunciationProfile::Default,
+        );
+        assert!(baseline.ok);
+        let automatic = convert(source, ExportTarget::Ustx);
+        let project = automatic.svp.as_ref().unwrap();
+        assert_eq!(head_languages(project), expected);
+        let identities = |project: &ProjectedProject| {
+            project
+                .tracks
+                .iter()
+                .flat_map(|track| &track.notes)
+                .map(|note| {
+                    (
+                        note.onset_ticks,
+                        note.duration_ticks,
+                        note.pitch,
+                        note.source_evidence.clone(),
+                        note.performance.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            identities(project),
+            identities(baseline.svp.as_ref().unwrap())
+        );
+        let native = ustx::serialize(project).unwrap();
+        assert_eq!(native.voice_parts.len(), 1);
+        assert_eq!(
+            native.voice_parts[0]
+                .notes
+                .iter()
+                .map(|note| note.phonemizer.as_deref())
+                .collect::<Vec<_>>(),
+            phonemizers.map(Some)
+        );
+        assert_eq!(native.voice_parts[0].notes[2].lyric, "hola[o l a]");
+        assert_eq!(native.voice_parts[0].notes[3].lyric, "obrigado");
+        if source_index == 0 {
+            if let Some(path) = std::env::var_os("VERSE_OPENUTAU_PRONUNCIATION_FIXTURE") {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .unwrap();
+                file.write_all(ustx::to_yaml(&native).as_bytes()).unwrap();
+            }
+        }
+        let svp = convert(source, ExportTarget::Svp);
+        assert_eq!(head_languages(svp.svp.as_ref().unwrap()), expected);
+        let bytes = target::serialize_to(ExportTarget::Svp, svp.svp.as_ref().unwrap()).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        for forbidden in ["phonemizer", "fr/", "en/", "es/", "pt/"] {
+            assert!(!text.contains(forbidden), "SVP contains {forbidden}");
+        }
+    }
+}
+
+#[test]
+fn external_spanish_portuguese_split_words_preserve_lyrics_holds_and_manual_hints() {
+    for (syllables, word, language, profile, phonemizer) in [
+        (
+            ["Can", "ción!"],
+            "Canción!",
+            PronunciationLanguage::Spanish,
+            PronunciationProfile::SpanishDiffSinger,
+            target::diffsinger::SPANISH_PHONEMIZER,
+        ),
+        (
+            ["Cora", "ção!"],
+            "Coração!",
+            PronunciationLanguage::Portuguese,
+            PronunciationProfile::PortugueseDiffSinger,
+            target::diffsinger::PORTUGUESE_PHONEMIZER,
+        ),
+    ] {
+        let xml = musicxml_score(&syllables)
+            .replacen("<syllabic>single</syllabic>", "<syllabic>begin</syllabic>", 1)
+            .replacen("<syllabic>single</syllabic>", "<syllabic>end</syllabic><extend type=\"start\"/>", 1)
+            .replace("</measure>", "<note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><lyric><extend type=\"stop\"/></lyric></note><note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><lyric><text>manual[custom]</text></lyric></note></measure>");
+        let source = musicxml::parse(xml.as_bytes()).unwrap();
+        for selected in [AUTO, profile] {
+            let outcome =
+                convert_midi_with_profile(&source, "french", None, ExportTarget::Ustx, selected);
+            assert!(outcome.ok, "{:?}", outcome.msg);
+            let project = outcome.svp.as_ref().unwrap();
+            let notes = &project.tracks[0].notes;
+            assert_eq!(notes.len(), 4);
+            for (note, raw) in notes.iter().zip(syllables) {
+                assert_eq!(source_lyric(note).unwrap().raw, raw);
+            }
+            if selected == AUTO {
+                assert!(notes[..3]
+                    .iter()
+                    .all(|note| note.pronunciation_language == Some(language)));
+                assert_eq!(notes[3].pronunciation_language, None);
+            }
+            let native = ustx::serialize(project).unwrap();
+            assert_eq!(native.tracks[0].phonemizer, phonemizer);
+            let sung = &native.voice_parts[0].notes;
+            assert_eq!(
+                sung.iter()
+                    .map(|note| note.lyric.as_str())
+                    .collect::<Vec<_>>(),
+                [word, "+", "+~", "manual[custom]"]
+            );
+            if selected == AUTO {
+                let name = if language == PronunciationLanguage::Spanish {
+                    target::diffsinger::SPANISH_NAME
+                } else {
+                    target::diffsinger::PORTUGUESE_NAME
+                };
+                assert_eq!(sung[0].phonemizer.as_deref(), Some(name));
+                assert!(sung[1..].iter().all(|note| note.phonemizer.is_none()));
+            }
+        }
+    }
+}
+
+#[test]
+fn external_exact_split_words_emit_mfa_hints() {
+    assert_exact_split_word_layout(false);
+}
+
+#[test]
+fn external_exact_split_words_reject_mismatched_syllable_attacks() {
+    assert_exact_split_word_layout(true);
+}
+
+fn assert_exact_split_word_layout(mismatch: bool) {
+    for (syllables, mismatched, raw_word, hint, language, profile, phonemizer, name) in [
+        (
+            ["Ho", "la!"],
+            ["H", "o", "la!"],
+            "Hola!",
+            "hola[o l a]",
+            PronunciationLanguage::Spanish,
+            PronunciationProfile::SpanishDiffSinger,
+            target::diffsinger::SPANISH_PHONEMIZER,
+            target::diffsinger::SPANISH_NAME,
+        ),
+        (
+            ["A", "cho"],
+            ["A", "c", "ho"],
+            "Acho",
+            "acho[a S u]",
+            PronunciationLanguage::Portuguese,
+            PronunciationProfile::PortugueseDiffSinger,
+            target::diffsinger::PORTUGUESE_PHONEMIZER,
+            target::diffsinger::PORTUGUESE_NAME,
+        ),
+    ] {
+        let fragments = if mismatch {
+            &mismatched[..]
+        } else {
+            &syllables[..]
+        };
+        // A Portuguese anchor supplies passage ownership for shared spelling `acho`.
+        let mut words = fragments.to_vec();
+        words.push(if language == PronunciationLanguage::Portuguese {
+            "obrigado"
+        } else {
+            "hola"
+        });
+        let mut xml = musicxml_score(&words);
+        for index in 0..fragments.len() {
+            let state = if index == 0 {
+                "begin"
+            } else if index + 1 == fragments.len() {
+                "end"
+            } else {
+                "middle"
+            };
+            xml = xml.replacen(
+                "<syllabic>single</syllabic>",
+                &format!("<syllabic>{state}</syllabic>"),
+                1,
+            );
+        }
+        let source = musicxml::parse(xml.as_bytes()).unwrap();
+        let baseline = convert_midi_with_profile(
+            &source,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            PronunciationProfile::Default,
+        );
+        assert!(baseline.ok);
+        for selected in [AUTO, profile] {
+            let outcome =
+                convert_midi_with_profile(&source, "english", None, ExportTarget::Ustx, selected);
+            assert!(outcome.ok, "{selected:?}: {:?}", outcome.msg);
+            let project = outcome.svp.as_ref().unwrap();
+            assert_eq!(project.tracks[0].notes.len(), words.len());
+            let notes = &project.tracks[0].notes[..fragments.len()];
+            for ((note, original), raw) in notes
+                .iter()
+                .zip(&baseline.svp.as_ref().unwrap().tracks[0].notes)
+                .zip(fragments)
+            {
+                let evidence = source_lyric(note).unwrap();
+                let original_lyric = source
+                    .tracks
+                    .iter()
+                    .flat_map(|track| &track.events)
+                    .filter_map(|event| match &event.kind {
+                        midi::Kind::NoteOn(note) => Some(&note.lyrics),
+                        _ => None,
+                    })
+                    .flatten()
+                    .find(|lyric| lyric.id == evidence.id)
+                    .unwrap();
+                assert_eq!(evidence, original_lyric);
+                assert_eq!(source_lyric(note).unwrap().raw, *raw);
+                assert_eq!(
+                    (note.onset_ticks, note.duration_ticks, note.pitch),
+                    (
+                        original.onset_ticks,
+                        original.duration_ticks,
+                        original.pitch
+                    )
+                );
+                assert_eq!(note.source_evidence, original.source_evidence);
+                assert_eq!(note.performance, original.performance);
+                if selected == AUTO {
+                    assert_eq!(note.pronunciation_language, Some(language));
+                }
+            }
+            let diagnostics: Vec<_> = outcome
+                .tracks
+                .iter()
+                .flat_map(|track| &track.warnings)
+                .collect();
+            let expected_code = if mismatch {
+                target::diffsinger::SYLLABLE_MISMATCH
+            } else {
+                target::diffsinger::APPLIED
+            };
+            let diagnostic = diagnostics
+                .iter()
+                .find(|d| d.code == expected_code)
+                .expect("word-head pronunciation diagnostic");
+            assert!(diagnostic.source_id.is_some());
+            let forbidden = if mismatch {
+                target::diffsinger::APPLIED
+            } else {
+                target::diffsinger::SYLLABLE_MISMATCH
+            };
+            assert!(!diagnostics
+                .iter()
+                .any(|d| d.code == forbidden && d.source_id == diagnostic.source_id));
+            let native = ustx::serialize(project).unwrap();
+            assert_eq!(native.tracks[0].phonemizer, phonemizer);
+            assert_eq!(native.voice_parts[0].notes.len(), words.len());
+            let sung = &native.voice_parts[0].notes[..fragments.len()];
+            assert_eq!(sung[0].lyric, if mismatch { raw_word } else { hint });
+            assert!(sung[1..]
+                .iter()
+                .all(|note| note.lyric == "+" && note.phonemizer.is_none()));
+            assert_eq!(
+                sung[0].phonemizer.as_deref(),
+                if selected == AUTO { Some(name) } else { None }
+            );
+            for (index, note) in sung.iter().enumerate() {
+                assert_eq!(
+                    (note.position, note.duration, note.tone),
+                    (index as i32 * 480, 480, 60)
+                );
+            }
+        }
     }
 }
 

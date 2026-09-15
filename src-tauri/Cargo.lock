@@ -1780,6 +1780,8 @@ dependencies = [
  "itertools",
  "lingua-english-language-model",
  "lingua-french-language-model",
+ "lingua-portuguese-language-model",
+ "lingua-spanish-language-model",
  "maplit",
  "rayon",
  "regex",
@@ -1804,6 +1806,24 @@ name = "lingua-french-language-model"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "45508227e42c9cc5eb202e17c4c40e38ea7b9be9421faeb3ab0fb7ac37d9c681"
+dependencies = [
+ "include_dir",
+]
+
+[[package]]
+name = "lingua-portuguese-language-model"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "432eda7984456055033ffa168037be9afe0f5c9ecd891bf5f27435247d496b47"
+dependencies = [
+ "include_dir",
+]
+
+[[package]]
+name = "lingua-spanish-language-model"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56395a8d96c892130a9efb433c5f042977fb75ae5fb6e0058c8814a947459137"
 dependencies = [
  "include_dir",
 ]

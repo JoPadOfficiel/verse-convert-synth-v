@@ -22,13 +22,18 @@ Some Rust tests are ignored by design:
 Ignored private tests are not optional once explicitly requested. They fail if
 their required fixtures are missing. Copyrighted fixtures remain outside Git.
 
-The mixed French/English integration gate is
+The four-language pronunciation integration gate is
 `src-tauri/tests/mixed_languages.rs`. Its committed fixtures cover MIDI, Soft
-Karaoke, MusicXML and native MuseScore with FR–EN–FR switching, OpenUtau
-per-note phonemizer overrides and track fallback, SynthV split-word/metadata
-isolation, geometry conservation and a French-liaison language boundary. The
-router's focused unit suite in `engine/language.rs` covers ambiguous short
-words, proper names, neutral vocalises, malformed/incomplete fragments,
+Karaoke, MusicXML and native MuseScore with French, English, Spanish and
+Portuguese routing, OpenUtau per-note phonemizer overrides and track fallback,
+SynthV split-word/metadata isolation, geometry conservation and a
+French-liaison language boundary. Spanish/Portuguese cases verify pinned MFA
+pronunciation lookup, exact-only lowering into the documented DiffSinger base
+inventories, fail-closed regional/phone ambiguity, per-note phonemizer routing,
+and source-word preservation when no exact hint can be emitted. The router's
+focused unit suite in `engine/language.rs`
+covers monolingual passages in all four languages, mixed passages, ambiguous
+short words, proper names, neutral vocalises, malformed/incomplete fragments,
 continuations and context across source-domain boundaries. The private
 development oracle is ignored because the two supplied MSCZ masters are
 copyrighted and are not checked into the repository.
@@ -43,12 +48,28 @@ VERSE_MIXED_LANGUAGE_CORPUS_DIR=/path/to/private-masters \
   -- --ignored
 ```
 
-The private masters are SHA-256 pinned and the gate compares every sung word
-head against a human-readable editorial oracle derived from each master's
+Corrective acceptance also covers shared inflected words (`une` in Spanish and
+Portuguese), punctuation-free four-language switches, and same-source sibling
+context for neutral technical chord lanes. `output_tests::automatic_acceptance`
+executes actual multi-file `convert_files` dispatch in reordered batches and
+checks independent Parts/verse rows, direct exports and bundle exports for both
+SVP and USTX. These tests compare source geometry and language metadata rather
+than treating a successful command as sufficient proof.
+
+The native compatibility gate additionally calls the pinned phonemizer's
+`SetSinger`, `SetUp` and `Process` using exact hints produced by Verse. Synthetic
+bank inventories exercise bare/prefixed Spanish allophones and Portuguese phones,
+plus missing duration/acoustic symbols. Tiny untrained model fixtures supply
+timing scaffolding; this gate does not assert audible quality or regional accent.
+
+The private masters are SHA-256 pinned and the gate compares eligible sung lyric
+records, including unresolved fragments, against a human-readable editorial oracle derived from each master's
 source staff, measure, verse and lyric ownership. Continuation and geometry
 conservation are covered separately by committed structural regressions. Audible
-bilingual quality still requires opening the exported project with a compatible
-multilingual DiffSinger bank and listening across the language boundaries.
+multilingual quality still requires opening the exported project with compatible
+DiffSinger banks and listening across the language boundaries. Portuguese
+Brazil/Portugal acoustic differences are singer-dependent and are not claimed by
+the structural gate.
 
 ## Required quality gates
 
@@ -75,7 +96,7 @@ The CI
 environment uses Node 22, .NET 10, Rust 1.93.0, an immutable npm install, the
 locked Cargo dependency graph, and Ubuntu 22.04 native Tauri dependencies.
 
-The browser gate retains all 31 rendered application cases and four full page
+The browser gate retains all 46 rendered application cases and six full page
 reloads, with native Tauri IPC/dialogs mocked. It requires a complete passing
 receipt; assertion, navigation, receipt, startup, and cleanup failures remain
 blocking. The lifecycle regression tests also exercise slow startup, process

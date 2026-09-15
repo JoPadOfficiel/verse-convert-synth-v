@@ -420,7 +420,7 @@ for (const [name, tests, reloads] of [
   test(`incomplete successful receipt fails closed: ${name}`, async (t) => {
     const result = await runHarness(t, { page: receiptPage({ passed: true, tests, reloads }) });
     assert.equal(result.code, 1);
-    assert.match(result.output, /Incomplete browser receipt: expected 31 passing cases and 4 reloads/);
+    assert.match(result.output, /Incomplete browser receipt: expected 46 passing cases and 6 reloads/);
   });
 }
 

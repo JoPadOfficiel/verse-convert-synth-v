@@ -28,7 +28,19 @@ grep -Fq 'PhonemizerFactory.GetAll().FirstOrDefault(f => f.name == note.Phonemiz
   "$WORK/OpenUtau.Core/Ustx/UPart.cs"
 git -C "$WORK" apply --check --ignore-space-change "$PATCH"
 git -C "$WORK" apply --ignore-space-change "$PATCH"
+cp "$ROOT/compat/openutau/NativePronunciationTest.cs" "$WORK/OpenUtau.Test/App/NativePronunciationTest.cs"
+export VERSE_OPENUTAU_EXACT_HINT_FIXTURE="$WORK/verse-exact-mfa-hints.tsv"
+# Rust applies the pinned lexical evidence; native tests consume those results
+# with a synthetic singer and embedded, untrained ONNX timing scaffolds.
+# This verifies symbols and inventory failures, never acoustic quality. The stock
+# consumer has no Spanish+ context rewrite or exact missing-phone substitution.
+cargo test --manifest-path "$ROOT/src-tauri/Cargo.toml" --locked --lib \
+  engine::target::diffsinger::tests::
+test -s "$VERSE_OPENUTAU_EXACT_HINT_FIXTURE"
+export VERSE_OPENUTAU_PRONUNCIATION_FIXTURE="$WORK/verse-four-languages.ustx"
+cargo test --manifest-path "$ROOT/src-tauri/Cargo.toml" --locked \
+  --test mixed_languages four_language_routing_preserves_source_notes_across_all_adapters -- --exact
 dotnet test "$WORK/OpenUtau.Test/OpenUtau.Test.csproj" \
-  --filter FullyQualifiedName~NoteLyricDisplayTest \
+  --filter 'FullyQualifiedName~NoteLyricDisplayTest|FullyQualifiedName~NativePronunciationTest' \
   --disable-build-servers \
   -p:EmbeddedResourceUseDependentUponConvention=false

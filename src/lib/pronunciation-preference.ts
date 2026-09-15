@@ -2,20 +2,23 @@ import type { PronunciationProfile } from "@/lib/tauri";
 
 const PROFILE_KEY = "verse.pronunciationProfile";
 
-/** Restore only an explicit supported choice; never infer a score's language. */
+/** Restore a supported choice; a fresh installation starts with offline Automatic. */
 export function storedPronunciationProfile(): PronunciationProfile {
   try {
     const value = localStorage.getItem(PROFILE_KEY);
+    if (value === "automaticFrenchEnglish") return "automatic";
     if (
-      value === "automaticFrenchEnglish" ||
+      value === "automatic" ||
       value === "frenchMillefeuille" ||
       value === "englishArpabet" ||
+      value === "spanishDiffSinger" ||
+      value === "portugueseDiffSinger" ||
       value === "default"
     ) return value;
   } catch {
     // Unavailable storage must not prevent the application from opening.
   }
-  return "default";
+  return "automatic";
 }
 
 /** Called only after the selected profile's analysis has been accepted. */

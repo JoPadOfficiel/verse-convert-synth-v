@@ -155,7 +155,7 @@ pub struct UstxNote {
     pub tone: u8,
     pub lyric: String,
     /// OpenUtau 0.1.569+ persists `UNote.PhonemizerOverride` as the YAML member
-    /// `phonemizer` (`OpenUtau.Core/Ustx/UNote.cs:24-25`). Automatic FR+EN writes
+    /// `phonemizer` (`OpenUtau.Core/Ustx/UNote.cs:24-25`). Automatic FR+EN+ES+PT writes
     /// this only on word heads; continuation notes inherit their owner's choice.
     pub phonemizer: Option<String>,
     pub pitch: UstxPitch,
@@ -404,7 +404,13 @@ fn exact_ustx_ticks(ticks: u32, ticks_per_beat: u16, context: &str) -> Result<i3
 /// state cannot silently fall into a wrong marker.
 fn lyric_text(lyric: &ProjectedLyric) -> String {
     match lyric {
-        ProjectedLyric::Pronounced { text, phonemes, .. } => format!("{text}[{phonemes}]"),
+        ProjectedLyric::Pronounced { text, phonemes, .. } => {
+            if phonemes.is_empty() {
+                text.clone()
+            } else {
+                format!("{text}[{phonemes}]")
+            }
+        }
         ProjectedLyric::PronouncedSplit { .. } => "+".into(),
         ProjectedLyric::Source(source) => match &source.state {
             LyricState::Text(text) => text.clone(),
@@ -578,10 +584,16 @@ pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
                 super::PronunciationProfile::Default => DEFAULT_PHONEMIZER,
                 super::PronunciationProfile::FrenchMillefeuille => super::french::PHONEMIZER,
                 super::PronunciationProfile::EnglishArpabet => super::english::PHONEMIZER,
+                super::PronunciationProfile::SpanishDiffSinger => {
+                    super::diffsinger::SPANISH_PHONEMIZER
+                }
+                super::PronunciationProfile::PortugueseDiffSinger => {
+                    super::diffsinger::PORTUGUESE_PHONEMIZER
+                }
                 // Older OpenUtau builds that predate per-note overrides still
                 // get a deterministic passage fallback. On 0.1.569+ every
                 // classified word head below states the exact override.
-                super::PronunciationProfile::AutomaticFrenchEnglish => track
+                super::PronunciationProfile::Automatic => track
                     .notes
                     .iter()
                     .find_map(|note| note.pronunciation_language)
@@ -854,7 +866,7 @@ fn serialize_note(
             }
             (
                 ProjectedLyric::Source(source),
-                PronunciationProfile::AutomaticFrenchEnglish,
+                PronunciationProfile::Automatic,
                 Some(crate::engine::projection::PronunciationLanguage::French),
             ) => match &source.state {
                 LyricState::Text(text) => french_syllable_text(text),
@@ -862,11 +874,11 @@ fn serialize_note(
             },
             _ => lyric_text(&note.lyric),
         },
-        phonemizer: if profile == PronunciationProfile::AutomaticFrenchEnglish
+        phonemizer: if profile == PronunciationProfile::Automatic
             && !note.lyric.continues_previous_note()
         {
             note.pronunciation_language
-                .map(phonemizer_for_language)
+                .map(phonemizer_name_for_language)
                 .map(str::to_string)
         } else {
             None
@@ -882,6 +894,24 @@ fn phonemizer_for_language(
     match language {
         crate::engine::projection::PronunciationLanguage::French => super::french::PHONEMIZER,
         crate::engine::projection::PronunciationLanguage::English => super::english::PHONEMIZER,
+        crate::engine::projection::PronunciationLanguage::Spanish => {
+            super::diffsinger::SPANISH_PHONEMIZER
+        }
+        crate::engine::projection::PronunciationLanguage::Portuguese => {
+            super::diffsinger::PORTUGUESE_PHONEMIZER
+        }
+    }
+}
+
+fn phonemizer_name_for_language(
+    language: crate::engine::projection::PronunciationLanguage,
+) -> &'static str {
+    use crate::engine::projection::PronunciationLanguage;
+    match language {
+        PronunciationLanguage::French => super::diffsinger::FRENCH_NAME,
+        PronunciationLanguage::English => super::diffsinger::ENGLISH_NAME,
+        PronunciationLanguage::Spanish => super::diffsinger::SPANISH_NAME,
+        PronunciationLanguage::Portuguese => super::diffsinger::PORTUGUESE_NAME,
     }
 }
 

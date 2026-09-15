@@ -27,7 +27,7 @@ const api = await load("../src/lib/tauri.ts", {
 });
 
 test("analysis, direct and bundle adapters carry one explicit pronunciation selection", async () => {
-  for (const profile of ["default", "automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet"]) {
+  for (const profile of ["default", "automatic", "frenchMillefeuille", "englishArpabet", "spanishDiffSinger", "portugueseDiffSinger"]) {
     calls.length = 0;
     await api.convertFiles(["/tmp/song.mscz"], false, "english", undefined, undefined, "ustx", profile);
     await api.exportVocalsWithDialog({ path: "/tmp/song.mscz" }, "english", undefined, "ustx", profile);
@@ -41,10 +41,13 @@ test("analysis, direct and bundle adapters carry one explicit pronunciation sele
   }
 });
 
-test("omitting pronunciation preserves the default adapter contract", async () => {
+test("omitting pronunciation selects Automatic consistently in every adapter", async () => {
   calls.length = 0;
   await api.convertFiles(["/tmp/song.mscz"], false);
-  assert.equal(calls[0].payload.pronunciationProfile, "default");
+  await api.exportVocalsWithDialog({ path: "/tmp/song.mscz" }, "english");
+  await api.exportBundle({ path: "/tmp/song.mscz" }, "/tmp/song.versebundle", "english");
+  assert.equal(calls.length, 3);
+  for (const call of calls) assert.equal(call.payload.pronunciationProfile, "automatic");
   assert.equal(calls[0].payload.exportTarget, "svp");
 });
 
@@ -75,9 +78,11 @@ function reanalysisHarness(convertFiles, initialProfile = "default") {
 }
 
 for (const [profile, unsupported] of [
-  ["automaticFrenchEnglish", "AUTOMATIC_LANGUAGE_LOW_CONFIDENCE"],
+  ["automatic", "AUTOMATIC_LANGUAGE_LOW_CONFIDENCE"],
   ["frenchMillefeuille", "FRENCH_PRONUNCIATION_UNSUPPORTED"],
   ["englishArpabet", "ENGLISH_PRONUNCIATION_UNSUPPORTED"],
+  ["spanishDiffSinger", "DIFFSINGER_PRONUNCIATION_INCOMPLETE_WORD"],
+  ["portugueseDiffSinger", "DIFFSINGER_PRONUNCIATION_INCOMPLETE_WORD"],
 ]) {
 test(`${profile}: same-target pronunciation change waits for reanalysis and adopts returned per-file verdicts`, async () => {
   let resolve;
@@ -127,7 +132,7 @@ test(`${profile}: unchanged selection or the active busy guard prevents another 
 }
 
 test("choosing a profile before import is remembered without running an analysis", async () => {
-  for (const profile of ["automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet", "default"]) {
+  for (const profile of ["automatic", "frenchMillefeuille", "englishArpabet", "spanishDiffSinger", "portugueseDiffSinger", "default"]) {
     const previous = profile === "default" ? "frenchMillefeuille" : "default";
     const { state, change } = reanalysisHarness(async () => assert.fail("no files to analyse"), previous);
     state.items.length = 0;
@@ -164,18 +169,22 @@ test("pronunciation preference survives restart, rejects stale values and tolera
       setItem: (key, value) => values.set(key, value),
     } });
     const preference = await load("../src/lib/pronunciation-preference.ts");
-    assert.equal(preference.storedPronunciationProfile(), "default");
-    for (const profile of ["automaticFrenchEnglish", "frenchMillefeuille", "englishArpabet", "default"]) {
+    assert.equal(preference.storedPronunciationProfile(), "automatic");
+    for (const profile of ["automatic", "frenchMillefeuille", "englishArpabet", "spanishDiffSinger", "portugueseDiffSinger", "default"]) {
       preference.storePronunciationProfile(profile);
       const restarted = await load("../src/lib/pronunciation-preference.ts");
       assert.equal(restarted.storedPronunciationProfile(), profile);
     }
+    values.set("verse.pronunciationProfile", "automaticFrenchEnglish");
+    assert.equal(preference.storedPronunciationProfile(), "automatic");
+    preference.storePronunciationProfile(preference.storedPronunciationProfile());
+    assert.equal(values.get("verse.pronunciationProfile"), "automatic");
     for (const value of ["unknown", "French", "", "null"]) {
       values.set("verse.pronunciationProfile", value);
-      assert.equal(preference.storedPronunciationProfile(), "default");
+      assert.equal(preference.storedPronunciationProfile(), "automatic");
     }
     Object.defineProperty(globalThis, "localStorage", { configurable: true, get() { throw new Error("storage disabled"); } });
-    assert.equal(preference.storedPronunciationProfile(), "default");
+    assert.equal(preference.storedPronunciationProfile(), "automatic");
     assert.doesNotThrow(() => preference.storePronunciationProfile("frenchMillefeuille"));
   } finally {
     if (original) Object.defineProperty(globalThis, "localStorage", original);
