@@ -5,6 +5,19 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.8.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.5...v0.8.0) (2026-09-15)
+
+
+### Features
+
+* add automatic four-language pronunciation ([47b7791](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/47b779148b819dff6014c01b9e228470242fd86b))
+* add Spanish and Portuguese automatic pronunciation ([7eebd21](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/7eebd2161c6a76244fbf932ae918d85697a0abf8))
+
+
+### Bug Fixes
+
+* preserve multilingual pronunciation context ([43edb08](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/43edb08cd0188c77979adef841c04112d17706b2))
+
 ## [0.7.5](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.4...v0.7.5) (2026-09-14)
 
 

@@ -1,6 +1,6 @@
 [package]
 name = "verse"
-version = "0.7.5"
+version = "0.8.0"
 default-run = "verse"
 description = "Convert karaoke, MIDI and score files into Synthesizer V or OpenUtau projects with real lyrics"
 authors = ["JoPadOfficiel"]
