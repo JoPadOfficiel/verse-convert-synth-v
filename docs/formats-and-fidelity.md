@@ -73,8 +73,21 @@ lyric lane. The router runs locally and offline. The application bundles Lingua
 model download, external binary or network classification service. Verse
 reconstructs complete source-attested words first, combines Lingua confidence
 with local lexical evidence and neighboring words, then decodes one
-deterministic language sequence across the passage. A short homograph or neutral
-vocalise therefore cannot switch a phrase solely from its spelling.
+deterministic language sequence across the passage. Shared words are checked
+against both membership and pronunciation dictionaries so inflected ES/PT forms
+are not mistaken for exclusive French anchors. Established phrase context
+constrains ambiguous switches, including text without punctuation. Neutral
+technical chord-member tracks can inherit context only from their original
+Part/staff/voice, playback occurrence/segment and lyric row. Only complete word
+heads provide donor evidence; every syllable and proven continuation retains
+its owning word's decision. Manual hints and conflicting source text bound the
+context search.
+This routing does not copy lyrics or notes between tracks.
+
+Lingua is a statistical language detector, not a generative LLM. Its scores are
+context evidence, not calibrated guarantees of correct pronunciation. A comparison
+with the previously investigated compact fastText model is recorded in
+[Automatic language models](automatic-language-models.md).
 
 French and English lexical resources also contain pinned pronunciation data for
 Verse's existing explicit pronunciation passes. The generated Spanish and
@@ -964,6 +977,36 @@ MFA phone strings and dialect membership verbatim after Unicode normalization.
 The runtime mapping accepts only reviewed exact correspondences into OpenUtau's
 base DiffSinger alphabets. A matching alphabet establishes symbol compatibility,
 not perfect pronunciation or acoustic quality for every bank.
+Spanish `B`/`D`/`G` hints preserve the allophones explicitly attested in the
+pinned MFA word reading; Verse does not run the separate community Spanish+
+contextual rewrite algorithm. The stock OpenUtau Spanish phonemizer accepts
+those symbols but does not select them from neighboring-word context.
+
+Verse exports without selecting a singer or knowing its inventories. Once the
+user assigns a singer in OpenUtau, the native consumer checks explicit hints
+against both dictionary symbol definitions and the duration model's vocabulary,
+trying the bare symbol before its `es/` or `pt/` form. A missing symbol makes
+public phonemization fail with an unrecognized-phoneme error; an explicit hint
+does not fall back to the word dictionary or an approximate replacement. The
+acoustic model has an independent vocabulary and can reject a symbol even after
+phonemization succeeds. Verse therefore cannot promise an exact fallback for
+missing bank symbols and does not suppress evidence-backed hints based on a
+hypothetical singer. This differs from an MFA reading that Verse cannot lower
+exactly: that case retains source spelling without an explicit hint and reports
+a stable diagnostic.
+
+These behaviors are pinned to OpenUtau
+[`3f213e8993ca792c3e6f8958c92ab27eae78eac5`](https://github.com/openutau/OpenUtau/tree/3f213e8993ca792c3e6f8958c92ab27eae78eac5):
+[`DiffSingerSpanishPhonemizer`](https://github.com/openutau/OpenUtau/blob/3f213e8993ca792c3e6f8958c92ab27eae78eac5/OpenUtau.Core/DiffSinger/Phonemizers/DiffSingerSpanishPhonemizer.cs),
+[`DiffSingerBasePhonemizer`](https://github.com/openutau/OpenUtau/blob/3f213e8993ca792c3e6f8958c92ab27eae78eac5/OpenUtau.Core/DiffSinger/DiffSingerBasePhonemizer.cs),
+[`MachineLearningPhonemizer.Process`](https://github.com/openutau/OpenUtau/blob/3f213e8993ca792c3e6f8958c92ab27eae78eac5/OpenUtau.Core/MachineLearningPhonemizer.cs),
+and [`DiffSingerSinger.PhonemeTokenize`](https://github.com/openutau/OpenUtau/blob/3f213e8993ca792c3e6f8958c92ab27eae78eac5/OpenUtau.Core/DiffSinger/DiffSingerSinger.cs).
+The native compatibility gate exercises `SetSinger`, `SetUp`, and `Process`
+with Verse's actual MFA hint results and a synthetic singer inventory. Tiny,
+untrained ONNX fixtures supply timing scaffolding only. This verifies symbol
+consumption and inventory errors, not real-bank audio, natural timing, regional
+accent, or singing quality; no speaker or acoustic models are downloaded.
+
 See [the DiffSinger guide](openutau-diffsinger-guide.fr.md) for bank selection,
 GENC, voice colours and the remaining expression-fidelity scope.
 

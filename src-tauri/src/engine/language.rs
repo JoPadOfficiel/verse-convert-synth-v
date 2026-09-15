@@ -59,6 +59,53 @@ pub struct Route {
     pub languages: Vec<Option<PronunciationLanguage>>,
     pub diagnostics: Vec<Diagnostic>,
     inherit_passage: Vec<bool>,
+    words: Vec<RoutedWord>,
+}
+
+#[derive(Clone, Debug)]
+struct RoutedWord {
+    members: Vec<usize>,
+    contextual: bool,
+    complete: bool,
+}
+
+impl RoutedWord {
+    fn is_donor(&self) -> bool {
+        self.complete && !self.contextual
+    }
+}
+
+fn playback_segment(note: &ProjectedNote) -> Option<u32> {
+    note.source_evidence
+        .as_ref()?
+        .origin
+        .as_ref()?
+        .source
+        .continuity
+        .as_ref()
+        .map(|continuity| continuity.playback_segment)
+}
+
+fn same_continuation_domain(head: &ProjectedNote, tail: &ProjectedNote) -> bool {
+    let domain = |note: &ProjectedNote| {
+        note.source_evidence
+            .as_ref()
+            .and_then(|e| e.origin.as_ref())
+            .map(|origin| {
+                (
+                    origin.source.part_id.clone(),
+                    origin.source.staff_id.clone(),
+                    origin.source.voice.clone(),
+                    origin.source.occurrence,
+                    playback_segment(note),
+                )
+            })
+    };
+    let row = |note: &ProjectedNote| {
+        lexical::source(&note.lyric).map(|source| (source.verse, source.lane.clone()))
+    };
+    domain(head) == domain(tail)
+        && row(tail).is_none_or(|tail_row| row(head).is_some_and(|head_row| head_row == tail_row))
 }
 
 fn detector() -> &'static LanguageDetector {
@@ -113,8 +160,8 @@ fn lexical_membership(key: &str) -> [bool; 4] {
     [
         french::contains_lexeme(key),
         english::contains_lexeme(key),
-        spanish::contains_lexeme(key),
-        portuguese::contains_lexeme(key),
+        spanish::contains_lexeme(key) || spanish::has_pronunciation(key),
+        portuguese::contains_lexeme(key) || portuguese::has_pronunciation(key),
     ]
 }
 
@@ -313,6 +360,7 @@ impl Unit {
 fn extend_language_scores(units: &mut [Unit], notes: &[ProjectedNote]) {
     let keys: Vec<_> = units.iter().map(|unit| unit.key.clone()).collect();
     let boundaries: Vec<_> = units.iter().map(|unit| unit.boundary_after).collect();
+    let heads: Vec<_> = units.iter().map(|unit| unit.members[0]).collect();
     let mut cache = HashMap::new();
     for (index, unit) in units.iter_mut().enumerate() {
         let start = (0..index)
@@ -399,6 +447,32 @@ fn extend_language_scores(units: &mut [Unit], notes: &[ProjectedNote]) {
             spanish_odds += 1.5 * vote * strength;
             family_odds += 0.65 * vote.abs() * strength;
         }
+        // Shared content words usually finish the preceding phrase, while
+        // a grammatical connector may begin the following one. Retain both
+        // directions instead of overwriting a new phrase with a backward window.
+        if ambiguous && membership[2] && membership[3] {
+            let forward = if shared_romance_word(&unit.key) && index + 1 < end {
+                let text = keys[index..(index + 3).min(end)].join(" ");
+                let scores = *cache
+                    .entry(text.clone())
+                    .or_insert_with(|| multilingual_scores(&text));
+                (scores[2].max(scores[3]) > 0.75).then_some(log_odds(scores[2], scores[3]))
+            } else {
+                None
+            };
+            let backward = if index > start {
+                let text = keys[index.saturating_sub(2).max(start)..=index].join(" ");
+                let scores = *cache
+                    .entry(text.clone())
+                    .or_insert_with(|| multilingual_scores(&text));
+                (scores[2].max(scores[3]) > 0.75).then_some(log_odds(scores[2], scores[3]))
+            } else {
+                None
+            };
+            if let Some(odds) = forward.or(backward) {
+                spanish_odds = odds;
+            }
+        }
         let normalizer = unit.french_score.max(unit.english_score);
         unit.french_score -= normalizer;
         unit.english_score -= normalizer;
@@ -412,7 +486,68 @@ fn extend_language_scores(units: &mut [Unit], notes: &[ProjectedNote]) {
             unit.inherit_passage = false;
             unit.local_uncertain = ranked[0] - ranked[1] < 0.3;
         }
-        if let Some(anchor) = automatic_anchor(&unit.key) {
+        // Dictionary overlap alone cannot justify an FR/EN prior. Use
+        // positive, independent words from the same lyric row. A rest or
+        // punctuation can isolate a repeated refrain, so consult its adjacent
+        // passage when that span contains no independent word at all.
+        let mut independent: Vec<_> = keys[start..end]
+            .iter()
+            .filter(|key| *key != &unit.key)
+            .cloned()
+            .collect();
+        if independent.is_empty() {
+            let row = lexical::source(&notes[unit.members[0]].lyric)
+                .map(|source| (&source.lane, source.verse));
+            let head = unit.members[0];
+            let same_row = |other: usize| {
+                let other_head = heads[other];
+                lexical::source(&notes[other_head].lyric).map(|source| (&source.lane, source.verse))
+                    == row
+                    && playback_segment(&notes[head]) == playback_segment(&notes[other_head])
+                    && !(head.min(other_head)..=head.max(other_head))
+                        .any(|index| carries_manual_hint(&notes[index]))
+            };
+            let mut previous: Vec<_> = (0..index)
+                .rev()
+                .filter(|&other| keys[other] != unit.key && same_row(other))
+                .take(2)
+                .collect();
+            previous.reverse();
+            let next = ((index + 1)..keys.len())
+                .filter(|&other| keys[other] != unit.key && same_row(other))
+                .take(2);
+            for other in previous.into_iter().chain(next) {
+                independent.push(keys[other].clone());
+            }
+        }
+        if (membership[0] || membership[1]) && lexical_match_count > 1 && !independent.is_empty() {
+            let contrary = independent.join(" ");
+            let scores = *cache
+                .entry(contrary.clone())
+                .or_insert_with(|| multilingual_scores(&contrary));
+            let romance_anchor = independent.iter().any(|key| {
+                matches!(
+                    automatic_anchor(key),
+                    Some(PronunciationLanguage::Spanish | PronunciationLanguage::Portuguese)
+                )
+            });
+            if scores[0] + scores[1] > 0.65 && !romance_anchor {
+                unit.spanish_score = unit.spanish_score.min(-1.0);
+                unit.portuguese_score = unit.portuguese_score.min(-1.0);
+            }
+        }
+        if let Some(anchor) = automatic_anchor(&unit.key).filter(|anchor| {
+            // Inflected forms absent from Hunspell roots can still be genuine
+            // Romance words in the pronunciation dictionaries. A complete
+            // sentence may disambiguate them against their function-word prior.
+            !(matches!(
+                anchor,
+                PronunciationLanguage::French | PronunciationLanguage::English
+            ) && (membership[2] || membership[3])
+                && own[anchor.index()] < 0.7
+                && family_odds > 1.0
+                && keys[start..end].iter().any(|key| key != &unit.key))
+        }) {
             let mut scores = [-12.0; 4];
             scores[anchor.index()] = 12.0;
             [
@@ -539,6 +674,165 @@ fn starts_capitalized(note: &ProjectedNote) -> bool {
 fn carries_manual_hint(note: &ProjectedNote) -> bool {
     lexical::raw_text(&note.lyric)
         .is_some_and(|text| text.contains(['[', ']']) || text.trim_start().starts_with(['+', '?']))
+}
+
+fn context_barrier(note: &ProjectedNote) -> bool {
+    carries_manual_hint(note)
+        || note
+            .source_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.origin.as_ref())
+            .is_some_and(|origin| origin.lyric_conflict)
+}
+
+/// Technical chord-member tracks can contain no lexical evidence of their own.
+/// Share only a language decision from the same original source domain and
+/// lyric row; no text, note or word membership moves between tracks.
+pub fn route_tracks(tracks: &mut [&mut ProjectedTrack]) -> Vec<Vec<Diagnostic>> {
+    let routed: Vec<_> = tracks
+        .iter_mut()
+        .map(|track| route_track_with_inheritance(track))
+        .collect();
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct Domain {
+        part: String,
+        staff: String,
+        voice: String,
+        occurrence: u32,
+        segment: Option<u32>,
+        verse: u32,
+        lane: String,
+    }
+    let domain = |note: &ProjectedNote| -> Option<Domain> {
+        let source = &note.source_evidence.as_ref()?.origin.as_ref()?.source;
+        let lyric = lexical::source(&note.lyric)?;
+        Some(Domain {
+            part: source.part_id.clone()?,
+            staff: source.staff_id.clone()?,
+            voice: source.voice.clone()?,
+            occurrence: source.occurrence,
+            segment: playback_segment(note),
+            verse: lyric.verse,
+            lane: lyric.lane.clone(),
+        })
+    };
+    let mut evidence: HashMap<Domain, Vec<(u32, PronunciationLanguage)>> = HashMap::new();
+    let mut barriers: HashMap<Domain, Vec<u32>> = HashMap::new();
+    for (track, (_, words)) in tracks.iter().zip(&routed) {
+        for note in &track.notes {
+            if context_barrier(note) {
+                if let Some(key) = domain(note) {
+                    barriers.entry(key).or_default().push(note.onset_ticks);
+                }
+            }
+        }
+        for word in words {
+            if !word.is_donor()
+                || word
+                    .members
+                    .iter()
+                    .any(|&member| context_barrier(&track.notes[member]))
+            {
+                continue;
+            }
+            // A later syllable or held attack does not start a new word and
+            // therefore cannot supersede a genuinely newer word head.
+            let head = &track.notes[word.members[0]];
+            if let (Some(key), Some(language)) = (domain(head), head.pronunciation_language) {
+                evidence
+                    .entry(key)
+                    .or_default()
+                    .push((head.onset_ticks, language));
+            }
+        }
+    }
+    let mut results = Vec::with_capacity(tracks.len());
+    for (track, (mut diagnostics, words)) in tracks.iter_mut().zip(routed) {
+        for word in words.iter().filter(|word| word.contextual) {
+            let head = &track.notes[word.members[0]];
+            if word
+                .members
+                .iter()
+                .any(|&member| context_barrier(&track.notes[member]))
+            {
+                continue;
+            }
+            let Some(key) = domain(head) else {
+                continue;
+            };
+            let Some(candidates) = evidence.get(&key) else {
+                continue;
+            };
+            let admissible = |onset: u32| {
+                !barriers.get(&key).is_some_and(|times| {
+                    times.iter().any(|time| {
+                        *time >= onset.min(head.onset_ticks) && *time <= onset.max(head.onset_ticks)
+                    })
+                })
+            };
+            // Filter blocked donors first: an inadmissible predecessor must
+            // not hide a valid successor on the other side of the recipient.
+            let previous = candidates
+                .iter()
+                .filter(|(onset, _)| *onset <= head.onset_ticks && admissible(*onset))
+                .map(|(onset, _)| *onset)
+                .max();
+            let next = candidates
+                .iter()
+                .filter(|(onset, _)| *onset > head.onset_ticks && admissible(*onset))
+                .map(|(onset, _)| *onset)
+                .min();
+            let Some(onset) = previous.or(next) else {
+                continue;
+            };
+            let mut owners = candidates
+                .iter()
+                .filter(|(time, _)| *time == onset)
+                .map(|(_, language)| *language);
+            let Some(language) = owners.next() else {
+                continue;
+            };
+            if owners.any(|other| other != language) {
+                continue;
+            }
+            // Source reconstruction already proved every member belongs to
+            // this head, including text syllables and source-proven holds.
+            for &member in &word.members {
+                let note = &mut track.notes[member];
+                note.pronunciation_language = Some(language);
+                if let Some(source_id) = note.source_evidence.as_ref().map(|e| &e.note_id) {
+                    for diagnostic in &mut diagnostics {
+                        if diagnostic.code == LOW_CONFIDENCE
+                            && diagnostic.source_id.as_ref() == Some(source_id)
+                        {
+                            diagnostic.message = format!("Automatic FR+EN+ES+PT: contextual sung text resolves to {} from the same source voice, playback segment and lyric row.", language.label());
+                        }
+                    }
+                }
+            }
+        }
+        diagnostics.retain(|diagnostic| diagnostic.code != ROUTED);
+        let mut counts = [0usize; 4];
+        for word in &words {
+            if let Some(language) = track.notes[word.members[0]].pronunciation_language {
+                counts[language.index()] += 1;
+            }
+        }
+        if counts.iter().any(|count| *count > 0) {
+            diagnostics.push(Diagnostic {
+                code: ROUTED.into(),
+                severity: DiagnosticSeverity::Info,
+                message: routing_message(counts),
+                source_id: track
+                    .notes
+                    .first()
+                    .and_then(|note| note.source_evidence.as_ref())
+                    .map(|e| e.note_id.clone()),
+            });
+        }
+        results.push(diagnostics);
+    }
+    results
 }
 
 fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
@@ -969,6 +1263,37 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
             english_score = 3.5;
         }
 
+        // Capitalization is weaker evidence than an attested function-word
+        // phrase for a shared, locally uncertain word. Repeated attacks of the
+        // same complete word retain that phrase context; repetition adds no
+        // independent evidence for the isolated spelling's language.
+        if capitalized && shared && unit_anchor.is_none() && local_log_odds.abs() < 0.8 {
+            let mut run_start = position;
+            while run_start > phrase_start && keys[run_start - 1] == key {
+                run_start -= 1;
+            }
+            if run_start > phrase_start {
+                if let Some(anchor) = function_word_anchor(&keys[run_start - 1]) {
+                    let pair = format!("{} {key}", keys[run_start - 1]);
+                    let (pair_fr, pair_en) = *score_cache
+                        .entry(pair.clone())
+                        .or_insert_with(|| lingua_scores(&pair));
+                    let odds = log_odds(pair_fr, pair_en);
+                    match anchor {
+                        PronunciationLanguage::French if odds >= 0.8 => {
+                            french_score = 3.5;
+                            english_score = -3.5;
+                        }
+                        PronunciationLanguage::English if odds <= -0.8 => {
+                            french_score = -3.5;
+                            english_score = 3.5;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         units.push(Unit {
             members,
             key,
@@ -1059,12 +1384,84 @@ fn decode(units: &[Unit]) -> Vec<PronunciationLanguage> {
 /// language and untexted notes remain neutral.
 pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
     assert_eq!(notes.len(), note_ids.len());
+    if !notes.iter().any(context_barrier) {
+        return route_span(notes, note_ids);
+    }
+    // Isolate barriers before scoring and decoding, not only while choosing a
+    // final donor. Otherwise a neutral word retains a decision already borrowed
+    // from the other side of a manual hint or conflicting source record.
+    let mut result = Route {
+        languages: vec![None; notes.len()],
+        inherit_passage: vec![false; notes.len()],
+        diagnostics: Vec::new(),
+        words: Vec::new(),
+    };
+    let mut start = 0;
+    while start < notes.len() {
+        let end = if context_barrier(&notes[start]) {
+            start + 1
+        } else {
+            ((start + 1)..notes.len())
+                .find(|&index| context_barrier(&notes[index]))
+                .unwrap_or(notes.len())
+        };
+        let routed = route_span(&notes[start..end], &note_ids[start..end]);
+        result.languages[start..end].copy_from_slice(&routed.languages);
+        result.inherit_passage[start..end].copy_from_slice(&routed.inherit_passage);
+        result
+            .words
+            .extend(routed.words.into_iter().map(|mut word| {
+                for member in &mut word.members {
+                    *member += start;
+                }
+                word
+            }));
+        result.diagnostics.extend(
+            routed
+                .diagnostics
+                .into_iter()
+                .filter(|diagnostic| diagnostic.code != ROUTED),
+        );
+        start = end;
+    }
+    let mut counts = [0usize; 4];
+    for word in result.words.iter().filter(|word| word.complete) {
+        if let Some(language) = result.languages[word.members[0]] {
+            counts[language.index()] += 1;
+        }
+    }
+    if counts.iter().any(|count| *count > 0) {
+        result.diagnostics.push(Diagnostic {
+            code: ROUTED.into(),
+            severity: DiagnosticSeverity::Info,
+            message: routing_message(counts),
+            source_id: note_ids.first().cloned(),
+        });
+    }
+    result
+}
+
+fn route_span(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
     let units = build_units(notes, note_ids);
     let decisions = decode(&units);
     let mut languages = vec![None; notes.len()];
     let mut inherit_passage = vec![false; notes.len()];
     let mut diagnostics = Vec::new();
     let mut counts = [0usize; 4];
+    let mut words: Vec<RoutedWord> = units
+        .iter()
+        .map(|unit| RoutedWord {
+            members: unit.members.clone(),
+            contextual: unit.inherit_passage,
+            complete: true,
+        })
+        .collect();
+    let mut ownership = vec![None; notes.len()];
+    for (owner, word) in words.iter().enumerate() {
+        for &member in &word.members {
+            ownership[member] = Some(owner);
+        }
+    }
 
     for (unit, language) in units.iter().zip(&decisions) {
         for &member in &unit.members {
@@ -1093,9 +1490,17 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
         if languages[index].is_none()
             && notes[index].lyric.continues_previous_note()
             && touches(&notes[index - 1], &notes[index])
+            && same_continuation_domain(
+                &notes[ownership[index - 1].map_or(index - 1, |owner| words[owner].members[0])],
+                &notes[index],
+            )
         {
             languages[index] = languages[index - 1];
             inherit_passage[index] = inherit_passage[index - 1];
+            if let Some(owner) = ownership[index - 1] {
+                ownership[index] = Some(owner);
+                words[owner].members.push(index);
+            }
         }
     }
 
@@ -1110,7 +1515,7 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
         let Some(source) = lexical::source(&notes[index].lyric) else {
             continue;
         };
-        if carries_manual_hint(&notes[index]) {
+        if context_barrier(&notes[index]) {
             continue;
         }
         let is_fragment = !matches!(
@@ -1126,24 +1531,34 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
         {
             languages[index] = Some(anchor);
             inherit_passage[index] = false;
+            ownership[index] = Some(words.len());
+            words.push(RoutedWord {
+                members: vec![index],
+                contextual: false,
+                complete: false,
+            });
             continue;
         }
         let mut owner = None;
         for candidate in (0..index).rev() {
-            if carries_manual_hint(&notes[candidate]) {
+            if context_barrier(&notes[candidate]) {
                 break;
             }
-            if let Some(language) = languages[candidate] {
+            if let Some(language) = languages[candidate]
+                .filter(|_| ownership[candidate].is_some_and(|owner| words[owner].is_donor()))
+            {
                 owner = Some(language);
                 break;
             }
         }
         if owner.is_none() {
             for candidate in (index + 1)..notes.len() {
-                if carries_manual_hint(&notes[candidate]) {
+                if context_barrier(&notes[candidate]) {
                     break;
                 }
-                if let Some(language) = languages[candidate] {
+                if let Some(language) = languages[candidate]
+                    .filter(|_| ownership[candidate].is_some_and(|owner| words[owner].is_donor()))
+                {
                     owner = Some(language);
                     break;
                 }
@@ -1155,8 +1570,37 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
         // wider same-verse passage prior settle it after every domain has been
         // decoded.
         inherit_passage[index] = true;
+        ownership[index] = Some(words.len());
+        words.push(RoutedWord {
+            members: vec![index],
+            contextual: true,
+            complete: false,
+        });
     }
 
+    // Fragment recovery above can establish an owner after the initial hold
+    // pass. Retain those source-proven tails in the same ownership metadata.
+    for index in 1..notes.len() {
+        if ownership[index].is_some()
+            || !notes[index].lyric.continues_previous_note()
+            || !touches(&notes[index - 1], &notes[index])
+        {
+            continue;
+        }
+        let Some(owner) = ownership[index - 1] else {
+            continue;
+        };
+        let head = words[owner].members[0];
+        if !same_continuation_domain(&notes[head], &notes[index]) {
+            continue;
+        }
+        ownership[index] = Some(owner);
+        words[owner].members.push(index);
+        languages[index] = languages[head];
+        inherit_passage[index] = inherit_passage[head];
+    }
+
+    words.sort_by_key(|word| word.members[0]);
     if !units.is_empty() {
         diagnostics.push(Diagnostic {
             code: ROUTED.into(),
@@ -1170,15 +1614,21 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
         languages,
         diagnostics,
         inherit_passage,
+        words,
     }
 }
 
 /// Route every source voice/repeat domain in a projected lane and store the
 /// decision directly on each note so alternative lyric lanes cannot collide.
 pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
+    route_track_with_inheritance(track).0
+}
+
+fn route_track_with_inheritance(track: &mut ProjectedTrack) -> (Vec<Diagnostic>, Vec<RoutedWord>) {
     let mut diagnostics = Vec::new();
     let mut inherit_passage = vec![false; track.notes.len()];
     let mut changed = HashMap::new();
+    let mut words = Vec::new();
     let mut start = 0usize;
     while start < track.notes.len() {
         let domain = track.notes[start]
@@ -1191,6 +1641,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                     origin.source.staff_id.clone(),
                     origin.source.voice.clone(),
                     origin.source.occurrence,
+                    playback_segment(&track.notes[start]),
                 )
             });
         let mut end = start + 1;
@@ -1205,6 +1656,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                         origin.source.staff_id.clone(),
                         origin.source.voice.clone(),
                         origin.source.occurrence,
+                        playback_segment(&track.notes[end]),
                     )
                 })
                 == domain
@@ -1228,6 +1680,11 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
         // or repeat occurrences.
         crate::engine::syllable::preserve_bracketed_melismas(&mut track.notes[start..end]);
         let routed = route(&track.notes[start..end], &ids);
+        words.extend(routed.words.iter().map(|word| RoutedWord {
+            members: word.members.iter().map(|member| member + start).collect(),
+            contextual: word.contextual,
+            complete: word.complete,
+        }));
         inherit_passage[start..end].copy_from_slice(&routed.inherit_passage);
         for (note, language) in track.notes[start..end].iter_mut().zip(routed.languages) {
             note.pronunciation_language = language;
@@ -1239,8 +1696,13 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
         // of its own, a directly preceding language-specific function word is
         // stronger phrase evidence than the isolated detector guess.
         if start > 0
+            && playback_segment(&track.notes[start - 1]) == playback_segment(&track.notes[start])
             && touches(&track.notes[start - 1], &track.notes[start])
             && !ends_phrase(&track.notes[start - 1])
+            && words
+                .iter()
+                .any(|word| word.is_donor() && word.members[0] == start - 1)
+            && !context_barrier(&track.notes[start - 1])
         {
             let previous_index = start - 1;
             if let (Some(previous_key), Some(previous_language)) = (
@@ -1286,6 +1748,8 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                                 && context_dependent
                                 && !proper_name_anchor
                                 && !explicit_new_language
+                                && !(previous_index..=start + head)
+                                    .any(|index| context_barrier(&track.notes[index]))
                             {
                                 for &member in &first_word {
                                     let index = start + member;
@@ -1307,6 +1771,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                                     start + first_word.last().copied().unwrap_or(head) + 1;
                                 while continuation < end
                                     && track.notes[continuation].lyric.continues_previous_note()
+                                    && !context_barrier(&track.notes[continuation])
                                     && touches(
                                         &track.notes[continuation - 1],
                                         &track.notes[continuation],
@@ -1348,17 +1813,19 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
     // after all source domains have been routed; this keeps translated rows
     // independent while allowing a passage to survive voice/repeat bookkeeping
     // boundaries.
-    for index in 0..track.notes.len() {
-        if !inherit_passage[index] || track.notes[index].lyric.continues_previous_note() {
-            continue;
-        }
+    for word in words.iter().filter(|word| word.contextual) {
+        let index = word.members[0];
         let row = lexical::source(&track.notes[index].lyric)
             .map(|source| (source.verse, source.lane.clone()));
         let same_passage = |candidate: usize| {
             let same_row = lexical::source(&track.notes[candidate].lyric)
                 .map(|source| (source.verse, source.lane.clone()))
                 == row;
-            if !same_row || candidate.abs_diff(index) > 16 {
+            if !same_row
+                || playback_segment(&track.notes[candidate])
+                    != playback_segment(&track.notes[index])
+                || candidate.abs_diff(index) > 16
+            {
                 return false;
             }
             let (from, to) = if candidate < index {
@@ -1366,29 +1833,43 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
             } else {
                 (index, candidate)
             };
-            !(from..to).any(|between| {
-                ends_phrase(&track.notes[between]) || carries_manual_hint(&track.notes[between])
-            })
+            !(from..to).any(|between| ends_phrase(&track.notes[between]))
+                && !(from..=to).any(|between| context_barrier(&track.notes[between]))
         };
-        let previous = (0..index).rev().find(|&candidate| {
-            !inherit_passage[candidate]
-                && same_passage(candidate)
-                && track.notes[candidate].pronunciation_language.is_some()
-                && !track.notes[candidate].lyric.continues_previous_note()
-        });
-        let next = ((index + 1)..track.notes.len()).find(|&candidate| {
-            !inherit_passage[candidate]
-                && same_passage(candidate)
-                && track.notes[candidate].pronunciation_language.is_some()
-                && !track.notes[candidate].lyric.continues_previous_note()
-        });
+        let previous = words
+            .iter()
+            .filter(|word| word.is_donor())
+            .map(|word| word.members[0])
+            .filter(|&candidate| candidate < index)
+            .rev()
+            .find(|&candidate| {
+                !inherit_passage[candidate]
+                    && same_passage(candidate)
+                    && track.notes[candidate].pronunciation_language.is_some()
+                    && !track.notes[candidate].lyric.continues_previous_note()
+            });
+        let next = words
+            .iter()
+            .filter(|word| word.is_donor())
+            .map(|word| word.members[0])
+            .filter(|&candidate| candidate > index)
+            .find(|&candidate| {
+                !inherit_passage[candidate]
+                    && same_passage(candidate)
+                    && track.notes[candidate].pronunciation_language.is_some()
+                    && !track.notes[candidate].lyric.continues_previous_note()
+            });
         let local_language = previous
             .or(next)
             .and_then(|owner| track.notes[owner].pronunciation_language);
         let row_language = if local_language.is_none() {
             let mut counts = [0usize; 4];
-            for (&inherits_passage, note) in inherit_passage.iter().zip(&track.notes) {
-                if inherits_passage
+            for donor in words.iter().filter(|word| word.is_donor()) {
+                let note = &track.notes[donor.members[0]];
+                let from = index.min(donor.members[0]);
+                let to = index.max(donor.members[0]);
+                if playback_segment(note) != playback_segment(&track.notes[index])
+                    || (from..=to).any(|between| context_barrier(&track.notes[between]))
                     || note.lyric.continues_previous_note()
                     || lexical::source(&note.lyric)
                         .map(|source| (source.verse, source.lane.clone()))
@@ -1415,25 +1896,17 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
         let Some(language) = local_language.or(row_language) else {
             continue;
         };
-        if track.notes[index].pronunciation_language != Some(language) {
-            if let Some(source_id) = track.notes[index]
-                .source_evidence
-                .as_ref()
-                .map(|evidence| evidence.note_id.clone())
-            {
-                changed.insert(source_id, language);
+        for &member in &word.members {
+            if track.notes[member].pronunciation_language != Some(language) {
+                if let Some(source_id) = track.notes[member]
+                    .source_evidence
+                    .as_ref()
+                    .map(|e| e.note_id.clone())
+                {
+                    changed.insert(source_id, language);
+                }
             }
-        }
-        track.notes[index].pronunciation_language = Some(language);
-
-        let mut continuation = index + 1;
-        while continuation < track.notes.len()
-            && inherit_passage[continuation]
-            && track.notes[continuation].lyric.continues_previous_note()
-            && touches(&track.notes[continuation - 1], &track.notes[continuation])
-        {
-            track.notes[continuation].pronunciation_language = Some(language);
-            continuation += 1;
+            track.notes[member].pronunciation_language = Some(language);
         }
     }
 
@@ -1443,7 +1916,10 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
     // the previous English pronunciation merely because a source voice or
     // repeat boundary restarted there. Split-word heads are excluded so a
     // syllable such as `et-` inside a longer word cannot be forced in isolation.
-    for index in 0..track.notes.len() {
+    for (index, &inherits_passage) in inherit_passage.iter().enumerate() {
+        if context_barrier(&track.notes[index]) {
+            continue;
+        }
         let Some(source) = lexical::source(&track.notes[index].lyric) else {
             continue;
         };
@@ -1459,6 +1935,9 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
         let Some(language) = automatic_anchor(&key) else {
             continue;
         };
+        if !inherits_passage && track.notes[index].pronunciation_language.is_some() {
+            continue;
+        }
         if track.notes[index].pronunciation_language != Some(language) {
             if let Some(source_id) = track.notes[index]
                 .source_evidence
@@ -1472,7 +1951,9 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
         let mut continuation = index + 1;
         while continuation < track.notes.len()
             && track.notes[continuation].lyric.continues_previous_note()
+            && !context_barrier(&track.notes[continuation])
             && touches(&track.notes[continuation - 1], &track.notes[continuation])
+            && same_continuation_domain(&track.notes[index], &track.notes[continuation])
         {
             track.notes[continuation].pronunciation_language = Some(language);
             continuation += 1;
@@ -1517,7 +1998,7 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
                 .map(|evidence| evidence.note_id.clone()),
         });
     }
-    diagnostics
+    (diagnostics, words)
 }
 
 #[cfg(test)]
@@ -1549,6 +2030,132 @@ mod tests {
             .collect();
         let ids: Vec<_> = (0..notes.len()).map(|i| format!("n{i}")).collect();
         route(&notes, &ids)
+    }
+
+    #[test]
+    fn shared_inflected_verb_follows_spanish_and_portuguese_sentences() {
+        for (text, language) in [
+            (
+                "ella une nuestras voces al amanecer",
+                PronunciationLanguage::Spanish,
+            ),
+            (
+                "o vento une nossas vozes ao amanhecer",
+                PronunciationLanguage::Portuguese,
+            ),
+        ] {
+            let words: Vec<_> = text.split_whitespace().collect();
+            assert_eq!(
+                languages(&words).languages,
+                vec![Some(language); words.len()],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_shared_romance_words_are_not_capped_without_contrary_context() {
+        for key in ["vida", "cada", "casa", "mesa"] {
+            for words in [vec![key], vec![key, key]] {
+                let result = languages(&words);
+                assert!(
+                    result.languages.iter().all(|owner| matches!(
+                        owner,
+                        Some(PronunciationLanguage::Spanish | PronunciationLanguage::Portuguese)
+                    )),
+                    "{words:?}: {:?}",
+                    result.languages
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strong_english_function_word_survives_foreign_dictionary_membership() {
+        assert_eq!(
+            languages(&["hola", "the", "gracias"]).languages,
+            [
+                Some(PronunciationLanguage::Spanish),
+                Some(PronunciationLanguage::English),
+                Some(PronunciationLanguage::Spanish)
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_phrase_start_uses_forward_portuguese_evidence() {
+        assert_eq!(
+            languages(&["quiero", "cantar", "no", "meu", "coração"]).languages,
+            [
+                Some(PronunciationLanguage::Spanish),
+                Some(PronunciationLanguage::Spanish),
+                Some(PronunciationLanguage::Portuguese),
+                Some(PronunciationLanguage::Portuguese),
+                Some(PronunciationLanguage::Portuguese)
+            ]
+        );
+    }
+
+    #[test]
+    fn unpunctuated_four_language_passage_keeps_shared_word_with_preceding_phrase() {
+        let words: Vec<_> =
+            "je chante doucement we follow the river quiero bailar contigo quero dançar contigo"
+                .split_whitespace()
+                .collect();
+        let expected: Vec<_> = [
+            (PronunciationLanguage::French, 3),
+            (PronunciationLanguage::English, 4),
+            (PronunciationLanguage::Spanish, 3),
+            (PronunciationLanguage::Portuguese, 3),
+        ]
+        .into_iter()
+        .flat_map(|(language, count)| std::iter::repeat_n(Some(language), count))
+        .collect();
+        assert_eq!(languages(&words).languages, expected);
+    }
+
+    #[test]
+    fn contextual_word_owners_reach_output_phonemizers_and_exact_hints() {
+        use crate::engine::{
+            convert::convert_midi_with_profile,
+            musicxml,
+            target::{self, ExportTarget, PronunciationProfile},
+        };
+        for (text, expected) in [
+            ("we hear the Radio Radio", vec![PronunciationLanguage::English; 5]),
+            ("ella une nuestras voces al amanecer", vec![PronunciationLanguage::Spanish; 6]),
+            ("o vento une nossas vozes ao amanhecer", vec![PronunciationLanguage::Portuguese; 7]),
+            ("je chante doucement we follow the river quiero bailar contigo quero dançar contigo", [vec![PronunciationLanguage::French; 3], vec![PronunciationLanguage::English; 4], vec![PronunciationLanguage::Spanish; 3], vec![PronunciationLanguage::Portuguese; 3]].concat()),
+        ] {
+            let words: Vec<_> = text.split_whitespace().collect();
+            let notes = words.iter().map(|word| format!("<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><lyric><syllabic>single</syllabic><text>{word}</text></lyric></note>")).collect::<String>();
+            let xml = format!("<score-partwise version=\"4.0\"><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes>{notes}</measure></part></score-partwise>");
+            let source = musicxml::parse(xml.as_bytes()).unwrap();
+            let baseline = convert_midi_with_profile(&source, "english", None, ExportTarget::Ustx, PronunciationProfile::Default);
+            let outcome = convert_midi_with_profile(&source, "english", None, ExportTarget::Ustx, PronunciationProfile::Automatic);
+            assert!(outcome.ok, "{:?}", outcome.msg);
+            let project = outcome.svp.as_ref().unwrap();
+            let projected = &project.tracks[0].notes;
+            assert_eq!(projected.len(), words.len());
+            for (((note, original), word), language) in projected.iter().zip(&baseline.svp.as_ref().unwrap().tracks[0].notes).zip(&words).zip(&expected) {
+                assert_eq!(note.pronunciation_language, Some(*language), "{text}: {word}");
+                assert_eq!(lexical::source(&note.lyric).unwrap().raw, *word);
+                assert_eq!((note.onset_ticks, note.duration_ticks, note.pitch, &note.source_evidence, &note.performance), (original.onset_ticks, original.duration_ticks, original.pitch, &original.source_evidence, &original.performance));
+            }
+            let native = target::ustx::serialize(project).unwrap();
+            for (note, language) in native.voice_parts[0].notes.iter().zip(expected) {
+                let phonemizer = match language {
+                    PronunciationLanguage::French => target::diffsinger::FRENCH_NAME,
+                    PronunciationLanguage::English => target::diffsinger::ENGLISH_NAME,
+                    PronunciationLanguage::Spanish => target::diffsinger::SPANISH_NAME,
+                    PronunciationLanguage::Portuguese => target::diffsinger::PORTUGUESE_NAME,
+                };
+                assert_eq!(note.phonemizer.as_deref(), Some(phonemizer));
+            }
+            if text.starts_with("ella") {
+                assert_eq!(native.voice_parts[0].notes[1].lyric, "une[u n e]");
+            }
+        }
     }
 
     #[test]
@@ -1660,6 +2267,529 @@ mod tests {
             }),
         });
         result
+    }
+
+    fn test_track(notes: Vec<ProjectedNote>) -> ProjectedTrack {
+        ProjectedTrack {
+            name: "Voice".into(),
+            source_track_id: "track".into(),
+            muted: false,
+            notes,
+        }
+    }
+
+    #[test]
+    fn neutral_technical_lane_uses_matching_source_sibling_in_every_language() {
+        for (word, expected) in [
+            ("bonjour", PronunciationLanguage::French),
+            ("the", PronunciationLanguage::English),
+            ("hola", PronunciationLanguage::Spanish),
+            ("você", PronunciationLanguage::Portuguese),
+        ] {
+            let mut established = test_track(vec![domain_note(0, word, "1")]);
+            let mut neutral = test_track(vec![
+                domain_note(480, "hou", "1"),
+                domain_note(960, "oh", "1"),
+            ]);
+            let original = neutral.clone();
+            let diagnostics = route_tracks(&mut [&mut established, &mut neutral]);
+            for note in &neutral.notes {
+                assert_eq!(note.pronunciation_language, Some(expected), "{word}");
+            }
+            assert!(diagnostics[1]
+                .iter()
+                .any(|d| d.code == LOW_CONFIDENCE && d.message.contains(expected.label())));
+            for note in &mut neutral.notes {
+                note.pronunciation_language = None;
+            }
+            assert_eq!(neutral, original);
+        }
+    }
+
+    #[test]
+    fn sibling_context_requires_identical_source_domain_and_lyric_row() {
+        for difference in 0..6 {
+            let mut established = test_track(vec![domain_note(0, "the", "1")]);
+            let mut neutral = test_track(vec![domain_note(480, "hou", "1")]);
+            let evidence = neutral.notes[0]
+                .source_evidence
+                .as_mut()
+                .unwrap()
+                .origin
+                .as_mut()
+                .unwrap();
+            match difference {
+                0 => evidence.source.part_id = Some("other".into()),
+                1 => evidence.source.staff_id = Some("2".into()),
+                2 => evidence.source.voice = Some("2".into()),
+                3 => evidence.source.occurrence += 1,
+                _ => {
+                    let ProjectedLyric::Source(source) = &mut neutral.notes[0].lyric else {
+                        unreachable!()
+                    };
+                    if difference == 4 {
+                        source.verse += 1;
+                    } else {
+                        source.lane = "other".into();
+                    }
+                }
+            }
+            let mut isolated = neutral.clone();
+            route_track(&mut isolated);
+            route_tracks(&mut [&mut established, &mut neutral]);
+            assert_eq!(neutral, isolated, "difference {difference}");
+        }
+    }
+
+    #[test]
+    fn sibling_context_keeps_neutral_begin_end_word_under_its_head_owner() {
+        let mut observed = Vec::new();
+        for (first, last, complete) in [("a", "h", "ah"), ("h", "ou", "hou")] {
+            for reverse in [false, true] {
+                let mut donor = test_track(vec![
+                    domain_note(0, "the", "1"),
+                    domain_note(720, "bonjour", "1"),
+                ]);
+                let mut neutral = test_track(vec![
+                    domain_note(480, first, "1"),
+                    domain_note(960, last, "1"),
+                ]);
+                for (note, syllabic) in neutral
+                    .notes
+                    .iter_mut()
+                    .zip([Syllabic::Begin, Syllabic::End])
+                {
+                    let ProjectedLyric::Source(source) = &mut note.lyric else {
+                        unreachable!()
+                    };
+                    source.syllabic = Some(syllabic);
+                }
+                let units = build_units(&neutral.notes, &["head".into(), "tail".into()]);
+                assert_eq!(units.len(), 1);
+                assert_eq!(units[0].key, complete);
+                assert_eq!(units[0].members, [0, 1]);
+                assert!(units[0].inherit_passage);
+                let original = neutral.clone();
+                if reverse {
+                    route_tracks(&mut [&mut neutral, &mut donor]);
+                } else {
+                    route_tracks(&mut [&mut donor, &mut neutral]);
+                }
+                observed.push(
+                    neutral
+                        .notes
+                        .iter()
+                        .map(|note| note.pronunciation_language)
+                        .collect::<Vec<_>>(),
+                );
+                for note in &mut neutral.notes {
+                    note.pronunciation_language = None;
+                }
+                assert_eq!(neutral, original, "routing changes ownership only");
+            }
+        }
+        assert_eq!(observed, vec![vec![Some(PronunciationLanguage::English); 2]; 4],
+            "a donor switch between source syllables cannot split the complete word; normal/reversed track order");
+    }
+
+    #[test]
+    fn sibling_context_uses_donor_time_before_first_and_after_last_in_either_track_order() {
+        for reverse in [false, true] {
+            let mut english = test_track(vec![domain_note(480, "the", "1")]);
+            let mut french = test_track(vec![domain_note(1440, "bonjour", "1")]);
+            let mut neutral = test_track(vec![
+                domain_note(0, "hou", "1"),
+                domain_note(960, "hou", "1"),
+                domain_note(2400, "hou", "1"),
+            ]);
+            let original = neutral.clone();
+            if reverse {
+                route_tracks(&mut [&mut neutral, &mut french, &mut english]);
+            } else {
+                route_tracks(&mut [&mut english, &mut french, &mut neutral]);
+            }
+            assert_eq!(
+                neutral
+                    .notes
+                    .iter()
+                    .map(|note| note.pronunciation_language)
+                    .collect::<Vec<_>>(),
+                [
+                    Some(PronunciationLanguage::English),
+                    Some(PronunciationLanguage::English),
+                    Some(PronunciationLanguage::French)
+                ],
+                "reverse={reverse}; before first, between donors, after last"
+            );
+            for note in &mut neutral.notes {
+                note.pronunciation_language = None;
+            }
+            assert_eq!(neutral, original);
+        }
+    }
+
+    #[test]
+    fn sibling_context_only_complete_word_heads_supply_donor_time() {
+        let mut old = test_track(vec![
+            domain_note(0, "bon", "1"),
+            domain_note(480, "jour", "1"),
+        ]);
+        for (note, syllabic) in old.notes.iter_mut().zip([Syllabic::Begin, Syllabic::End]) {
+            let ProjectedLyric::Source(source) = &mut note.lyric else {
+                unreachable!()
+            };
+            source.syllabic = Some(syllabic);
+        }
+        let mut newer = test_track(vec![domain_note(240, "the", "1")]);
+        let mut neutral = test_track(vec![domain_note(960, "hou", "1")]);
+        route_tracks(&mut [&mut old, &mut newer, &mut neutral]);
+        assert_eq!(
+            neutral.notes[0].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+    }
+
+    #[test]
+    fn recovered_function_fragments_keep_own_label_without_donating_context() {
+        for syllabic in [Syllabic::Begin, Syllabic::Middle] {
+            let mut fragment = domain_note(480, "the", "1");
+            let ProjectedLyric::Source(source) = &mut fragment.lyric else {
+                unreachable!()
+            };
+            source.syllabic = Some(syllabic.clone());
+            let mut complete = test_track(vec![domain_note(0, "bonjour", "1")]);
+            let mut recovered = test_track(vec![fragment.clone()]);
+            let mut neutral = test_track(vec![domain_note(960, "hou", "1")]);
+            route_tracks(&mut [&mut complete, &mut recovered, &mut neutral]);
+            assert_eq!(
+                recovered.notes[0].pronunciation_language,
+                Some(PronunciationLanguage::English)
+            );
+            assert_eq!(
+                neutral.notes[0].pronunciation_language,
+                Some(PronunciationLanguage::French),
+                "sibling {syllabic:?}"
+            );
+            for voice in ["1", "2"] {
+                let mut local = test_track(vec![
+                    domain_note(0, "bonjour", "1"),
+                    fragment.clone(),
+                    domain_note(960, "hou", voice),
+                ]);
+                route_track(&mut local);
+                assert_eq!(
+                    local.notes[1].pronunciation_language,
+                    Some(PronunciationLanguage::English)
+                );
+                assert_eq!(
+                    local.notes[2].pronunciation_language,
+                    Some(PronunciationLanguage::French),
+                    "local {syllabic:?}, voice={voice}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_context_cannot_borrow_through_manual_or_conflict_barriers() {
+        for conflict in [false, true] {
+            for successor in [false, true] {
+                let mut barrier = domain_note(480, if conflict { "the" } else { "?manual" }, "1");
+                if conflict {
+                    barrier
+                        .source_evidence
+                        .as_mut()
+                        .unwrap()
+                        .origin
+                        .as_mut()
+                        .unwrap()
+                        .lyric_conflict = true;
+                }
+                let mut extension = domain_note(1440, "", "1");
+                extension.lyric = ProjectedLyric::Extension;
+                let mut local = test_track(vec![
+                    domain_note(0, "the", "1"),
+                    barrier,
+                    domain_note(960, "hou", "1"),
+                    extension,
+                ]);
+                let isolated = route(&local.notes[2..], &["neutral".into(), "hold".into()]);
+                let expected = if successor {
+                    Some(PronunciationLanguage::Spanish)
+                } else {
+                    isolated.languages[0]
+                };
+                if successor {
+                    local.notes.push(domain_note(1920, "hola", "1"));
+                }
+                let original = local.clone();
+                let ids: Vec<_> = (0..local.notes.len())
+                    .map(|index| format!("n{index}"))
+                    .collect();
+                let direct = route(&local.notes, &ids);
+                assert_eq!(
+                    direct.languages[2..4],
+                    [expected; 2],
+                    "route conflict={conflict}, successor={successor}"
+                );
+                route_track(&mut local);
+                assert_eq!(
+                    local.notes[2..4]
+                        .iter()
+                        .map(|note| note.pronunciation_language)
+                        .collect::<Vec<_>>(),
+                    [expected; 2],
+                    "route_track conflict={conflict}, successor={successor}"
+                );
+                let mut combined = original.clone();
+                route_tracks(&mut [&mut combined]);
+                assert_eq!(
+                    combined.notes[2..4]
+                        .iter()
+                        .map(|note| note.pronunciation_language)
+                        .collect::<Vec<_>>(),
+                    [expected; 2],
+                    "route_tracks conflict={conflict}, successor={successor}"
+                );
+                for track in [&mut local, &mut combined] {
+                    for note in &mut track.notes {
+                        note.pronunciation_language = None;
+                    }
+                    assert_eq!(*track, original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_context_newer_sibling_evidence_supersedes_old_local_evidence() {
+        let mut local = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(960, "hou", "1"),
+        ]);
+        let mut newer = test_track(vec![domain_note(480, "the", "1")]);
+        route_tracks(&mut [&mut local, &mut newer]);
+        assert_eq!(
+            local
+                .notes
+                .iter()
+                .map(|note| note.pronunciation_language)
+                .collect::<Vec<_>>(),
+            [
+                Some(PronunciationLanguage::French),
+                Some(PronunciationLanguage::English)
+            ]
+        );
+    }
+
+    #[test]
+    fn sibling_context_filters_barriers_before_selecting_a_donor() {
+        for conflict in [false, true] {
+            let mut previous = test_track(vec![domain_note(0, "the", "1")]);
+            let mut barrier = test_track(vec![domain_note(
+                480,
+                if conflict { "bonjour" } else { "?manual" },
+                "1",
+            )]);
+            if conflict {
+                barrier.notes[0]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .lyric_conflict = true;
+            }
+            let mut next = test_track(vec![domain_note(1440, "hola", "1")]);
+            let mut neutral = test_track(vec![domain_note(960, "hou", "1")]);
+            route_tracks(&mut [&mut previous, &mut barrier, &mut next, &mut neutral]);
+            assert_eq!(
+                neutral.notes[0].pronunciation_language,
+                Some(PronunciationLanguage::Spanish),
+                "conflict={conflict}"
+            );
+        }
+    }
+
+    fn set_playback_segment(note: &mut ProjectedNote, segment: u32) {
+        use crate::engine::midi::{SourceContinuity, SourceEvidenceRef, SourceFormat};
+        let source = &mut note
+            .source_evidence
+            .as_mut()
+            .unwrap()
+            .origin
+            .as_mut()
+            .unwrap()
+            .source;
+        source.continuity = Some(std::sync::Arc::new(SourceContinuity {
+            evidence: SourceEvidenceRef {
+                source_format: SourceFormat::MusicXml,
+                source_version: None,
+                program_version: None,
+                source_id: source.id.clone(),
+                raw_xml: "<note/>".into(),
+            },
+            chord_id: source.id.clone(),
+            playback_segment: segment,
+            extensions: vec![],
+            incoming_tie: None,
+            issues: vec![],
+        }));
+    }
+
+    #[test]
+    fn sibling_context_and_continuations_respect_playback_segments() {
+        let mut donor = test_track(vec![domain_note(0, "the", "1")]);
+        set_playback_segment(&mut donor.notes[0], 1);
+        let mut neutral = test_track(vec![
+            domain_note(480, "hou", "1"),
+            domain_note(960, "", "1"),
+        ]);
+        set_playback_segment(&mut neutral.notes[0], 1);
+        set_playback_segment(&mut neutral.notes[1], 2);
+        neutral.notes[1].lyric = ProjectedLyric::Extension;
+        let mut other_segment = test_track(vec![domain_note(480, "hou", "1")]);
+        set_playback_segment(&mut other_segment.notes[0], 2);
+        route_tracks(&mut [&mut donor, &mut neutral, &mut other_segment]);
+        assert_eq!(
+            neutral.notes[0].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert_eq!(neutral.notes[1].pronunciation_language, None);
+        assert_ne!(
+            other_segment.notes[0].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+
+        let mut same_track = test_track(vec![
+            domain_note(0, "the", "1"),
+            domain_note(480, "hou", "1"),
+        ]);
+        set_playback_segment(&mut same_track.notes[0], 1);
+        set_playback_segment(&mut same_track.notes[1], 2);
+        route_track(&mut same_track);
+        assert_ne!(
+            same_track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+    }
+
+    #[test]
+    fn sibling_context_cannot_cross_manual_hint_or_competing_owners() {
+        for barrier in [true, false] {
+            let mut established = test_track(vec![domain_note(0, "the", "1")]);
+            let mut other = test_track(vec![domain_note(
+                if barrier { 240 } else { 0 },
+                if barrier { "?manual" } else { "bonjour" },
+                "1",
+            )]);
+            let mut neutral = test_track(vec![domain_note(480, "hou", "1")]);
+            let mut isolated = neutral.clone();
+            route_track(&mut isolated);
+            route_tracks(&mut [&mut established, &mut other, &mut neutral]);
+            assert_eq!(neutral, isolated);
+        }
+    }
+
+    #[test]
+    fn sibling_owner_reaches_extensions_and_splits_but_stops_at_source_boundaries() {
+        for stop in 0..4 {
+            let mut established = test_track(vec![domain_note(0, "the", "1")]);
+            let mut neutral = test_track(vec![
+                domain_note(480, "hou", "1"),
+                domain_note(960, "", "1"),
+                domain_note(1440, "", "1"),
+                domain_note(1920, "", "1"),
+            ]);
+            neutral.notes[1].lyric = ProjectedLyric::Extension;
+            let ProjectedLyric::Source(source) = &mut neutral.notes[2].lyric else {
+                unreachable!()
+            };
+            source.state = LyricState::SyllableSplit;
+            match stop {
+                0 => neutral.notes[3] = domain_note(1920, "bonjour", "2"),
+                1 => {
+                    neutral.notes[3] = domain_note(1920, "", "2");
+                    neutral.notes[3].lyric = ProjectedLyric::Extension;
+                }
+                2 => {
+                    neutral.notes[3].onset_ticks += 480;
+                    neutral.notes[3].lyric = ProjectedLyric::Extension;
+                }
+                _ => {
+                    let ProjectedLyric::Source(source) = &mut neutral.notes[3].lyric else {
+                        unreachable!()
+                    };
+                    source.state = LyricState::Continuation;
+                    source.verse += 1;
+                }
+            }
+            let original = neutral.clone();
+            let diagnostics = route_tracks(&mut [&mut established, &mut neutral]);
+            for note in &neutral.notes[..3] {
+                assert_eq!(
+                    note.pronunciation_language,
+                    Some(PronunciationLanguage::English),
+                    "stop {stop}"
+                );
+            }
+            assert_ne!(
+                neutral.notes[3].pronunciation_language,
+                Some(PronunciationLanguage::English),
+                "stop {stop}"
+            );
+            assert_eq!(
+                diagnostics[1].iter().filter(|d| d.code == ROUTED).count(),
+                1
+            );
+            for note in &mut neutral.notes {
+                note.pronunciation_language = None;
+            }
+            assert_eq!(neutral, original);
+        }
+    }
+
+    #[test]
+    fn repeated_shared_word_fragments_agree_with_complete_word_routing() {
+        let mut notes = vec![note(0, "we"), note(480, "hear"), note(960, "the")];
+        for (index, word) in ["Ra", "di", "o", "Ra", "di", "o"].into_iter().enumerate() {
+            let mut fragment = note((index as u32 + 3) * 480, word);
+            let ProjectedLyric::Source(source) = &mut fragment.lyric else {
+                unreachable!()
+            };
+            source.syllabic = Some(match index % 3 {
+                0 => Syllabic::Begin,
+                1 => Syllabic::Middle,
+                _ => Syllabic::End,
+            });
+            notes.push(fragment);
+        }
+        let ids: Vec<_> = (0..notes.len()).map(|i| format!("n{i}")).collect();
+        // Both the declared English phrase and complete-word ownership must
+        // survive capitalized repetitions and source-attested syllable splits.
+        let whole = languages(&["we", "hear", "the", "Radio", "Radio"]).languages;
+        assert_eq!(whole, vec![Some(PronunciationLanguage::English); 5]);
+        for spelling in ["radio", "Radio", "RADIO"] {
+            assert_eq!(
+                languages(&["we", "hear", "the", spelling, spelling]).languages,
+                vec![Some(PronunciationLanguage::English); 5]
+            );
+            assert_eq!(
+                languages(&["nous", "écoutons", "une", spelling, spelling]).languages,
+                vec![Some(PronunciationLanguage::French); 5]
+            );
+        }
+        let expected: Vec<_> = whole[..3]
+            .iter()
+            .copied()
+            .chain(
+                whole[3..]
+                    .iter()
+                    .flat_map(|owner| std::iter::repeat_n(*owner, 3)),
+            )
+            .collect();
+        assert_eq!(route(&notes, &ids).languages, expected);
     }
 
     #[test]

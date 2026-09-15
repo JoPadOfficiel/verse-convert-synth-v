@@ -48,8 +48,22 @@ VERSE_MIXED_LANGUAGE_CORPUS_DIR=/path/to/private-masters \
   -- --ignored
 ```
 
-The private masters are SHA-256 pinned and the gate compares every sung word
-head against a human-readable editorial oracle derived from each master's
+Corrective acceptance also covers shared inflected words (`une` in Spanish and
+Portuguese), punctuation-free four-language switches, and same-source sibling
+context for neutral technical chord lanes. `output_tests::automatic_acceptance`
+executes actual multi-file `convert_files` dispatch in reordered batches and
+checks independent Parts/verse rows, direct exports and bundle exports for both
+SVP and USTX. These tests compare source geometry and language metadata rather
+than treating a successful command as sufficient proof.
+
+The native compatibility gate additionally calls the pinned phonemizer's
+`SetSinger`, `SetUp` and `Process` using exact hints produced by Verse. Synthetic
+bank inventories exercise bare/prefixed Spanish allophones and Portuguese phones,
+plus missing duration/acoustic symbols. Tiny untrained model fixtures supply
+timing scaffolding; this gate does not assert audible quality or regional accent.
+
+The private masters are SHA-256 pinned and the gate compares eligible sung lyric
+records, including unresolved fragments, against a human-readable editorial oracle derived from each master's
 source staff, measure, verse and lyric ownership. Continuation and geometry
 conservation are covered separately by committed structural regressions. Audible
 multilingual quality still requires opening the exported project with compatible

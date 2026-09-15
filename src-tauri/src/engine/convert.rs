@@ -2373,10 +2373,13 @@ pub fn convert_midi_with_profile(
         return fail(error);
     }
     if profile == PronunciationProfile::Automatic {
-        for (index, _, track) in &mut pending_tracks {
-            report[*index]
-                .warnings
-                .extend(crate::engine::language::route_track(track));
+        let mut tracks: Vec<_> = pending_tracks
+            .iter_mut()
+            .map(|(_, _, track)| track)
+            .collect();
+        let diagnostics = crate::engine::language::route_tracks(&mut tracks);
+        for ((index, _, _), diagnostics) in pending_tracks.iter().zip(diagnostics) {
+            report[*index].warnings.extend(diagnostics);
         }
     }
     let automatic_french: BTreeSet<(String, u32, String)> =

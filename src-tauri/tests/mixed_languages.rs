@@ -159,6 +159,134 @@ fn musescore_score(words: &[&str]) -> String {
     )
 }
 
+#[test]
+fn neutral_adapter_chord_member_inherits_sibling_across_gap_through_export() {
+    let musicxml = r#"<score-partwise version="4.0">
+      <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+      <part id="P1"><measure number="1"><attributes><divisions>480</divisions></attributes>
+        <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><staff>1</staff><lyric><text>the</text></lyric></note>
+        <note><rest/><duration>480</duration><voice>1</voice><staff>1</staff></note>
+        <note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><staff>1</staff><lyric><text>hou</text></lyric></note>
+        <note><chord/><pitch><step>E</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><staff>1</staff><lyric><text>hou</text></lyric></note>
+      </measure></part></score-partwise>"#;
+    let musescore = r#"<museScore version="4.0"><Score><Division>480</Division>
+      <Part><Staff id="1"/><trackName>Voice</trackName></Part><Staff id="1"><Measure><voice>
+        <TimeSig><sigN>4</sigN><sigD>4</sigD></TimeSig>
+        <Chord><durationType>quarter</durationType><Lyrics><text>the</text></Lyrics><Note><pitch>60</pitch><tpc>14</tpc></Note></Chord>
+        <Rest><durationType>quarter</durationType></Rest>
+        <Chord><durationType>quarter</durationType><Lyrics><text>hou</text></Lyrics><Note><pitch>60</pitch><tpc>14</tpc></Note><Note><pitch>64</pitch><tpc>18</tpc></Note></Chord>
+      </voice></Measure></Staff></Score></museScore>"#;
+    for (adapter, mut source) in [
+        ("MusicXML", musicxml::parse(musicxml.as_bytes()).unwrap()),
+        ("MuseScore", musescore::parse(musescore.as_bytes()).unwrap()),
+    ] {
+        assert!(
+            source.tracks.len() >= 2,
+            "{adapter} must produce real technical chord-member tracks"
+        );
+        assert_eq!(source.topology.part_count(), 1);
+        assert_eq!(source.topology.staff_count(), 1);
+        assert_eq!(source.topology.voice_count(), 1);
+        for reverse in [false, true] {
+            if reverse {
+                source.tracks.reverse();
+            }
+            let baseline = convert_midi_with_profile(
+                &source,
+                "english",
+                None,
+                ExportTarget::Ustx,
+                PronunciationProfile::Default,
+            );
+            assert!(
+                baseline.ok,
+                "{adapter}, reverse={reverse}: {:?}",
+                baseline.msg
+            );
+            for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+                let outcome = convert(&source, target);
+                let project = outcome.svp.as_ref().unwrap();
+                let mut notes: Vec<_> = project
+                    .tracks
+                    .iter()
+                    .flat_map(|track| &track.notes)
+                    .collect();
+                notes.sort_by_key(|note| (note.onset_ticks, note.pitch));
+                let mut original: Vec<_> = baseline
+                    .svp
+                    .as_ref()
+                    .unwrap()
+                    .tracks
+                    .iter()
+                    .flat_map(|track| &track.notes)
+                    .collect();
+                original.sort_by_key(|note| (note.onset_ticks, note.pitch));
+                assert_eq!(notes.len(), 3, "{adapter}, reverse={reverse}");
+                assert_eq!(notes.len(), original.len());
+                assert!(
+                    notes[0].onset_ticks + notes[0].duration_ticks < notes[1].onset_ticks,
+                    "fixture must contain a real performed gap"
+                );
+                for (note, original) in notes.iter().zip(original) {
+                    assert_eq!(
+                        note.pronunciation_language,
+                        Some(PronunciationLanguage::English),
+                        "{adapter}, reverse={reverse}: {:?}",
+                        source_lyric(note).map(|lyric| &lyric.raw)
+                    );
+                    assert_eq!(
+                        (
+                            note.onset_ticks,
+                            note.duration_ticks,
+                            note.pitch,
+                            &note.source_evidence,
+                            &note.performance
+                        ),
+                        (
+                            original.onset_ticks,
+                            original.duration_ticks,
+                            original.pitch,
+                            &original.source_evidence,
+                            &original.performance
+                        )
+                    );
+                    assert_eq!(source_lyric(note), source_lyric(original));
+                }
+                assert!(
+                    project.tracks.iter().any(|track| track.notes.len() == 1
+                        && track.notes[0].pitch == 64
+                        && source_lyric(&track.notes[0]).unwrap().raw == "hou"),
+                    "neutral-only technical lane survives conversion"
+                );
+                if target == ExportTarget::Ustx {
+                    let exported = ustx::serialize(project).unwrap();
+                    let neutral = exported
+                        .voice_parts
+                        .iter()
+                        .flat_map(|part| &part.notes)
+                        .find(|note| note.tone == 64)
+                        .unwrap();
+                    assert_eq!(
+                        neutral.phonemizer.as_deref(),
+                        Some(target::diffsinger::ENGLISH_NAME)
+                    );
+                    assert!(
+                        String::from_utf8(target::serialize_to(target, project).unwrap())
+                            .unwrap()
+                            .contains(target::diffsinger::ENGLISH_NAME)
+                    );
+                } else {
+                    assert!(
+                        !String::from_utf8(target::serialize_to(target, project).unwrap())
+                            .unwrap()
+                            .contains("phonemizer")
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn push_vlq(out: &mut Vec<u8>, mut value: u32) {
     let mut bytes = [0u8; 5];
     let mut len = 0usize;

@@ -428,6 +428,150 @@ pub(crate) fn apply(
 mod tests {
     use super::*;
 
+    use crate::engine::midi::Lyric;
+    use crate::engine::projection::ProjectedLyric;
+
+    fn source_note(onset: u32, text: &str, syllabic: Syllabic) -> ProjectedNote {
+        let mut lyric = Lyric::text(format!("source-{onset}"), text.into());
+        lyric.syllabic = Some(syllabic);
+        ProjectedNote {
+            performance: None,
+            pronunciation_language: None,
+            source_evidence: None,
+            onset_ticks: onset,
+            duration_ticks: 480,
+            pitch: 60,
+            lyric: ProjectedLyric::Source(Box::new(lyric)),
+        }
+    }
+
+    #[test]
+    fn exact_mfa_words_feed_native_consumer_fixture() {
+        // Contextual phones are attested by these complete MFA word readings.
+        // This is not a Spanish+ contextual rewrite algorithm. In particular,
+        // stops remain stops where the evidence specifies them (including dedo).
+        let cases = [
+            (PronunciationLanguage::Spanish, "sabe", "s a β e", "s a B e"),
+            (PronunciationLanguage::Spanish, "cada", "k a ð a", "k a D a"),
+            (PronunciationLanguage::Spanish, "lago", "l a ɣ o", "l a G o"),
+            (PronunciationLanguage::Spanish, "boca", "b o k a", "b o k a"),
+            (PronunciationLanguage::Spanish, "dame", "d̪ a m e", "d a m e"),
+            (PronunciationLanguage::Spanish, "gato", "ɡ a t̪ o", "g a t o"),
+            (PronunciationLanguage::Spanish, "dedo", "d̪ e ð o", "d e D o"),
+            (PronunciationLanguage::Portuguese, "acho", "a ʃ u", "a S u"),
+        ];
+        let mut fixture = String::new();
+        for (language, word, mfa, expected) in cases {
+            assert_eq!(
+                readings(language, word),
+                &[(
+                    if language == PronunciationLanguage::Spanish {
+                        "spain+latin-america"
+                    } else {
+                        "brazil+portugal"
+                    },
+                    mfa,
+                )],
+                "the native fixture must stay grounded in the pinned MFA word: {word}"
+            );
+            let mut notes = [source_note(480, word, Syllabic::Single)];
+            let original = notes[0].clone();
+            let diagnostics = apply(&mut notes, &["word-head".into()], language, false);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, APPLIED);
+            assert_eq!(diagnostics[0].source_id.as_deref(), Some("word-head"));
+            let ProjectedLyric::Pronounced {
+                source,
+                text,
+                phonemes: hint,
+            } = &notes[0].lyric
+            else {
+                panic!("expected an exact complete-word hint for {word}");
+            };
+            assert_eq!(text, word);
+            assert_eq!(hint, expected);
+            assert_eq!(Some(source.as_ref()), lexical::source(&original.lyric));
+            let tag = if language == PronunciationLanguage::Spanish {
+                "es"
+            } else {
+                "pt"
+            };
+            fixture.push_str(&format!("{tag}\t{text}\t{hint}\n"));
+            notes[0].lyric = original.lyric.clone();
+            assert_eq!(
+                notes[0], original,
+                "hinting changed note evidence or geometry"
+            );
+        }
+        // Only the developer compatibility gate requests this temporary bridge.
+        // The C# tests consume actual apply() results, not a second copied hint table.
+        if let Some(path) = std::env::var_os("VERSE_OPENUTAU_EXACT_HINT_FIXTURE") {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .expect("create a new native hint fixture without replacing existing data");
+            file.write_all(fixture.as_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn unsupported_mfa_readings_keep_whole_and_split_source_without_partial_hints() {
+        for (language, word, fragments) in [
+            (PronunciationLanguage::Spanish, "canción", ["can", "ción"]),
+            (
+                PronunciationLanguage::Portuguese,
+                "obrigado",
+                ["obri", "gado"],
+            ),
+        ] {
+            let mut whole = [source_note(0, word, Syllabic::Single)];
+            let original = whole.clone();
+            let diagnostics = apply(&mut whole, &["whole".into()], language, false);
+            assert_eq!(
+                whole, original,
+                "unsupported whole word must stay source-owned"
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, UNMAPPABLE);
+            assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+            assert_eq!(diagnostics[0].source_id.as_deref(), Some("whole"));
+
+            let mut split = [
+                source_note(0, fragments[0], Syllabic::Begin),
+                source_note(480, fragments[1], Syllabic::End),
+            ];
+            let original = split.clone();
+            let diagnostics = apply(&mut split, &["head".into(), "tail".into()], language, false);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, UNMAPPABLE);
+            assert_eq!(diagnostics[0].source_id.as_deref(), Some("head"));
+            let ProjectedLyric::Pronounced {
+                text,
+                phonemes: hint,
+                ..
+            } = &split[0].lyric
+            else {
+                panic!("source-proven split word must retain complete-word ownership");
+            };
+            assert_eq!(text, word);
+            assert!(
+                hint.is_empty(),
+                "never retain only the mappable prefix of a reading"
+            );
+            assert!(matches!(
+                split[1].lyric,
+                ProjectedLyric::PronouncedSplit { .. }
+            ));
+            for (note, before) in split.iter_mut().zip(original) {
+                assert_eq!(lexical::source(&note.lyric), lexical::source(&before.lyric));
+                note.lyric = before.lyric.clone();
+                assert_eq!(*note, before, "fallback changed geometry or other evidence");
+            }
+        }
+    }
+
     #[test]
     fn spanish_exact_map_preserves_trill_tap_and_community_allophones() {
         assert_eq!(map_spanish_reading("p e r o").unwrap(), "p e rr o");
