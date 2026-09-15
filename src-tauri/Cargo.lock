@@ -3938,7 +3938,7 @@ dependencies = [
 
 [[package]]
 name = "verse"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "hound",
