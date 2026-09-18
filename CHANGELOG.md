@@ -5,6 +5,15 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.8.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.0...v0.8.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* harden automatic pronunciation routing ([6700012](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/67000127fe51b152e14ebeb6426a5f58dca07f32))
+* harden automatic pronunciation routing ([f3ef8d5](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/f3ef8d5f1937949f644d36a10b7a3387d8ead7a3))
+* harden automatic pronunciation routing ([3640b3f](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/3640b3fa1c6ed056f3c4a686f84a439d9ab12638))
+
 ## [0.8.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.7.5...v0.8.0) (2026-09-15)
 
 
