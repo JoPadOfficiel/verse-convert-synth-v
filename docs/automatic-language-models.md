@@ -7,6 +7,15 @@ resolves a language sequence. Pronunciation dictionaries are separate: a languag
 owner selects the appropriate native phonemizer and the exact supported hints.
 Neither detector scores nor successful YAML parsing prove acoustic quality.
 
+Low-confidence local islands also use a bounded wider source lyric row as context. If
+the nearest confident complete words on both sides, within eight source words,
+belong to the same language and the same part/staff, verse/lane, playback segment
+and occurrence, Verse keeps that language across rests and source-voice bookkeeping
+restarts. Confident switches remain untouched, and a low-confidence word that has
+independent lexical/model evidence for its current language is not flattened by the
+surrounding row. This keeps proper names and real single-word switches while a
+monolingual track does not acquire a stray phonemizer.
+
 ## Historical candidate and measured decision
 
 The initial investigation considered fastText `lid.176.ftz`, a compressed

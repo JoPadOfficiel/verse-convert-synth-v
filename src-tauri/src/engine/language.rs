@@ -5,7 +5,7 @@
 //! with Verse's pinned French/English/Spanish/Portuguese lexicons, and decodes one deterministic
 //! language sequence so short homographs do not flip a phrase on their own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
@@ -108,6 +108,30 @@ fn same_continuation_domain(head: &ProjectedNote, tail: &ProjectedNote) -> bool 
         && row(tail).is_none_or(|tail_row| row(head).is_some_and(|head_row| head_row == tail_row))
 }
 
+fn same_language_context_row(head: &ProjectedNote, tail: &ProjectedNote) -> bool {
+    let domain = |note: &ProjectedNote| {
+        note.source_evidence
+            .as_ref()
+            .and_then(|e| e.origin.as_ref())
+            .map(|origin| {
+                (
+                    origin.source.part_id.clone(),
+                    origin.source.staff_id.clone(),
+                    origin.source.occurrence,
+                    playback_segment(note),
+                )
+            })
+    };
+    let row = |note: &ProjectedNote| {
+        lexical::source(&note.lyric).map(|source| (source.verse, source.lane.clone()))
+    };
+    matches!(
+        (domain(head), domain(tail), row(head), row(tail)),
+        (Some(left_domain), Some(right_domain), Some(left_row), Some(right_row))
+            if left_domain == right_domain && left_row == right_row
+    )
+}
+
 fn detector() -> &'static LanguageDetector {
     static DETECTOR: OnceLock<LanguageDetector> = OnceLock::new();
     DETECTOR.get_or_init(|| {
@@ -158,7 +182,7 @@ fn multilingual_scores(text: &str) -> [f64; 4] {
 
 fn lexical_membership(key: &str) -> [bool; 4] {
     [
-        french::contains_lexeme(key),
+        french::contains_automatic_lexeme(key),
         english::contains_lexeme(key),
         spanish::contains_lexeme(key) || spanish::has_pronunciation(key),
         portuguese::contains_lexeme(key) || portuguese::has_pronunciation(key),
@@ -683,6 +707,95 @@ fn context_barrier(note: &ProjectedNote) -> bool {
             .as_ref()
             .and_then(|evidence| evidence.origin.as_ref())
             .is_some_and(|origin| origin.lyric_conflict)
+}
+
+fn has_independent_language_evidence(
+    track: &ProjectedTrack,
+    word: &RoutedWord,
+    language: PronunciationLanguage,
+) -> bool {
+    let head = word.members[0];
+    let key = lexical::preferred_joined_key(&track.notes, &word.members, known_lexeme);
+    if automatic_anchor(&key) == Some(language) {
+        return true;
+    }
+    let membership = lexical_membership(&key);
+    let index = language.index();
+    let scores = multilingual_scores(&key);
+    let strongest_other = scores
+        .iter()
+        .enumerate()
+        .filter(|(candidate, _)| *candidate != index)
+        .map(|(_, score)| *score)
+        .fold(0.0_f64, f64::max);
+    let margin = scores[index] - strongest_other;
+    if !membership[index] {
+        return scores[index] >= 0.75 && margin >= 0.5;
+    }
+    let membership_count = membership.iter().filter(|known| **known).count();
+    let unique_lexicon = membership
+        .iter()
+        .enumerate()
+        .all(|(candidate, known)| candidate == index || !known);
+    let capitalized_shared_model = starts_capitalized(&track.notes[head])
+        && membership_count > 1
+        && !shared_romance_word(&key)
+        && function_word_anchor(&key).is_none()
+        && match language {
+            PronunciationLanguage::French | PronunciationLanguage::English => {
+                let (french, english) = lingua_scores(&key);
+                match language {
+                    PronunciationLanguage::French => french - english >= 0.1,
+                    PronunciationLanguage::English => english - french >= 0.1,
+                    _ => unreachable!(),
+                }
+            }
+            PronunciationLanguage::Spanish | PronunciationLanguage::Portuguese => margin >= 0.15,
+        };
+    let capitalized_phrase_model = starts_capitalized(&track.notes[head])
+        && [
+            head.checked_sub(1),
+            word.members.last().copied().map(|tail| tail + 1),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|&neighbor| neighbor < track.notes.len())
+        .filter(|&neighbor| starts_capitalized(&track.notes[neighbor]))
+        .filter(|&neighbor| {
+            same_language_context_row(&track.notes[head], &track.notes[neighbor])
+                && !context_barrier(&track.notes[neighbor])
+        })
+        .filter_map(|neighbor| {
+            lexical::candidate(&track.notes[neighbor].lyric).map(|neighbor_key| {
+                if neighbor < head {
+                    format!("{neighbor_key} {key}")
+                } else {
+                    format!("{key} {neighbor_key}")
+                }
+            })
+        })
+        .any(|phrase| match language {
+            PronunciationLanguage::French | PronunciationLanguage::English => {
+                let (french, english) = lingua_scores(&phrase);
+                match language {
+                    PronunciationLanguage::French => french - english >= 0.1,
+                    PronunciationLanguage::English => english - french >= 0.1,
+                    _ => unreachable!(),
+                }
+            }
+            PronunciationLanguage::Spanish | PronunciationLanguage::Portuguese => {
+                let scores = multilingual_scores(&phrase);
+                let own = scores[index];
+                let other = scores
+                    .iter()
+                    .enumerate()
+                    .filter(|(candidate, _)| *candidate != index)
+                    .map(|(_, score)| *score)
+                    .fold(0.0_f64, f64::max);
+                own - other >= 0.2
+            }
+        });
+    (unique_lexicon && margin >= 0.15) || capitalized_shared_model || capitalized_phrase_model
 }
 
 /// Technical chord-member tracks can contain no lexical evidence of their own.
@@ -1624,11 +1737,142 @@ pub fn route_track(track: &mut ProjectedTrack) -> Vec<Diagnostic> {
     route_track_with_inheritance(track).0
 }
 
+const TRACK_STABILIZATION_WORD_RADIUS: usize = 8;
+
+fn stabilize_low_confidence_track_words(
+    track: &mut ProjectedTrack,
+    words: &[RoutedWord],
+    low_confidence_heads: &HashSet<usize>,
+    changed: &mut HashMap<String, PronunciationLanguage>,
+) {
+    if low_confidence_heads.is_empty() {
+        return;
+    }
+    let row_keys: Vec<_> = track
+        .notes
+        .iter()
+        .map(|note| {
+            let lyric = lexical::source(&note.lyric)?;
+            let origin = note.source_evidence.as_ref()?.origin.as_ref()?;
+            Some((
+                origin.source.part_id.clone(),
+                origin.source.staff_id.clone(),
+                lyric.verse,
+                lyric.lane.clone(),
+                origin.source.occurrence,
+                playback_segment(note),
+            ))
+        })
+        .collect();
+    let barriers: Vec<_> = track.notes.iter().map(context_barrier).collect();
+    let initial_languages: Vec<_> = track
+        .notes
+        .iter()
+        .map(|note| note.pronunciation_language)
+        .collect();
+    // A projected sung lane may restart its source voice bookkeeping without
+    // changing the authored lyric row. Part/staff, however, remain hard source
+    // ownership boundaries for this wider contextual repair.
+    let same_row = |left: usize, right: usize| match (&row_keys[left], &row_keys[right]) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    };
+    let context_is_open = |left: usize, right: usize| {
+        let Some(row) = row_keys[left].as_ref() else {
+            return false;
+        };
+        let from = left.min(right);
+        let to = left.max(right);
+        !(from..=to).any(|index| row_keys[index].as_ref() == Some(row) && barriers[index])
+    };
+
+    for (position, word) in words.iter().enumerate() {
+        if !word.is_donor() || !low_confidence_heads.contains(&word.members[0]) {
+            continue;
+        }
+        let head = word.members[0];
+        if word.members.iter().any(|&member| barriers[member]) {
+            continue;
+        }
+        let previous = words[..position]
+            .iter()
+            .rev()
+            .filter(|candidate| same_row(candidate.members[0], head))
+            .take(TRACK_STABILIZATION_WORD_RADIUS)
+            .find_map(|candidate| {
+                (candidate.is_donor()
+                    && !low_confidence_heads.contains(&candidate.members[0])
+                    && candidate.members.iter().all(|&member| !barriers[member])
+                    && context_is_open(candidate.members[0], head))
+                .then(|| initial_languages[candidate.members[0]])
+                .flatten()
+            });
+        let next = words[position + 1..]
+            .iter()
+            .filter(|candidate| same_row(candidate.members[0], head))
+            .take(TRACK_STABILIZATION_WORD_RADIUS)
+            .find_map(|candidate| {
+                (candidate.is_donor()
+                    && !low_confidence_heads.contains(&candidate.members[0])
+                    && candidate.members.iter().all(|&member| !barriers[member])
+                    && context_is_open(candidate.members[0], head))
+                .then(|| initial_languages[candidate.members[0]])
+                .flatten()
+            });
+        let Some(language) = previous.filter(|language| Some(*language) == next) else {
+            continue;
+        };
+        if initial_languages[head].is_some_and(|current| {
+            current != language && has_independent_language_evidence(track, word, current)
+        }) {
+            continue;
+        }
+        for &member in &word.members {
+            if track.notes[member].pronunciation_language == Some(language) {
+                continue;
+            }
+            if let Some(source_id) = track.notes[member]
+                .source_evidence
+                .as_ref()
+                .map(|evidence| evidence.note_id.clone())
+            {
+                changed.insert(source_id, language);
+            }
+            track.notes[member].pronunciation_language = Some(language);
+        }
+    }
+}
+
+fn record_low_confidence_heads(
+    routed: &Route,
+    note_ids: &[String],
+    start: usize,
+    low_confidence_heads: &mut HashSet<usize>,
+) {
+    for diagnostic in routed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == LOW_CONFIDENCE)
+    {
+        let Some(source_id) = diagnostic.source_id.as_ref() else {
+            continue;
+        };
+        if let Some(word) = routed.words.iter().find(|word| {
+            note_ids
+                .get(word.members[0])
+                .is_some_and(|candidate| candidate == source_id)
+        }) {
+            low_confidence_heads.insert(start + word.members[0]);
+        }
+    }
+}
+
 fn route_track_with_inheritance(track: &mut ProjectedTrack) -> (Vec<Diagnostic>, Vec<RoutedWord>) {
     let mut diagnostics = Vec::new();
     let mut inherit_passage = vec![false; track.notes.len()];
     let mut changed = HashMap::new();
     let mut words = Vec::new();
+    let mut low_confidence_heads = HashSet::new();
     let mut start = 0usize;
     while start < track.notes.len() {
         let domain = track.notes[start]
@@ -1680,6 +1924,7 @@ fn route_track_with_inheritance(track: &mut ProjectedTrack) -> (Vec<Diagnostic>,
         // or repeat occurrences.
         crate::engine::syllable::preserve_bracketed_melismas(&mut track.notes[start..end]);
         let routed = route(&track.notes[start..end], &ids);
+        record_low_confidence_heads(&routed, &ids, start, &mut low_confidence_heads);
         words.extend(routed.words.iter().map(|word| RoutedWord {
             members: word.members.iter().map(|member| member + start).collect(),
             contextual: word.contextual,
@@ -1806,6 +2051,15 @@ fn route_track_with_inheritance(track: &mut ProjectedTrack) -> (Vec<Diagnostic>,
         );
         start = end;
     }
+
+    // Local statistical windows are intentionally allowed to propose a
+    // language switch, but a low-confidence island must not split an otherwise
+    // established source row merely because a rest or phrase boundary made its
+    // local window tiny. Confident words on both sides are whole-track context:
+    // if they agree, use that owner for the uncertain complete word. Confident
+    // switches remain untouched, so genuinely multilingual passages still
+    // select their own phonemizers.
+    stabilize_low_confidence_track_words(track, &words, &low_confidence_heads, &mut changed);
 
     // Some source domains contain only a neutral vocalise or a very short
     // unknown spelling. Such a domain has no trustworthy local language to
@@ -2276,6 +2530,673 @@ mod tests {
             muted: false,
             notes,
         }
+    }
+
+    fn routed_word(index: usize) -> RoutedWord {
+        RoutedWord {
+            members: vec![index],
+            contextual: false,
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn track_stabilization_leaves_a_low_confidence_word_when_sides_disagree() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "de", "1"),
+            domain_note(960, "beautiful", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::Spanish);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::English);
+        let words = (0..3).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::Spanish)
+        );
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn track_stabilization_keeps_a_real_single_word_switch_with_independent_evidence() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "the", "1"),
+            domain_note(960, "merci", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..3).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn track_stabilization_keeps_strong_model_only_language_evidence() {
+        assert!(!known_lexeme("nottinghamshire"));
+        let scores = multilingual_scores("nottinghamshire");
+        assert!(
+            scores[PronunciationLanguage::English.index()] >= 0.75,
+            "unexpected detector score: {scores:?}"
+        );
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "Nottinghamshire", "1"),
+            domain_note(960, "merci", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..3).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn track_stabilization_keeps_capitalized_proper_name_evidence() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "Beatles", "1"),
+            domain_note(960, "merci", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..3).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn track_stabilization_keeps_a_capitalized_multiword_name_from_phrase_evidence() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "Big", "1"),
+            domain_note(960, "Ben", "1"),
+            domain_note(1440, "merci", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[3].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..4).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1, 2]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert_eq!(
+            track.notes[2].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn track_stabilization_keeps_capitalized_multiword_name_across_voice_restart() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "Big", "1"),
+            domain_note(960, "Ben", "2"),
+            domain_note(1440, "merci", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[3].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..4).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1, 2]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert_eq!(
+            track.notes[2].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn track_stabilization_can_correct_capitalized_unaccented_french_reves() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "Reves", "1"),
+            domain_note(960, "merci", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..3).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::French)
+        );
+        assert_eq!(
+            changed.get("note-1-480"),
+            Some(&PronunciationLanguage::French)
+        );
+    }
+
+    #[test]
+    fn track_stabilization_requires_model_support_for_capitalized_shared_word() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "La", "1"),
+            domain_note(960, "merci", "1"),
+        ]);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::English);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..3).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::French)
+        );
+    }
+
+    #[test]
+    fn track_stabilization_updates_every_member_of_a_low_confidence_split_word() {
+        let mut track = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "suis", "1"),
+            domain_note(960, "moi", "1"),
+            domain_note(1440, "merci", "1"),
+        ]);
+        let ProjectedLyric::Source(left) = &mut track.notes[1].lyric else {
+            unreachable!()
+        };
+        left.syllabic = Some(crate::engine::midi::Syllabic::Begin);
+        let ProjectedLyric::Source(right) = &mut track.notes[2].lyric else {
+            unreachable!()
+        };
+        right.syllabic = Some(crate::engine::midi::Syllabic::End);
+        track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        track.notes[1].pronunciation_language = Some(PronunciationLanguage::Spanish);
+        track.notes[2].pronunciation_language = Some(PronunciationLanguage::Spanish);
+        track.notes[3].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = vec![
+            routed_word(0),
+            RoutedWord {
+                members: vec![1, 2],
+                contextual: false,
+                complete: true,
+            },
+            routed_word(3),
+        ];
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::French)
+        );
+        assert_eq!(
+            track.notes[2].pronunciation_language,
+            Some(PronunciationLanguage::French)
+        );
+        assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    fn unrelated_rows_do_not_consume_the_stabilization_radius_or_add_barriers() {
+        let mut track = test_track(
+            (0..19)
+                .map(|index| {
+                    domain_note(
+                        index as u32 * 480,
+                        if index == 0 {
+                            "bonjour"
+                        } else if index == 9 {
+                            "de"
+                        } else if index == 18 {
+                            "merci"
+                        } else {
+                            "other"
+                        },
+                        "1",
+                    )
+                })
+                .collect(),
+        );
+        for index in 1..18 {
+            if index == 9 {
+                continue;
+            }
+            let ProjectedLyric::Source(source) = &mut track.notes[index].lyric else {
+                unreachable!()
+            };
+            source.lane = "other".into();
+        }
+        let ProjectedLyric::Source(manual) = &mut track.notes[5].lyric else {
+            unreachable!()
+        };
+        manual.raw = "?manual".into();
+        manual.state = LyricState::Text("?manual".into());
+        for (index, note) in track.notes.iter_mut().enumerate() {
+            note.pronunciation_language = Some(if matches!(index, 0 | 18) {
+                PronunciationLanguage::French
+            } else {
+                PronunciationLanguage::Spanish
+            });
+        }
+        let words = (0..track.notes.len()).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([9]);
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[9].pronunciation_language,
+            Some(PronunciationLanguage::French)
+        );
+    }
+
+    #[test]
+    fn low_confidence_heads_are_scoped_to_the_routed_occurrence_not_note_id() {
+        let warning = Route {
+            languages: vec![Some(PronunciationLanguage::French)],
+            diagnostics: vec![Diagnostic {
+                code: LOW_CONFIDENCE.into(),
+                severity: DiagnosticSeverity::Info,
+                message: "test".into(),
+                source_id: Some("same-source-note".into()),
+            }],
+            inherit_passage: vec![false],
+            words: vec![routed_word(0)],
+        };
+        let confident = Route {
+            languages: vec![Some(PronunciationLanguage::French)],
+            diagnostics: Vec::new(),
+            inherit_passage: vec![false],
+            words: vec![routed_word(0)],
+        };
+        let ids = vec!["same-source-note".into()];
+        let mut heads = HashSet::new();
+
+        record_low_confidence_heads(&warning, &ids, 0, &mut heads);
+        record_low_confidence_heads(&confident, &ids, 3, &mut heads);
+
+        assert_eq!(heads, HashSet::from([0]));
+    }
+
+    #[test]
+    fn track_stabilization_respects_part_and_staff_but_allows_voice_restart() {
+        for boundary in ["part", "staff"] {
+            let mut track = test_track(vec![
+                domain_note(0, "bonjour", "1"),
+                domain_note(480, "de", "1"),
+                domain_note(960, "merci", "1"),
+            ]);
+            track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+            track.notes[1].pronunciation_language = Some(PronunciationLanguage::Spanish);
+            track.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+            let source = &mut track.notes[1]
+                .source_evidence
+                .as_mut()
+                .unwrap()
+                .origin
+                .as_mut()
+                .unwrap()
+                .source;
+            if boundary == "part" {
+                source.part_id = Some("P2".into());
+            } else {
+                source.staff_id = Some("2".into());
+            }
+            let words = (0..3).map(routed_word).collect::<Vec<_>>();
+            let low_confidence_heads = HashSet::from([1]);
+            let mut changed = HashMap::new();
+            stabilize_low_confidence_track_words(
+                &mut track,
+                &words,
+                &low_confidence_heads,
+                &mut changed,
+            );
+            assert_eq!(
+                track.notes[1].pronunciation_language,
+                Some(PronunciationLanguage::Spanish),
+                "{boundary} must remain a hard source boundary"
+            );
+        }
+
+        let mut restarted = test_track(vec![
+            domain_note(0, "bonjour", "1"),
+            domain_note(480, "de", "2"),
+            domain_note(960, "merci", "1"),
+        ]);
+        restarted.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+        restarted.notes[1].pronunciation_language = Some(PronunciationLanguage::Spanish);
+        restarted.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+        let words = (0..3).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = HashSet::from([1]);
+        let mut changed = HashMap::new();
+        stabilize_low_confidence_track_words(
+            &mut restarted,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+        assert_eq!(
+            restarted.notes[1].pronunciation_language,
+            Some(PronunciationLanguage::French)
+        );
+    }
+
+    #[test]
+    fn track_stabilization_respects_row_occurrence_segment_and_manual_boundaries() {
+        for boundary in [
+            "verse",
+            "lane",
+            "occurrence",
+            "segment",
+            "manual",
+            "conflict",
+        ] {
+            let mut track = test_track(vec![
+                domain_note(0, "bonjour", "1"),
+                domain_note(480, "de", "1"),
+                domain_note(960, "merci", "1"),
+            ]);
+            track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+            track.notes[1].pronunciation_language = Some(PronunciationLanguage::Spanish);
+            track.notes[2].pronunciation_language = Some(PronunciationLanguage::French);
+            match boundary {
+                "verse" | "lane" => {
+                    let ProjectedLyric::Source(source) = &mut track.notes[1].lyric else {
+                        unreachable!()
+                    };
+                    if boundary == "verse" {
+                        source.verse += 1;
+                    } else {
+                        source.lane = "other".into();
+                    }
+                }
+                "occurrence" => {
+                    track.notes[1]
+                        .source_evidence
+                        .as_mut()
+                        .unwrap()
+                        .origin
+                        .as_mut()
+                        .unwrap()
+                        .source
+                        .occurrence += 1;
+                }
+                "segment" => set_playback_segment(&mut track.notes[1], 2),
+                "manual" => {
+                    let ProjectedLyric::Source(source) = &mut track.notes[1].lyric else {
+                        unreachable!()
+                    };
+                    source.raw = "?manual".into();
+                    source.state = LyricState::Text("?manual".into());
+                }
+                "conflict" => {
+                    track.notes[1]
+                        .source_evidence
+                        .as_mut()
+                        .unwrap()
+                        .origin
+                        .as_mut()
+                        .unwrap()
+                        .lyric_conflict = true;
+                }
+                _ => unreachable!(),
+            }
+            let words = (0..3).map(routed_word).collect::<Vec<_>>();
+            let low_confidence_heads = HashSet::from([1]);
+            let mut changed = HashMap::new();
+
+            stabilize_low_confidence_track_words(
+                &mut track,
+                &words,
+                &low_confidence_heads,
+                &mut changed,
+            );
+
+            assert_eq!(
+                track.notes[1].pronunciation_language,
+                Some(PronunciationLanguage::Spanish),
+                "{boundary}"
+            );
+            assert!(changed.is_empty(), "{boundary}");
+        }
+    }
+
+    #[test]
+    fn track_stabilization_cannot_cross_same_row_manual_or_conflict_barrier() {
+        for barrier in ["manual", "conflict"] {
+            let mut track = test_track(vec![
+                domain_note(0, "bonjour", "1"),
+                domain_note(480, "barrier", "1"),
+                domain_note(960, "de", "1"),
+                domain_note(1440, "merci", "1"),
+            ]);
+            track.notes[0].pronunciation_language = Some(PronunciationLanguage::French);
+            track.notes[1].pronunciation_language = Some(PronunciationLanguage::French);
+            track.notes[2].pronunciation_language = Some(PronunciationLanguage::Spanish);
+            track.notes[3].pronunciation_language = Some(PronunciationLanguage::French);
+            if barrier == "manual" {
+                let ProjectedLyric::Source(source) = &mut track.notes[1].lyric else {
+                    unreachable!()
+                };
+                source.raw = "?manual".into();
+                source.state = LyricState::Text("?manual".into());
+            } else {
+                track.notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .lyric_conflict = true;
+            }
+            let words = (0..4).map(routed_word).collect::<Vec<_>>();
+            let low_confidence_heads = HashSet::from([2]);
+            let mut changed = HashMap::new();
+
+            stabilize_low_confidence_track_words(
+                &mut track,
+                &words,
+                &low_confidence_heads,
+                &mut changed,
+            );
+
+            assert_eq!(
+                track.notes[2].pronunciation_language,
+                Some(PronunciationLanguage::Spanish),
+                "{barrier}"
+            );
+            assert!(changed.is_empty(), "{barrier}");
+        }
+    }
+
+    #[test]
+    fn track_stabilization_does_not_borrow_beyond_its_word_radius() {
+        let mut track = test_track(
+            (0..19)
+                .map(|index| {
+                    domain_note(
+                        index as u32 * 480,
+                        if index == 0 {
+                            "bonjour"
+                        } else if index == 18 {
+                            "merci"
+                        } else {
+                            "de"
+                        },
+                        "1",
+                    )
+                })
+                .collect(),
+        );
+        for (index, note) in track.notes.iter_mut().enumerate() {
+            note.pronunciation_language = Some(if index == 0 || index == 18 {
+                PronunciationLanguage::French
+            } else {
+                PronunciationLanguage::Spanish
+            });
+        }
+        let words = (0..track.notes.len()).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = (1..18).collect::<HashSet<_>>();
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert!(track.notes[1..18]
+            .iter()
+            .all(|note| { note.pronunciation_language == Some(PronunciationLanguage::Spanish) }));
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn track_stabilization_borrows_at_exact_word_radius() {
+        let mut track = test_track(
+            (0..17)
+                .map(|index| {
+                    domain_note(
+                        index as u32 * 480,
+                        if index == 0 {
+                            "bonjour"
+                        } else if index == 16 {
+                            "merci"
+                        } else {
+                            "de"
+                        },
+                        "1",
+                    )
+                })
+                .collect(),
+        );
+        for (index, note) in track.notes.iter_mut().enumerate() {
+            note.pronunciation_language = Some(if index == 0 || index == 16 {
+                PronunciationLanguage::French
+            } else {
+                PronunciationLanguage::Spanish
+            });
+        }
+        let words = (0..track.notes.len()).map(routed_word).collect::<Vec<_>>();
+        let low_confidence_heads = (1..16).collect::<HashSet<_>>();
+        let mut changed = HashMap::new();
+
+        stabilize_low_confidence_track_words(
+            &mut track,
+            &words,
+            &low_confidence_heads,
+            &mut changed,
+        );
+
+        assert_eq!(
+            track.notes[8].pronunciation_language,
+            Some(PronunciationLanguage::French)
+        );
     }
 
     #[test]
@@ -2811,6 +3732,124 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == LOW_CONFIDENCE));
+    }
+
+    #[test]
+    fn track_context_keeps_a_low_confidence_french_island_french_across_a_rest() {
+        let mut track = test_track(vec![
+            domain_note(0, "dans", "1"),
+            domain_note(480, "des", "1"),
+            domain_note(960, "trompettes", "1"),
+            domain_note(3840, "ou", "1"),
+            domain_note(4320, "àforce", "1"),
+            domain_note(4800, "de", "1"),
+            domain_note(5280, "murmures", "1"),
+        ]);
+        let diagnostics = route_track(&mut track);
+        assert_eq!(
+            track
+                .notes
+                .iter()
+                .map(|note| note.pronunciation_language)
+                .collect::<Vec<_>>(),
+            vec![Some(PronunciationLanguage::French); 7]
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == LOW_CONFIDENCE
+                && diagnostic.source_id.as_deref() == Some("note-1-3840")
+                && diagnostic.message.contains("French")
+                && diagnostic.message.contains("surrounding passage")
+        }));
+    }
+
+    #[test]
+    fn track_context_keeps_unaccented_french_reves_with_its_french_row() {
+        let mut track = test_track(vec![
+            domain_note(0, "au", "1"),
+            domain_note(480, "bout", "1"),
+            domain_note(960, "de", "1"),
+            domain_note(1440, "mes", "1"),
+            domain_note(1920, "reves", "1"),
+            domain_note(2400, "j'irai", "1"),
+        ]);
+        route_track(&mut track);
+        assert_eq!(
+            track
+                .notes
+                .iter()
+                .map(|note| note.pronunciation_language)
+                .collect::<Vec<_>>(),
+            vec![Some(PronunciationLanguage::French); 6]
+        );
+    }
+
+    #[test]
+    fn track_context_keeps_monolingual_rows_stable_across_rests_in_all_four_languages() {
+        for (words, expected) in [
+            (
+                ["bonjour", "ou", "de", "murmures", "merci"],
+                PronunciationLanguage::French,
+            ),
+            (
+                ["the", "on", "radio", "with", "friends"],
+                PronunciationLanguage::English,
+            ),
+            (
+                ["hola", "de", "la", "vida", "gracias"],
+                PronunciationLanguage::Spanish,
+            ),
+            (
+                ["olá", "de", "uma", "vida", "obrigado"],
+                PronunciationLanguage::Portuguese,
+            ),
+        ] {
+            let mut track = test_track(
+                words
+                    .iter()
+                    .enumerate()
+                    .map(|(index, word)| domain_note(index as u32 * 960, word, "1"))
+                    .collect(),
+            );
+            route_track(&mut track);
+            assert_eq!(
+                track
+                    .notes
+                    .iter()
+                    .map(|note| note.pronunciation_language)
+                    .collect::<Vec<_>>(),
+                vec![Some(expected); words.len()],
+                "{words:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn track_context_preserves_real_language_switches_with_ambiguous_words() {
+        let passages = [
+            (["bonjour", "de", "merci"], PronunciationLanguage::French),
+            (["the", "on", "baby"], PronunciationLanguage::English),
+            (["hola", "de", "gracias"], PronunciationLanguage::Spanish),
+            (["olá", "de", "obrigado"], PronunciationLanguage::Portuguese),
+        ];
+        let mut notes = Vec::new();
+        let mut expected = Vec::new();
+        for (passage_index, (words, language)) in passages.into_iter().enumerate() {
+            let base = passage_index as u32 * 2400;
+            for (word_index, word) in words.into_iter().enumerate() {
+                notes.push(domain_note(base + word_index as u32 * 480, word, "1"));
+                expected.push(Some(language));
+            }
+        }
+        let mut track = test_track(notes);
+        route_track(&mut track);
+        assert_eq!(
+            track
+                .notes
+                .iter()
+                .map(|note| note.pronunciation_language)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

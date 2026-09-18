@@ -13,6 +13,137 @@ use verse_lib::engine::{musescore, musicxml};
 
 const AUTO: PronunciationProfile = PronunciationProfile::Automatic;
 
+#[test]
+fn automatic_french_compound_and_silent_endings_use_millefeuille_hints() {
+    let midi = musicxml::parse(
+        musicxml_score(&["bonjour", "suis", "suis-moi", "chanter", "merci"]).as_bytes(),
+    )
+    .unwrap();
+    let outcome = convert(&midi, ExportTarget::Ustx);
+    let project = outcome.svp.as_ref().unwrap();
+    assert_eq!(
+        head_languages(project),
+        vec![PronunciationLanguage::French; 5],
+        "a clear French passage must keep French ownership for the compound and silent-ending word"
+    );
+
+    let native = ustx::serialize(project).unwrap();
+    let notes = &native.voice_parts[0].notes;
+    assert_eq!(notes[1].lyric, "suis[fr/s fr/uy fr/ih]");
+    assert_eq!(notes[2].lyric, "suis-moi[fr/s fr/uy fr/ih fr/m fr/w fr/ah]");
+    assert_eq!(notes[3].lyric, "chanter[fr/sh fr/en fr/t fr/eh]");
+    assert_eq!(
+        notes[2].phonemizer.as_deref(),
+        Some(target::diffsinger::FRENCH_NAME)
+    );
+    assert_eq!(
+        notes[3].phonemizer.as_deref(),
+        Some(target::diffsinger::FRENCH_NAME)
+    );
+
+    let svp = convert(&midi, ExportTarget::Svp);
+    let text = String::from_utf8(
+        target::serialize_to(ExportTarget::Svp, svp.svp.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(!text.contains("phonemizer"));
+    assert!(!text.contains("fr/"));
+}
+
+#[test]
+fn automatic_suis_moi_accepts_supported_source_hyphen_variants() {
+    for hyphen in [
+        '\u{002D}', '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}',
+        '\u{2212}', '\u{FE58}', '\u{FE63}', '\u{FF0D}',
+    ] {
+        let compound = format!("suis{hyphen}moi");
+        let source = ["bonjour", compound.as_str(), "merci"];
+        let midi = musicxml::parse(musicxml_score(&source).as_bytes()).unwrap();
+        let outcome = convert(&midi, ExportTarget::Ustx);
+        let native = ustx::serialize(outcome.svp.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            native.voice_parts[0].notes[1].lyric,
+            format!("{compound}[fr/s fr/uy fr/ih fr/m fr/w fr/ah]"),
+            "{hyphen:?}"
+        );
+        assert_eq!(
+            native.voice_parts[0].notes[1].phonemizer.as_deref(),
+            Some(target::diffsinger::FRENCH_NAME),
+            "{hyphen:?}"
+        );
+    }
+}
+
+#[test]
+fn automatic_split_suis_moi_keeps_the_audited_millefeuille_reading() {
+    let midi = musicxml::parse(musicxml_split_suis_moi().as_bytes()).unwrap();
+    let outcome = convert(&midi, ExportTarget::Ustx);
+    let project = outcome.svp.as_ref().unwrap();
+    assert_eq!(
+        head_languages(project),
+        vec![PronunciationLanguage::French; 3],
+        "a source-proven split suis-moi must stay one French word"
+    );
+
+    let native = ustx::serialize(project).unwrap();
+    let notes = &native.voice_parts[0].notes;
+    assert_eq!(notes[1].lyric, "suis-moi[fr/s fr/uy fr/ih fr/m fr/w fr/ah]");
+    assert_eq!(notes[2].lyric, "+");
+    assert_eq!(
+        notes[1].phonemizer.as_deref(),
+        Some(target::diffsinger::FRENCH_NAME)
+    );
+    assert!(notes[2].phonemizer.is_none());
+}
+
+#[test]
+fn automatic_isolated_split_suis_moi_keeps_the_audited_millefeuille_reading() {
+    let source = musicxml_score(&["suis", "moi"])
+        .replacen(
+            "<syllabic>single</syllabic><text>suis</text>",
+            "<syllabic>begin</syllabic><text>suis</text>",
+            1,
+        )
+        .replacen(
+            "<syllabic>single</syllabic><text>moi</text>",
+            "<syllabic>end</syllabic><text>moi</text>",
+            1,
+        );
+    let midi = musicxml::parse(source.as_bytes()).unwrap();
+    let outcome = convert(&midi, ExportTarget::Ustx);
+    let project = outcome.svp.as_ref().unwrap();
+    assert_eq!(
+        head_languages(project),
+        vec![PronunciationLanguage::French],
+        "the audited split compound must route as French without neighboring context"
+    );
+
+    let native = ustx::serialize(project).unwrap();
+    let notes = &native.voice_parts[0].notes;
+    assert_eq!(notes[0].lyric, "suis-moi[fr/s fr/uy fr/ih fr/m fr/w fr/ah]");
+    assert_eq!(notes[1].lyric, "+");
+    assert_eq!(
+        notes[0].phonemizer.as_deref(),
+        Some(target::diffsinger::FRENCH_NAME)
+    );
+}
+
+#[test]
+fn automatic_isolated_suis_moi_uses_audited_french_evidence() {
+    let midi = musicxml::parse(musicxml_score(&["suis-moi"]).as_bytes()).unwrap();
+    let outcome = convert(&midi, ExportTarget::Ustx);
+    let project = outcome.svp.as_ref().unwrap();
+    assert_eq!(head_languages(project), vec![PronunciationLanguage::French]);
+
+    let native = ustx::serialize(project).unwrap();
+    let note = &native.voice_parts[0].notes[0];
+    assert_eq!(note.lyric, "suis-moi[fr/s fr/uy fr/ih fr/m fr/w fr/ah]");
+    assert_eq!(
+        note.phonemizer.as_deref(),
+        Some(target::diffsinger::FRENCH_NAME)
+    );
+}
+
 fn convert(midi: &Midi, target: ExportTarget) -> ConvertOutcome {
     let result = convert_midi_with_profile(midi, "english", None, target, AUTO);
     assert!(result.ok, "automatic conversion failed: {:?}", result.msg);
@@ -138,6 +269,20 @@ fn musicxml_split_word() -> String {
          <measure number=\"1\"><attributes><divisions>1</divisions><time><beats>3</beats>\
          <beat-type>4</beat-type></time></attributes>{notes}</measure></part></score-partwise>"
     )
+}
+
+fn musicxml_split_suis_moi() -> String {
+    musicxml_score(&["bonjour", "suis", "moi", "merci"])
+        .replacen(
+            "<syllabic>single</syllabic><text>suis</text>",
+            "<syllabic>begin</syllabic><text>suis</text>",
+            1,
+        )
+        .replacen(
+            "<syllabic>single</syllabic><text>moi</text>",
+            "<syllabic>end</syllabic><text>moi</text>",
+            1,
+        )
 }
 
 fn musescore_score(words: &[&str]) -> String {
