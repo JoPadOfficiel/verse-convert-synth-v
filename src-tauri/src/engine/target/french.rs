@@ -9,7 +9,7 @@ use super::lexical as shared;
 use crate::engine::convert::{Diagnostic, DiagnosticSeverity};
 use crate::engine::midi::{Lyric, LyricState, Syllabic};
 use crate::engine::projection::{ProjectedLyric, ProjectedNote};
-use crate::engine::syllable::{preserve_bracketed_melismas, touches};
+use crate::engine::syllable::{preserve_bracketed_melismas, touches, SYLLABLE_HYPHENS};
 
 // The misspelling is the actual installed OpenUtau type name.
 pub const PHONEMIZER: &str = "OpenUtau.Core.DiffSinger.DiffSingerFrenchMillfeuillePhonemizer";
@@ -98,6 +98,36 @@ fn lexical(key: &str) -> Option<String> {
     None
 }
 
+fn audited_compound_lexical(key: &str) -> Option<String> {
+    let parts: Vec<_> = key.split(SYLLABLE_HYPHENS).collect();
+    if parts.as_slice() != ["suis", "moi"] {
+        return None;
+    }
+    parts
+        .into_iter()
+        .map(lexical)
+        .collect::<Option<Vec<_>>>()
+        .map(|hints| hints.join(" "))
+}
+
+fn automatic_lexical(key: &str) -> Option<String> {
+    lexical(key).or_else(|| audited_compound_lexical(key))
+}
+
+fn automatic_word_key(notes: &[ProjectedNote], members: &[usize]) -> String {
+    let parts = members
+        .iter()
+        .map(|&index| candidate(&notes[index].lyric))
+        .collect::<Option<Vec<_>>>();
+    if parts
+        .as_deref()
+        .is_some_and(|parts| parts.len() == 2 && parts[0] == "suis" && parts[1] == "moi")
+    {
+        return "suis-moi".into();
+    }
+    shared::preferred_joined_key(notes, members, contains_lexeme)
+}
+
 /// Read-only lexical evidence for the automatic FR/EN/ES/PT router. Membership says
 /// a spelling exists in the French resources; it does not choose a pronunciation
 /// or override ambiguity safeguards used by the actual pronunciation pass.
@@ -115,6 +145,14 @@ pub(crate) fn contains_lexeme(key: &str) -> bool {
         || COMMUNITY_INDEX
             .get_or_init(|| shared::index(COMMUNITY))
             .contains_key(key.as_str())
+}
+
+/// Automatic routing may use the same narrowly audited compound evidence that
+/// the Automatic French pronunciation pass accepts. Keep this separate from
+/// `contains_lexeme` so explicit French profile semantics and generic dictionary
+/// membership remain unchanged.
+pub(crate) fn contains_automatic_lexeme(key: &str) -> bool {
+    contains_lexeme(key) || audited_compound_lexical(&normalize(key)).is_some()
 }
 
 fn standalone_allowed(lyric: &ProjectedLyric, key: &str) -> bool {
@@ -836,7 +874,7 @@ fn apply_inner(
             continue;
         }
         let key = if automatic_recovery {
-            shared::preferred_joined_key(notes, &members, contains_lexeme)
+            automatic_word_key(notes, &members)
         } else {
             let Some(parts) = members
                 .iter()
@@ -847,7 +885,12 @@ fn apply_inner(
             };
             parts.concat()
         };
-        if let Some(hint) = lexical(&key) {
+        let hint = if automatic_recovery {
+            automatic_lexical(&key)
+        } else {
+            lexical(&key)
+        };
+        if let Some(hint) = hint {
             if shared::vowel_count(&hint) == members.len() {
                 shared::pronounce_word(notes, &members, &key, &hint);
                 words.push((members[0], *members.last().unwrap(), key));
@@ -863,7 +906,12 @@ fn apply_inner(
             // grammatical or sung-schwa rule.
             if (!fragments[index] || key == "rê") && standalone_allowed(&notes[index].lyric, &key)
             {
-                if let Some(hint) = lexical(&key) {
+                let hint = if automatic_recovery {
+                    automatic_lexical(&key)
+                } else {
+                    lexical(&key)
+                };
+                if let Some(hint) = hint {
                     pronounce(&mut notes[index], &hint);
                     changed[index] = true;
                     if key != "rê" {

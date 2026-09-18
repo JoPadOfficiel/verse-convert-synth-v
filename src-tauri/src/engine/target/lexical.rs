@@ -297,6 +297,16 @@ pub(crate) fn joined_key(notes: &[ProjectedNote], members: &[usize]) -> String {
         .collect()
 }
 
+fn hyphenated_joined_key(notes: &[ProjectedNote], members: &[usize]) -> Option<String> {
+    (members.len() > 1).then(|| {
+        members
+            .iter()
+            .map(|&index| normalize(raw_text(&notes[index].lyric).unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("-")
+    })
+}
+
 fn overlapped_joined_key(notes: &[ProjectedNote], members: &[usize]) -> Option<String> {
     let mut parts = members
         .iter()
@@ -317,9 +327,11 @@ fn overlapped_joined_key(notes: &[ProjectedNote], members: &[usize]) -> Option<S
 }
 
 /// Prefer the literal source-fragment concatenation. Only if it has no known
-/// reading may an overlapping-boundary spelling be used for lookup, e.g. a
-/// score writer's `Beat` + `tles` can resolve to `beatles`. This is a lookup key
-/// recovery only; raw source lyrics and note identities remain unchanged.
+/// reading may a hyphenated compound spelling or an overlapping-boundary
+/// spelling be used for lookup, e.g. source fragments `suis` + `moi` can
+/// resolve to `suis-moi`, while `Beat` + `tles` can resolve to `beatles`.
+/// This is a lookup key recovery only; raw source lyrics and note identities
+/// remain unchanged.
 pub(crate) fn preferred_joined_key(
     notes: &[ProjectedNote],
     members: &[usize],
@@ -328,6 +340,11 @@ pub(crate) fn preferred_joined_key(
     let plain = joined_key(notes, members);
     if known(&plain) {
         return plain;
+    }
+    if let Some(hyphenated) =
+        hyphenated_joined_key(notes, members).filter(|candidate| known(candidate))
+    {
+        return hyphenated;
     }
     overlapped_joined_key(notes, members)
         .filter(|candidate| known(candidate))

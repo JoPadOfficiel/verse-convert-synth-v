@@ -10,6 +10,28 @@ use verse_lib::engine::{musescore, musicxml};
 const FR: PronunciationProfile = PronunciationProfile::FrenchMillefeuille;
 
 #[test]
+fn explicit_french_keeps_unaudited_suis_moi_source_text_unchanged() {
+    let mut notes = direct_notes(&["suis-moi"]);
+    let original = notes.clone();
+    let diagnostics = direct_apply(&mut notes);
+    assert_eq!(notes, original);
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == french::UNSUPPORTED));
+}
+
+#[test]
+fn unaudited_known_word_compounds_do_not_invent_a_combined_reading() {
+    let mut notes = direct_notes(&["bonjour-merci"]);
+    let original = notes.clone();
+    let diagnostics = direct_apply(&mut notes);
+    assert_eq!(notes, original);
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == french::UNSUPPORTED));
+}
+
+#[test]
 fn contextual_sung_layout_matrix_in_both_score_formats() {
     // Synthetic isolated words: expected phones come from the FR-004 contract,
     // including contexts that previously received a wrong dictionary reading.
