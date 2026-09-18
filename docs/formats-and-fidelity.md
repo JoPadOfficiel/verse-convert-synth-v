@@ -82,6 +82,14 @@ Part/staff/voice, playback occurrence/segment and lyric row. Only complete word
 heads provide donor evidence; every syllable and proven continuation retains
 its owning word's decision. Manual hints and conflicting source text bound the
 context search.
+For a low-confidence word isolated by a rest or source-domain boundary, the
+router also consults confident complete words on both sides within eight source
+words of the same part/staff, playback occurrence/segment and lyric row. A
+source-voice bookkeeping restart may still share that row context. Agreement
+stabilizes a monolingual row; disagreement leaves the local decision intact so
+genuine language switches remain possible. A low-confidence word with independent
+lexical/model evidence for its current language is also left intact, including
+proper names and real single-word switches.
 This routing does not copy lyrics or notes between tracks.
 
 Lingua is a statistical language detector, not a generative LLM. Its scores are
