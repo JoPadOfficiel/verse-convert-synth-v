@@ -33,6 +33,12 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      - name: Report skipped release reason
+        if: steps.release.outputs.release_created != 'true' && steps.release.outputs.prs_created != 'true'
+        run: |
+          echo "Release Please found no conventional release commit."
+          echo "Commits merged into main must use Conventional Commits (for example: fix: ..., feat: ...)."
+
       # Release Please cannot address the `verse` entry inside Cargo.lock: that
       # file is an array of [[package]] tables and its TOML updater does not
       # support the jsonpath filter that would select one. Left alone, the lock
