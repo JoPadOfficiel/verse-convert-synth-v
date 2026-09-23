@@ -439,10 +439,13 @@ artifact, checksum, platform-support, and unsigned-package contract.
 - `src-tauri/src/engine/target/svp.rs` and `target/ustx.rs` are the two
   serializers; `target/mod.rs` owns the `ExportTarget` selector, the one write
   boundary and the analysis gate both targets answer.
-- `src-tauri/src/stems.rs` maps each note-bearing source Part to one stable
-  audio stem and its default mute policy.
-- `src-tauri/src/renderer.rs` probes MuseScore 3/4 capabilities, extracts
-  bounded Parts and bounds every render.
+- `src-tauri/src/stems.rs` maps each audible source Part (with notes, or with
+  playable chord symbols only) to one stable audio stem and its default mute
+  policy.
+- `src-tauri/src/renderer.rs` probes MuseScore 3/4 capabilities, converts
+  MusicXML and MIDI to `.mscz` and bounds every render.
+- `src-tauri/src/score_stems.rs` silences every other Part of the whole source
+  score, or of MuseScore's MIDI import, to isolate one stem.
 - `src-tauri/src/bundle.rs` creates the transactional preservation bundle,
   validates exact Part coverage, WAVs, hashes and project audio references.
 - `src-tauri/src/lib.rs` exposes validated Tauri commands and structured

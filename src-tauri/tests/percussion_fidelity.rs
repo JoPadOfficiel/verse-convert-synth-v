@@ -348,22 +348,168 @@ fn notation_taxonomy_alone_keeps_declared_percussion_out_of_vocals() {
     }
 }
 
-#[test]
-fn unsupported_instrument_changes_are_refused_without_reassigning_notes() {
-    let xml = one_part(inventory(), &format!("<direction><sound><midi-instrument id=\"voice\"><midi-channel>10</midi-channel></midi-instrument></sound></direction>{}", xml_note(r#"<instrument id="voice"/>"#, "Hello")));
-    assert!(musicxml::parse(xml.as_bytes())
-        .unwrap_err()
-        .contains("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED"));
-    for tag in [
-        "InstrumentChange",
-        "channelSwitch",
-        "articulationChange",
-        "StaffTypeChange",
-    ] {
-        let xml = fixtures::mscx().replacen("<voice>", &format!("<voice><{tag}/>"), 1);
-        assert!(musescore::parse(xml.as_bytes())
+fn insert_first(xml: &str, at: &str, inserted: &str) -> String {
+    xml.replacen(at, &format!("{at}{inserted}"), 1)
+}
+
+fn insert_last(xml: &str, at: &str, inserted: &str) -> String {
+    let index = xml.rfind(at).unwrap() + at.len();
+    format!("{}{inserted}{}", &xml[..index], &xml[index..])
+}
+
+/// Track, tick, key, channel, instrument, role and lyrics of one note.
+type OwnedNote = (
+    String,
+    u32,
+    Option<u8>,
+    Option<u8>,
+    Option<String>,
+    String,
+    Vec<String>,
+);
+
+/// Every note with its instant, key, channel, owner and lyrics; element
+/// positions in source IDs are not part of ownership.
+fn owned_notes(midi: &Midi) -> Vec<OwnedNote> {
+    midi.tracks
+        .iter()
+        .flat_map(|track| {
+            track
+                .events
+                .iter()
+                .filter_map(move |event| match &event.kind {
+                    Kind::NoteOn(note) => Some((
+                        track.id.clone(),
+                        event.tick,
+                        note.key,
+                        note.channel,
+                        note.source.instrument_id.clone(),
+                        format!("{:?}", note.source.instrument_role),
+                        note.lyrics.iter().map(|lyric| lyric.raw.clone()).collect(),
+                    )),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+fn assert_refused(result: Result<Midi, String>, case: &str) {
+    assert!(
+        result
             .unwrap_err()
-            .contains("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED"));
+            .contains("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED"),
+        "{case}"
+    );
+}
+
+#[test]
+fn pitched_only_mid_score_changes_keep_the_initial_owner() {
+    let baseline = musescore::parse(fixtures::mscx().as_bytes()).unwrap();
+    for change in [
+        "<InstrumentChange><Instrument><instrumentId>pluck.harp</instrumentId><Channel><program value=\"46\"/><midiChannel>0</midiChannel></Channel></Instrument></InstrumentChange>",
+        "<InstrumentChange><Instrument id=\"oboe\"><instrumentId>wind.reed.oboe</instrumentId></Instrument></InstrumentChange>",
+        "<channelSwitch voice=\"0\" name=\"open\"/>",
+        "<articulationChange voice=\"0\" name=\"staccato\"/>",
+        "<StaffTypeChange><StaffType group=\"pitched\"><name>stdNormal</name></StaffType></StaffTypeChange>",
+    ] {
+        let midi =
+            musescore::parse(insert_first(&fixtures::mscx(), "<voice>", change).as_bytes())
+                .unwrap_or_else(|error| panic!("{change}: {error}"));
+        assert_eq!(owned_notes(&midi), owned_notes(&baseline), "{change}");
+        assert_eq!(
+            midi.tracks.iter().map(|track| &track.instruments).collect::<Vec<_>>(),
+            baseline.tracks.iter().map(|track| &track.instruments).collect::<Vec<_>>()
+        );
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            assert_eq!(
+                exported(&midi, target, false).1,
+                exported(&baseline, target, false).1
+            );
+        }
+    }
+    let notes = xml_note(r#"<instrument id="voice"/>"#, "Hello");
+    let baseline = musicxml::parse(one_part(inventory(), &notes).as_bytes()).unwrap();
+    for sound in [
+        r#"<midi-instrument id="voice"><midi-channel>2</midi-channel><midi-program>41</midi-program></midi-instrument>"#,
+        r#"<midi-device port="2"/>"#,
+        r#"<instrument-change id="voice"><instrument-sound>wind.reed.oboe</instrument-sound></instrument-change>"#,
+    ] {
+        let xml = one_part(
+            inventory(),
+            &format!("<direction><sound>{sound}</sound></direction>{notes}"),
+        );
+        let midi =
+            musicxml::parse(xml.as_bytes()).unwrap_or_else(|error| panic!("{sound}: {error}"));
+        assert_eq!(owned_notes(&midi), owned_notes(&baseline), "{sound}");
+    }
+}
+
+#[test]
+fn percussion_identity_changes_are_refused_without_reassigning_notes() {
+    let notes = xml_note(r#"<instrument id="voice"/>"#, "Hello");
+    for sound in [
+        r#"<midi-instrument id="voice"><midi-channel>10</midi-channel></midi-instrument>"#,
+        r#"<midi-instrument id="voice"><midi-unpitched>36</midi-unpitched></midi-instrument>"#,
+        r#"<midi-instrument id="drums"><midi-channel>1</midi-channel></midi-instrument>"#,
+        r#"<instrument-change id="voice"><instrument-sound>drum.snare-drum</instrument-sound></instrument-change>"#,
+        r#"<midi-instrument><midi-channel>10</midi-channel></midi-instrument>"#,
+    ] {
+        let xml = one_part(
+            inventory(),
+            &format!("<direction><sound>{sound}</sound></direction>{notes}"),
+        );
+        assert_refused(musicxml::parse(xml.as_bytes()), sound);
+    }
+
+    let to_drums = "<InstrumentChange><Instrument><instrumentId>drum.group</instrumentId><useDrumset>1</useDrumset></Instrument></InstrumentChange>";
+    let to_channel_ten = "<InstrumentChange><Instrument><instrumentId>keyboard.piano</instrumentId><Channel><midiChannel>9</midiChannel></Channel></Instrument></InstrumentChange>";
+    let to_harp = "<InstrumentChange><Instrument><instrumentId>pluck.harp</instrumentId></Instrument></InstrumentChange>";
+    let to_percussion_staff =
+        "<StaffTypeChange><StaffType group=\"percussion\"/></StaffTypeChange>";
+    let to_pitched_staff = "<StaffTypeChange><StaffType group=\"pitched\"/></StaffTypeChange>";
+    let percussion_declared = fixtures::mscx().replace(
+        "<Staff id=\"4\"/>",
+        "<Staff id=\"4\"><StaffType group=\"percussion\"/></Staff>",
+    );
+    let mixed_channels = fixtures::mscx().replace(
+        "<Channel><program value=\"52\"/><midiPort>0</midiPort><midiChannel>0</midiChannel></Channel>",
+        "<Channel><program value=\"52\"/><midiPort>0</midiPort><midiChannel>0</midiChannel></Channel><Channel name=\"perc\"><midiPort>0</midiPort><midiChannel>9</midiChannel></Channel>",
+    );
+    for (case, xml) in [
+        (
+            "to a drumset",
+            insert_first(&fixtures::mscx(), "<voice>", to_drums),
+        ),
+        (
+            "to channel 10",
+            insert_first(&fixtures::mscx(), "<voice>", to_channel_ten),
+        ),
+        (
+            "from a drumset",
+            insert_last(&fixtures::mscx(), "<voice>", to_harp),
+        ),
+        (
+            "unreadable target",
+            insert_first(&fixtures::mscx(), "<voice>", "<InstrumentChange/>"),
+        ),
+        (
+            "to a percussion staff",
+            insert_first(&fixtures::mscx(), "<voice>", to_percussion_staff),
+        ),
+        (
+            "from a percussion staff",
+            insert_last(&percussion_declared, "<voice>", to_pitched_staff),
+        ),
+        (
+            "channel switch in a mixed instrument",
+            insert_first(
+                &mixed_channels,
+                "<voice>",
+                "<channelSwitch voice=\"0\" name=\"perc\"/>",
+            ),
+        ),
+    ] {
+        assert_refused(musescore::parse(xml.as_bytes()), case);
     }
 }
 
@@ -568,81 +714,99 @@ fn both_analysis_and_writers_reject_tampered_percussion_provenance() {
     }
 }
 
-#[test]
-fn midi_stems_preserve_original_chunks_channels_programs_and_external_state() {
-    let original = fixtures::midi();
-    let slices = midi_split::split_tracks(&original).unwrap();
+/// Channel events a stem carries: its own track's, with nothing added.
+fn channel_events(bytes: &[u8]) -> Vec<(u32, Kind)> {
+    midi::parse(bytes)
+        .unwrap()
+        .tracks
+        .iter()
+        .flat_map(|track| &track.events)
+        .filter(|event| {
+            matches!(
+                event.kind,
+                Kind::NoteOn(_)
+                    | Kind::NoteOff(_)
+                    | Kind::ControlChange { .. }
+                    | Kind::ProgramChange { .. }
+                    | Kind::PitchBend { .. }
+                    | Kind::ChannelPressure { .. }
+                    | Kind::PolyPressure { .. }
+                    | Kind::SysEx { .. }
+            )
+        })
+        .map(|event| {
+            let mut kind = event.kind.clone();
+            if let Kind::NoteOn(note) = &mut kind {
+                // Parser IDs name the track position, which a stem changes.
+                note.source = Default::default();
+            }
+            (event.tick, kind)
+        })
+        .collect()
+}
+
+/// A MIDI stem is the global marks plus the byte-identical source `MTrk`,
+/// never another track's channel state.
+fn assert_per_track_stems(source: &[u8]) {
+    let slices = midi_split::split_tracks(source).unwrap();
     let mut offset = 14;
     for slice in slices {
-        let len = u32::from_be_bytes(original[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        let chunk = &original[offset..offset + 8 + len];
+        let len = u32::from_be_bytes(source[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let chunk = &source[offset..offset + 8 + len];
         assert!(
             slice.bytes.ends_with(chunk),
             "the chosen MTrk must remain byte-identical"
         );
-        let parsed = midi::parse(&slice.bytes).unwrap();
+        let meta_len = u32::from_be_bytes(slice.bytes[18..22].try_into().unwrap()) as usize;
         assert_eq!(
-            parsed
-                .tracks
+            slice.bytes.len(),
+            22 + meta_len + chunk.len(),
+            "only the global context track precedes the source chunk"
+        );
+        let alone = fixtures::smf(&[source[offset + 8..offset + 8 + len].to_vec()]);
+        assert_eq!(channel_events(&slice.bytes), channel_events(&alone));
+        offset += 8 + len;
+    }
+}
+
+#[test]
+fn midi_stems_are_the_byte_identical_track_and_its_own_channel_state() {
+    assert_per_track_stems(&fixtures::midi());
+    for slice in midi_split::split_tracks(&fixtures::midi()).unwrap() {
+        assert_eq!(
+            channel_events(&slice.bytes)
                 .iter()
-                .flat_map(|t| &t.events)
-                .filter(|e| matches!(e.kind, Kind::NoteOn(_)))
+                .filter(|(_, kind)| matches!(kind, Kind::NoteOn(_)))
                 .count(),
             2
         );
-        offset += 8 + len;
     }
+    // Another track's bank/program on the same channel is not copied in:
+    // MuseScore applies channel state per imported track.
     let state = vec![0, 0xb0, 0, 3, 0, 0xc0, 24, 0, 0xff, 0x2f, 0];
     let notes = vec![
         0x83, 0x60, 0x90, 60, 96, 0x83, 0x60, 0x80, 60, 0, 0, 0xff, 0x2f, 0,
     ];
     let source = fixtures::smf(&[state, notes.clone()]);
-    let slices = midi_split::split_tracks(&source).unwrap();
-    assert!(slices[1].bytes.ends_with(&notes));
-    let parsed = midi::parse(&slices[1].bytes).unwrap();
-    assert!(parsed
-        .tracks
-        .iter()
-        .flat_map(|t| &t.events)
-        .any(|e| e.tick == 0
-            && matches!(
-                e.kind,
-                Kind::ProgramChange {
-                    channel: 0,
-                    program: 24
-                }
-            )));
-    assert!(parsed
-        .tracks
-        .iter()
-        .flat_map(|t| &t.events)
-        .any(|e| e.tick == 0
-            && matches!(
-                e.kind,
-                Kind::ControlChange {
-                    channel: 0,
-                    controller: 0,
-                    value: 3
-                }
-            )));
+    assert_per_track_stems(&source);
+    assert!(
+        !channel_events(&midi_split::split_tracks(&source).unwrap()[1].bytes)
+            .iter()
+            .any(|(_, kind)| matches!(
+                kind,
+                Kind::ProgramChange { .. } | Kind::ControlChange { .. }
+            ))
+    );
 }
 
 #[test]
-fn midi_stem_ambiguous_simultaneous_state_is_refused_and_other_ports_do_not_leak() {
+fn midi_stem_simultaneous_cross_track_state_no_longer_blocks_the_split() {
     let notes = vec![0, 0x90, 60, 96, 0x83, 0x60, 0x80, 60, 0, 0, 0xff, 0x2f, 0];
     let state = vec![0, 0xc0, 24, 0, 0xff, 0x2f, 0];
     let source = fixtures::smf(&[state, notes.clone()]);
-    assert!(midi_split::split_tracks(&source)
-        .unwrap_err()
-        .contains("MIDI_STEM_SHARED_STATE_ORDER_UNRESOLVED"));
+    assert_per_track_stems(&source);
     let other_port = vec![0, 0xff, 0x21, 1, 1, 0, 0xc0, 24, 0, 0xff, 0x2f, 0];
-    let slices = midi_split::split_tracks(&fixtures::smf(&[other_port, notes])).unwrap();
-    let parsed = midi::parse(&slices[1].bytes).unwrap();
-    assert!(!parsed
-        .tracks
-        .iter()
-        .flat_map(|t| &t.events)
-        .any(|e| matches!(e.kind, Kind::ProgramChange { .. })));
+    assert_per_track_stems(&fixtures::smf(&[other_port, notes]));
 }
 
 fn events(messages: &[(u32, &[u8])]) -> Vec<u8> {
@@ -798,7 +962,7 @@ fn musicxml_device_ports_are_scoped_to_their_source_instruments() {
 }
 
 #[test]
-fn midi_stems_carry_bank_program_bend_pressure_and_sustain_only_on_the_used_route() {
+fn midi_stems_never_inject_bank_program_bend_pressure_or_sustain_from_other_tracks() {
     let state = events(&[
         (0, &[0xff, 0x21, 1, 2]),
         (0, &[0xb0, 0, 2]),
@@ -816,145 +980,63 @@ fn midi_stems_carry_bank_program_bend_pressure_and_sustain_only_on_the_used_rout
     ]);
     let notes = events(&[
         (0, &[0xff, 0x21, 1, 2]),
+        (0, &[0xc0, 52]),
         (480, &[0x90, 60, 96]),
         (480, &[0x80, 60, 0]),
     ]);
     let source = fixtures::smf(&[state, notes.clone()]);
+    assert_per_track_stems(&source);
     let slices = midi_split::split_tracks(&source).unwrap();
-    assert!(slices[1].bytes.ends_with(&notes));
-    let midi = midi::parse(&slices[1].bytes).unwrap();
-    let events: Vec<_> = midi
-        .tracks
-        .iter()
-        .flat_map(|track| &track.events)
-        .map(|event| (event.tick, &event.kind))
-        .collect();
-    let expected = [
-        (
-            0,
-            Kind::ControlChange {
-                channel: 0,
-                controller: 0,
-                value: 2,
-            },
-        ),
-        (
-            0,
-            Kind::ControlChange {
-                channel: 0,
-                controller: 32,
-                value: 5,
-            },
-        ),
-        (
-            0,
-            Kind::ProgramChange {
-                channel: 0,
-                program: 24,
-            },
-        ),
-        (
-            0,
-            Kind::ControlChange {
-                channel: 0,
-                controller: 7,
-                value: 90,
-            },
-        ),
-        (
-            0,
-            Kind::ControlChange {
-                channel: 0,
-                controller: 10,
-                value: 40,
-            },
-        ),
-        (
-            120,
-            Kind::ControlChange {
-                channel: 0,
-                controller: 64,
-                value: 127,
-            },
-        ),
-        (
-            120,
-            Kind::PitchBend {
-                channel: 0,
-                value: 9216,
-            },
-        ),
-        (
-            120,
-            Kind::ChannelPressure {
-                channel: 0,
-                pressure: 65,
-            },
-        ),
-        (
-            120,
-            Kind::PolyPressure {
-                channel: 0,
-                key: 60,
-                pressure: 30,
-            },
-        ),
-        (
-            240,
-            Kind::ProgramChange {
-                channel: 0,
-                program: 33,
-            },
-        ),
-        (
-            720,
-            Kind::ControlChange {
-                channel: 0,
-                controller: 64,
-                value: 0,
-            },
-        ),
-    ];
-    let ordered_state: Vec<_> = events
-        .iter()
-        .filter(|(_, kind)| {
-            matches!(
-                kind,
-                Kind::ControlChange { .. }
-                    | Kind::ProgramChange { .. }
-                    | Kind::PitchBend { .. }
-                    | Kind::ChannelPressure { .. }
-                    | Kind::PolyPressure { .. }
-            )
-        })
-        .map(|(tick, kind)| (*tick, (*kind).clone()))
-        .collect();
     assert_eq!(
-        ordered_state, expected,
-        "external playback state order changed"
+        channel_events(&slices[1].bytes)
+            .into_iter()
+            .filter(|(_, kind)| !matches!(kind, Kind::NoteOn(_) | Kind::NoteOff(_)))
+            .collect::<Vec<_>>(),
+        [(
+            0,
+            Kind::ProgramChange {
+                channel: 0,
+                program: 52
+            }
+        )],
+        "only the track's own program change survives"
     );
-    assert!(!events
-        .iter()
-        .any(|(_, kind)| matches!(kind, Kind::ProgramChange { channel: 1, .. })));
+    let midi = midi::parse(&slices[1].bytes).unwrap();
     assert!(midi
         .tracks
         .iter()
         .flat_map(|track| &track.instruments)
-        .all(|instrument| instrument.port == Some(2)));
+        .all(|instrument| instrument.port == Some(2) && instrument.program == Some(52)));
 }
 
 #[test]
-fn midi_stems_refuse_unprovable_shared_notes_system_state_and_context_timing() {
+fn midi_stems_report_shared_notes_keep_system_state_local_and_refuse_bad_timing() {
     let on = events(&[(0, &[0x90, 60, 96])]);
     let off = events(&[(480, &[0x80, 60, 0])]);
-    assert!(midi_split::split_tracks(&fixtures::smf(&[on, off]))
-        .unwrap_err()
-        .contains("MIDI_STEM_NOTE_OWNERSHIP_UNRESOLVED"));
+    let divided = midi_split::split(&fixtures::smf(&[on, off])).unwrap();
+    assert_eq!(divided.slices.len(), 2);
+    assert_eq!(
+        divided
+            .shared_note_routes
+            .iter()
+            .map(|route| (
+                route.port,
+                route.channel,
+                route.source_tracks.clone(),
+                route.keys.clone()
+            ))
+            .collect::<Vec<_>>(),
+        [(0, 0, vec![0, 1], vec![60])]
+    );
     let notes = events(&[(480, &[0x90, 60, 96]), (480, &[0x80, 60, 0])]);
     let system = events(&[(0, &[0xf0, 2, 0x7e, 0xf7])]);
-    assert!(midi_split::split_tracks(&fixtures::smf(&[system, notes]))
-        .unwrap_err()
-        .contains("MIDI_STEM_SYSTEM_STATE_UNRESOLVED"));
+    let source = fixtures::smf(&[system, notes]);
+    assert_per_track_stems(&source);
+    assert!(
+        !channel_events(&midi_split::split_tracks(&source).unwrap()[1].bytes)
+            .iter()
+            .any(|(_, kind)| matches!(kind, Kind::SysEx { .. }))
+    );
     let huge = events(&[(0x0fff_ffff, &[0x90, 60, 96]), (1, &[0x80, 60, 0])]);
     assert!(midi_split::split_tracks(&fixtures::smf(&[huge]))
         .unwrap_err()

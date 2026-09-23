@@ -307,8 +307,8 @@ draws the same note as a greyed-out unsung `la`, which reads like an invented
 syllable even though it is not.
 
 Nothing is lost. Those notes stay byte-exact in the bundle's preserved source and
-are audible in the stem MuseScore renders from it — the same way every
-instrumental note has always been kept. Each lane reports how many it left out,
+are audible in their Part's stem — the same way every instrumental note has
+always been kept. Each lane reports how many it left out,
 under `UNTEXTED_NOTES_LEFT_OUT`.
 
 Two rules bound what counts as untexted.
@@ -723,28 +723,83 @@ voices, and are never duplicated into another lane.
 
 ### Audio stems
 
-A score's Parts are extracted by MuseScore, which reads the same file Verse
-did. An imported MIDI is different: MuseScore decides on its own how its tracks
-become Parts, merging those that share an instrument and dropping empty ones, so
-its Part list answers a different question than "which source track is this".
+Every stem reproduces what its source Part or track contributes to the
+MuseScore reference mix.
 
-Verse therefore divides a MIDI itself, along the `MTrk` chunks the format
-already separates. Each stem is the source track copied byte for byte, preceded
-by a rebuilt context track carrying tempo, meter, key and SMPTE offset, plus
-source-owned bank/program changes, controllers, pitch bend and pressure from
-other tracks on the exact port/channel used by its notes. Port routing is
-stated before copied channel state; unrelated routes do not leak into a stem.
-The selected `MTrk` remains byte-identical. Nothing is transposed, quantised or
-assigned a replacement instrument.
+A score stem is rendered from the whole source score. Verse inserts
+`<play>0</play>` into every note and chord symbol of the other Parts'
+main-score staves and changes no other byte; excerpts and every other container
+entry stay untouched. Tempo marks, fermatas, breaths and every other timing
+mark therefore stay in each stem exactly as in the reference mix, including
+when only some Parts write them. Rendering a Part on its own would lose that
+timing: a fermata written on one Part holds every Part. A MusicXML or MXL
+source is first converted by MuseScore to `.mscz`, which renders identically to
+the MusicXML itself, and is then silenced Part by Part. A native MuseScore
+score with nothing else audible is rendered from its own bytes.
 
-Extraction refuses simultaneous cross-track state with unproven ordering,
-overlapping same-key note ownership between tracks, conflicting simultaneous
-global marks, shared system-exclusive state and an unrepresentable context
-delta. These use stable `MIDI_STEM_*` diagnostics. Raw source events preserve
-the full program/bank/port timeline; a single initial instrument summary is not
-a claim that the timbre stays constant throughout the track.
+Each score stem maps onto exactly one source Part, by position and, for a native
+score, by Part ID. A Part count, Part identity or staff count that differs from
+the source topology, MusicXML Parts not written in `part-list` order, a staff
+holding notes or chord symbols that no Part owns, or a master score that is not
+UTF-8 is refused before rendering. The manifest records these stems as
+`musescore-silenced-score`.
 
-A stem may therefore be shorter than the reference mix when its track falls
+A note-free Part whose chord symbols MuseScore plays receives its own
+accompaniment stem. `playable_chord_symbols` counts, per source Part, the
+MuseScore `<Harmony>` elements whose own `play` property is not off and the
+MusicXML `<harmony>` elements other than `none` (N.C.). MuseScore 4 plays
+MuseScore 3 chord symbols even under a 3.x `harmonyPlay` style of `0`, so that
+style is not read as silence. Such a stem has no source notes and may have no
+projection lane; its manifest record carries `sourceChordSymbolCount`.
+
+MuseScore does not mix Parts linearly (the residual of a stem sum against the
+reference is typically -12 to -30 dB), so the stems sum to the reference mix
+closely but not bit for bit.
+
+A MIDI or KAR stem is rendered from MuseScore's own import of the whole file.
+MuseScore quantizes each imported track with evidence from the whole file:
+measured with MuseScore 4.7.5 on seven KAR files, eight tracks imported alone
+placed notes a grid step away from their import inside the file. Verse
+therefore hands the source bytes to MuseScore once as a Standard MIDI File
+(MuseScore aborts on a `.kar` path), converts them to `.mscz`, and silences
+every other Part's notes exactly as for a score. That conversion renders
+identically to the direct MIDI render, so the stems carry the reference mix's
+own import of their track.
+
+The imported Parts are MuseScore's decomposition, not the source's, so Verse
+proves the mapping before using it: one Part per note-bearing source track, in
+file order, and each named track's raw name is the `, <name>` suffix of its
+Part's `<trackName>`. Every Part must also hold a playable note. The manifest
+records these stems as `musescore-silenced-midi-import`.
+
+When the mapping is unproven — a merged, split or dropped track, a Part named
+after another track, or a conversion MuseScore does not complete — each stem
+falls back to its source track: a context track carrying the file's tempo,
+meter, key and SMPTE marks, followed by the source `MTrk` copied byte for byte.
+The manifest records these stems as `midi-track-split` and carries a stable
+`MIDI_STEM_IMPORT_MAPPING_UNPROVEN` warning with the reason. MuseScore applies
+MIDI channel state per imported track, so another track's program or CC7 does
+not change how a track renders and no channel event of another track is
+injected. The whole-file quantization above is the one difference this
+fallback can show. Neither path transposes, quantises or assigns a replacement
+instrument.
+
+Tracks may sound the same port/channel/key at overlapping or identical
+instants. In the whole file one track's note-off can then end another track's
+note, which a per-track stem cannot reproduce and a silenced import may render
+differently from the whole file. Such routes are exported with a
+stable `MIDI_STEM_SHARED_NOTE_ROUTE` manifest warning per set of tracks and
+port/channel, naming the tracks, the route and its keys; sequential reuse of a
+key is not reported. Extraction still refuses SMF
+format 2 (`MIDI_STEM_INDEPENDENT_SEQUENCES`), an invalid port declaration
+(`MIDI_STEM_PORT_UNRESOLVED`), conflicting simultaneous global marks in
+different tracks (`MIDI_STEM_GLOBAL_STATE_ORDER_UNRESOLVED`) and an
+unrepresentable context delta (`MIDI_STEM_TIMING_UNREPRESENTABLE`). Raw source
+events preserve the full program/bank/port timeline; a single initial
+instrument summary is not a claim that the timbre stays constant throughout the
+track.
+
+A stem may be shorter than the reference mix when its track or Part falls
 silent before the end. Both start at zero, so it stays in step for every frame
 it has; a stem running past the end of the whole score is still refused.
 
@@ -796,9 +851,13 @@ it has; a stem running past the end of the whole score is still refused.
 - XML encodings outside the documented set.
 - A timing grid whose exact common PPQ exceeds the supported `u16` range.
 - Ambiguous or non-convergent playback navigation.
-- Instrument/device changes inside `<sound>` are refused until their playback
-  ownership timeline is represented. Initial declarations and used note-level
-  instrument references remain supported.
+- A `<sound>` `midi-instrument` or `instrument-change` that can alter
+  percussion identity is refused: a MIDI channel 10 or `midi-unpitched`
+  mapping, or a percussion `instrument-sound`, whose role differs from the
+  instrument it names (or from every declared instrument when it names none).
+  A `midi-device` change and every other playback change keep the part's
+  initial owner, as they did before ownership was checked. Initial declarations and used note-level instrument
+  references remain supported.
 
 ## Native MuseScore
 
@@ -816,11 +875,22 @@ it has; a stem running past the end of the whole score is still refused.
 The parser rejects archive traversal, ambiguous masters, a package containing
 only Excerpts, malformed XML, and unsafe timing/pitch values.
 
-Native `InstrumentChange`, `channelSwitch`, `articulationChange`, and
-`StaffTypeChange` inside the master score's staff bodies are explicitly refused
-until their ownership timeline can be represented. An initial instrument must
-not silently own the notes after a change. Excerpt-only changes do not change
-the selected master score's ownership.
+Native `InstrumentChange`, `channelSwitch` and `StaffTypeChange` inside the
+master score's staff bodies keep the staff's initial owner, because their
+ownership timeline is not represented. That is safe only while the change
+cannot turn pitched material into percussion or back, so these are refused
+with `SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED`:
+
+- an `InstrumentChange` to or from a drumset, percussion-taxonomy or channel-10
+  instrument, or one whose `<Instrument>` cannot be read;
+- a `StaffTypeChange` to or from a `percussion` (or `unpitched`) staff type, or
+  one without a readable group;
+- a `channelSwitch` in an instrument whose channels mix percussion and pitched
+  roles.
+
+Changes between pitched instruments, channels or staff types parse as they did
+before ownership was checked. `articulationChange` alters playback only.
+Excerpt-only changes do not change the selected master score's ownership.
 
 ### Lyrics on chords
 
@@ -951,7 +1021,8 @@ use Parts and source voices; technical lanes remain visible only in detailed
 track contracts.
 
 Parts containing only metadata or rests remain in topology and the exact
-source. Only note-bearing Parts require WAV stems.
+source. Note-bearing Parts, and note-free Parts with playable chord symbols,
+require WAV stems.
 
 ## Timing and target defaults
 

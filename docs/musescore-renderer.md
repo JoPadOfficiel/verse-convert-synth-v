@@ -28,7 +28,8 @@ A native MuseScore 4 `.mscx`/`.mscz` cannot be rendered by MuseScore 3. Verse
 detects the source major and returns an unsupported-renderer error.
 
 The executable must report MuseScore identity and expose `--score-parts` in
-`--help`.
+`--help`. That flag qualifies the installation; complete bundles no longer
+extract Parts with it.
 
 ## Installation
 
@@ -106,40 +107,45 @@ version output, major version, executable SHA-256, and capabilities.
 
 ## Fixed commands
 
-Part extraction:
+Score conversion, for a MusicXML/MXL or MIDI/KAR source (a `.kar` is handed
+over as a `.mid` copy of the same bytes, because MuseScore aborts on a `.kar`
+path):
 
 ```text
-MuseScore -F --score-parts <input>
+MuseScore -F -o <output.mscz> <input>
 ```
 
-WAV rendering:
+WAV rendering, for the full-score reference and every stem:
 
 ```text
 MuseScore -F -o <output.wav> <input>
 ```
 
-No shell is involved.
+No shell is involved. Conversion uses the same score-loading process policy,
+executable hash checks, retry rules and deadline as rendering.
 
-MuseScore's `--score-parts` is a backend compatibility interface that returns
-JSON containing Part names, optional metadata, and base64 MSCZ payloads. Verse
-parses and validates that payload; it does not assume the CLI writes Part files
-itself.
+A score stem is the whole source score, or its converted `.mscz`, with every
+other Part's notes and chord symbols silenced by an inserted `<play>0</play>`.
+Rendering the full score keeps every fermata, breath and tempo mark on the
+reference mix's timeline; a Part cut out with `--score-parts` would lose the
+timing other Parts impose. A MIDI stem is MuseScore's `.mscz` import of the
+whole file silenced the same way, once its Parts are proven to be the
+note-bearing source tracks; otherwise it is one byte-identical source track
+after the file's global marks. See
+[Formats and fidelity](formats-and-fidelity.md#audio-stems).
 
-## Extraction limits
+## Conversion limits
 
-- JSON response: 128 MiB
-- Parts: 1–256
-- Decoded MSCZ per Part: 32 MiB
-- Aggregate decoded Parts: 512 MiB
-- Archive entries per extracted Part: at most 128
-- Master MSCX files per extracted Part: exactly one
+- Converted `.mscz`: 32 MiB, and never more than the WAV limit
+- Archive entries: at most 128, each with a confined path
+- Master MSCX files: exactly one
 
-Unsafe paths, malformed JSON/base64, mismatched arrays, oversized payloads, or
-ambiguous archives are rejected.
+A converted score that is not such an archive is rejected before any stem is
+rendered.
 
 ## Render limits
 
-- Aggregate extraction + full-score + all-stems deadline: 20 minutes
+- Aggregate conversion + full-score + all-stems deadline: 20 minutes
 - Maximum one WAV: 2 GiB
 - Maximum aggregate audio in a bundle: 8 GiB
 - Captured failure log: 64 KiB
@@ -169,10 +175,11 @@ For MuseScore 4 on macOS only, Verse:
 - waits ten seconds between completed processes;
 - permits at most three attempts under the same aggregate deadline;
 - retries only an actual `SIGABRT`;
-- retries Part extraction only if the complete JSON payload was already valid;
-- removes any failed-attempt WAV before retry;
-- still requires the final process to exit successfully and the WAV to pass
-  all validation.
+- retries `--score-parts` (probe and corpus use only) only if the complete JSON
+  payload was already valid;
+- removes any failed-attempt WAV or converted score before retry;
+- still requires the final process to exit successfully and the WAV or
+  converted score to pass all validation.
 
 This is a bounded compatibility workaround, not permission to ignore arbitrary
 MuseScore failures.

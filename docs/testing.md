@@ -173,9 +173,32 @@ The Rust suites exercise:
   distinguishable from an encoder fault;
 - that lyric text of any language reaches the output byte-exactly with nothing
   configured (`tests/language_fidelity.rs`, covering fr, es, en, pt, de, pl, tr);
-- Part-level stem planning;
+- Part-level stem planning, including an accompaniment stem for a note-free
+  Part with playable chord symbols;
+- MIDI/KAR stems: MuseScore's import of the whole file (a `.kar` handed over as
+  `.mid`) silenced to one Part per stem when the Part mapping is proven by
+  count, order and track-name suffix; the per-track fallback (the
+  byte-identical `MTrk` after the global marks, no channel state from another
+  track) with `MIDI_STEM_IMPORT_MAPPING_UNPROVEN` for a merged or renamed Part,
+  an unreadable import or a renderer without conversion;
+  `MIDI_STEM_SHARED_NOTE_ROUTE` reported rather than refused; and SMF 2,
+  invalid port, conflicting global mark and unrepresentable-delta refusals;
+- silenced-score stems: only `<play>0</play>` inserted into other Parts'
+  notes and chord symbols, fermatas, breaths and excerpts untouched, a score
+  with nothing else audible passed through byte for byte, and Part-count,
+  Part-identity, staff-count and ownerless-staff refusals for native and
+  converted MusicXML/MXL scores;
+- mid-score MuseScore instrument, channel and staff-type changes and MusicXML
+  `<sound>` changes: kept with the initial owner between pitched roles, refused
+  with `SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED` when they can alter percussion
+  identity;
+- contextual MIDI gain contributors (port declarations, SysEx, CC120–127)
+  authenticated in the preservation ledger by lane or route and time, while
+  unrelated IDs stay rejected and context alone never supports a curve;
 - renderer probing, fixed arguments, timeouts, process-tree termination,
-  output validation, Part extraction, and the bounded macOS retry policy;
+  output validation, the `--score-parts` API (not used by bundles),
+  score-to-`.mscz` conversion with its 32 MiB cap, and the bounded macOS retry
+  policy;
 - preservation-ledger completeness, hashes, audio references, staging,
   rollback, destination races, and atomic no-replace bundle publication;
 - both bundle project variants: that a `.ustx` bundle references the same stems
@@ -257,7 +280,7 @@ The private score fixtures lock:
 - “Help” MXL: 6 Parts and 10 source voices;
 - “Help” MSCZ: 6 Parts and 10 source voices;
 - “Iko Iko”: 8 Parts and 9 source voices;
-- exactly one stem per note-bearing Part;
+- exactly one stem per audible Part (notes, or playable chord symbols only);
 - no empty vocal track in the generated project.
 
 ## Public OpenScore corpus
@@ -271,8 +294,9 @@ Parse and project the complete pinned corpus:
 scripts/run-openscore-corpus.sh --full-parse
 ```
 
-Also render the default deterministic sample of three scores and every
-extracted Part:
+Also render the default deterministic sample of three scores and one stem per
+source Part, each the whole score with every other Part silenced, as bundles
+render them:
 
 ```sh
 VERSE_MUSESCORE_GATE="/path/to/mscore" \
@@ -288,18 +312,20 @@ The current accepted baseline is:
 - 0 unexpected errors;
 - 0 evidence-invariant failures;
 - 2,893 Parts and 7,154 voices;
-- 1,315,791 source notes;
-- 279,661 source lyrics;
-- 278,643 projected lyrics;
+- 1,442,554 source notes;
+- 284,314 source lyrics;
+- 244,645 projected lyrics;
 - 3 deterministically selected scores rendered;
-- 6 expected Part stems rendered;
+- 6 expected Part stems rendered, each the whole score with the other Part
+  silenced;
 - 0 render errors;
-- MuseScore 4.7.4 used for the render sample.
+- MuseScore 4.7.5 used for the render sample.
 
 The runner verifies the repository URL, exact commit, clean checkout, and
 license evidence before auditing. Unknown errors fail the run. Only a narrow,
 typed set of structures that cannot be projected exactly may be classified as
-evidence-ineligible. Baseline drift also fails.
+evidence-ineligible. Drift in the file counts also fails; the Part, voice, note
+and lyric totals are recorded for comparison but not enforced.
 
 ## Full renderer integration
 
@@ -317,12 +343,10 @@ Use a supported MuseScore 3.6.2+ or MuseScore 4 executable that advertises
 `--score-parts`. MuseScore 4 is required when the native input itself is a
 MuseScore 4 score.
 
-### Complete bundles with combined excerpts and note-free Parts
+### Complete bundles
 
-Use the complete-bundle gate to verify Part alignment through rendering and
-transactional publication. Raw excerpt counts are not a substitute: a combined
-excerpt can establish a note-free Part's identity without providing a standalone
-stem. Every note-bearing source Part still requires its own standalone excerpt.
+Use the complete-bundle gate to verify Part isolation through rendering and
+transactional publication:
 
 ```sh
 VERSE_MUSESCORE_GATE="/path/to/mscore" \
@@ -341,7 +365,14 @@ bundles, recording source hashes, source Part identities, and track counts.
 Without `VERSE_BUNDLE_OUTPUT_DIR`, successful outputs are removed after testing.
 Keep scores, audio, bundles, and verification receipts in ignored local paths.
 
-Native MuseScore Part renders may retain a quiet overrun of at most two seconds
+`VERSE_PART_MAPPING_GATE` (a file or a directory of sources) runs
+`configured_real_renderer_maps_every_stem_onto_one_source_part`: every stem of
+every source must map onto exactly one source Part, and each silenced score or
+MIDI import must leave only that Part audible. MusicXML/MXL and MIDI/KAR
+sources are converted by the configured MuseScore first; a MIDI source prints
+which isolation method its import proved.
+
+Native MuseScore score stems may retain a quiet overrun of at most two seconds
 at the actual, matching sample rate. Verse checks every excess sample strictly
 after the full-score reference end: floats must be finite with absolute value
 at most `1e-4`, and integer PCM must be zero. Audible, oversized, wrong-rate,
@@ -353,6 +384,32 @@ samples are removed, shifted, rewritten, or padded. Accepted tails produce a
 `MUSESCORE_QUIET_TAIL` diagnostic; length and tail checks do not establish exact
 musical alignment. Deterministic `bundle::tests::quiet_tail_` tests cover these
 checks through WAV inspection and transactional SVP/USTX bundle publication.
+
+### Manual real-file stem fidelity check
+
+This is not an in-repo gate and cannot be reproduced from the repository. It is
+a manual procedure run with an out-of-repo harness, private source files and
+local audio audits, none of which are committed. Length checks cannot show
+that a stem is in time or complete, so before a release that changes stem
+isolation, export a complete USTX bundle for each private MIDI, KAR, MusicXML,
+MXL and MuseScore source through the public `export_bundle` path, render with
+the installed MuseScore, and check that:
+
+- every source produces a bundle and no drum note appears in a vocal track;
+- every audible stem has a global offset of 0 ms (±25 ms) against the reference
+  mix, found by cross-correlating its envelope with the mix;
+- the stems sum to the reference mix with a residual of at most -10 dB. MuseScore
+  does not mix Parts linearly, so a bit-exact sum is not expected;
+- a stem's note onsets match its own source track or Part better than any
+  other stem's;
+- for KAR sources, the notes each stem plays are the notes MuseScore's import of
+  the whole file gives that track: same onsets, keys, durations and velocities.
+  A stem cut from the silenced import satisfies this by construction; a
+  per-track fallback stem is checked against the whole-file import.
+
+A native score without a Part-specific timing modifier is expected to render
+stems identical to MuseScore's own Part render; a fermata or breath on only
+some Parts is the case the whole-score stem exists for.
 
 ## Interpreting a failure
 

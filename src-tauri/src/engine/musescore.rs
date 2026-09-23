@@ -40,41 +40,6 @@ pub fn parse(data: &[u8]) -> Result<Midi, String> {
     parse_mscx(&xml)
 }
 
-/// The Parts a MuseScore container holds, in score order, each named by the
-/// `id` MuseScore writes on it.
-///
-/// `--score-parts` answers with every part the score can be cut into *and*
-/// every excerpt already saved in the file, so a score whose author saved a
-/// two-instrument part comes back with more containers than the source has
-/// Parts. Reading what a container actually holds is what tells a
-/// one-Part excerpt apart from a saved multi-instrument one.
-///
-/// `None` for bytes that are not a readable score; a `None` entry for a Part
-/// written without an id, as MuseScore 3 writes them.
-pub fn container_part_ids(data: &[u8]) -> Option<Vec<Option<String>>> {
-    let xml = if data.len() >= 2 && &data[0..2] == b"PK" {
-        extract_mscz(data).ok()?
-    } else {
-        crate::engine::musicxml::decode_xml_bytes(data).ok()?
-    };
-    crate::engine::musicxml::check_nesting(&xml).ok()?;
-    let options = roxmltree::ParsingOptions {
-        allow_dtd: false,
-        nodes_limit: 5_000_000,
-    };
-    let document = roxmltree::Document::parse_with_options(&xml, options).ok()?;
-    let score = document
-        .descendants()
-        .find(|node| node.has_tag_name("Score"))?;
-    Some(
-        score
-            .children()
-            .filter(|node| node.has_tag_name("Part"))
-            .map(|part| part.attribute("id").map(str::to_string))
-            .collect(),
-    )
-}
-
 fn is_mscx_path(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -186,7 +151,7 @@ fn select_declared_master(container: &str) -> Result<String, String> {
     Err("MuseScore container has ambiguous master .mscx rootfiles".to_string())
 }
 
-fn master_mscx_path(data: &[u8]) -> Result<String, String> {
+pub(crate) fn master_mscx_path(data: &[u8]) -> Result<String, String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
 
     let mut container_indices = Vec::new();
@@ -1585,7 +1550,7 @@ fn measure_marks(measures: &[roxmltree::Node]) -> Result<Vec<MeasureMarks>, Stri
 }
 
 /// Reuse the parser's declaration fallback once for topology and linkage evidence.
-fn declaration_staff_id(
+pub(crate) fn declaration_staff_id(
     part: roxmltree::Node,
     staff: roxmltree::Node,
     part_index: usize,
@@ -1984,23 +1949,6 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         instrument_count: usize,
     }
 
-    // These declarations change the active owner over time. Until their
-    // staff/voice timeline is represented, retaining the initial instrument
-    // would silently reassign later notes. Refuse rather than guess.
-    if score
-        .children()
-        .filter(|node| node.has_tag_name("Staff"))
-        .flat_map(|staff| staff.descendants())
-        .any(|node| {
-            matches!(
-                node.tag_name().name(),
-                "InstrumentChange" | "channelSwitch" | "articulationChange" | "StaffTypeChange"
-            )
-        })
-    {
-        return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: native instrument, channel or staff-type changes cannot be assigned safely; the original source remains unchanged".into());
-    }
-
     let top_level_staff_ids: Vec<&str> = score
         .children()
         .filter(|node| node.has_tag_name("Staff"))
@@ -2020,6 +1968,8 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         .filter_map(|node| node.attribute("id"))
         .collect();
     let mut declared_parts = Vec::new();
+    // Declared percussion roles of every resolved staff, linked views included.
+    let mut staff_roles: BTreeMap<String, (BTreeSet<bool>, bool)> = BTreeMap::new();
     for (part_index, part) in score
         .children()
         .filter(|n| n.has_tag_name("Part"))
@@ -2215,6 +2165,16 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                     "MuseScore duplicate resolved staff declaration ID: {staff_id:?}"
                 ));
             }
+            staff_roles.insert(
+                staff_id.clone(),
+                (
+                    instruments
+                        .iter()
+                        .map(|instrument| instrument.percussion)
+                        .collect(),
+                    percussion_staff_type(staff),
+                ),
+            );
             for (link_index, link) in staff
                 .children()
                 .filter(|node| node.has_tag_name("linkedTo"))
@@ -2241,11 +2201,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 id: staff_id.clone(),
                 voices: Vec::new(),
             });
-            let group = staff
-                .children()
-                .find(|node| node.has_tag_name("StaffType"))
-                .and_then(|node| node.attribute("group"));
-            let percussion = matches!(group, Some("percussion" | "unpitched"));
+            let percussion = percussion_staff_type(staff);
             staff_info.insert(
                 staff_id,
                 StaffInfo {
@@ -2266,8 +2222,11 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             name,
             source_track_ids: Vec::new(),
             staves: declared_staves,
+            playable_chord_symbols: 0,
         });
     }
+
+    refuse_percussion_identity_changes(score, &staff_roles)?;
 
     // Voice containers exist independently of pitched notes. Seed them before
     // projection so a rest-only source voice remains visible in topology.
@@ -3363,6 +3322,21 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     if tracks.is_empty() {
         return Err("no usable staff in the MuseScore file".into());
     }
+    for staff in &score_staves {
+        let Some(info) = staff.attribute("id").and_then(|id| staff_info.get(id)) else {
+            continue;
+        };
+        let playable = staff
+            .descendants()
+            .filter(|node| node.has_tag_name("Harmony") && plays(*node))
+            .count();
+        if let Some(part) = declared_parts
+            .iter_mut()
+            .find(|part| part.id == info.part_id)
+        {
+            part.playable_chord_symbols = part.playable_chord_symbols.saturating_add(playable);
+        }
+    }
     let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
     Ok(Midi {
         ticks_per_beat: tpb,
@@ -3373,6 +3347,121 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         score_intensity: (!score_expression.is_empty()).then_some(score_expression),
         staff_links,
         tracks,
+    })
+}
+
+fn percussion_staff_type(staff: roxmltree::Node) -> bool {
+    matches!(
+        staff
+            .children()
+            .find(|node| node.has_tag_name("StaffType"))
+            .and_then(|node| node.attribute("group")),
+        Some("percussion" | "unpitched")
+    )
+}
+
+/// Percussion roles of an `<Instrument>`, read as the Part declarations are.
+fn instrument_percussion_roles(instrument: roxmltree::Node) -> Result<BTreeSet<bool>, String> {
+    let drumset = instrument_integer(
+        instrument
+            .children()
+            .filter(|node| node.has_tag_name("useDrumset"))
+            .map(|node| node.text().unwrap_or("")),
+        "useDrumset",
+        0,
+        1,
+    )? == Some(1)
+        || instrument
+            .descendants()
+            .any(|node| node.has_tag_name("Drum"))
+        || crate::engine::midi::instrument_taxonomy_is_percussion(child_text(
+            instrument,
+            "instrumentId",
+        ));
+    let mut roles = BTreeSet::new();
+    for channel in instrument
+        .children()
+        .filter(|node| node.has_tag_name("Channel"))
+    {
+        let number = instrument_integer(
+            channel.attribute("channel").into_iter().chain(
+                channel
+                    .children()
+                    .filter(|node| matches!(node.tag_name().name(), "midiChannel" | "channel"))
+                    .map(|node| node.text().unwrap_or("")),
+            ),
+            "midiChannel",
+            -1,
+            15,
+        )?;
+        roles.insert(drumset || number == Some(9));
+    }
+    if roles.is_empty() {
+        roles.insert(drumset);
+    }
+    Ok(roles)
+}
+
+/// A mid-score instrument, channel or staff-type change keeps the initial
+/// owner, which is safe only while it cannot turn pitched material into
+/// percussion or back. Such a change, or one whose target cannot be read,
+/// is refused; `articulationChange` alters playback only.
+fn refuse_percussion_identity_changes(
+    score: roxmltree::Node,
+    staff_roles: &BTreeMap<String, (BTreeSet<bool>, bool)>,
+) -> Result<(), String> {
+    for staff in score.children().filter(|node| node.has_tag_name("Staff")) {
+        let declared = staff.attribute("id").and_then(|id| staff_roles.get(id));
+        for node in staff.descendants() {
+            let tag = node.tag_name().name();
+            if !matches!(
+                tag,
+                "InstrumentChange" | "channelSwitch" | "StaffTypeChange"
+            ) {
+                continue;
+            }
+            let Some((roles, percussion_group)) = declared else {
+                return Err(unresolved_change(tag));
+            };
+            let from_percussion = *percussion_group || roles.contains(&true);
+            let changes_identity = match tag {
+                "InstrumentChange" => match node
+                    .children()
+                    .find(|child| child.has_tag_name("Instrument"))
+                {
+                    Some(instrument) => {
+                        from_percussion || instrument_percussion_roles(instrument)?.contains(&true)
+                    }
+                    None => true,
+                },
+                "StaffTypeChange" => {
+                    *percussion_group
+                        || node
+                            .children()
+                            .find(|child| child.has_tag_name("StaffType"))
+                            .and_then(|staff_type| staff_type.attribute("group"))
+                            .is_none_or(|group| matches!(group, "percussion" | "unpitched"))
+                }
+                _ => roles.len() > 1,
+            };
+            if changes_identity {
+                return Err(unresolved_change(tag));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unresolved_change(tag: &str) -> String {
+    format!("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: native {tag} can change percussion identity and cannot be assigned safely; the original source remains unchanged")
+}
+
+/// A note or chord symbol sounds unless its own `play` property is off.
+/// MuseScore 4 plays MuseScore 3 chord symbols even under a 3.x `harmonyPlay`
+/// style of 0, so that style is not read.
+pub(crate) fn plays(element: roxmltree::Node) -> bool {
+    !element.children().any(|child| {
+        child.has_tag_name("play") && matches!(child.text().map(str::trim), Some("0" | "false"))
     })
 }
 
@@ -3962,33 +4051,6 @@ mod tests {
             assert_eq!(played_notes(&midi), vec![(0, 480, 60)]);
             assert_eq!(link_interpretations(&midi), vec![("2".into(), None)]);
         }
-    }
-
-    #[test]
-    fn a_container_names_the_source_parts_it_holds() {
-        let two = zipped_score(
-            br#"<?xml version="1.0" encoding="UTF-8"?>
-<museScore version="4.70"><Score><Division>480</Division>
-<Part id="2"><trackName>Bass</trackName></Part>
-<Part id="3"><trackName>Drums</trackName></Part>
-</Score></museScore>"#,
-        );
-        assert_eq!(
-            container_part_ids(&two),
-            Some(vec![Some("2".into()), Some("3".into())])
-        );
-
-        // MuseScore 3 writes Parts without an id, so a container written that
-        // way names nothing and cannot place itself on the source.
-        let unnamed = zipped_score(
-            br#"<?xml version="1.0" encoding="UTF-8"?>
-<museScore version="3.02"><Score><Division>480</Division>
-<Part><trackName>Bass</trackName></Part>
-</Score></museScore>"#,
-        );
-        assert_eq!(container_part_ids(&unnamed), Some(vec![None]));
-
-        assert_eq!(container_part_ids(b"not a score"), None);
     }
 
     fn container(paths: &[&str]) -> String {
@@ -5167,6 +5229,26 @@ Melodie</trackName>
                 ("Alto", vec![0, 480, 960, 1_440]),
                 ("Soprano", vec![0, 480, 960, 1_440]),
             ]
+        );
+    }
+
+    #[test]
+    fn playable_chord_symbols_are_counted_per_part() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02"><Score><Division>480</Division>
+<Part><Staff id="1"/><trackName>Voice</trackName></Part>
+<Part><Staff id="2"/><trackName>Piano</trackName></Part>
+<Staff id="1"><Measure><voice><Harmony><root>14</root><play>0</play></Harmony><Chord><durationType>quarter</durationType><Note><pitch>60</pitch><tpc>14</tpc></Note></Chord></voice></Measure></Staff>
+<Staff id="2"><Measure><voice><Harmony><root>14</root></Harmony><Harmony><root>16</root><play>1</play></Harmony><Rest><durationType>quarter</durationType></Rest></voice></Measure></Staff>
+</Score></museScore>"#;
+        let midi = parse(xml.as_bytes()).unwrap();
+        assert_eq!(
+            midi.topology
+                .parts
+                .iter()
+                .map(|part| part.playable_chord_symbols)
+                .collect::<Vec<_>>(),
+            [0, 2]
         );
     }
 

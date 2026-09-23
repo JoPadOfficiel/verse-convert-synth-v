@@ -24,15 +24,22 @@ pub struct StemDescriptor {
     /// Bundle-owned, filename-safe identifier. Source names are never paths.
     pub stem_id: String,
     pub source_part_id: String,
-    /// Position of this Part in the source topology. Stems skip note-free
-    /// Parts, so this is not the stem's own index, and it is the key that maps
-    /// a stem onto the Part MuseScore cut for it.
+    /// Position of this Part in the source topology. Stems skip silent Parts,
+    /// so this is not the stem's own index; it selects the Part a stem keeps
+    /// audible.
     pub source_part_index: usize,
     pub display_name: String,
     pub source_track_ids: Vec<String>,
     pub source_note_count: usize,
+    /// Playable chord symbols of the Part. They make a note-free Part audible.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_chord_symbol_count: usize,
     pub role: StemRole,
     pub active_by_default: bool,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,7 +50,7 @@ pub struct StemPlan {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum StemPlanError {
-    #[error("source contains no note-bearing Parts")]
+    #[error("source contains no audible Parts")]
     NoNoteBearingParts,
     #[error("source topology contains duplicate Part ID {0}")]
     DuplicatePartId(String),
@@ -60,9 +67,9 @@ pub enum StemPlanError {
 }
 
 impl StemPlan {
-    /// Builds one render stem per note-bearing source Part, preserving source
-    /// Part order. Technical chord-member lanes remain grouped inside their
-    /// owning Part.
+    /// Builds one render stem per audible source Part, preserving source Part
+    /// order: every Part with notes, and every note-free Part with playable
+    /// chord symbols. Technical chord-member lanes stay inside their Part.
     pub fn from_source(midi: &Midi, reports: &[TrackReport]) -> Result<Self, StemPlanError> {
         let tracks = midi
             .tracks
@@ -100,10 +107,6 @@ impl StemPlan {
                     }
                 }
             }
-            if source_track_ids.is_empty() {
-                continue;
-            }
-
             let source_note_count = source_track_ids
                 .iter()
                 .filter_map(|track_id| tracks.get(track_id.as_str()))
@@ -115,7 +118,12 @@ impl StemPlan {
                     )
                 })
                 .count();
-            if source_note_count == 0 {
+            let source_chord_symbol_count = if source_note_count == 0 {
+                part.playable_chord_symbols
+            } else {
+                0
+            };
+            if source_note_count == 0 && source_chord_symbol_count == 0 {
                 // Metadata/KAR word tracks are preserved by the source and
                 // ledger; they are not fake silent instrumental stems.
                 continue;
@@ -136,6 +144,7 @@ impl StemPlan {
                 display_name: nonempty_display_name(&part.name, part_index),
                 source_track_ids,
                 source_note_count,
+                source_chord_symbol_count,
                 role,
                 active_by_default: !has_vocal_projection,
             });
@@ -160,10 +169,15 @@ impl StemPlan {
             if !part_ids.insert(stem.source_part_id.clone()) {
                 return Err(StemPlanError::DuplicatePartId(stem.source_part_id.clone()));
             }
-            if stem.source_track_ids.is_empty() {
+            // A chord-symbol stem is audible through its Part's Harmony alone;
+            // it owns no notes and needs no projection lane.
+            let chord_symbol_stem = stem.source_note_count == 0
+                && stem.source_chord_symbol_count > 0
+                && stem.role == StemRole::Accompaniment;
+            if stem.source_track_ids.is_empty() && !chord_symbol_stem {
                 return Err(StemPlanError::EmptyStem(stem.stem_id.clone()));
             }
-            if stem.source_note_count == 0 {
+            if stem.source_note_count == 0 && !chord_symbol_stem {
                 return Err(StemPlanError::NoteFreeStem(stem.stem_id.clone()));
             }
             for track_id in &stem.source_track_ids {
@@ -264,6 +278,7 @@ mod tests {
                 parts: vec![
                     SourcePart {
                         id: "part:soprano".into(),
+                        playable_chord_symbols: 0,
                         name: "Soprano".into(),
                         source_track_ids: vec!["sop-a".into(), "sop-b".into()],
                         staves: vec![SourceStaff {
@@ -277,6 +292,7 @@ mod tests {
                     },
                     SourcePart {
                         id: "part:piano".into(),
+                        playable_chord_symbols: 0,
                         name: "Piano".into(),
                         source_track_ids: vec!["pno".into()],
                         staves: vec![SourceStaff {
@@ -324,5 +340,65 @@ mod tests {
         let plan = StemPlan::from_source(&midi, &[]).unwrap();
         assert_eq!(plan.stems.len(), 1);
         assert_eq!(plan.stems[0].source_track_ids, ["music"]);
+    }
+
+    #[test]
+    fn a_note_free_part_with_playable_chord_symbols_is_an_accompaniment_stem() {
+        let tracks = vec![note_track("voice", 0)];
+        let mut topology = SourceTopology::from_tracks(&tracks);
+        for (id, chords) in [("chords", 45), ("rests", 0)] {
+            topology.parts.push(SourcePart {
+                id: id.into(),
+                name: "Piano".into(),
+                source_track_ids: Vec::new(),
+                staves: vec![SourceStaff {
+                    id: format!("{id}:staff"),
+                    voices: Vec::new(),
+                }],
+                playable_chord_symbols: chords,
+            });
+        }
+        let midi = Midi {
+            score_intensity: None,
+            staff_links: Vec::new(),
+            ticks_per_beat: 480,
+            time_base: TimeBase::PulsesPerQuarter(480),
+            format: 1,
+            source_format: SourceFormat::MuseScore,
+            topology,
+            tracks,
+        };
+        let plan = StemPlan::from_source(&midi, &[]).unwrap();
+        assert_eq!(plan.stems.len(), 2);
+        let chords = &plan.stems[1];
+        assert_eq!(
+            (chords.source_part_id.as_str(), chords.source_part_index),
+            ("chords", 1)
+        );
+        assert!(chords.source_track_ids.is_empty());
+        assert_eq!(chords.source_note_count, 0);
+        assert_eq!(chords.source_chord_symbol_count, 45);
+        assert_eq!(chords.role, StemRole::Accompaniment);
+        assert!(chords.active_by_default);
+        assert_eq!(plan.stems[0].source_chord_symbol_count, 0);
+
+        let mut vocal = plan.clone();
+        vocal.stems[1].role = StemRole::VocalReference;
+        assert_eq!(
+            vocal.validate(),
+            Err(StemPlanError::EmptyStem(chords.stem_id.clone()))
+        );
+        let mut silent = plan.clone();
+        silent.stems[1].source_chord_symbol_count = 0;
+        assert_eq!(
+            silent.validate(),
+            Err(StemPlanError::EmptyStem(chords.stem_id.clone()))
+        );
+        let mut noteless = plan;
+        noteless.stems[0].source_note_count = 0;
+        assert!(matches!(
+            noteless.validate(),
+            Err(StemPlanError::NoteFreeStem(_))
+        ));
     }
 }

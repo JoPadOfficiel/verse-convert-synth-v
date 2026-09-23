@@ -7,7 +7,8 @@ Start by identifying which output you opened:
   intentionally has no piano, percussion, instrument stems, or full-score audio.
 - **Complete bundle project** is the file under `<name>.versebundle/project/`, a
   `.svp` or a `.ustx` per the export target. It contains editable vocals, the
-  audio-backed instrumental material for every note-bearing source Part, and a
+  audio-backed instrumental material for every audible source Part (with notes,
+  or with playable chord symbols only), and a
   muted full-score reference. Both variants reference the same stems: SVP
   instrumental tracks in a `.svp`, `wave_parts` in a `.ustx`.
 
@@ -64,8 +65,8 @@ a `.svp`, as `wave_parts` in a `.ustx`.
 
 If the project contains only `Full score reference mix` and an empty
 `Unnamed Track`, it is probably an older bundle or the wrong project file.
-Current bundle schema v2 either contains one verified stem per note-bearing
-source Part or fails without publishing a bundle. Export to a new name and
+Current bundle schema v2 either contains one verified stem per audible source
+Part or fails without publishing a bundle. Export to a new name and
 open the newly generated project.
 
 Nobody has yet confirmed by ear that a `.ustx` bundle's stems play in OpenUtau
@@ -204,20 +205,44 @@ two-track file came back as one Part, a three-track file as four, a twelve-track
 file as eleven. Verse compared that count against its own source tracks and
 refused the export.
 
-Current builds do not ask MuseScore to divide a MIDI. A MIDI, unlike a score,
-divides exactly along its own `MTrk` chunks, so Verse cuts it itself: each stem
-is the source track copied byte for byte, preceded by a rebuilt meta track
-carrying the file's tempo, meter, key and SMPTE marks so it renders on the same
-timeline as the reference mix. The stem is named `<track> (MIDI track)` rather
-than `(MuseScore Part)`, because Verse chose the division and knows exactly
-which source track each stem holds.
+Current builds no longer compare counts blindly. Verse converts the whole MIDI
+with MuseScore and uses that import only when its Parts are proven to be the
+note-bearing source tracks, in order and by name; each stem is then the whole
+import with every other Part silenced. Otherwise each stem is the source track
+copied byte for byte after the file's tempo, meter, key and SMPTE marks (see
+`MIDI_STEM_IMPORT_MAPPING_UNPROVEN` below). The stem is named
+`<track> (MIDI track)` either way, because it holds exactly one source track.
 
-Score sources are unchanged: their Parts still come from MuseScore, and a
-mismatch there is still a blocking error.
+Current builds no longer ask MuseScore to cut score Parts either: each score
+stem is the whole score with every other Part silenced, so a fermata or breath
+written on only some Parts stays on the reference mix's timeline. A score whose
+Parts cannot be mapped onto the source topology still blocks the bundle. Look
+for the detail code, not the message text: `SCORE_STEM_TOPOLOGY_MISMATCH`,
+`SCORE_STEM_PART_ORDER_UNRESOLVED`, `SCORE_STEM_STAFF_UNOWNED` or
+`SCORE_STEM_UNSILENCEABLE` (see
+[Bundle format](bundle-format.md#part-isolation)).
 
-A MIDI stem may be shorter than the full-score reference when its track falls
-silent before the end. Both start at zero, so it stays in step; padding it would
-add audio the source never carried.
+A per-track MIDI stem may be shorter than the full-score reference when its
+track falls silent before the end. Both start at zero, so it stays in step;
+padding it would add audio the source never carried.
+
+## `MIDI_STEM_IMPORT_MAPPING_UNPROVEN` in the bundle warnings
+
+MIDI and KAR stems are normally cut from MuseScore's own import of the whole
+file, because MuseScore quantizes each track with evidence from all of them.
+Verse uses that import only when it can prove one Part per note-bearing track,
+in file order, named after its track. The warning gives the reason it could
+not. The bundle is complete: each stem is then its own source track, byte for
+byte, and a loosely timed track may place some notes a grid step away from the
+reference mix.
+
+## `MIDI_STEM_SHARED_NOTE_ROUTE` in the bundle warnings
+
+Two or more MIDI tracks sound the same port, channel and key at overlapping or
+identical instants — often a kick drum written in two drum tracks. The bundle is
+complete. In the whole file, one track's note-off can end the other's note, so
+those notes can sound slightly differently in the stems than in the reference
+mix.
 
 ## A karaoke line is missing from the project
 
@@ -403,8 +428,8 @@ First open the source directly in MuseScore and confirm that:
 - every note-bearing Part selected for rendering contains the expected audible
   material.
 
-The 20-minute renderer deadline covers Part extraction, the full reference,
-and every sequential Part stem. Very large scores with many Parts can exhaust
+The 20-minute renderer deadline covers MusicXML or MIDI conversion, the full
+reference, and every sequential Part stem. Very large scores with many Parts can exhaust
 that aggregate budget. A silent, truncated, malformed, oversized, or
 identity-mismatched output is reported as a renderer failure.
 

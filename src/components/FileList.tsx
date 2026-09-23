@@ -408,7 +408,8 @@ function Row({
       {open && item.ok && (
         <div className="border-t px-4 py-2 pl-11">
           <p className="mb-2 text-xs text-muted-foreground">
-            Each note-bearing source Part becomes its own MuseScore-rendered{" "}
+            Each audible source Part (notes or playable chord symbols) becomes
+            its own MuseScore-rendered{" "}
             {TARGET_COPY[exportTarget].audioReference}. Vocal reference Parts and
             the full-score reference are muted by default; accompaniment Parts
             remain audible.

@@ -236,6 +236,33 @@ pub fn parse(data: &[u8]) -> Result<Midi, String> {
     parse_musicxml(&xml)
 }
 
+/// Score-part IDs in `<part-list>` order, the order MuseScore imports Parts in.
+pub fn part_list_ids(data: &[u8]) -> Result<Vec<String>, String> {
+    let xml = if is_zip(data) {
+        extract_mxl(data)?
+    } else {
+        decode_xml_bytes(data)?
+    };
+    check_nesting(&xml)?;
+    let safe_xml = mask_external_musicxml_doctype(&xml)?;
+    let doc = roxmltree::Document::parse_with_options(
+        &safe_xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 5_000_000,
+        },
+    )
+    .map_err(|e| format!("invalid XML: {}", e))?;
+    Ok(doc
+        .root_element()
+        .children()
+        .filter(|node| node.has_tag_name("part-list"))
+        .flat_map(|list| list.children())
+        .filter(|node| node.has_tag_name("score-part"))
+        .filter_map(|part| part.attribute("id").map(str::to_string))
+        .collect())
+}
+
 fn step_semitone(s: &str) -> Option<i32> {
     match s {
         "C" => Some(0),
@@ -1001,6 +1028,46 @@ fn resolve_jump_targets(marks: &mut [MeasureMarks]) {
     }
 }
 
+/// A `<sound>` playback change keeps the part's declared owner, which is safe
+/// only while the percussion role it states matches the instrument it names,
+/// or every declared instrument when it names none.
+fn refuse_percussion_sound_changes(
+    part: roxmltree::Node,
+    instruments: &BTreeMap<String, InstrumentInfo>,
+) -> Result<(), String> {
+    let declared: BTreeSet<bool> = instruments
+        .values()
+        .map(|instrument| instrument.percussion)
+        .collect();
+    for change in part
+        .descendants()
+        .filter(|node| node.has_tag_name("sound"))
+        .flat_map(|sound| sound.children())
+        .filter(roxmltree::Node::is_element)
+    {
+        let role = match change.tag_name().name() {
+            "midi-instrument" => {
+                let channel = instrument_integer(change, "midi-channel", 16)?;
+                let unpitched = instrument_integer(change, "midi-unpitched", 128)?.is_some();
+                (unpitched || channel.is_some()).then_some(unpitched || channel == Some(10))
+            }
+            "instrument-change" => change
+                .children()
+                .find(|node| node.has_tag_name("instrument-sound"))
+                .map(|node| crate::engine::midi::instrument_taxonomy_is_percussion(node.text())),
+            _ => None,
+        };
+        let target = match change.attribute("id").and_then(|id| instruments.get(id)) {
+            Some(instrument) => BTreeSet::from([instrument.percussion]),
+            None => declared.clone(),
+        };
+        if role.is_some_and(|role| target.len() != 1 || !target.contains(&role)) {
+            return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: a MusicXML playback change can alter percussion identity and cannot be assigned safely; the original source remains unchanged".into());
+        }
+    }
+    Ok(())
+}
+
 fn instrument_integer(
     node: roxmltree::Node,
     tag: &str,
@@ -1237,25 +1304,12 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         .filter(|n| n.has_tag_name("part"))
         .enumerate()
     {
-        if part
-            .descendants()
-            .filter(|node| node.has_tag_name("sound"))
-            .any(|sound| {
-                sound.children().any(|node| {
-                    matches!(
-                        node.tag_name().name(),
-                        "midi-instrument" | "midi-device" | "instrument-change"
-                    )
-                })
-            })
-        {
-            return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: MusicXML playback instrument changes cannot be assigned safely; the original source remains unchanged".into());
-        }
         let part_id = part
             .attribute("id")
             .map(str::to_string)
             .unwrap_or_else(|| format!("part-{}", part_index + 1));
         let info = part_info.get(&part_id).cloned().unwrap_or_default();
+        refuse_percussion_sound_changes(part, &info.instruments)?;
         let measures: Vec<_> = part
             .children()
             .filter(|n| n.has_tag_name("measure"))
@@ -1317,10 +1371,24 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         for staff in 1..=declared_staff_count {
             declared_staff_ids.insert(staff.to_string());
         }
+        let playable_chord_symbols = measures
+            .iter()
+            .flat_map(|measure| measure.children())
+            .filter(|node| {
+                // `none` is the MusicXML spelling of N.C.: nothing sounds.
+                node.has_tag_name("harmony")
+                    && node
+                        .children()
+                        .find(|child| child.has_tag_name("kind"))
+                        .and_then(|kind| kind.text())
+                        .is_none_or(|kind| kind.trim() != "none")
+            })
+            .count();
         declared_parts.push(SourcePart {
             id: part_id.clone(),
             name: info.name.clone(),
             source_track_ids: Vec::new(),
+            playable_chord_symbols,
             staves: declared_staff_ids
                 .into_iter()
                 .map(|staff_id| SourceStaff {
@@ -1949,6 +2017,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
             name: info.name.clone(),
             source_track_ids: Vec::new(),
             staves: Vec::new(),
+            playable_chord_symbols: 0,
         });
     }
     let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
@@ -3033,6 +3102,31 @@ mod tests {
             "expected a clean nesting error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn playable_chord_symbols_are_counted_per_part_in_part_list_order() {
+        let harmony = |kind: &str| {
+            format!("<harmony><root><root-step>C</root-step></root><kind>{kind}</kind></harmony>")
+        };
+        let xml = format!(
+            "<score-partwise version=\"4.0\"><part-list><score-part id=\"V\"><part-name>Voice</part-name></score-part><score-part id=\"C\"><part-name>Chords</part-name></score-part></part-list>\
+             <part id=\"V\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration></note></measure></part>\
+             <part id=\"C\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes>{}{}{}<note><rest/><duration>1</duration></note></measure></part></score-partwise>",
+            harmony("major"),
+            harmony("minor-seventh"),
+            harmony("none")
+        );
+        let midi = parse(xml.as_bytes()).unwrap();
+        assert_eq!(
+            midi.topology
+                .parts
+                .iter()
+                .map(|part| (part.id.as_str(), part.playable_chord_symbols))
+                .collect::<Vec<_>>(),
+            [("V", 0), ("C", 2)]
+        );
+        assert_eq!(part_list_ids(xml.as_bytes()).unwrap(), ["V", "C"]);
     }
 
     #[test]

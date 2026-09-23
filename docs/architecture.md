@@ -30,7 +30,7 @@ flowchart LR
     SVP --> OUTPUT["Local .svp / .ustx / .versebundle"]
     USTX --> OUTPUT
     BUNDLE --> OUTPUT
-    MS -->|"validated WAV + extracted Parts"| BUNDLE
+    MS -->|"validated WAV + converted scores"| BUNDLE
 ```
 
 The webview is not a musical domain runtime. It may ask the user to select
@@ -54,8 +54,9 @@ files, build manifests, launch processes, or commit output.
 | Target dispatch | `engine/target/mod.rs` | `ExportTarget`, the analysis gate `validate_for`, and the single write boundary `serialize_to` |
 | Target adapter | `engine/target/svp.rs` | Raw Synthesizer V project v113 serialization; blicks |
 | Target adapter | `engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 serialization; 480 ticks per quarter, and its own deterministic YAML emitter |
-| Stem policy | `stems.rs` | One stable stem per note-bearing source Part |
-| Renderer adapter | `renderer.rs` | MuseScore discovery, capability probe, extraction, render, validation |
+| Stem policy | `stems.rs` | One stable stem per audible source Part: with notes, or with playable chord symbols only |
+| Renderer adapter | `renderer.rs` | MuseScore discovery, capability probe, score conversion, render, validation |
+| Score stems | `score_stems.rs` | Per-Part silencing of the whole source score, mapped onto the source topology |
 | Artifact adapter | `bundle.rs` | Ledger, staged files, the per-target bundle project and its audio references, integrity checks, no-replace commit |
 | Delivery | `.github/workflows/` | Locked tests, multi-platform builds, release publication |
 
@@ -72,8 +73,8 @@ flowchart LR
     PROJECT --> GATE["Selected target's exactness gate"]
     GATE --> SVP["SVP vocal project"]
     GATE --> USTX[".ustx vocal project"]
-    STEMPLAN --> EXTRACT["MuseScore score-parts extraction"]
-    EXTRACT --> RENDER["Sequential validated WAV renders"]
+    STEMPLAN --> ISOLATE["Silenced full scores or MIDI imports (per-track MIDI fallback)"]
+    ISOLATE --> RENDER["Sequential validated WAV renders"]
     RENDER --> AUDIO["Part stems + muted full-score reference"]
     BYTES --> LEDGER["Complete source disposition ledger"]
     SVP --> STAGE["Owned sibling staging"]
@@ -148,8 +149,11 @@ intentionally absent from both formats; a `.ustx` carries `wave_parts: []`.
 
 `export_bundle` reparses one immutable source snapshot, projects vocals, builds
 one `StemPlan`, builds the complete preservation ledger, probes MuseScore,
-extracts all score Parts, renders every expected Part and the original full
-score, validates all artifacts, and publishes a new bundle transactionally.
+isolates every audible source Part (the whole score, or MuseScore's import of
+the whole MIDI, with every other Part silenced; a byte-identical MIDI track when
+that import cannot be mapped), renders every expected Part and the original
+full score, validates all artifacts, and publishes a new bundle
+transactionally.
 There is no mixed-only or audio-less fallback.
 
 It takes an `export_target: Option<ExportTarget>` and writes that target's
@@ -247,12 +251,16 @@ rewrite source role, copy lyrics from another track, or prove a vocal identity.
 Bundle rendering uses one aggregate twenty-minute deadline, a 2 GiB limit per
 WAV, an 8 GiB aggregate audio limit, fixed arguments, bounded logs, a private
 working directory, controlled environment variables, process-tree
-termination, and strict WAV validation.
+termination, and strict WAV validation. The port's `convert_to_mscz`
+capability (unsupported by default) converts a MusicXML/MXL or MIDI/KAR source
+to `.mscz` under the same policy; `score_stems.rs` then silences every other
+Part in that container, or in a native source, to produce each stem.
 
 On macOS with MuseScore 4, score-loading processes are serialized, separated
 by a ten-second cooldown, and retried at most three times only for the known
-shutdown `SIGABRT` signature. A score-Parts retry also requires a fully valid
-payload. A WAV created by a failed process is removed and never accepted.
+shutdown `SIGABRT` signature. A retry of `--score-parts`, which bundles no
+longer use, also requires a fully valid payload. A WAV or converted score
+created by a failed process is removed and never accepted.
 
 See [MuseScore renderer](musescore-renderer.md).
 
@@ -267,7 +275,7 @@ Bundle publication follows:
 2. create a uniquely named sibling staging directory;
 3. write a Verse ownership marker;
 4. copy the exact source and write project/ledger files;
-5. extract and render the required audio;
+5. isolate and render the required audio;
 6. write the manifest;
 7. reopen and validate every expected file, hash, size, WAV, coverage set,
    group ID, and relative reference;

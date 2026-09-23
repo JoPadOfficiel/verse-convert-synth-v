@@ -87,8 +87,9 @@ the mute state sits on the track — the same place Synthesizer V keeps it.
 
 ### Part stems
 
-`audio/stems/*.wav` contains one stem per **note-bearing** source Part.
-Technical lanes from chords remain grouped inside their source Part.
+`audio/stems/*.wav` contains one stem per **audible** source Part: every
+note-bearing Part, and every note-free Part whose chord symbols MuseScore
+plays. Technical lanes from chords remain grouped inside their source Part.
 
 Stem IDs are deterministic:
 
@@ -104,6 +105,13 @@ Roles:
 
 Rest-only, metadata-only, and lyrics-only Parts do not receive fake silent
 stems. They remain in the source and preservation evidence.
+
+How a stem isolates its Part is described in
+[Formats and fidelity](formats-and-fidelity.md#audio-stems): a score stem is the
+whole score with every other Part's notes and chord symbols silenced; a MIDI
+stem is MuseScore's import of the whole file with every other Part silenced,
+or, when that import cannot be mapped onto the source tracks, one
+byte-identical source track after the file's global marks.
 
 ### Full-score reference
 
@@ -139,8 +147,15 @@ Each `audio.stems[]` record contains:
 
 - stable stem ID and display name;
 - owning source Part ID and source track IDs;
+- `sourceChordSymbolCount`, present only when a note-free Part is audible
+  through its chord symbols; only such an accompaniment stem of a score may
+  have no source track IDs;
 - role and default active state;
-- isolation method;
+- isolation method, the same for every stem of one bundle:
+  `musescore-silenced-score` for a MusicXML/MXL/MuseScore source;
+  `musescore-silenced-midi-import` or, as the fallback, `midi-track-split` for a
+  MIDI/KAR source. Verification also accepts `musescore-score-parts`, the value
+  earlier bundles recorded for every stem;
 - WAV path/hash/size/duration/sample rate/channels/bits/frames;
 - matching SVP group ID.
 
@@ -218,6 +233,7 @@ All table fields use camelCase:
 | `sourceTracks` | Inventoried source track IDs |
 | `sourceNotes` | `noteId`, original `sourceTrackId`, `originalSourceId`, `startTick`, `sourceOccurrence`, optional `scoreOwner` and `midiChannel`, actual native MIDI `velocity`/`attackSourceId`/`explicitAttack`, and parser-proven `mergedVelocitySources` |
 | `controllers` | Inventoried CC7/CC11 `sourceId`, `sourceTrackId`, `tick`, channel `owner` (`port`, `channel`), `controller`, and `value` |
+| `contextualSources` | Optional. Inventoried MIDI `sourceId`, `sourceTrackId`, `tick` and typed `role`: `portDeclaration` (`port`), `systemExclusive` (`port`) or `channelMode` (`owner`, `controller` 120–127) |
 | `projectedNotes` | `noteId`, original `sourceTrackId`, zero-based `targetTrack`, final `destinationTrackId`, source-tick `startTick`/`endTick`, and optional source-proven tie root `intensityAttackNoteId` |
 | `scoreOwners` | Original `sourceTrackId` and typed `owner` (`part`, `staff`, `voice`, optional `instrument`), including declared silent voices |
 | `declarations` | Original `sourceId`, parser `kinds`, original `scope`, exact written `at`, optional raw `noteSourceId`, symmetric original `pairedSourceIds`, and shared source-route `applications` |
@@ -285,7 +301,14 @@ belong to the original attack or an independently proven tie root; moved notes
 retain original ownership. Source-only unresolved `0/0` cannot claim target notes.
 
 Every contributing typed CC7/CC11 is checked against original MIDI port/channel
-and time, including spans with nonempty velocity provenance. A controller on a
+and time, including spans with nonempty velocity provenance. A MIDI port
+declaration routes a contributing event, and SysEx or a CC120–127 message makes
+the held gain or pitch unknown; the normalizer folds these into later gain
+points. Such a contextual contributor is accepted only when it is listed in
+`contextualSources`, is no later than the span start, and belongs to the span's
+own source lane or to the port (port declaration, SysEx) or port/channel
+(CC120–127) of every affected note. It never counts as controller support, and
+any other unlisted contributor is still rejected. A controller on a
 different physical track is valid on the same port/channel; historical held or
 recovery contributors may precede the span. An empty provenance array is allowed only for
 neutral, controller-only MIDI intensity whose inventoried contributing CC7/CC11
@@ -354,20 +377,34 @@ The ledger inventories constructs represented in Verse's current source model.
 Unknown or opaque source-format constructs remain preserved by the
 byte-identical source even when they do not receive their own ledger row.
 
-## Part alignment
+## Part isolation
 
-MuseScore `--score-parts` output is aligned to planned stems using:
+A score stem is mapped onto its source Part by that Part's position in the
+source topology. Before rendering, Verse re-reads the source topology and checks the MuseScore
+container Part by Part: the same Part count, the same Part IDs for a native
+score, the same staff count for a converted MusicXML/MXL score, MusicXML Parts
+written in `part-list` order, and every staff holding notes or chord symbols
+owned by exactly one Part. A native Part whose notes all say `play 0` keeps a
+silent stem, because that is what the source asks for. A converted
+MusicXML/MXL Part must hold at least one playable note or chord symbol when its
+source Part has notes: MusicXML cannot mute a note, so a silent converted Part
+means the positional mapping is wrong. Any mismatch blocks publication rather
+than rendering a stem that might belong to another Part, with a stable
+`BUNDLE_INTEGRITY_FAILED` detail code:
 
-1. unique native Part ID from `partsMeta.id`; then
-2. a unique normalized Part display name.
+| Code | Meaning |
+|---|---|
+| `SCORE_STEM_TOPOLOGY_MISMATCH` | Part count, native Part ID or staff count differs from the source, or a stem cannot be mapped onto exactly one source Part |
+| `SCORE_STEM_PART_ORDER_UNRESOLVED` | MusicXML Parts are not written in `part-list` order |
+| `SCORE_STEM_STAFF_UNOWNED` | A staff holding notes or chord symbols belongs to no Part, or two declarations resolve to one staff |
+| `SCORE_STEM_UNSILENCEABLE` | The container is unreadable, not UTF-8, over 64 MiB, or an element cannot take `<play>0</play>` in place |
 
-Duplicate IDs, duplicate names without an ID match, missing expected Parts,
-duplicated ordinals, or a Part count that does not prove the expected
-note-bearing topology blocks publication.
-
-If MuseScore exposes an additional rest-only Part that the current stem plan
-cannot match one-to-one, the bundle fails closed rather than silently ignoring
-or fabricating an asset.
+A MIDI stem is mapped onto its source track by the `midi:track:N` Part ID. Its
+MuseScore import is used only when it holds exactly one Part per note-bearing
+source track, in file order, each Part holding a playable note and each named
+track's raw name ending its Part's `<trackName>` as `, <name>`. Otherwise the
+bundle uses the per-track split and records a `MIDI_STEM_IMPORT_MAPPING_UNPROVEN`
+warning; the export continues.
 
 ## Integrity validation
 
@@ -384,6 +421,9 @@ Before and after publication, Verse verifies:
   that is missing, resized, or altered fails here;
 - complete/unique stem coverage across `expectedStemIds`, `renderedStemIds`, and
   the `stems[]` records;
+- one isolation method shared by every stem and allowed for the manifest's
+  `sourceFormat`, and source track IDs on every stem except a score's
+  chord-symbol accompaniment stem;
 - non-empty, non-silent, valid PCM/float WAV data;
 - WAV metadata and timeline alignment;
 - aggregate audio size;
