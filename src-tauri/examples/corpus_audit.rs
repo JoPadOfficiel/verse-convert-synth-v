@@ -14,6 +14,8 @@ use verse_lib::engine::{convert::convert_midi, midi::Midi, musescore, musicxml};
 use verse_lib::renderer::{
     AudioRenderer, MuseScoreConfig, MuseScoreRenderer, RenderLimits, DEFAULT_MAX_WAV_BYTES,
 };
+use verse_lib::score_stems::ScoreStems;
+use verse_lib::stems::StemPlan;
 
 const REPORT_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_RENDER_SAMPLE_SIZE: usize = 3;
@@ -911,15 +913,15 @@ fn render_deterministic_sample(
         max_output_bytes: DEFAULT_MAX_WAV_BYTES,
     };
 
-    ranked
+    let render_root = input_root
+        .parent()
+        .unwrap_or(input_root)
+        .join(format!(".verse-corpus-render-{}", std::process::id()));
+    let audits = ranked
         .into_iter()
         .map(|(rank, path, relative, expected_parts)| {
             eprintln!("rendering deterministic sample {relative}");
-            let work = input_root
-                .parent()
-                .unwrap_or(input_root)
-                .join(format!(".verse-corpus-render-{}", std::process::id()))
-                .join(&rank[..16]);
+            let work = render_root.join(&rank[..16]);
             let result = render_one_sample(&renderer, path, &work, expected_parts, &limits);
             let _ = fs::remove_dir_all(&work);
             match result {
@@ -956,7 +958,10 @@ fn render_deterministic_sample(
                 }
             }
         })
-        .collect()
+        .collect();
+    // The pinned checkout must stay clean for the next audit run.
+    let _ = fs::remove_dir_all(&render_root);
+    audits
 }
 
 fn render_one_sample(
@@ -977,30 +982,55 @@ fn render_one_sample(
             &remaining_render_limits(started, limits)?,
         )
         .map_err(|error| format!("full-score render failed: {error}"))?;
-    let parts = renderer
-        .extract_score_parts(source, &remaining_render_limits(started, limits)?)
-        .map_err(|error| format!("Part extraction failed: {error}"))?;
-    if parts.len() != expected_parts {
+    // The same isolation bundles use: one stem per planned source Part, each
+    // the whole score with every other Part silenced.
+    let bytes = fs::read(source).map_err(|error| format!("cannot read sampled score: {error}"))?;
+    let midi = parse_score(source, &bytes)?;
+    let outcome = convert_midi(&midi, "english");
+    let plan = StemPlan::from_source(&midi, &outcome.tracks)
+        .map_err(|error| format!("cannot plan stems: {error}"))?;
+    let native = matches!(extension(source).as_str(), "mscx" | "mscz");
+    let container = if native {
+        bytes
+    } else {
+        renderer
+            .convert_to_mscz(
+                source,
+                &work.join("converted.mscz"),
+                &remaining_render_limits(started, limits)?,
+            )
+            .map_err(|error| format!("score conversion failed: {error}"))?
+    };
+    let scores =
+        ScoreStems::read(&container).map_err(|error| format!("cannot map Parts: {error}"))?;
+    let parts = scores.parts().len();
+    if parts != expected_parts {
         return Err(format!(
-            "Part coverage mismatch: parser expected {expected_parts}, renderer extracted {}",
-            parts.len()
+            "Part coverage mismatch: parser expected {expected_parts}, score holds {parts}"
         ));
     }
+    scores
+        .validate_topology(&midi.topology, native)
+        .map_err(|error| format!("cannot map Parts: {error}"))?;
 
-    for part in &parts {
-        let part_source = work.join(format!("part-{:04}.mscz", part.ordinal));
-        let part_output = work.join(format!("part-{:04}.wav", part.ordinal));
-        fs::write(&part_source, &part.mscz)
-            .map_err(|error| format!("cannot stage Part {}: {error}", part.ordinal))?;
+    for stem in &plan.stems {
+        let index = stem.source_part_index;
+        let part_source = work.join(format!("part-{index:04}.{}", scores.extension()));
+        let part_output = work.join(format!("part-{index:04}.wav"));
+        let silenced = scores
+            .silenced(index)
+            .map_err(|error| format!("cannot isolate Part {index}: {error}"))?;
+        fs::write(&part_source, silenced)
+            .map_err(|error| format!("cannot stage Part {index}: {error}"))?;
         renderer
-            .render(
+            .render_part(
                 &part_source,
                 &part_output,
                 &remaining_render_limits(started, limits)?,
             )
-            .map_err(|error| format!("Part {} render failed: {error}", part.ordinal))?;
+            .map_err(|error| format!("Part {index} render failed: {error}"))?;
     }
-    Ok((parts.len(), parts.len(), full.wav.bytes))
+    Ok((parts, plan.stems.len(), full.wav.bytes))
 }
 
 fn remaining_render_limits(

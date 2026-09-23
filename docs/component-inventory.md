@@ -128,8 +128,9 @@ resources and Tauri IPC; it does not authorize arbitrary web connections.
 | `src-tauri/src/engine/target/mod.rs` | `ExportTarget`, `SerializeError`, the analysis gate `validate_for`, the write boundary `serialize_to`, and the `LYRIC_REINTERPRETED_BY_TARGET` audit |
 | `src-tauri/src/engine/target/svp.rs` | Synthesizer V project v113 data model and serialization; blicks |
 | `src-tauri/src/engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 data model, the 480-tick exactness gate, the OpenUtau marker vocabulary, and a deterministic always-double-quote YAML emitter |
-| `src-tauri/src/stems.rs` | Stable one-stem-per-note-bearing-Part plan and default mute policy |
-| `src-tauri/src/renderer.rs` | MuseScore discovery, capability probe, Part extraction, bounded rendering, process cleanup, and WAV validation |
+| `src-tauri/src/stems.rs` | Stable one-stem-per-audible-Part plan (notes, or playable chord symbols only) and default mute policy |
+| `src-tauri/src/renderer.rs` | MuseScore discovery, capability probe, MusicXML/MIDI-to-`.mscz` conversion, bounded rendering, process cleanup, and WAV validation |
+| `src-tauri/src/score_stems.rs` | One silenced full-score container per stem, mapped onto the source topology |
 | `src-tauri/src/bundle.rs` | Preservation ledger, staging, rendering orchestration, the per-target bundle project and its audio references, integrity validation, rollback, and no-replace commit |
 | `src-tauri/examples/corpus_audit.rs` | Standalone pinned public-corpus audit command, run as a Cargo example so that `verse` remains the only application binary |
 
@@ -143,7 +144,7 @@ model or `convert.rs`; format-specific syntax belongs in the owning parser.
 |---|---|---|
 | Tauri dialog plugin | UI to operating system | Select source files, output directory, destination, and renderer executable |
 | Local filesystem | Rust to disk | Read immutable source snapshots and publish only to new destinations |
-| MuseScore Studio | Rust child process | Fixed `--version`, `--help`, `--score-parts`, and WAV-render commands |
+| MuseScore Studio | Rust child process | Fixed `--version`, `--help`, `--score-parts` (probe), `.mscz` conversion, and WAV-render commands |
 | Synthesizer V Studio | Persisted file consumer | Opens raw SVP project version 113; Verse does not automate or embed Synthesizer V |
 | OpenUtau | Persisted file consumer | Opens `.ustx` at `ustx_version` 0.6; format facts are read from the `0.1.568` sources. Verse does not automate, embed, or bundle OpenUtau, and names no singer |
 | GitHub Actions | Delivery only | Tests and packages releases; it is not a runtime dependency |

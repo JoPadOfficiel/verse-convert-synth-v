@@ -108,8 +108,14 @@ without a shell:
 
 ```text
 MuseScore -F --score-parts <input>
+MuseScore -F -o <output.mscz> <input.musicxml|input.mxl|source.mid>
 MuseScore -F -o <output.wav> <input>
 ```
+
+`--score-parts` qualifies the installation; neither complete bundles nor the
+corpus render sample extract Parts with it. Bundles convert MusicXML/MXL and
+MIDI/KAR sources to `.mscz` and render WAV files only; every stem is a whole
+score with the other Parts silenced, or a per-track MIDI fallback.
 
 Accepted renderers are MuseScore 3.6.2 or later in the 3.x line and MuseScore
 4.x, with `--score-parts` support. Unsupported versions, future unqualified
@@ -132,14 +138,16 @@ processes receive:
 | Renderer resource | Limit |
 |---|---:|
 | Version/capability probe | 10 seconds |
-| Aggregate Part extraction + full-score + all-stem render | 20 minutes |
+| Aggregate score conversion + full-score + all-stem render | 20 minutes |
 | Captured failure log | 64 KiB |
 | `--help` output | 1 MiB |
-| `--score-parts` JSON | 128 MiB |
-| Extracted Parts | 1–256 |
-| One decoded Part MSCZ | 32 MiB |
-| Aggregate decoded Part MSCZ data | 512 MiB |
-| Archive entries in an extracted Part | At most 128 |
+| `--score-parts` JSON (API only, unused by bundles) | 128 MiB |
+| Extracted Parts (API only) | 1–256 |
+| One decoded Part MSCZ (API only) | 32 MiB |
+| Aggregate decoded Part MSCZ data (API only) | 512 MiB |
+| Archive entries in an extracted Part (API only) | At most 128 |
+| One converted `.mscz` | 32 MiB, at most 128 entries, exactly one master MSCX |
+| One master MSCX silenced per stem | 64 MiB |
 | Native-score version prologue | 1 MiB |
 | One rendered WAV | 2 GiB |
 | Aggregate bundle audio | 8 GiB |
@@ -156,14 +164,19 @@ exit and valid output remain mandatory.
 
 ## Part identity and audio integrity
 
-Part extraction must map one-to-one to every note-bearing source Part. Verse
-uses a native Part identifier first and a unique normalized name only as a
-fallback identity key. Missing, duplicate, ambiguous, extra, or mismatched
-Parts block the bundle.
+Every stem must map onto exactly one source Part. A score stem is the whole
+score with every other Part's notes and chord symbols silenced, so its source
+container must match the source topology Part by Part (count, native Part IDs
+or converted staff counts, `part-list` order) and every staff holding notes or
+chord symbols must belong to one Part. A MIDI stem is its source track's
+contribution: MuseScore's import of the whole file with the other Parts silenced when
+its Parts are proven to be the note-bearing tracks in order, otherwise the
+byte-identical source track after the global marks. Missing, duplicate,
+ambiguous, extra, or mismatched score Parts block the bundle.
 
 The complete bundle requires:
 
-- exactly one rendered stem for every expected note-bearing Part;
+- exactly one rendered stem for every expected audible Part;
 - matching expected, rendered, and recorded stem IDs;
 - exactly one project audio reference per stem asset — one audio-backed SVP track
   in a `.svp` bundle, one `wave_parts` entry in a `.ustx` bundle;
@@ -182,7 +195,7 @@ never walks the bundle directory, so an extra unrelated file placed inside a
 committed bundle is not detected. See
 [Bundle format](bundle-format.md#integrity-validation).
 
-Verse does not downgrade a failed Part extraction to a mixed-only bundle and
+Verse does not downgrade a failed Part isolation to a mixed-only bundle and
 does not substitute a renderer output from another path.
 
 ## Transactional publication
@@ -224,7 +237,7 @@ remediation.
 | `RENDERER_NOT_FOUND` | No qualified MuseScore executable was found |
 | `RENDERER_UNSUPPORTED` | Renderer identity, version, capability, or score compatibility failed |
 | `RENDERER_TIMEOUT` | Renderer exceeded its bounded deadline |
-| `RENDERER_FAILED` | Renderer process, Part extraction, or WAV validation failed |
+| `RENDERER_FAILED` | Renderer process, score conversion, or WAV validation failed |
 | `STEM_PLAN_INVALID` | Source Parts cannot form an exact one-stem-per-Part plan |
 | `PRESERVATION_INCOMPLETE` | Preservation ledger is incomplete or inconsistent |
 | `BUNDLE_INTEGRITY_FAILED` | Staged source, SVP, audio, IDs, hashes, or references do not agree |

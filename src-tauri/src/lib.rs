@@ -1,6 +1,7 @@
 pub mod bundle;
 pub mod engine;
 pub mod renderer;
+pub mod score_stems;
 pub mod stems;
 
 use bundle::{
@@ -217,7 +218,15 @@ fn part_infos(topology: &SourceTopology, reports: &[TrackReport]) -> Vec<PartInf
                     }
                 }
             }
+            // Chord symbols alone still sound in the reference mix, whatever
+            // metadata or lyric lanes the Part also owns.
+            let chord_symbols_only = notes == 0
+                && part.playable_chord_symbols > 0
+                && roles
+                    .iter()
+                    .all(|role| matches!(role, SourceRole::Metadata | SourceRole::LyricsOnly));
             let source_role = match roles.as_slice() {
+                _ if chord_symbols_only => SourceRole::Instrumental,
                 [] => SourceRole::Metadata,
                 [role] => *role,
                 roles
@@ -277,7 +286,8 @@ fn part_infos(topology: &SourceTopology, reports: &[TrackReport]) -> Vec<PartInf
                         | ExportRepresentation::VocalNotesAndReferenceMix
                 )
             });
-            let has_audio_stem = notes > 0;
+            // The same Parts `StemPlan::from_source` renders.
+            let has_audio_stem = notes > 0 || part.playable_chord_symbols > 0;
             let export_representation = match (vocal_projection, has_audio_stem) {
                 (true, true) => ExportRepresentation::VocalNotesAndReferenceMix,
                 (true, false) => ExportRepresentation::VocalNotes,
@@ -1088,6 +1098,7 @@ mod output_tests {
             parts: vec![
                 SourcePart {
                     id: "part:P1".into(),
+                    playable_chord_symbols: 0,
                     name: "Voice".into(),
                     source_track_ids: vec![
                         "part:P1:voice:1:lane:1".into(),
@@ -1108,6 +1119,7 @@ mod output_tests {
                 },
                 SourcePart {
                     id: "part:P2".into(),
+                    playable_chord_symbols: 0,
                     name: "Piano".into(),
                     source_track_ids: vec!["part:P2:voice:1".into()],
                     staves: vec![SourceStaff {
@@ -1228,6 +1240,71 @@ mod output_tests {
         assert_eq!(parts[1].part, "Piano");
         assert_eq!(parts[1].track_ids, vec![2]);
         assert_eq!(parts[1].source_role, SourceRole::Instrumental);
+    }
+
+    #[test]
+    fn part_dto_reports_a_chord_symbol_part_as_its_own_audio_stem() {
+        use engine::midi::SourcePart;
+
+        let part = |id: &str, chords| SourcePart {
+            id: id.into(),
+            name: id.into(),
+            source_track_ids: Vec::new(),
+            staves: Vec::new(),
+            playable_chord_symbols: chords,
+        };
+        let parts = part_infos(
+            &SourceTopology {
+                parts: vec![part("chords", 45), part("rests", 0)],
+            },
+            &[],
+        );
+        assert!(parts[0].has_audio_stem);
+        assert_eq!(parts[0].source_role, SourceRole::Instrumental);
+        assert_eq!(
+            parts[0].export_representation,
+            ExportRepresentation::ReferenceMixMember
+        );
+        assert!(!parts[1].has_audio_stem);
+        assert_eq!(
+            parts[1].export_representation,
+            ExportRepresentation::SourceOnly
+        );
+
+        // A lyric-only or metadata lane does not hide the chord symbols' audio.
+        let report = |source_id: &str, source_role| TrackReport {
+            id: 0,
+            source_id: source_id.into(),
+            track: source_id.into(),
+            notes: 0,
+            role: String::new(),
+            placed: 0,
+            source_role,
+            lyric_status: LyricStatus {
+                state: engine::convert::LyricStatusState::None,
+                source_text_count: 0,
+                projected_text_count: 0,
+                explicit_empty_count: 0,
+                continuation_count: 0,
+                unsupported_count: 0,
+            },
+            export_representation: ExportRepresentation::SourceOnly,
+            requires_voice_assignment: false,
+            warnings: Vec::new(),
+        };
+        let mut chords = part("chords", 3);
+        chords.source_track_ids = vec!["words".into(), "meta".into()];
+        let parts = part_infos(
+            &SourceTopology {
+                parts: vec![chords],
+            },
+            &[
+                report("words", SourceRole::LyricsOnly),
+                report("meta", SourceRole::Metadata),
+            ],
+        );
+        assert!(parts[0].has_audio_stem);
+        assert_eq!(parts[0].source_role, SourceRole::Instrumental);
     }
 
     fn detached_lyric_kar() -> Vec<u8> {
@@ -1624,7 +1701,6 @@ mod output_tests {
         // Exercise the actual command worker, including profile propagation,
         // audio references and manifest diagnostics, with the existing fake
         // renderer. This performs no installed acoustic rendering.
-        let plan = stems::StemPlan::from_source(&midi, &converted.tracks).unwrap();
         let bundled = export_bundle_blocking(
             path.into(),
             root.join("profile.versebundle")
@@ -1636,7 +1712,7 @@ mod output_tests {
             Some(ExportTarget::Ustx),
             Some(profile),
             &|_| {},
-            Some(bundle::tests::successful_renderer(&plan.stems)),
+            Some(bundle::tests::successful_renderer()),
         )
         .unwrap();
         let emitted = std::fs::read_to_string(&bundled.project_path).unwrap();
@@ -2004,7 +2080,7 @@ mod output_tests {
                 Some(target),
                 Some(AUTO),
                 &|_| {},
-                Some(bundle::tests::successful_renderer(&plan.stems)),
+                Some(bundle::tests::successful_renderer()),
             )
             .unwrap();
             let bundled = std::fs::read(&bundle.project_path).unwrap();

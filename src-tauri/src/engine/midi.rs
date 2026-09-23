@@ -71,6 +71,9 @@ pub struct SourcePart {
     /// metadata-only lanes that intentionally have no SVP projection voice.
     pub source_track_ids: Vec<String>,
     pub staves: Vec<SourceStaff>,
+    /// Chord symbols the score asks MuseScore to play. A Part may sound
+    /// through them alone, without a single note.
+    pub playable_chord_symbols: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,6 +150,7 @@ impl SourceTopology {
                         name: part_name.clone(),
                         source_track_ids: Vec::new(),
                         staves: Vec::new(),
+                        playable_chord_symbols: 0,
                     });
                     topology.parts.len() - 1
                 });

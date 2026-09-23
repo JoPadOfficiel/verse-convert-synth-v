@@ -133,6 +133,19 @@ pub trait AudioRenderer: Send + Sync {
         })
     }
 
+    /// Convert a score into a native `.mscz` at `output` and return its bytes.
+    /// A stem is then that container with other Parts silenced.
+    fn convert_to_mscz(
+        &self,
+        _input: &Path,
+        _output: &Path,
+        _limits: &RenderLimits,
+    ) -> Result<Vec<u8>, RenderError> {
+        Err(RenderError::UnsupportedCapabilities {
+            missing: vec!["score-conversion".into()],
+        })
+    }
+
     fn render(
         &self,
         input: &Path,
@@ -599,6 +612,54 @@ impl MuseScoreRenderer {
         policy: ScoreLoadRetryPolicy,
         allow_silence: bool,
     ) -> Result<RenderedAudio, RenderError> {
+        let renderer = self.capabilities.identity.clone();
+        self.write_output_with_policy(input, output, limits, policy, |output| {
+            Ok(RenderedAudio {
+                path: output.to_path_buf(),
+                wav: validate_wav_with_policy(output, limits.max_output_bytes, allow_silence)?,
+                renderer: renderer.clone(),
+            })
+        })
+    }
+
+    fn convert_with_policy(
+        &self,
+        input: &Path,
+        output: &Path,
+        limits: &RenderLimits,
+        policy: ScoreLoadRetryPolicy,
+    ) -> Result<Vec<u8>, RenderError> {
+        if !output
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mscz"))
+        {
+            return Err(RenderError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "converted score output must be an .mscz file",
+            )));
+        }
+        let limits = RenderLimits {
+            timeout: limits.timeout,
+            max_output_bytes: limits.max_output_bytes.min(MAX_PART_MSCZ_BYTES as u64),
+        };
+        self.write_output_with_policy(input, output, &limits, policy, |output| {
+            let bytes = read_bounded_regular_file(output, limits.max_output_bytes)?;
+            validate_mscz_archive(&bytes, "converted score")?;
+            Ok(bytes)
+        })
+    }
+
+    /// One score-loading MuseScore run that writes `output`, under the shared
+    /// timeout, hash, retry and output-size policy.
+    fn write_output_with_policy<T>(
+        &self,
+        input: &Path,
+        output: &Path,
+        limits: &RenderLimits,
+        policy: ScoreLoadRetryPolicy,
+        validate: impl Fn(&Path) -> Result<T, RenderError>,
+    ) -> Result<T, RenderError> {
         self.validate_input(input)?;
         if output.exists() {
             return Err(RenderError::Io(io::Error::new(
@@ -639,26 +700,15 @@ impl MuseScoreRenderer {
                 if !output.exists() {
                     return Err(RenderError::MissingOutput);
                 }
-                let wav = validate_wav_with_policy(output, limits.max_output_bytes, allow_silence)?;
-                return Ok(RenderedAudio {
-                    path: output.to_path_buf(),
-                    wav,
-                    renderer: renderer_identity,
-                });
+                return validate(output);
             }
 
             let was_sigabrt = status_is_sigabrt(&result.status);
             if can_recover_macos_shutdown_abort(&renderer_identity, &result.status)
                 && output.exists()
             {
-                if let Ok(wav) =
-                    validate_wav_with_policy(output, limits.max_output_bytes, allow_silence)
-                {
-                    return Ok(RenderedAudio {
-                        path: output.to_path_buf(),
-                        wav,
-                        renderer: renderer_identity,
-                    });
+                if let Ok(value) = validate(output) {
+                    return Ok(value);
                 }
             }
             if was_sigabrt {
@@ -681,6 +731,20 @@ impl MuseScoreRenderer {
 impl AudioRenderer for MuseScoreRenderer {
     fn capabilities(&self) -> &RendererCapabilities {
         &self.capabilities
+    }
+
+    fn convert_to_mscz(
+        &self,
+        input: &Path,
+        output: &Path,
+        limits: &RenderLimits,
+    ) -> Result<Vec<u8>, RenderError> {
+        self.convert_with_policy(
+            input,
+            output,
+            limits,
+            ScoreLoadRetryPolicy::for_renderer(&self.capabilities.identity),
+        )
     }
 
     fn extract_score_parts(
@@ -834,14 +898,18 @@ fn sanitize_part_display_name(value: &str) -> String {
 }
 
 fn validate_part_mscz(bytes: &[u8], ordinal: usize) -> Result<(), RenderError> {
+    validate_mscz_archive(bytes, &format!("part {ordinal}"))
+}
+
+fn validate_mscz_archive(bytes: &[u8], label: &str) -> Result<(), RenderError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|error| {
         RenderError::InvalidScoreParts {
-            reason: format!("part {ordinal} is not an MSCZ archive: {error}"),
+            reason: format!("{label} is not an MSCZ archive: {error}"),
         }
     })?;
     if archive.is_empty() || archive.len() > 128 {
         return Err(RenderError::InvalidScoreParts {
-            reason: format!("part {ordinal} has an invalid archive entry count"),
+            reason: format!("{label} has an invalid archive entry count"),
         });
     }
     let mut score_paths = Vec::new();
@@ -849,11 +917,11 @@ fn validate_part_mscz(bytes: &[u8], ordinal: usize) -> Result<(), RenderError> {
         let entry = archive
             .by_index(index)
             .map_err(|error| RenderError::InvalidScoreParts {
-                reason: format!("part {ordinal} archive cannot be read: {error}"),
+                reason: format!("{label} archive cannot be read: {error}"),
             })?;
         if entry.enclosed_name().is_none() {
             return Err(RenderError::InvalidScoreParts {
-                reason: format!("part {ordinal} contains an unsafe archive path"),
+                reason: format!("{label} contains an unsafe archive path"),
             });
         }
         if !entry.is_dir() && entry.name().to_ascii_lowercase().ends_with(".mscx") {
@@ -863,12 +931,30 @@ fn validate_part_mscz(bytes: &[u8], ordinal: usize) -> Result<(), RenderError> {
     if score_paths.len() != 1 {
         return Err(RenderError::InvalidScoreParts {
             reason: format!(
-                "part {ordinal} must contain exactly one unambiguous master MSCX score (found {})",
+                "{label} must contain exactly one unambiguous master MSCX score (found {})",
                 score_paths.len()
             ),
         });
     }
     Ok(())
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, RenderError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(RenderError::OutputIsNotRegularFile);
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(RenderError::OutputTooLarge {
+            bytes: bytes.len() as u64,
+            limit: max_bytes,
+        });
+    }
+    Ok(bytes)
 }
 
 fn process_probe_error(error: ProcessError) -> RenderError {
@@ -2868,6 +2954,101 @@ mod tests {
         assert_eq!(rendered.path, output);
         assert_eq!(fs::read_to_string(attempts).unwrap().trim(), "2");
         assert!(rendered.wav.duration_seconds > 0.0);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_converter(label: &str, template: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temp_dir(label);
+        let executable = directory.join("mscore");
+        let arguments = directory.join("arguments");
+        let template_path = directory.join("template.bin");
+        fs::write(&template_path, template).unwrap();
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' 'MuseScore 4.5.2' ;;\n  \
+             --help) printf '%s\\n' '--score-parts' ;;\n  -F)\n    printf '%s|' \"$@\" > '{arguments}'\n    \
+             if [ -e \"$3\" ]; then exit 9; fi\n    cp '{template}' \"$3\"\n    ;;\n  *) exit 2 ;;\nesac\n",
+            arguments = arguments.display(),
+            template = template_path.display()
+        );
+        fs::write(&executable, script).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        (directory, executable, arguments)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn score_conversion_writes_one_validated_mscz_with_fixed_arguments() {
+        let limits = RenderLimits {
+            timeout: Duration::from_secs(5),
+            max_output_bytes: 1024 * 1024,
+        };
+        let container = part_mscz("4.50");
+        let (directory, executable, arguments) = fake_converter("convert-mscz", &container);
+        let input = directory.join("score.musicxml");
+        fs::write(&input, b"<score-partwise/>").unwrap();
+        let renderer = MuseScoreRenderer::probe(&executable).unwrap();
+        let output = directory.join("converted.mscz");
+        let bytes = renderer
+            .convert_with_policy(&input, &output, &limits, no_score_load_retry_policy())
+            .unwrap();
+        assert_eq!(bytes, container);
+        assert_eq!(
+            fs::read_to_string(&arguments).unwrap(),
+            format!("-F|-o|{}|{}|", output.display(), input.display())
+        );
+        // The output is new, typed and never overwritten.
+        assert!(renderer
+            .convert_with_policy(&input, &output, &limits, no_score_load_retry_policy())
+            .is_err());
+        assert!(renderer
+            .convert_with_policy(
+                &input,
+                &directory.join("converted.wav"),
+                &limits,
+                no_score_load_retry_policy()
+            )
+            .is_err());
+        fs::remove_dir_all(directory).unwrap();
+
+        let (directory, executable, _) = fake_converter("convert-not-mscz", b"not an archive");
+        let input = directory.join("score.musicxml");
+        fs::write(&input, b"<score-partwise/>").unwrap();
+        let renderer = MuseScoreRenderer::probe(&executable).unwrap();
+        assert!(matches!(
+            renderer.convert_with_policy(
+                &input,
+                &directory.join("converted.mscz"),
+                &limits,
+                no_score_load_retry_policy()
+            ),
+            Err(RenderError::InvalidScoreParts { reason }) if reason.contains("converted score")
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_converted_score_over_32_mib_is_refused_whatever_the_wav_limit() {
+        let oversized = vec![0; MAX_PART_MSCZ_BYTES + 1];
+        let (directory, executable, _) = fake_converter("convert-oversized", &oversized);
+        let input = directory.join("score.musicxml");
+        fs::write(&input, b"<score-partwise/>").unwrap();
+        let renderer = MuseScoreRenderer::probe(&executable).unwrap();
+        assert!(matches!(
+            renderer.convert_with_policy(
+                &input,
+                &directory.join("converted.mscz"),
+                &RenderLimits {
+                    timeout: Duration::from_secs(10),
+                    max_output_bytes: 1024 * 1024 * 1024,
+                },
+                no_score_load_retry_policy()
+            ),
+            Err(RenderError::OutputTooLarge { limit, .. }) if limit == MAX_PART_MSCZ_BYTES as u64
+        ));
         fs::remove_dir_all(directory).unwrap();
     }
 

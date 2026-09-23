@@ -22,8 +22,9 @@ use crate::engine::target::ustx::{self, UstxProject};
 use crate::engine::target::ExportTarget;
 use crate::renderer::{
     sha256_bytes, sha256_file, validate_wav, validate_wav_allowing_silence, AudioRenderer,
-    ExtractedScorePart, RenderError, RenderLimits, RendererIdentity, WavInfo,
+    RenderError, RenderLimits, RendererIdentity, WavInfo,
 };
+use crate::score_stems::ScoreStems;
 use crate::stems::{StemDescriptor, StemPlan, StemRole};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -248,6 +249,9 @@ pub struct StemAudioRecord {
     pub display_name: String,
     pub source_part_id: String,
     pub source_track_ids: Vec<String>,
+    /// Chord symbols that make a note-free Part's stem audible.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub source_chord_symbol_count: usize,
     pub role: StemRole,
     pub isolation_method: String,
     pub active_by_default: bool,
@@ -325,6 +329,35 @@ pub struct IntensityContext {
     /// from bounded source normalization, never from a target transfer report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<IntensityDependencySource>,
+    /// Inventoried MIDI events that qualify a controller value without being
+    /// one: a port declaration routes it, and SysEx or channel-mode messages
+    /// make the held gain or pitch unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contextual_sources: Vec<IntensityContextSource>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IntensityContextSource {
+    pub source_id: String,
+    pub source_track_id: String,
+    pub tick: u32,
+    pub role: IntensityContextRole,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum IntensityContextRole {
+    PortDeclaration {
+        port: u8,
+    },
+    SystemExclusive {
+        port: u8,
+    },
+    ChannelMode {
+        owner: IntensityMidiChannel,
+        controller: u8,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -349,6 +382,10 @@ pub struct IntensityDependencySource {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -870,6 +907,7 @@ impl IntensityContext {
             .len()
             .saturating_add(self.source_notes.len().saturating_mul(4))
             .saturating_add(self.controllers.len().saturating_mul(2))
+            .saturating_add(self.contextual_sources.len().saturating_mul(2))
             .saturating_add(self.projected_notes.len().saturating_mul(4))
             .saturating_add(self.score_owners.len().saturating_mul(2))
             .saturating_add(self.declarations.iter().fold(0usize, |n, d| {
@@ -906,6 +944,7 @@ struct IntensityOwnership<'a> {
     projections: IntensityProjectionIndex<'a>,
     endpoints: BTreeSet<(usize, &'a str, u32)>,
     controllers: BTreeMap<&'a str, &'a IntensityControllerSource>,
+    contextual: BTreeMap<&'a str, &'a IntensityContextSource>,
     tracks: BTreeSet<&'a str>,
     declarations: BTreeMap<&'a str, &'a IntensityDeclarationSource>,
     applications: IntensityApplicationIndex<'a>,
@@ -945,6 +984,7 @@ impl<'a> IntensityOwnership<'a> {
             (context.projected_notes.len(), 64),
             (context.projected_notes.len(), 64),
             (context.controllers.len(), 64),
+            (context.contextual_sources.len(), 64),
             (context.score_owners.len(), 128),
             (context.score_owners.len(), 64),
             (context.score_owners.len(), 64),
@@ -1067,6 +1107,31 @@ impl<'a> IntensityOwnership<'a> {
                     .is_some()
             {
                 return Err("invalid intensity controller source table".into());
+            }
+        }
+        let mut contextual = BTreeMap::new();
+        for row in &context.contextual_sources {
+            let valid_role = match row.role {
+                IntensityContextRole::PortDeclaration { port }
+                | IntensityContextRole::SystemExclusive { port } => port <= 127,
+                IntensityContextRole::ChannelMode { owner, controller } => {
+                    owner.port <= 127 && owner.channel < 16 && (120..=127).contains(&controller)
+                }
+            };
+            if !valid_role
+                || !tracks.contains(row.source_track_id.as_str())
+                || !row
+                    .source_id
+                    .strip_prefix("event:")
+                    .and_then(|rest| rest.strip_prefix(row.source_track_id.as_str()))
+                    .is_some_and(|rest| rest.starts_with(':'))
+                || !entries
+                    .get(row.source_id.as_str())
+                    .is_some_and(|entry| entry.item_kind == SourceItemKind::Event)
+                || controllers.contains_key(row.source_id.as_str())
+                || contextual.insert(row.source_id.as_str(), row).is_some()
+            {
+                return Err("invalid intensity contextual source table".into());
             }
         }
         let mut score_tracks = BTreeMap::<_, Vec<_>>::new();
@@ -1292,6 +1357,7 @@ impl<'a> IntensityOwnership<'a> {
             projections,
             endpoints,
             controllers,
+            contextual,
             tracks,
             declarations,
             applications,
@@ -1836,11 +1902,56 @@ impl<'a> IntensityOwnership<'a> {
                     }
                 }
                 supported = true;
-            } else if !evidence_sources.contains(source) {
+            } else if !evidence_sources.contains(source)
+                && !self.contextual_contributor(span, source, count)?
+            {
                 return Err("intensity backlink has no authenticated contributor role".into());
             }
         }
         Ok(supported)
+    }
+
+    /// A contextual event qualifies the gain it is folded into only when it is
+    /// no later than the span and belongs to the span's own lane or to the
+    /// port/channel route of every note it covers. It never supports a curve.
+    fn contextual_contributor(
+        &self,
+        span: &crate::engine::performance::PerformanceReference,
+        source: &str,
+        count: &mut LedgerValidationBudget,
+    ) -> Result<bool, String> {
+        count.visit(
+            1 + usize::BITS as usize - self.contextual.len().max(1).leading_zeros() as usize,
+        )?;
+        let Some(row) = self.contextual.get(source) else {
+            return Ok(false);
+        };
+        if row.tick > span.start_tick {
+            return Ok(false);
+        }
+        if row.source_track_id == span.source_track_id {
+            return Ok(true);
+        }
+        if span.note_ids.is_empty() {
+            return Ok(false);
+        }
+        for id in &span.note_ids {
+            count.visit(
+                1 + usize::BITS as usize - self.notes.len().max(1).leading_zeros() as usize,
+            )?;
+            let Some(route) = self.notes.get(id.as_str()).and_then(|n| n.midi_channel) else {
+                return Ok(false);
+            };
+            let same_route = match row.role {
+                IntensityContextRole::PortDeclaration { port }
+                | IntensityContextRole::SystemExclusive { port } => port == route.port,
+                IntensityContextRole::ChannelMode { owner, .. } => owner == route,
+            };
+            if !same_route {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -1867,6 +1978,7 @@ fn build_intensity_context(
         score_owners: Vec::new(),
         declarations: Vec::new(),
         dependencies: Vec::new(),
+        contextual_sources: Vec::new(),
     };
     let native_midi = matches!(
         midi.source_format,
@@ -1896,8 +2008,38 @@ fn build_intensity_context(
             physical = Some(track.source.source_track);
             port = 0;
         }
+        let contextual = match &event.kind {
+            Kind::Port(value) if native_midi => {
+                port = *value;
+                Some(IntensityContextRole::PortDeclaration { port })
+            }
+            Kind::SysEx { .. } if native_midi => {
+                Some(IntensityContextRole::SystemExclusive { port })
+            }
+            Kind::ControlChange {
+                channel,
+                controller: controller @ 120..=127,
+                ..
+            } if native_midi => Some(IntensityContextRole::ChannelMode {
+                owner: IntensityMidiChannel {
+                    port,
+                    channel: *channel,
+                },
+                controller: *controller,
+            }),
+            _ => None,
+        };
+        if let Some(role) = contextual {
+            budget.references(2)?;
+            budget.text(track.id.len().saturating_mul(2).saturating_add(160))?;
+            context.contextual_sources.push(IntensityContextSource {
+                source_id: format!("event:{}:{}", track.id, event.order),
+                source_track_id: track.id.clone(),
+                tick: event.tick,
+                role,
+            });
+        }
         match &event.kind {
-            Kind::Port(value) if native_midi => port = *value,
             Kind::NoteOn(note) if note.velocity != Some(0) => {
                 budget.references(4)?;
                 budget.text(
@@ -3561,26 +3703,34 @@ fn export_bundle_with_hook_and_progress(
     hook.checkpoint(FaultPoint::AfterSource)?;
 
     let render_started = Instant::now();
+    let midi_source = is_midi_source(&request.input.source_format);
     progress(BundleProgressEvent {
         phase: BundleProgressPhase::ExtractingParts,
         completed: 1,
         total: progress_total,
-        message: "Extracting source Parts with MuseScore".into(),
+        message: "Preparing one isolated score per source Part".into(),
         stem_id: None,
         stem_name: None,
     });
-    let extracted_parts = if is_midi_source(&request.input.source_format) {
-        midi_source_parts(&request.input.source_bytes, &request.input.stem_plan.stems)?
+    let (stem_sources, preparation_warnings) = if midi_source {
+        midi_stem_sources(
+            request.renderer.as_ref(),
+            &request.input.source_bytes,
+            &request.input.stem_plan.stems,
+            render_work.path(),
+            &remaining_render_limits(render_started, &request.render_limits)?,
+        )?
     } else {
-        let extracted = request.renderer.extract_score_parts(
+        let scores = score_stem_sources(
+            request.renderer.as_ref(),
             &source_path,
+            &request.input.source_format,
+            &request.input.source_bytes,
+            &request.input.stem_plan.stems,
+            &render_work.path().join("converted.mscz"),
             &remaining_render_limits(render_started, &request.render_limits)?,
         )?;
-        align_extracted_parts(
-            &request.input.source_format,
-            &request.input.stem_plan.stems,
-            extracted,
-        )?
+        (StemSources::Score(scores), Vec::new())
     };
 
     progress(BundleProgressEvent {
@@ -3611,15 +3761,14 @@ fn export_bundle_with_hook_and_progress(
         ));
     }
     let mut total_audio_bytes = reference_wav.bytes;
-    let mut rendered_stems = Vec::with_capacity(extracted_parts.len());
+    let mut rendered_stems = Vec::with_capacity(request.input.stem_plan.stems.len());
     let mut timeline_diagnostics = Vec::new();
-    for (stem_index, ((stem, relative_path), part)) in request
+    for (stem_index, (stem, relative_path)) in request
         .input
         .stem_plan
         .stems
         .iter()
         .zip(&stem_relative_paths)
-        .zip(extracted_parts)
         .enumerate()
     {
         progress(BundleProgressEvent {
@@ -3635,12 +3784,13 @@ fn export_bundle_with_hook_and_progress(
             stem_id: Some(stem.stem_id.clone()),
             stem_name: Some(stem.display_name.clone()),
         });
-        let part_input = render_work.path().join("parts").join(format!(
-            "{}.{}",
-            stem.stem_id,
-            part_container_extension(&request.input.source_format)
-        ));
-        write_new(&part_input, &part.mscz, "write extracted source Part")?;
+        let (container, extension) = stem_sources.container(stem_index, stem)?;
+        let part_input = render_work
+            .path()
+            .join("parts")
+            .join(format!("{}.{extension}", stem.stem_id));
+        write_new(&part_input, &container, "write isolated source Part")?;
+        drop(container);
         let part_output = render_work
             .path()
             .join("parts")
@@ -3696,7 +3846,6 @@ fn export_bundle_with_hook_and_progress(
         rendered_stems.push(RenderedStem {
             descriptor: stem.clone(),
             relative_path: relative_path.clone(),
-            extracted_name: part.name,
             wav,
         });
     }
@@ -3712,10 +3861,9 @@ fn export_bundle_with_hook_and_progress(
         stem_name: None,
     });
     let mut stem_audio_records = Vec::with_capacity(rendered_stems.len());
-    // A score stem is the Part MuseScore extracted; a MIDI stem is the source
-    // track Verse divided out itself. Naming the second one after MuseScore
-    // would credit a decomposition it never made.
-    let stem_origin = if is_midi_source(&request.input.source_format) {
+    // A MIDI stem always holds exactly one source track, whichever path cut it;
+    // a MuseScore Part of an imported MIDI is not a source Part.
+    let stem_origin = if midi_source {
         "MIDI track"
     } else {
         "MuseScore Part"
@@ -3732,8 +3880,9 @@ fn export_bundle_with_hook_and_progress(
             display_name: stem.descriptor.display_name.clone(),
             source_part_id: stem.descriptor.source_part_id.clone(),
             source_track_ids: stem.descriptor.source_track_ids.clone(),
+            source_chord_symbol_count: stem.descriptor.source_chord_symbol_count,
             role: stem.descriptor.role,
-            isolation_method: "musescore-score-parts".into(),
+            isolation_method: stem_sources.isolation_method().into(),
             active_by_default: stem.descriptor.active_by_default,
             asset: AudioArtifactRecord {
                 artifact: artifact_record(&root, &stem.relative_path)?,
@@ -3794,6 +3943,7 @@ fn export_bundle_with_hook_and_progress(
         .map(|stem| stem.stem_id.clone())
         .collect::<Vec<_>>();
     let mut warnings = request.input.warnings;
+    warnings.extend(preparation_warnings);
     warnings.extend(timeline_diagnostics);
     // Named after the shape the project actually holds. The Synthesizer V sentence
     // is 0.4.9's, verbatim, because it is part of a manifest that must not change.
@@ -3803,16 +3953,6 @@ fn export_bundle_with_hook_and_progress(
         ExportTarget::Ustx =>
             "The full-score reference mix is retained muted; source Parts are rendered as separate audio-backed OpenUtau wave parts.".to_string(),
     });
-    for stem in &rendered_stems {
-        if normalize_part_name(&stem.extracted_name)
-            != normalize_part_name(&stem.descriptor.display_name)
-        {
-            warnings.push(format!(
-                "[PART_NAME_DIFFERENCE] Source Part '{}' was returned by MuseScore as '{}'; verified source ordinal was preserved.",
-                stem.descriptor.display_name, stem.extracted_name
-            ));
-        }
-    }
     warnings.sort();
     warnings.dedup();
     let manifest = BundleManifest {
@@ -4032,7 +4172,6 @@ fn has_quiet_musescore_overrun(
 struct RenderedStem {
     descriptor: StemDescriptor,
     relative_path: String,
-    extracted_name: String,
     wav: WavInfo,
 }
 
@@ -4057,182 +4196,290 @@ fn is_midi_source(source_format: &str) -> bool {
     matches!(source_format, "standardMidi" | "karaokeMidi")
 }
 
-/// Filename extension a Part container needs so the renderer imports it as the
-/// format it actually is.
-fn part_container_extension(source_format: &str) -> &'static str {
-    if is_midi_source(source_format) {
-        "mid"
-    } else {
-        "mscz"
+/// A MIDI stem rendered from MuseScore's own import of the whole file.
+const MIDI_IMPORT_ISOLATION: &str = "musescore-silenced-midi-import";
+/// A MIDI stem that is one source track after the file's global marks.
+const MIDI_TRACK_ISOLATION: &str = "midi-track-split";
+/// The value earlier bundles recorded for every stem; still verifiable.
+const LEGACY_ISOLATION: &str = "musescore-score-parts";
+
+/// Stable warning when MuseScore's MIDI import cannot be mapped onto the
+/// note-bearing source tracks and the per-track split is used instead.
+pub const MIDI_STEM_IMPORT_MAPPING_UNPROVEN: &str = "MIDI_STEM_IMPORT_MAPPING_UNPROVEN";
+
+/// What each stem renders.
+enum StemSources {
+    /// One source track after the file's global marks.
+    MidiTracks(Vec<Vec<u8>>),
+    /// MuseScore's import of the whole MIDI, with the stem's Part left audible.
+    MidiImport {
+        scores: ScoreStems,
+        parts: Vec<usize>,
+    },
+    /// The whole score with every other Part silenced.
+    Score(ScoreStems),
+}
+
+impl StemSources {
+    fn isolation_method(&self) -> &'static str {
+        match self {
+            Self::MidiTracks(_) => MIDI_TRACK_ISOLATION,
+            Self::MidiImport { .. } => MIDI_IMPORT_ISOLATION,
+            Self::Score(_) => crate::score_stems::ISOLATION_METHOD,
+        }
+    }
+
+    fn container(
+        &self,
+        index: usize,
+        stem: &StemDescriptor,
+    ) -> Result<(Vec<u8>, &'static str), BundleError> {
+        let (scores, part) = match self {
+            Self::MidiTracks(slices) => {
+                return slices
+                    .get(index)
+                    .map(|slice| (slice.clone(), "mid"))
+                    .ok_or_else(|| {
+                        BundleError::Integrity(format!("stem {} has no MIDI slice", stem.stem_id))
+                    })
+            }
+            Self::MidiImport { scores, parts } => (
+                scores,
+                *parts.get(index).ok_or_else(|| {
+                    BundleError::Integrity(format!("stem {} has no imported Part", stem.stem_id))
+                })?,
+            ),
+            Self::Score(scores) => (scores, stem.source_part_index),
+        };
+        scores
+            .silenced(part)
+            .map(|bytes| (bytes, scores.extension()))
+            .map_err(|error| {
+                BundleError::Integrity(format!("stem {} cannot be isolated: {error}", stem.stem_id))
+            })
     }
 }
 
-/// One renderable Part per stem, taken from the source itself.
-///
-/// MuseScore decides on its own how an imported MIDI becomes Parts — merging
-/// tracks that share an instrument, dropping empty ones — so its Part list
-/// answers a different question than "which source track is this". The counts
-/// disagreed and every MIDI bundle failed. A MIDI, unlike a score, divides
-/// exactly along its own `MTrk` chunks, so Verse cuts it here and knows which
-/// track each stem carries because it chose it.
-fn midi_source_parts(
+/// MIDI stems come from MuseScore's import of the whole file, because the
+/// import quantizes each track with evidence from all of them. When that
+/// import cannot be mapped onto the note-bearing tracks, each stem is its own
+/// source track instead. Shared channel/key routes are reported either way.
+fn midi_stem_sources(
+    renderer: &dyn AudioRenderer,
     source_bytes: &[u8],
     stems: &[StemDescriptor],
-) -> Result<Vec<ExtractedScorePart>, BundleError> {
-    let slices = crate::engine::midi_split::split_tracks(source_bytes).map_err(|error| {
+    work: &Path,
+    limits: &RenderLimits,
+) -> Result<(StemSources, Vec<String>), BundleError> {
+    let split = crate::engine::midi_split::split(source_bytes).map_err(|error| {
         BundleError::Integrity(format!("source MIDI cannot be divided: {error}"))
     })?;
-    stems
-        .iter()
-        .enumerate()
-        .map(|(ordinal, stem)| {
-            let source_track =
-                SourceTopology::midi_part_track(&stem.source_part_id).ok_or_else(|| {
-                    BundleError::Integrity(format!(
-                        "stem {} does not name a source MIDI track",
-                        stem.stem_id
-                    ))
-                })?;
-            let slice = slices
-                .iter()
-                .find(|slice| slice.source_track == source_track)
-                .ok_or_else(|| {
-                    BundleError::Integrity(format!(
-                        "source MIDI has no track {source_track} for stem {}",
-                        stem.stem_id
-                    ))
-                })?;
-            Ok(ExtractedScorePart {
-                ordinal,
-                name: stem.display_name.clone(),
-                metadata: serde_json::Value::Null,
-                mscz: slice.bytes.clone(),
-            })
-        })
-        .collect()
+    let mut tracks = Vec::with_capacity(stems.len());
+    let mut slices = Vec::with_capacity(stems.len());
+    for stem in stems {
+        let source_track =
+            SourceTopology::midi_part_track(&stem.source_part_id).ok_or_else(|| {
+                BundleError::Integrity(format!(
+                    "stem {} does not name a source MIDI track",
+                    stem.stem_id
+                ))
+            })?;
+        let slice = split
+            .slices
+            .iter()
+            .find(|slice| slice.source_track == source_track)
+            .ok_or_else(|| {
+                BundleError::Integrity(format!(
+                    "source MIDI has no track {source_track} for stem {}",
+                    stem.stem_id
+                ))
+            })?;
+        tracks.push(source_track);
+        slices.push(slice.bytes.clone());
+    }
+    let mut warnings = Vec::new();
+    let sources = match midi_import(renderer, source_bytes, &tracks, &split, work, limits)? {
+        Ok(scores) => StemSources::MidiImport {
+            scores,
+            parts: (0..stems.len()).collect(),
+        },
+        Err(reason) => {
+            warnings.push(format!(
+                "[{MIDI_STEM_IMPORT_MAPPING_UNPROVEN}] MuseScore's import of this MIDI cannot be mapped onto its note-bearing tracks ({reason}); each stem is its own source track after the file's global marks, and MuseScore may quantize a track alone differently than inside the file."
+            ));
+            StemSources::MidiTracks(slices)
+        }
+    };
+    let whole_file_import = matches!(sources, StemSources::MidiImport { .. });
+    warnings.extend(
+        split
+            .shared_note_routes
+            .iter()
+            .map(|route| route.diagnostic(whole_file_import)),
+    );
+    Ok((sources, warnings))
 }
 
-/// Where each source Part's standalone container sits in `parts`, in source
-/// Part order. An empty slot preserves a Part seen only in combined excerpts;
-/// an absent ordering retains compatibility with wholly unidentified containers.
-///
-/// `--score-parts` returns the excerpts already saved in the score alongside
-/// the one-per-instrument parts it can cut, so a score whose author saved a
-/// two-instrument part comes back with a container that is not any single
-/// source Part and must never be rendered as one. MuseScore stamps each Part it
-/// writes with the id that Part has in the score, which both says which Part a
-/// container holds and orders the containers the way the score does.
-fn single_source_part_container_order(
-    parts: &[ExtractedScorePart],
-) -> Result<Option<Vec<Option<usize>>>, BundleError> {
-    let mut source_parts = BTreeMap::<u64, Option<usize>>::new();
-    let mut unidentified = false;
-    let mut combined = false;
-    for (index, part) in parts.iter().enumerate() {
-        let Some(ids) = crate::engine::musescore::container_part_ids(&part.mscz) else {
-            unidentified = true;
-            continue;
-        };
-        let standalone = ids.len() == 1;
-        combined |= ids.len() > 1;
-        for id in ids {
-            let Some(order) = id.and_then(|id| id.parse::<u64>().ok()) else {
-                unidentified = true;
-                continue;
-            };
-            // Combined excerpts establish identity slots, never stem audio.
-            let slot = source_parts.entry(order).or_default();
-            if standalone && slot.is_none() {
-                *slot = Some(index);
+/// A bounded, stable name for a renderer failure; its display can carry a
+/// long process log that does not belong in a persisted manifest.
+fn render_error_kind(error: &RenderError) -> &'static str {
+    match error {
+        RenderError::UnsupportedCapabilities { .. } => "conversion is unsupported",
+        RenderError::IncompatibleScore { .. } => "incompatible score",
+        RenderError::InvalidScoreParts { .. } => "invalid converted score",
+        RenderError::Exit { .. } => "MuseScore exited unsuccessfully",
+        RenderError::MissingOutput => "no converted score was written",
+        RenderError::OutputTooLarge { .. } => "converted score is too large",
+        RenderError::OutputIsNotRegularFile => "converted score is not a regular file",
+        _ => "renderer failure",
+    }
+}
+
+/// MuseScore's `.mscz` import of the whole MIDI, proven to hold one Part per
+/// note-bearing track in file order, each named `<instrument>, <track name>`
+/// when the track is named. The inner `Err` is why the mapping is unproven.
+fn midi_import(
+    renderer: &dyn AudioRenderer,
+    source_bytes: &[u8],
+    stem_tracks: &[usize],
+    split: &crate::engine::midi_split::MidiSplit,
+    work: &Path,
+    limits: &RenderLimits,
+) -> Result<Result<ScoreStems, String>, BundleError> {
+    if !stem_tracks
+        .iter()
+        .copied()
+        .eq(split.note_tracks.iter().map(|track| track.source_track))
+    {
+        return Ok(Err(
+            "the stems are not the note-bearing tracks in file order".into(),
+        ));
+    }
+    // MuseScore aborts on a `.kar` path; the bytes are a Standard MIDI File.
+    let input = work.join("source.mid");
+    write_new(&input, source_bytes, "write MIDI for MuseScore import")?;
+    let converted = match renderer.convert_to_mscz(&input, &work.join("converted.mscz"), limits) {
+        Ok(bytes) => bytes,
+        Err(
+            error @ (RenderError::Timeout { .. }
+            | RenderError::ExecutableChanged { .. }
+            | RenderError::Spawn(_)
+            | RenderError::Io(_)
+            | RenderError::NotFound { .. }
+            | RenderError::InvalidExecutable),
+        ) => return Err(error.into()),
+        Err(error) => {
+            return Ok(Err(format!(
+                "MuseScore did not convert it: {}",
+                render_error_kind(&error)
+            )))
+        }
+    };
+    let scores = match ScoreStems::read(&converted) {
+        Ok(scores) => scores,
+        Err(error) => return Ok(Err(error)),
+    };
+    let parts = scores.parts();
+    if parts.len() != split.note_tracks.len() {
+        return Ok(Err(format!(
+            "MuseScore made {} Parts from {} note-bearing tracks",
+            parts.len(),
+            split.note_tracks.len()
+        )));
+    }
+    for (index, (part, track)) in parts.iter().zip(&split.note_tracks).enumerate() {
+        if let Some(name) = track
+            .name
+            .as_deref()
+            .filter(|name| !name.trim_ascii().is_empty())
+        {
+            let track_name = part.track_name.as_deref().unwrap_or("");
+            let named = std::str::from_utf8(name)
+                .ok()
+                .map(str::to_string)
+                .into_iter()
+                .chain([name.iter().map(|byte| char::from(*byte)).collect()])
+                .any(|candidate| track_name.ends_with(&format!(", {candidate}")));
+            if !named {
+                return Ok(Err(format!(
+                    "Part {} is named {track_name:?}, not after source track {}",
+                    index + 1,
+                    track.source_track
+                )));
             }
         }
-    }
-    if unidentified {
-        // Partial identity evidence cannot establish source order. In particular,
-        // an exact container count must not turn a combined excerpt into a stem.
-        if !source_parts.is_empty() || combined {
-            return Err(BundleError::Integrity(
-                "MuseScore returned incomplete source Part identities".into(),
-            ));
-        }
-        return Ok(None);
-    }
-    // Sorting only the observed IDs would collapse a missing source position
-    // and could bind a later instrument to an earlier stem. Accept the ordinal
-    // mapping only when the renderer has evidenced every preceding slot.
-    for (index, id) in source_parts.keys().enumerate() {
-        if *id != index as u64 + 1 {
-            return Err(BundleError::Integrity(
-                "MuseScore returned gaps in source Part identities".into(),
-            ));
+        if part.audible_elements() == 0 {
+            return Ok(Err(format!("Part {} holds no playable note", index + 1)));
         }
     }
-    Ok(Some(source_parts.into_values().collect()))
+    Ok(Ok(scores))
 }
 
-fn align_extracted_parts(
-    _source_format: &str,
+/// The source score as MuseScore reads it (a MusicXML source is converted to
+/// `.mscz` first), mapped onto the source topology Part by Part.
+fn score_stem_sources(
+    renderer: &dyn AudioRenderer,
+    source_path: &Path,
+    source_format: &str,
+    source_bytes: &[u8],
     stems: &[StemDescriptor],
-    parts: Vec<ExtractedScorePart>,
-) -> Result<Vec<ExtractedScorePart>, BundleError> {
-    let mut available = vec![None; parts.len()];
-    for part in parts {
-        let ordinal = part.ordinal;
-        if ordinal >= available.len() || available[ordinal].replace(part).is_some() {
+    converted_path: &Path,
+    limits: &RenderLimits,
+) -> Result<ScoreStems, BundleError> {
+    let integrity = |error: String| BundleError::Integrity(error);
+    let native = match source_format {
+        "museScore" => true,
+        "musicXml" => false,
+        other => {
+            return Err(BundleError::Integrity(format!(
+                "unsupported score source format {other:?}"
+            )))
+        }
+    };
+    let (topology, container) = if native {
+        let midi = crate::engine::musescore::parse(source_bytes).map_err(integrity)?;
+        (midi.topology, source_bytes.to_vec())
+    } else {
+        let midi = crate::engine::musicxml::parse(source_bytes).map_err(integrity)?;
+        let listed = crate::engine::musicxml::part_list_ids(source_bytes).map_err(integrity)?;
+        if !listed.iter().map(String::as_str).eq(midi
+            .topology
+            .parts
+            .iter()
+            .map(|part| part.id.as_str()))
+        {
             return Err(BundleError::Integrity(
-                "MuseScore returned duplicated or out-of-range Part ordinals".into(),
+                "SCORE_STEM_PART_ORDER_UNRESOLVED: MusicXML Parts are not written in part-list order, so MuseScore's Parts cannot be mapped onto them".into(),
             ));
         }
-    }
-    let ordered = available
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, part)| {
-            part.ok_or_else(|| {
-                BundleError::Integrity(format!(
-                    "MuseScore returned no Part at source ordinal {ordinal}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let selection = single_source_part_container_order(&ordered)?;
-    let mut slots: Vec<Option<ExtractedScorePart>> = ordered.into_iter().map(Some).collect();
-    let Some(selection) = selection else {
-        // Containers that do not name their Part: the count is the only evidence
-        // left that each one is the Part at its own source ordinal.
-        if slots.len() != stems.len() {
-            return Err(topology_count_mismatch(slots.len(), stems.len()));
-        }
-        return Ok(slots.into_iter().flatten().collect());
+        let converted = renderer.convert_to_mscz(source_path, converted_path, limits)?;
+        (midi.topology, converted)
     };
-    let standalone_count = selection.iter().flatten().count();
-    if standalone_count < stems.len() {
-        return Err(topology_count_mismatch(standalone_count, stems.len()));
+    let scores = ScoreStems::read(&container).map_err(integrity)?;
+    scores
+        .validate_topology(&topology, native)
+        .map_err(integrity)?;
+    // A native Part whose notes all say `play 0` keeps its silent stem.
+    // MusicXML cannot mute a note, so a silent converted Part with source
+    // notes means the positional mapping is wrong.
+    for stem in stems {
+        let part = scores.parts().get(stem.source_part_index);
+        if topology
+            .parts
+            .get(stem.source_part_index)
+            .is_none_or(|source| source.id != stem.source_part_id)
+            || part.is_none()
+            || (!native
+                && stem.source_note_count > 0
+                && part.is_some_and(|part| part.audible_elements() == 0))
+        {
+            return Err(BundleError::Integrity(format!(
+                "SCORE_STEM_TOPOLOGY_MISMATCH: stem {} cannot be mapped to exactly one source Part",
+                stem.stem_id
+            )));
+        }
     }
-    stems
-        .iter()
-        .map(|stem| {
-            selection
-                .get(stem.source_part_index)
-                .copied()
-                .flatten()
-                .and_then(|index| slots[index].take())
-                .ok_or_else(|| {
-                    BundleError::Integrity(format!(
-                        "MuseScore extracted no Part for source Part {} of stem {}",
-                        stem.source_part_index + 1,
-                        stem.stem_id
-                    ))
-                })
-        })
-        .collect()
-}
-
-fn topology_count_mismatch(extracted: usize, required: usize) -> BundleError {
-    BundleError::Integrity(format!(
-        "MuseScore extracted {extracted} Parts but the source topology requires {required}"
-    ))
+    Ok(scores)
 }
 
 fn remaining_render_limits(
@@ -4300,14 +4547,6 @@ fn validate_owned_render(
         ));
     }
     Ok(rendered)
-}
-
-fn normalize_part_name(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn remove_owned_destination(destination: &Path) {
@@ -4711,9 +4950,28 @@ fn verify_bundle(root: &Path, layout: &BundleLayout) -> Result<(), BundleError> 
     }
     let mut audio_paths = BTreeSet::new();
     audio_paths.insert(manifest.audio.reference_mix.asset.artifact.path.clone());
+    let isolation_methods: &[&str] = if is_midi_source(&manifest.source_format) {
+        &[
+            MIDI_IMPORT_ISOLATION,
+            MIDI_TRACK_ISOLATION,
+            LEGACY_ISOLATION,
+        ]
+    } else {
+        &[crate::score_stems::ISOLATION_METHOD, LEGACY_ISOLATION]
+    };
+    let bundle_isolation = manifest
+        .audio
+        .stems
+        .first()
+        .map(|stem| stem.isolation_method.as_str());
     for stem in &manifest.audio.stems {
-        if stem.source_track_ids.is_empty()
-            || stem.isolation_method != "musescore-score-parts"
+        // Only a score's chord-symbol Part renders without projection lanes.
+        let chord_symbol_stem = stem.isolation_method == crate::score_stems::ISOLATION_METHOD
+            && stem.source_chord_symbol_count > 0
+            && stem.role == StemRole::Accompaniment;
+        if (stem.source_track_ids.is_empty() && !chord_symbol_stem)
+            || !isolation_methods.contains(&stem.isolation_method.as_str())
+            || Some(stem.isolation_method.as_str()) != bundle_isolation
             || !stem
                 .asset
                 .artifact
@@ -5269,14 +5527,15 @@ pub(crate) mod tests {
     use super::*;
     use crate::engine::target::svp::{RenderConfig, Time};
     use crate::renderer::{MuseScoreRenderer, RendererCapabilities, WavInfo};
+    use crate::score_stems::ScorePart;
     use crate::stems::{StemDescriptor, StemPlan, StemRole};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
 
     static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    pub(crate) fn successful_renderer(stems: &[StemDescriptor]) -> Arc<dyn AudioRenderer> {
-        Arc::new(FakeRenderer::with_stems(FakeMode::Success, stems))
+    pub(crate) fn successful_renderer() -> Arc<dyn AudioRenderer> {
+        Arc::new(FakeRenderer::new(FakeMode::Success))
     }
 
     #[derive(Clone, Copy)]
@@ -5289,10 +5548,14 @@ pub(crate) mod tests {
         Timeout,
     }
 
+    /// Renders fixed WAVs, converts a MusicXML input into a small MuseScore 4
+    /// container with its Part/staff structure, and records every stem input.
     struct FakeRenderer {
         mode: FakeMode,
-        parts: Vec<ExtractedScorePart>,
         capabilities: RendererCapabilities,
+        stem_inputs: Mutex<Vec<(String, Vec<u8>)>>,
+        converted_inputs: Mutex<Vec<String>>,
+        converted: Option<Vec<u8>>,
     }
 
     struct ExternalPathRenderer {
@@ -5303,14 +5566,6 @@ pub(crate) mod tests {
     impl AudioRenderer for ExternalPathRenderer {
         fn capabilities(&self) -> &RendererCapabilities {
             &self.capabilities
-        }
-
-        fn extract_score_parts(
-            &self,
-            _input: &Path,
-            _limits: &RenderLimits,
-        ) -> Result<Vec<ExtractedScorePart>, RenderError> {
-            Ok(vec![fake_part(0)])
         }
 
         fn render(
@@ -5331,37 +5586,8 @@ pub(crate) mod tests {
 
     impl FakeRenderer {
         fn new(mode: FakeMode) -> Self {
-            Self::with_parts(mode, 1)
-        }
-
-        fn with_parts(mode: FakeMode, part_count: usize) -> Self {
-            Self::with_extracted_parts(mode, (0..part_count).map(fake_part).collect())
-        }
-
-        fn with_stems(mode: FakeMode, stems: &[StemDescriptor]) -> Self {
-            Self::with_extracted_parts(
-                mode,
-                stems
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, stem)| ExtractedScorePart {
-                        ordinal,
-                        name: stem.display_name.clone(),
-                        metadata: serde_json::json!({
-                            "id": stem.source_part_id
-                                .strip_prefix("musescore-part-")
-                                .unwrap_or(&stem.source_part_id)
-                        }),
-                        mscz: format!("fake MSCZ for {}", stem.source_part_id).into_bytes(),
-                    })
-                    .collect(),
-            )
-        }
-
-        fn with_extracted_parts(mode: FakeMode, parts: Vec<ExtractedScorePart>) -> Self {
             Self {
                 mode,
-                parts,
                 capabilities: RendererCapabilities {
                     identity: RendererIdentity {
                         provider: "fake-musescore".into(),
@@ -5375,11 +5601,26 @@ pub(crate) mod tests {
                             "part-wav".into(),
                         ],
                     },
-                    supported_extensions: vec!["mid", "mscz", "mxl"],
+                    supported_extensions: vec!["mid", "mscz", "mscx", "mxl", "musicxml"],
                     output_format: "wav",
                     score_parts: true,
                 },
+                stem_inputs: Mutex::new(Vec::new()),
+                converted_inputs: Mutex::new(Vec::new()),
+                converted: None,
             }
+        }
+
+        /// A converter that returns these container bytes whatever the input.
+        fn converting_to(mode: FakeMode, converted: Vec<u8>) -> Self {
+            Self {
+                converted: Some(converted),
+                ..Self::new(mode)
+            }
+        }
+
+        fn stem_inputs(&self) -> Vec<(String, Vec<u8>)> {
+            self.stem_inputs.lock().unwrap().clone()
         }
     }
 
@@ -5388,11 +5629,16 @@ pub(crate) mod tests {
             &self.capabilities
         }
 
-        fn extract_score_parts(
+        fn convert_to_mscz(
             &self,
-            _input: &Path,
+            input: &Path,
+            output: &Path,
             limits: &RenderLimits,
-        ) -> Result<Vec<ExtractedScorePart>, RenderError> {
+        ) -> Result<Vec<u8>, RenderError> {
+            self.converted_inputs
+                .lock()
+                .unwrap()
+                .push(input.file_name().unwrap().to_string_lossy().into_owned());
             match self.mode {
                 FakeMode::Missing => return Err(RenderError::MissingOutput),
                 FakeMode::Timeout => {
@@ -5400,14 +5646,42 @@ pub(crate) mod tests {
                         milliseconds: limits.timeout.as_millis() as u64,
                     })
                 }
-                FakeMode::Corrupt => {
-                    return Err(RenderError::InvalidScoreParts {
-                        reason: "injected corrupt response".into(),
-                    })
-                }
-                FakeMode::Success | FakeMode::SilentStem | FakeMode::MisalignedStem => {}
+                _ => {}
             }
-            Ok(self.parts.clone())
+            let bytes = match &self.converted {
+                Some(bytes) => bytes.clone(),
+                None if input.extension() == Some("mid".as_ref()) => {
+                    fake_midi_import(&fs::read(input)?, &[])
+                }
+                None => {
+                    let midi = crate::engine::musicxml::parse(&fs::read(input)?)
+                        .map_err(|reason| RenderError::InvalidScoreParts { reason })?;
+                    let staves: Vec<usize> = midi
+                        .topology
+                        .parts
+                        .iter()
+                        .map(|part| part.staves.len().max(1))
+                        .collect();
+                    let chord_only: Vec<usize> = midi
+                        .topology
+                        .parts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, part)| {
+                            part.playable_chord_symbols > 0
+                                && part
+                                    .staves
+                                    .iter()
+                                    .flat_map(|staff| &staff.voices)
+                                    .all(|voice| voice.projection_track_ids.is_empty())
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    zipped_score(&native_score("4.20", &staves, &chord_only))
+                }
+            };
+            write_new(output, &bytes, "write fake converted score").unwrap();
+            Ok(bytes)
         }
 
         fn render(
@@ -5452,6 +5726,10 @@ pub(crate) mod tests {
             output: &Path,
             limits: &RenderLimits,
         ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+            self.stem_inputs.lock().unwrap().push((
+                input.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read(input)?,
+            ));
             if matches!(self.mode, FakeMode::SilentStem) {
                 write_silent_test_wav(output);
                 let wav = validate_wav_allowing_silence(output, limits.max_output_bytes)?;
@@ -5465,21 +5743,147 @@ pub(crate) mod tests {
         }
     }
 
-    fn fake_part(ordinal: usize) -> ExtractedScorePart {
-        let (name, id) = match ordinal {
-            0 => ("Music".to_string(), "part:midi-track-0".to_string()),
-            1 => ("Piano".to_string(), "part:piano".to_string()),
-            _ => (
-                format!("Part {}", ordinal + 1),
-                format!("part:fake-{ordinal}"),
-            ),
-        };
-        ExtractedScorePart {
-            ordinal,
-            name,
-            metadata: serde_json::json!({"test": true, "id": id}),
-            mscz: b"fake MSCZ for fake renderer".to_vec(),
+    /// A renderer without the score-conversion capability.
+    /// Without the conversion capability, or (`true`) timing out while
+    /// converting.
+    struct NoConversion(Arc<FakeRenderer>, bool);
+
+    impl AudioRenderer for NoConversion {
+        fn capabilities(&self) -> &RendererCapabilities {
+            self.0.capabilities()
         }
+
+        fn convert_to_mscz(
+            &self,
+            _input: &Path,
+            _output: &Path,
+            limits: &RenderLimits,
+        ) -> Result<Vec<u8>, RenderError> {
+            Err(if self.1 {
+                RenderError::Timeout {
+                    milliseconds: limits.timeout.as_millis() as u64,
+                }
+            } else {
+                RenderError::UnsupportedCapabilities {
+                    missing: vec!["score-conversion".into()],
+                }
+            })
+        }
+
+        fn render(
+            &self,
+            input: &Path,
+            output: &Path,
+            limits: &RenderLimits,
+        ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+            self.0.render(input, output, limits)
+        }
+
+        fn render_part(
+            &self,
+            input: &Path,
+            output: &Path,
+            limits: &RenderLimits,
+        ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+            self.0.render_part(input, output, limits)
+        }
+    }
+
+    /// A native score with one Part per entry of `staves`, each staff holding
+    /// one note. Parts listed in `chord_only` hold one chord symbol instead.
+    fn native_score(version: &str, staves: &[usize], chord_only: &[usize]) -> String {
+        let mut parts = String::new();
+        let mut bodies = String::new();
+        let mut staff_id = 0;
+        for (index, count) in staves.iter().enumerate() {
+            let modern = version.starts_with('4');
+            parts.push_str(&if modern {
+                format!("<Part id=\"{}\">", index + 1)
+            } else {
+                "<Part>".to_string()
+            });
+            for _ in 0..*count {
+                staff_id += 1;
+                parts.push_str(&if modern {
+                    "<Staff/>".to_string()
+                } else {
+                    format!("<Staff id=\"{staff_id}\"/>")
+                });
+                let content = if chord_only.contains(&index) {
+                    "<Harmony><root>14</root></Harmony><Rest><durationType>quarter</durationType></Rest>".to_string()
+                } else {
+                    format!(
+                        "<Chord><durationType>quarter</durationType><Note><pitch>{}</pitch><tpc>14</tpc></Note></Chord>",
+                        59 + staff_id
+                    )
+                };
+                bodies.push_str(&format!(
+                    "<Staff id=\"{staff_id}\"><Measure><voice><TimeSig><sigN>1</sigN><sigD>4</sigD></TimeSig>{content}</voice></Measure></Staff>\n"
+                ));
+            }
+            parts.push_str(&format!(
+                "<trackName>Part {n}</trackName><Instrument><longName>Part {n}</longName><instrumentId>keyboard.piano</instrumentId></Instrument></Part>\n",
+                n = index + 1
+            ));
+        }
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<museScore version=\"{version}\">\n<Score>\n<Division>480</Division>\n{parts}{bodies}</Score>\n</museScore>\n"
+        )
+    }
+
+    /// The shape the mapping proof accepts: one Part per note-bearing track, in
+    /// order, named `<instrument>, <track name>` when the track is named.
+    /// `renamed` overrides the trackName of the Parts at those positions.
+    fn fake_midi_import(midi: &[u8], renamed: &[(usize, &str)]) -> Vec<u8> {
+        zipped_score(&fake_midi_import_mscx(midi, renamed))
+    }
+
+    fn fake_midi_import_mscx(midi: &[u8], renamed: &[(usize, &str)]) -> String {
+        let tracks = crate::engine::midi_split::split(midi).unwrap().note_tracks;
+        let mut parts = String::new();
+        let mut bodies = String::new();
+        for (index, track) in tracks.iter().enumerate() {
+            let name = renamed
+                .iter()
+                .find(|(at, _)| *at == index)
+                .map(|(_, name)| (*name).to_string())
+                .unwrap_or_else(|| match &track.name {
+                    Some(name) => format!("Piano, {}", String::from_utf8_lossy(name)),
+                    None => "Piano".into(),
+                });
+            let name = name
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            parts.push_str(&format!(
+                "<Part id=\"{}\"><Staff/><trackName>{name}</trackName></Part>\n",
+                index + 1
+            ));
+            bodies.push_str(&format!(
+                "<Staff id=\"{}\"><Measure><voice><Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord></voice></Measure></Staff>\n",
+                index + 1
+            ));
+        }
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<museScore version=\"4.70\">\n<Score>\n<Division>480</Division>\n{parts}{bodies}</Score>\n</museScore>\n"
+        )
+    }
+
+    fn zipped_score(mscx: &str) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        for (name, bytes) in [
+            (
+                "META-INF/container.xml",
+                &b"<container><rootfiles><rootfile full-path=\"score.mscx\"/></rootfiles></container>"[..],
+            ),
+            ("score.mscx", mscx.as_bytes()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
     }
 
     fn write_test_wav(path: &Path) {
@@ -5582,6 +5986,7 @@ pub(crate) mod tests {
                 display_name: "Music".into(),
                 source_track_ids: vec!["midi-track-0".into()],
                 source_note_count: 1,
+                source_chord_symbol_count: 0,
                 role: StemRole::Accompaniment,
                 active_by_default: true,
             }],
@@ -5748,6 +6153,7 @@ pub(crate) mod tests {
             display_name: "Piano".into(),
             source_track_ids: vec!["piano".into()],
             source_note_count: 4,
+            source_chord_symbol_count: 0,
             role: StemRole::Accompaniment,
             active_by_default: true,
         };
@@ -5770,7 +6176,7 @@ pub(crate) mod tests {
             .expected_source_ids
             .push(entry.source_id.clone());
         request.input.ledger.entries.push(entry);
-        request.renderer = Arc::new(FakeRenderer::with_parts(mode, 2));
+        request.renderer = Arc::new(FakeRenderer::new(mode));
         request
     }
 
@@ -5794,208 +6200,767 @@ pub(crate) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn source_format_name(format: midi::SourceFormat) -> &'static str {
+        match format {
+            midi::SourceFormat::StandardMidi => "standardMidi",
+            midi::SourceFormat::KaraokeMidi => "karaokeMidi",
+            midi::SourceFormat::MusicXml => "musicXml",
+            midi::SourceFormat::MuseScore => "museScore",
+        }
+    }
+
+    fn parse_fixture(original_name: &str, bytes: &[u8]) -> Midi {
+        match Path::new(original_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap()
+        {
+            "kar" => midi::parse_with_karaoke_profile(bytes),
+            "mid" => midi::parse(bytes),
+            "mscx" | "mscz" => crate::engine::musescore::parse(bytes),
+            _ => crate::engine::musicxml::parse(bytes),
+        }
+        .unwrap()
+    }
+
+    /// A request built from the source itself: its real projection, stem plan
+    /// and ledger, exactly as the export command assembles them.
+    fn real_request(
+        root: &Path,
+        target: ExportTarget,
+        original_name: &str,
+        source_bytes: Vec<u8>,
+        renderer: Arc<FakeRenderer>,
+    ) -> BundleRequest {
+        let midi = parse_fixture(original_name, &source_bytes);
+        let outcome =
+            crate::engine::convert::convert_midi_with_target(&midi, "english", None, target);
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let destination = root.join("Song.versebundle");
+        let layout = BundleLayout::new(&destination, original_name, target).unwrap();
+        let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+        let ledger = build_preservation_ledger(&midi, &outcome.projection, &layout, &stem_plan);
+        BundleRequest {
+            destination,
+            input: BundleInput {
+                original_name: original_name.into(),
+                source_format: source_format_name(midi.source_format).into(),
+                source_bytes,
+                project: BundleProject::from_projection(target, outcome.svp.as_ref().unwrap())
+                    .unwrap(),
+                stem_plan,
+                ledger,
+                warnings: vec![],
+            },
+            renderer,
+            render_limits: RenderLimits {
+                timeout: Duration::from_secs(60),
+                max_output_bytes: 1024 * 1024,
+            },
+        }
+    }
+
+    fn midi_file(tracks: &[&[u8]]) -> Vec<u8> {
+        let mut data = b"MThd\0\0\0\x06\0\x01".to_vec();
+        data.extend_from_slice(&(tracks.len() as u16).to_be_bytes());
+        data.extend_from_slice(&480u16.to_be_bytes());
+        for track in tracks {
+            data.extend_from_slice(b"MTrk");
+            data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+            data.extend_from_slice(track);
+        }
+        data
+    }
+
+    const CONDUCTOR: &[u8] = &[
+        0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, 0x00, 0xff, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08,
+        0x00, 0xff, 0x2f, 0x00,
+    ];
+    const SUNG: &[u8] = &[
+        0x00, 0xff, 0x05, 0x02, b'l', b'a', 0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0x00,
+        0xff, 0x05, 0x02, b'l', b'o', 0x00, 0x90, 62, 90, 0x83, 0x60, 0x80, 62, 0, 0x00, 0xff,
+        0x2f, 0x00,
+    ];
+
+    /// Every stem input is the global marks plus one byte-identical `MTrk`.
+    fn assert_midi_stem_inputs(source: &[u8], inputs: &[(String, Vec<u8>)]) {
+        let split = crate::engine::midi_split::split(source).unwrap();
+        for (name, bytes) in inputs {
+            assert!(name.ends_with(".mid"), "{name}");
+            assert!(
+                split.slices.iter().any(|slice| &slice.bytes == bytes),
+                "{name} is not a per-track slice"
+            );
+        }
+    }
+
+    /// Stem `n` is MuseScore's import of the whole file with only Part `n`
+    /// still audible.
+    fn assert_midi_import_stem_inputs(inputs: &[(String, Vec<u8>)]) {
+        for (index, (name, bytes)) in inputs.iter().enumerate() {
+            assert!(name.ends_with(".mscz"), "{name}");
+            let parts = ScoreStems::read(bytes).unwrap();
+            assert_eq!(parts.parts().len(), inputs.len());
+            for (part_index, part) in parts.parts().iter().enumerate() {
+                assert_eq!(part.audible_elements() > 0, part_index == index, "{name}");
+            }
+        }
+    }
+
+    fn manifest_of(result: &BundleResult) -> BundleManifest {
+        serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap()
+    }
+
+    fn named_track(name: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut track = vec![0x00, 0xff, 0x03, name.len() as u8];
+        track.extend_from_slice(name);
+        track.extend_from_slice(body);
+        track
+    }
+
     #[test]
-    fn incomplete_part_extraction_is_blocking_and_transactional() {
-        let root = temp_dir("missing-part");
-        let mut request = request(&root, FakeMode::Success);
-        // Only a score has Parts extracted by MuseScore; a MIDI is divided by
-        // Verse itself and cannot come back short.
-        request.input.source_format = "museScore".into();
-        request.renderer = Arc::new(FakeRenderer::with_parts(FakeMode::Success, 2));
+    fn kar_drum_stems_ignore_cross_track_channel_state() {
+        // Channel-10 program and volume sit in another track at the drums'
+        // first tick; each stem is still the whole-file import with one Part.
+        let state: &[u8] = &[
+            0x00, 0xc9, 24, 0x00, 0xb9, 7, 90, 0x00, 0xb9, 10, 64, 0x00, 0xff, 0x2f, 0x00,
+        ];
+        let drums: &[u8] = &[
+            0x00, 0x99, 36, 100, 0x83, 0x60, 0x89, 36, 0, 0x00, 0x99, 38, 100, 0x83, 0x60, 0x89,
+            38, 0, 0x00, 0xff, 0x2f, 0x00,
+        ];
+        let source = midi_file(&[CONDUCTOR, state, drums, SUNG]);
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let root = temp_dir("kar-cross-track-state");
+            let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+            let request = real_request(&root, target, "song.kar", source.clone(), renderer.clone());
+            assert_eq!(request.input.stem_plan.stems.len(), 2);
+            let result = export_bundle(request).expect("cross-track state no longer blocks");
+            assert_midi_import_stem_inputs(&renderer.stem_inputs());
+            let manifest = manifest_of(&result);
+            assert!(manifest
+                .audio
+                .stems
+                .iter()
+                .all(|stem| stem.isolation_method == MIDI_IMPORT_ISOLATION));
+            assert!(!result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(MIDI_STEM_IMPORT_MAPPING_UNPROVEN)));
+            let project = fs::read_to_string(&result.project_path).unwrap();
+            for drum in ["\"pitch\": 36", "\"pitch\": 38", "tone: 36", "tone: 38"] {
+                assert!(!project.contains(drum), "a drum note became vocal");
+            }
+            assert_eq!(fs::read(&result.source_path).unwrap(), source);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn kar_stems_carry_the_whole_file_import_of_their_named_tracks() {
+        // MuseScore quantizes a track with evidence from the whole file, so the
+        // stem is cut from that import. A `.kar` reaches MuseScore as MIDI.
+        let melody = named_track(b"Melody  ", SUNG);
+        let bass = named_track(
+            b"Bass & <Low>",
+            &[
+                0x00, 0x91, 40, 100, 0x87, 0x40, 0x81, 40, 0, 0x00, 0xff, 0x2f, 0x00,
+            ],
+        );
+        let source = midi_file(&[CONDUCTOR, &melody, &bass]);
+        let root = temp_dir("kar-whole-file-import");
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.kar",
+            source.clone(),
+            renderer.clone(),
+        );
+        let result = export_bundle(request).unwrap();
+        assert_eq!(
+            *renderer.converted_inputs.lock().unwrap(),
+            ["source.mid".to_string()]
+        );
+        assert_midi_import_stem_inputs(&renderer.stem_inputs());
+        let manifest = manifest_of(&result);
+        assert!(manifest
+            .audio
+            .stems
+            .iter()
+            .all(|stem| stem.isolation_method == MIDI_IMPORT_ISOLATION));
+        assert_eq!(fs::read(&result.source_path).unwrap(), source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unproven_midi_import_falls_back_to_the_per_track_split() {
+        let melody = named_track(b"Melody", SUNG);
+        let bass = named_track(
+            b"Bass",
+            &[
+                0x00, 0x91, 40, 100, 0x87, 0x40, 0x81, 40, 0, 0x00, 0xff, 0x2f, 0x00,
+            ],
+        );
+        let source = midi_file(&[CONDUCTOR, &melody, &bass]);
+        let merged = fake_midi_import(&midi_file(&[CONDUCTOR, &melody]), &[]);
+        let renamed = fake_midi_import(&source, &[(1, "Contrabass, Guitar")]);
+        let import = fake_midi_import_mscx(&source, &[]);
+        let played = "<Note><pitch>60</pitch></Note>";
+        let at = import.rfind(played).unwrap();
+        let silent = zipped_score(&format!(
+            "{}<Note><pitch>60</pitch><play>0</play></Note>{}",
+            &import[..at],
+            &import[at + played.len()..]
+        ));
+        let cases = [
+            ("made 1 Parts from 2", Some(merged), false),
+            ("not after source track 2", Some(renamed), false),
+            ("invalid XML", Some(b"not a score".to_vec()), false),
+            ("Part 2 holds no playable note", Some(silent), false),
+            ("not the note-bearing tracks in file order", None, true),
+            ("MuseScore did not convert it", None, false),
+        ];
+        for (case, converted, reversed) in cases {
+            let root = temp_dir("kar-import-unproven");
+            let fake = Arc::new(match converted {
+                Some(bytes) => FakeRenderer::converting_to(FakeMode::Success, bytes),
+                None => FakeRenderer::new(FakeMode::Success),
+            });
+            let renderer: Arc<dyn AudioRenderer> = if case.starts_with("MuseScore") {
+                Arc::new(NoConversion(fake.clone(), false))
+            } else {
+                fake.clone()
+            };
+            let request = real_request(
+                &root,
+                ExportTarget::Ustx,
+                "song.kar",
+                source.clone(),
+                Arc::new(FakeRenderer::new(FakeMode::Success)),
+            );
+            let mut request = BundleRequest {
+                renderer,
+                ..request
+            };
+            if reversed {
+                request.input.stem_plan.stems.reverse();
+            }
+            let result = export_bundle(request).expect("the split still exports");
+            let inputs = fake.stem_inputs();
+            assert_eq!(inputs.len(), 2);
+            assert_midi_stem_inputs(&source, &inputs);
+            if reversed {
+                assert!(fake.converted_inputs.lock().unwrap().is_empty());
+            }
+            let unproven: Vec<_> = result
+                .warnings
+                .iter()
+                .filter(|warning| {
+                    warning.starts_with(&format!("[{MIDI_STEM_IMPORT_MAPPING_UNPROVEN}]"))
+                })
+                .collect();
+            assert_eq!(unproven.len(), 1, "{case}: {:?}", result.warnings);
+            assert!(unproven[0].contains(case), "{case}: {}", unproven[0]);
+            assert!(manifest_of(&result)
+                .audio
+                .stems
+                .iter()
+                .all(|stem| stem.isolation_method == MIDI_TRACK_ISOLATION));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_latin1_track_name_still_proves_the_midi_import() {
+        let melody = named_track(b"Melody", SUNG);
+        let bass = named_track(
+            b"Basse \xe9lectrique",
+            &[
+                0x00, 0x91, 40, 100, 0x87, 0x40, 0x81, 40, 0, 0x00, 0xff, 0x2f, 0x00,
+            ],
+        );
+        let source = midi_file(&[CONDUCTOR, &melody, &bass]);
+        let converted = fake_midi_import(&source, &[(1, "Piano, Basse électrique")]);
+        let root = temp_dir("kar-latin1-name");
+        let renderer = Arc::new(FakeRenderer::converting_to(FakeMode::Success, converted));
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.kar",
+            source,
+            renderer.clone(),
+        );
+        let result = export_bundle(request).unwrap();
+        assert_midi_import_stem_inputs(&renderer.stem_inputs());
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains(MIDI_STEM_IMPORT_MAPPING_UNPROVEN)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_fatal_renderer_error_during_midi_import_aborts_the_export() {
+        let source = midi_file(&[CONDUCTOR, SUNG]);
+        let root = temp_dir("kar-import-timeout");
+        let fake = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(&root, ExportTarget::Ustx, "song.kar", source, fake.clone());
+        let destination = request.destination.clone();
+        let request = BundleRequest {
+            renderer: Arc::new(NoConversion(fake.clone(), true)),
+            ..request
+        };
+        assert!(matches!(
+            export_bundle(request),
+            Err(BundleError::Render(RenderError::Timeout { .. }))
+        ));
+        assert!(fake.stem_inputs().is_empty(), "no per-track fallback");
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kar_shared_channel_key_notes_export_with_a_stable_warning() {
+        // Two tracks sound the same channel-10 key at overlapping instants.
+        let first: &[u8] = &[
+            0x00, 0x99, 36, 100, 0x83, 0x60, 0x89, 36, 0, 0x00, 0xff, 0x2f, 0x00,
+        ];
+        let second: &[u8] = &[
+            0x81, 0x70, 0x99, 36, 90, 0x83, 0x60, 0x89, 36, 0, 0x00, 0xff, 0x2f, 0x00,
+        ];
+        let source = midi_file(&[CONDUCTOR, first, second, SUNG]);
+        let root = temp_dir("kar-shared-route");
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.kar",
+            source.clone(),
+            renderer.clone(),
+        );
+        let result = export_bundle(request).expect("a shared route is reported, not refused");
+        assert_midi_import_stem_inputs(&renderer.stem_inputs());
+        let shared: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|warning| warning.starts_with("[MIDI_STEM_SHARED_NOTE_ROUTE]"))
+            .collect();
+        assert_eq!(shared.len(), 1, "{:?}", result.warnings);
+        assert!(shared[0].contains("Source tracks 1, 2 share MIDI port 0, channel 10, key 36"));
+        assert!(shared[0].contains("these notes sound as in the reference mix"));
+        assert_eq!(manifest_of(&result).warnings, result.warnings);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kar_contextual_gain_contributors_publish_a_valid_ledger() {
+        // SysEx with a port declaration, a CC121 reset, and a port declaration
+        // alone, each folded into another track's CC7 gain.
+        for state in [
+            &[
+                0x00u8, 0xff, 0x21, 0x01, 0x00, 0x00, 0xf0, 0x05, 0x7e, 0x7f, 0x09, 0x01, 0xf7,
+            ][..],
+            &[0x00, 0xb0, 121, 0][..],
+            &[0x00, 0xff, 0x21, 0x01, 0x00][..],
+        ] {
+            let root = temp_dir("kar-contextual-gain");
+            let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+            let request = real_request(
+                &root,
+                ExportTarget::Ustx,
+                "song.kar",
+                contextual_gain_midi(state),
+                renderer,
+            );
+            assert!(request.input.ledger.intensity_context.is_some());
+            export_bundle(request).expect("contextual contributors are authenticated");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_midi_still_refuses_the_bundle_transactionally() {
+        let fast: &[u8] = &[
+            0x00, 0xff, 0x51, 0x03, 0x06, 0x1a, 0x80, 0x00, 0xff, 0x2f, 0x00,
+        ];
+        let source = midi_file(&[CONDUCTOR, fast, SUNG]);
+        let root = temp_dir("midi-global-conflict");
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.mid",
+            source,
+            Arc::new(FakeRenderer::new(FakeMode::Success)),
+        );
         let destination = request.destination.clone();
         assert!(matches!(
             export_bundle(request),
-            Err(BundleError::Integrity(message)) if message.contains("source topology")
+            Err(BundleError::Integrity(message))
+                if message.contains("MIDI_STEM_GLOBAL_STATE_ORDER_UNRESOLVED")
         ));
         assert!(!destination.exists());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// A `.mscz` holding exactly the Parts named, as MuseScore writes a part it
-    /// cut from a score.
-    fn part_container(part_ids: &[&str]) -> Vec<u8> {
-        let parts = part_ids
-            .iter()
-            .map(|id| format!("<Part id=\"{id}\"><trackName>Part {id}</trackName></Part>"))
-            .collect::<String>();
-        let mscx = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <museScore version=\"4.20\"><Score><Division>480</Division>{parts}</Score></museScore>"
+    fn silence_removed(bytes: &[u8]) -> String {
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .replace("<play>0</play>", "")
+    }
+
+    /// Two Parts; a fermata and a breath are written on the first one only.
+    const FERMATA_SCORE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<museScore version=\"3.02\">\n<Score>\n<Division>480</Division>\n\
+        <Part><Staff id=\"1\"/><trackName>Soprano</trackName><Instrument><longName>Soprano</longName><instrumentId>voice.soprano</instrumentId></Instrument></Part>\n\
+        <Part><Staff id=\"2\"/><trackName>Piano</trackName><Instrument><longName>Piano</longName><instrumentId>keyboard.piano</instrumentId></Instrument></Part>\n\
+        <Staff id=\"1\"><Measure><voice><TimeSig><sigN>2</sigN><sigD>4</sigD></TimeSig><Chord><durationType>quarter</durationType><Fermata><subtype>fermataAbove</subtype></Fermata><Lyrics><text>la</text></Lyrics><Note><pitch>72</pitch><tpc>14</tpc></Note></Chord><Breath><subtype>breathMark</subtype></Breath><Chord><durationType>quarter</durationType><Lyrics><text>lo</text></Lyrics><Note><pitch>74</pitch><tpc>16</tpc></Note></Chord></voice></Measure></Staff>\n\
+        <Staff id=\"2\"><Measure><voice><TimeSig><sigN>2</sigN><sigD>4</sigD></TimeSig><Chord><durationType>half</durationType><Note><pitch>48</pitch><tpc>14</tpc></Note><Note><pitch>55</pitch><tpc>15</tpc></Note></Chord></voice></Measure></Staff>\n\
+        </Score>\n</museScore>\n";
+
+    #[test]
+    fn a_fermata_on_one_part_stays_in_every_score_stem() {
+        // Each stem is the whole score, so the timing a fermata or breath on one
+        // Part imposes on every Part is kept.
+        for (name, source) in [
+            ("song.mscx", FERMATA_SCORE.as_bytes().to_vec()),
+            ("song.mscz", zipped_score(FERMATA_SCORE)),
+        ] {
+            let root = temp_dir("score-fermata");
+            let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+            let request = real_request(
+                &root,
+                ExportTarget::Ustx,
+                name,
+                source.clone(),
+                renderer.clone(),
+            );
+            assert_eq!(request.input.stem_plan.stems.len(), 2);
+            let result = export_bundle(request).unwrap();
+            let inputs = renderer.stem_inputs();
+            assert_eq!(inputs.len(), 2);
+            let master = |bytes: &[u8]| {
+                if name.ends_with(".mscz") {
+                    let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).unwrap();
+                    let mut text = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut archive.by_name("score.mscx").unwrap(),
+                        &mut text,
+                    )
+                    .unwrap();
+                    text
+                } else {
+                    bytes.to_vec()
+                }
+            };
+            for (index, (file, bytes)) in inputs.iter().enumerate() {
+                assert!(file.ends_with(&name[name.len() - 5..]), "{file}");
+                let text = master(bytes);
+                assert_eq!(silence_removed(&text), FERMATA_SCORE);
+                let text = String::from_utf8(text).unwrap();
+                assert!(text.contains("<Fermata><subtype>fermataAbove</subtype></Fermata>"));
+                assert!(text.contains("<Breath><subtype>breathMark</subtype></Breath>"));
+                let silenced = text.matches("<play>0</play>").count();
+                // Each Part has two notes, so each stem silences the other two.
+                assert_eq!(silenced, 2);
+                if index == 0 {
+                    assert!(text.contains("<pitch>72</pitch><tpc>14</tpc></Note>"));
+                    assert!(text.contains("<pitch>48</pitch><tpc>14</tpc><play>0</play></Note>"));
+                } else {
+                    assert!(text.contains("<pitch>72</pitch><tpc>14</tpc><play>0</play></Note>"));
+                    assert!(text.contains("<pitch>55</pitch><tpc>15</tpc></Note>"));
+                }
+            }
+            let manifest: BundleManifest =
+                serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
+            assert!(manifest
+                .audio
+                .stems
+                .iter()
+                .all(|stem| stem.isolation_method == crate::score_stems::ISOLATION_METHOD));
+            assert_eq!(fs::read(&result.source_path).unwrap(), source);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_note_free_part_with_chord_symbols_gets_its_own_stem() {
+        // The second Part holds only chord symbols MuseScore plays.
+        let score = native_score("3.02", &[1, 1], &[1]);
+        let midi = crate::engine::musescore::parse(score.as_bytes()).unwrap();
+        assert_eq!(midi.topology.parts[1].playable_chord_symbols, 1);
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let root = temp_dir("chord-symbol-stem");
+            let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+            let request = real_request(
+                &root,
+                target,
+                "song.mscx",
+                score.clone().into_bytes(),
+                renderer.clone(),
+            );
+            let stems = &request.input.stem_plan.stems;
+            assert_eq!(stems.len(), 2);
+            assert_eq!(stems[1].source_part_index, 1);
+            assert_eq!(stems[1].source_note_count, 0);
+            assert_eq!(stems[1].source_chord_symbol_count, 1);
+            assert!(stems[1].source_track_ids.is_empty());
+            assert_eq!(stems[1].role, StemRole::Accompaniment);
+            assert!(stems[1].active_by_default);
+            let result = export_bundle(request).unwrap();
+            let inputs = renderer.stem_inputs();
+            let chords = String::from_utf8(inputs[1].1.clone()).unwrap();
+            assert!(chords.contains("<Harmony><root>14</root></Harmony>"));
+            assert!(chords.contains("<tpc>14</tpc><play>0</play></Note>"));
+            let own = String::from_utf8(inputs[0].1.clone()).unwrap();
+            assert!(own.contains("<Harmony><root>14</root><play>0</play></Harmony>"));
+            let manifest: BundleManifest =
+                serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
+            let record = &manifest.audio.stems[1];
+            assert!(record.source_track_ids.is_empty());
+            assert_eq!(record.source_chord_symbol_count, 1);
+            assert_eq!(manifest.audio.stems[0].source_chord_symbol_count, 0);
+            let text = fs::read_to_string(&result.manifest_path).unwrap();
+            assert_eq!(text.matches("sourceChordSymbolCount").count(), 1);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn verification_binds_isolation_and_chord_stems_to_the_source_format() {
+        for (to, accepted) in [
+            ("\"isolationMethod\": \"musescore-silenced-score\"", false),
+            ("\"isolationMethod\": \"midi-track-split\"", true),
+            ("\"isolationMethod\": \"musescore-score-parts\"", true),
+        ] {
+            let root = temp_dir("isolation-method-midi");
+            let hook = MutateStagedFile {
+                parent: root.clone(),
+                at: FaultPoint::AfterManifest,
+                relative_path: MANIFEST_RELATIVE_PATH.into(),
+                from: "\"isolationMethod\": \"musescore-silenced-midi-import\"",
+                to,
+            };
+            let result = export_bundle_with_hook(request(&root, FakeMode::Success), &hook);
+            if accepted {
+                result.expect("earlier MIDI isolation values stay verifiable");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(BundleError::Integrity(message)) if message.contains("invalid ownership")
+                ));
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        // Every stem of one bundle states the same isolation.
+        let root = temp_dir("isolation-method-mixed");
+        let hook = MutateStagedFile {
+            parent: root.clone(),
+            at: FaultPoint::AfterManifest,
+            relative_path: MANIFEST_RELATIVE_PATH.into(),
+            from: "\"isolationMethod\": \"musescore-silenced-midi-import\"",
+            to: "\"isolationMethod\": \"midi-track-split\"",
+        };
+        assert!(matches!(
+            export_bundle_with_hook(
+                two_stem_request(&root, FakeMode::Success, ExportTarget::Svp),
+                &hook
+            ),
+            Err(BundleError::Integrity(message)) if message.contains("invalid ownership")
+        ));
+        fs::remove_dir_all(root).unwrap();
+
+        let root = temp_dir("chord-stem-claim");
+        let hook = MutateStagedFile {
+            parent: root.clone(),
+            at: FaultPoint::AfterManifest,
+            relative_path: MANIFEST_RELATIVE_PATH.into(),
+            from: "\"sourceChordSymbolCount\": 1",
+            to: "\"sourceChordSymbolCount\": 0",
+        };
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.mscx",
+            native_score("3.02", &[1, 1], &[1]).into_bytes(),
+            Arc::new(FakeRenderer::new(FakeMode::Success)),
         );
+        assert!(matches!(
+            export_bundle_with_hook(request, &hook),
+            Err(BundleError::Integrity(message)) if message.contains("invalid ownership")
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+
+        // A score bundle cannot claim a MIDI isolation.
+        let root = temp_dir("isolation-method-score");
+        let hook = MutateStagedFile {
+            parent: root.clone(),
+            at: FaultPoint::AfterManifest,
+            relative_path: MANIFEST_RELATIVE_PATH.into(),
+            from: "\"isolationMethod\": \"musescore-silenced-score\"",
+            to: "\"isolationMethod\": \"midi-track-split\"",
+        };
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.mscx",
+            native_score("3.02", &[1], &[]).into_bytes(),
+            Arc::new(FakeRenderer::new(FakeMode::Success)),
+        );
+        assert!(matches!(
+            export_bundle_with_hook(request, &hook),
+            Err(BundleError::Integrity(message)) if message.contains("invalid ownership")
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stems_keep_their_own_source_part_audible_after_a_rest_only_part() {
+        let score = native_score("3.02", &[1, 1, 1], &[]).replacen(
+            "<Chord><durationType>quarter</durationType><Note><pitch>60</pitch><tpc>14</tpc></Note></Chord>",
+            "<Rest><durationType>quarter</durationType></Rest>",
+            1,
+        );
+        let root = temp_dir("rest-only-first-part");
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.mscx",
+            score.into_bytes(),
+            renderer.clone(),
+        );
+        let stems = request.input.stem_plan.stems.clone();
+        assert_eq!(
+            stems
+                .iter()
+                .map(|stem| stem.source_part_index)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        export_bundle(request).unwrap();
+        for (stem, (_, bytes)) in stems.iter().zip(renderer.stem_inputs()) {
+            let parts = ScoreStems::read(&bytes).unwrap();
+            for (index, part) in parts.parts().iter().enumerate() {
+                assert_eq!(
+                    part.audible_elements() > 0,
+                    index == stem.source_part_index,
+                    "{} Part {index}",
+                    stem.stem_id
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_score_with_nothing_else_audible_renders_its_own_bytes() {
+        // Without another audible Part the stem input is the source container.
+        let score = zipped_score(&native_score("4.20", &[2], &[]));
+        let root = temp_dir("single-part-score");
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(
+            &root,
+            ExportTarget::Svp,
+            "song.mscz",
+            score.clone(),
+            renderer.clone(),
+        );
+        export_bundle(request).unwrap();
+        let inputs = renderer.stem_inputs();
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].0.ends_with(".mscz"));
+        assert_eq!(inputs[0].1, score);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn two_part_musicxml() -> String {
+        let part = |id: &str, name: &str, step: &str, lyric: &str| {
+            format!("<part id=\"{id}\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes><note><pitch><step>{step}</step><octave>4</octave></pitch><duration>1</duration>{lyric}</note></measure></part><!--{name}-->")
+        };
+        format!(
+            "<score-partwise version=\"4.0\"><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part><score-part id=\"P2\"><part-name>Piano</part-name></score-part></part-list>{}{}</score-partwise>",
+            part("P1", "Voice", "C", "<lyric><text>la</text></lyric>"),
+            part("P2", "Piano", "E", "")
+        )
+    }
+
+    fn mxl(musicxml: &str) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
-        writer
-            .start_file("score.mscx", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(mscx.as_bytes()).unwrap();
+        for (name, bytes) in [
+            (
+                "META-INF/container.xml",
+                &b"<container><rootfiles><rootfile full-path=\"score.musicxml\"/></rootfiles></container>"[..],
+            ),
+            ("score.musicxml", musicxml.as_bytes()),
+        ] {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
         writer.finish().unwrap().into_inner()
     }
 
-    fn part_descriptor(stem_id: &str, source_part_index: usize) -> StemDescriptor {
-        StemDescriptor {
-            stem_id: stem_id.into(),
-            source_part_id: format!("musescore-part-{source_part_index}"),
-            source_part_index,
-            display_name: stem_id.into(),
-            source_track_ids: vec![stem_id.into()],
-            source_note_count: 1,
-            role: StemRole::Accompaniment,
-            active_by_default: true,
-        }
-    }
-
-    fn extracted(ordinal: usize, part_ids: &[&str]) -> ExtractedScorePart {
-        ExtractedScorePart {
-            ordinal,
-            name: part_ids.join("+"),
-            metadata: serde_json::Value::Null,
-            mscz: part_container(part_ids),
-        }
-    }
-
     #[test]
-    fn a_part_the_author_saved_over_several_instruments_is_not_a_source_part() {
-        // `--score-parts` answers with the excerpts already in the file as well
-        // as the parts it can cut, so a score whose author saved a combined
-        // part comes back with one container more than the source has Parts.
-        let descriptors = vec![
-            part_descriptor("melodie", 0),
-            part_descriptor("basse", 1),
-            part_descriptor("batterie", 2),
-        ];
-        let parts = vec![
-            extracted(0, &["1"]),
-            extracted(1, &["2"]),
-            extracted(2, &["3"]),
-            extracted(3, &["2", "3"]),
-        ];
-
-        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
-
-        assert_eq!(aligned.len(), 3);
-        assert_eq!(aligned[0].mscz, part_container(&["1"]));
-        assert_eq!(aligned[1].mscz, part_container(&["2"]));
-        assert_eq!(aligned[2].mscz, part_container(&["3"]));
-    }
-
-    #[test]
-    fn saved_parts_are_placed_on_the_source_whatever_order_musescore_lists_them() {
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
-        let parts = vec![extracted(0, &["2"]), extracted(1, &["1"])];
-
-        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
-
-        assert_eq!(aligned[0].mscz, part_container(&["1"]));
-        assert_eq!(aligned[1].mscz, part_container(&["2"]));
-    }
-
-    #[test]
-    fn a_source_part_that_carries_no_note_keeps_the_others_on_their_own_parts() {
-        // A note-free Part has no stem, so the stems are a subsequence of the
-        // Parts MuseScore cuts and position alone no longer places them.
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("third", 2)];
-        let parts = vec![
-            extracted(0, &["1"]),
-            extracted(1, &["2"]),
-            extracted(2, &["3"]),
-        ];
-
-        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
-
-        assert_eq!(aligned[0].mscz, part_container(&["1"]));
-        assert_eq!(aligned[1].mscz, part_container(&["3"]));
-    }
-
-    #[test]
-    fn combined_only_note_free_part_preserves_later_source_positions() {
-        let descriptors = vec![
-            part_descriptor("first", 0),
-            part_descriptor("second", 1),
-            part_descriptor("third", 2),
-            part_descriptor("fifth", 4),
-        ];
-        let parts = vec![
-            extracted(0, &["1"]),
-            extracted(1, &["2"]),
-            extracted(2, &["3"]),
-            extracted(3, &["5"]),
-            extracted(4, &["3", "4"]),
-        ];
-
-        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
-
-        assert_eq!(aligned.len(), 4);
-        for (part, id) in aligned.iter().zip(["1", "2", "3", "5"]) {
-            assert_eq!(part.mscz, part_container(&[id]));
+    fn musicxml_stems_silence_parts_of_the_converted_score() {
+        let musicxml = two_part_musicxml();
+        for (name, source) in [
+            ("song.musicxml", musicxml.clone().into_bytes()),
+            ("song.mxl", mxl(&musicxml)),
+        ] {
+            let root = temp_dir("musicxml-silenced");
+            let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+            let request = real_request(
+                &root,
+                ExportTarget::Ustx,
+                name,
+                source.clone(),
+                renderer.clone(),
+            );
+            let result = export_bundle(request).unwrap();
+            let inputs = renderer.stem_inputs();
+            assert_eq!(inputs.len(), 2);
+            for (index, (file, bytes)) in inputs.iter().enumerate() {
+                assert!(file.ends_with(".mscz"));
+                let stems = ScoreStems::read(bytes).unwrap();
+                // Re-reading a stem finds only its own Part still audible.
+                for (part_index, part) in stems.parts().iter().enumerate() {
+                    assert_eq!(part.audible_elements(), usize::from(part_index == index));
+                }
+            }
+            assert_eq!(fs::read(&result.source_path).unwrap(), source);
+            fs::remove_dir_all(root).unwrap();
         }
     }
 
     #[test]
-    fn combined_only_note_free_part_alignment_is_independent_of_extraction_order() {
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("fifth", 4)];
-        let parts = vec![
-            extracted(3, &["2", "3", "4"]),
-            extracted(1, &["5"]),
-            extracted(4, &["1"]),
-            extracted(0, &["3", "4"]),
-            extracted(2, &["1", "5"]),
-        ];
-
-        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
-
-        assert_eq!(aligned.len(), 2);
-        assert_eq!(aligned[0].mscz, part_container(&["1"]));
-        assert_eq!(aligned[1].mscz, part_container(&["5"]));
-    }
-
-    #[test]
-    fn combined_only_required_part_cannot_use_a_later_standalone() {
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
-        let parts = vec![
-            extracted(0, &["1"]),
-            extracted(1, &["2", "3"]),
-            extracted(2, &["3"]),
-        ];
-
-        let error = align_extracted_parts("museScore", &descriptors, parts).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BundleError::Integrity(message) if message.contains("no Part for source Part 2")
-        ));
-    }
-
-    #[test]
-    fn an_unobserved_required_part_cannot_be_replaced_by_a_later_instrument() {
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("third", 2)];
-        let parts = vec![
-            extracted(0, &["1"]),
-            extracted(1, &["4"]),
-            extracted(2, &["2", "4"]),
-        ];
-        assert!(matches!(
-            align_extracted_parts("museScore", &descriptors, parts),
-            Err(BundleError::Integrity(message)) if message.contains("gaps in source Part identities")
-        ));
-    }
-
-    #[test]
-    fn combined_only_required_part_blocks_publication_for_both_targets() {
-        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
-            let root = temp_dir("combined-only-required-part");
-            let mut request = request_for(&root, FakeMode::Success, target);
-            request.input.source_format = "museScore".into();
-            request.renderer = Arc::new(FakeRenderer::with_extracted_parts(
-                FakeMode::Success,
-                vec![extracted(0, &["1", "2"]), extracted(1, &["2"])],
-            ));
+    fn a_converted_score_with_other_parts_is_refused_transactionally() {
+        for converted in [
+            zipped_score(&native_score("4.20", &[1], &[])),
+            zipped_score(&native_score("4.20", &[2, 1], &[])),
+        ] {
+            let root = temp_dir("musicxml-part-mismatch");
+            let request = real_request(
+                &root,
+                ExportTarget::Ustx,
+                "song.musicxml",
+                two_part_musicxml().into_bytes(),
+                Arc::new(FakeRenderer::converting_to(FakeMode::Success, converted)),
+            );
             let destination = request.destination.clone();
-
-            assert!(matches!(
-                export_bundle(request),
-                Err(BundleError::Integrity(message))
-                    if message.contains("no Part for source Part 1")
-            ));
+            let error = export_bundle(request).unwrap_err();
+            assert!(
+                matches!(&error, BundleError::Integrity(message)
+                    if message.contains("Parts but the source topology has")
+                        || message.contains("does not match source Part")),
+                "{error}"
+            );
             assert!(!destination.exists());
             assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
             fs::remove_dir_all(root).unwrap();
@@ -6003,175 +6968,177 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn combined_part_with_incomplete_identity_never_uses_ordinal_fallback() {
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
-        let parts = vec![extracted(0, &["1"]), extracted(1, &["2", "unknown"])];
-
-        assert!(align_extracted_parts("museScore", &descriptors, parts).is_err());
+    fn musicxml_parts_out_of_part_list_order_are_refused_transactionally() {
+        let musicxml = two_part_musicxml();
+        let (first, second) = musicxml
+            .split_once("<part id=\"P2\">")
+            .map(|(head, tail)| (head.to_string(), format!("<part id=\"P2\">{tail}")))
+            .unwrap();
+        let (head, voice) = first.split_once("<part id=\"P1\">").unwrap();
+        let piano = second.trim_end_matches("</score-partwise>");
+        let swapped = format!("{head}{piano}<part id=\"P1\">{voice}</score-partwise>");
+        assert!(swapped.find("<part id=\"P2\">") < swapped.find("<part id=\"P1\">"));
+        let root = temp_dir("musicxml-part-order");
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.musicxml",
+            swapped.into_bytes(),
+            renderer.clone(),
+        );
+        let destination = request.destination.clone();
+        assert!(matches!(
+            export_bundle(request),
+            Err(BundleError::Integrity(message)) if message.contains("part-list order")
+        ));
+        assert!(renderer.converted_inputs.lock().unwrap().is_empty());
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn part_alignment_rejects_duplicate_and_out_of_range_ordinals() {
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
-        for ordinal in [0, 2] {
-            let parts = vec![extracted(0, &["1"]), extracted(ordinal, &["2"])];
+    fn a_musicxml_part_holding_only_chord_symbols_gets_an_accompaniment_stem() {
+        let musicxml = "<score-partwise version=\"4.0\"><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part><score-part id=\"P2\"><part-name>Chords</part-name></score-part></part-list>\
+            <part id=\"P1\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><lyric><text>la</text></lyric></note></measure></part>\
+            <part id=\"P2\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes><harmony><root><root-step>C</root-step></root><kind>major</kind></harmony><note><rest/><duration>1</duration></note></measure></part></score-partwise>";
+        let root = temp_dir("musicxml-chord-stem");
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.musicxml",
+            musicxml.as_bytes().to_vec(),
+            renderer.clone(),
+        );
+        let stems = &request.input.stem_plan.stems;
+        assert_eq!(stems.len(), 2);
+        assert_eq!(
+            (
+                stems[1].source_part_id.as_str(),
+                stems[1].source_note_count,
+                stems[1].source_chord_symbol_count,
+                stems[1].role
+            ),
+            ("P2", 0, 1, StemRole::Accompaniment)
+        );
+        let result = export_bundle(request).unwrap();
+        let chords = ScoreStems::read(&renderer.stem_inputs()[1].1).unwrap();
+        assert_eq!(
+            chords
+                .parts()
+                .iter()
+                .map(ScorePart::audible_elements)
+                .collect::<Vec<_>>(),
+            [0, 1],
+            "only the chord symbol stays audible"
+        );
+        let record = &manifest_of(&result).audio.stems[1];
+        assert!(record.source_track_ids.is_empty());
+        assert_eq!(record.source_chord_symbol_count, 1);
+        assert_eq!(
+            record.isolation_method,
+            crate::score_stems::ISOLATION_METHOD
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_native_part_whose_notes_never_play_keeps_a_silent_stem() {
+        let score = native_score("3.02", &[1, 1], &[]).replace(
+            "<pitch>61</pitch><tpc>14</tpc></Note>",
+            "<pitch>61</pitch><tpc>14</tpc><play>0</play></Note>",
+        );
+        let root = temp_dir("silent-native-part");
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.mscx",
+            score.into_bytes(),
+            renderer.clone(),
+        );
+        assert_eq!(request.input.stem_plan.stems.len(), 2);
+        export_bundle(request).expect("a silent Part still has its stem");
+        let silent = ScoreStems::read(&renderer.stem_inputs()[1].1).unwrap();
+        assert!(silent
+            .parts()
+            .iter()
+            .all(|part| part.audible_elements() == 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stem_naming_another_source_part_is_refused_transactionally() {
+        let root = temp_dir("score-part-identity");
+        let mut request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.mscx",
+            native_score("3.02", &[1, 1], &[]).into_bytes(),
+            Arc::new(FakeRenderer::new(FakeMode::Success)),
+        );
+        request.input.stem_plan.stems[1].source_part_id = "musescore-part-9".into();
+        let destination = request.destination.clone();
+        assert!(matches!(
+            export_bundle(request),
+            Err(BundleError::Integrity(message))
+                if message.contains("cannot be mapped to exactly one source Part")
+        ));
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_silent_converted_part_with_source_notes_is_refused_transactionally() {
+        let converted = zipped_score(&native_score("4.20", &[1, 1], &[]).replace(
+            "<pitch>61</pitch><tpc>14</tpc></Note>",
+            "<pitch>61</pitch><tpc>14</tpc><play>0</play></Note>",
+        ));
+        let root = temp_dir("musicxml-silent-part");
+        let request = real_request(
+            &root,
+            ExportTarget::Ustx,
+            "song.musicxml",
+            two_part_musicxml().into_bytes(),
+            Arc::new(FakeRenderer::converting_to(FakeMode::Success, converted)),
+        );
+        let destination = request.destination.clone();
+        assert!(matches!(
+            export_bundle(request),
+            Err(BundleError::Integrity(message))
+                if message.starts_with("SCORE_STEM_TOPOLOGY_MISMATCH")
+        ));
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_score_conversion_rolls_back_everything() {
+        for mode in [FakeMode::Timeout, FakeMode::Missing] {
+            let root = temp_dir("musicxml-conversion-failure");
+            let renderer = Arc::new(FakeRenderer::new(mode));
+            let request = real_request(
+                &root,
+                ExportTarget::Ustx,
+                "song.musicxml",
+                two_part_musicxml().into_bytes(),
+                renderer.clone(),
+            );
+            let destination = request.destination.clone();
             assert!(matches!(
-                align_extracted_parts("museScore", &descriptors, parts),
-                Err(BundleError::Integrity(message))
-                    if message.contains("duplicated or out-of-range Part ordinals")
+                export_bundle(request),
+                Err(BundleError::Render(_))
             ));
+            assert_eq!(renderer.converted_inputs.lock().unwrap().len(), 1);
+            assert!(renderer.stem_inputs().is_empty());
+            assert!(!destination.exists());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            fs::remove_dir_all(root).unwrap();
         }
-    }
-
-    #[test]
-    fn unidentified_legacy_parts_still_require_an_exact_count() {
-        let descriptors = vec![part_descriptor("first", 0), part_descriptor("second", 1)];
-        let legacy_part = |ordinal| ExtractedScorePart {
-            ordinal,
-            name: "Same".into(),
-            metadata: serde_json::Value::Null,
-            mscz: vec![ordinal as u8],
-        };
-        let aligned = align_extracted_parts(
-            "museScore",
-            &descriptors,
-            vec![legacy_part(1), legacy_part(0)],
-        )
-        .unwrap();
-        assert_eq!(aligned[0].mscz, [0]);
-        assert_eq!(aligned[1].mscz, [1]);
-        assert!(matches!(
-            align_extracted_parts("museScore", &descriptors, vec![legacy_part(0)]),
-            Err(BundleError::Integrity(message)) if message.contains("source topology")
-        ));
-    }
-
-    #[test]
-    fn a_source_part_musescore_never_cut_is_still_refused() {
-        let descriptors = vec![
-            part_descriptor("first", 0),
-            part_descriptor("second", 1),
-            part_descriptor("third", 2),
-        ];
-        let parts = vec![extracted(0, &["1"]), extracted(1, &["2", "3"])];
-
-        let error = align_extracted_parts("museScore", &descriptors, parts).unwrap_err();
-
-        assert!(matches!(
-            error,
-            BundleError::Integrity(message) if message.contains("source topology")
-        ));
-    }
-
-    #[test]
-    fn native_scores_align_parts_by_verified_source_order() {
-        let descriptors = vec![
-            StemDescriptor {
-                stem_id: "first".into(),
-                source_part_index: 0,
-                source_part_id: "musescore-part-native-b".into(),
-                display_name: "Same".into(),
-                source_track_ids: vec!["b".into()],
-                source_note_count: 1,
-                role: StemRole::Accompaniment,
-                active_by_default: true,
-            },
-            StemDescriptor {
-                stem_id: "second".into(),
-                source_part_index: 1,
-                source_part_id: "musescore-part-native-a".into(),
-                display_name: "Same".into(),
-                source_track_ids: vec!["a".into()],
-                source_note_count: 1,
-                role: StemRole::Accompaniment,
-                active_by_default: true,
-            },
-        ];
-        let parts = vec![
-            ExtractedScorePart {
-                ordinal: 0,
-                name: "Same".into(),
-                metadata: serde_json::json!({"id": "native-a"}),
-                mscz: vec![1],
-            },
-            ExtractedScorePart {
-                ordinal: 1,
-                name: "Same".into(),
-                metadata: serde_json::json!({"id": "native-b"}),
-                mscz: vec![2],
-            },
-        ];
-        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
-        assert_eq!(aligned[0].mscz, [1]);
-        assert_eq!(aligned[1].mscz, [2]);
-    }
-
-    #[test]
-    fn imported_scores_align_parts_by_source_order_when_musescore_rewrites_names_and_ids() {
-        let descriptors = vec![
-            StemDescriptor {
-                stem_id: "banjo".into(),
-                source_part_index: 0,
-                source_part_id: "midi:track:3".into(),
-                display_name: "BANJO MELODY".into(),
-                source_track_ids: vec!["midi:track:3".into()],
-                source_note_count: 1,
-                role: StemRole::Accompaniment,
-                active_by_default: true,
-            },
-            StemDescriptor {
-                stem_id: "strings".into(),
-                source_part_index: 1,
-                source_part_id: "midi:track:5".into(),
-                display_name: "STRINGS".into(),
-                source_track_ids: vec!["midi:track:5".into()],
-                source_note_count: 1,
-                role: StemRole::Accompaniment,
-                active_by_default: true,
-            },
-        ];
-        let parts = vec![
-            ExtractedScorePart {
-                ordinal: 0,
-                name: "Banjo, BANJO MELODY".into(),
-                metadata: serde_json::json!({"id": "generated-banjo-id"}),
-                mscz: vec![1],
-            },
-            ExtractedScorePart {
-                ordinal: 1,
-                name: "Violins, STRINGS".into(),
-                metadata: serde_json::json!({"id": "generated-strings-id"}),
-                mscz: vec![2],
-            },
-        ];
-
-        let aligned = align_extracted_parts("karaokeMidi", &descriptors, parts).unwrap();
-        assert_eq!(aligned[0].mscz, [1]);
-        assert_eq!(aligned[1].mscz, [2]);
-    }
-
-    #[test]
-    fn native_scores_tolerate_musescore_rewritten_part_identity() {
-        let descriptors = vec![StemDescriptor {
-            stem_id: "voice".into(),
-            source_part_index: 0,
-            source_part_id: "musescore-part-voice".into(),
-            display_name: "Voice".into(),
-            source_track_ids: vec!["voice".into()],
-            source_note_count: 1,
-            role: StemRole::VocalReference,
-            active_by_default: false,
-        }];
-        let parts = vec![ExtractedScorePart {
-            ordinal: 0,
-            name: "Piano".into(),
-            metadata: serde_json::json!({"id": "piano"}),
-            mscz: vec![1],
-        }];
-
-        let aligned = align_extracted_parts("museScore", &descriptors, parts).unwrap();
-        assert_eq!(aligned[0].name, "Piano");
-        assert_eq!(aligned[0].mscz, [1]);
     }
 
     #[test]
@@ -6276,12 +7243,15 @@ pub(crate) mod tests {
             &self.capabilities
         }
 
-        fn extract_score_parts(
+        fn convert_to_mscz(
             &self,
             _input: &Path,
+            output: &Path,
             _limits: &RenderLimits,
-        ) -> Result<Vec<ExtractedScorePart>, RenderError> {
-            Ok(vec![extracted(0, &["1"])])
+        ) -> Result<Vec<u8>, RenderError> {
+            let bytes = zipped_score(&native_score("4.20", &[1], &[]));
+            fs::write(output, &bytes)?;
+            Ok(bytes)
         }
 
         fn render(
@@ -6303,6 +7273,8 @@ pub(crate) mod tests {
         }
     }
 
+    const ONE_PART_MUSICXML: &str = "<score-partwise version=\"4.0\"><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration></note></measure></part></score-partwise>";
+
     fn quiet_tail_request(
         root: &Path,
         target: ExportTarget,
@@ -6314,7 +7286,7 @@ pub(crate) mod tests {
         let mut request = request_for(root, FakeMode::Success, target);
         request.input.source_format = "museScore".into();
         request.input.original_name = "source.mscz".into();
-        request.input.source_bytes = part_container(&["1"]);
+        request.input.source_bytes = zipped_score(&native_score("4.20", &[1], &[]));
         request.input.stem_plan.stems[0].source_part_id = "musescore-part-1".into();
         let layout = BundleLayout::new(&request.destination, "source.mscz", target).unwrap();
         request.input.ledger.entries[0].artifact_paths[0] = layout.source_relative_path;
@@ -6427,7 +7399,10 @@ pub(crate) mod tests {
                     case == "stem-hash",
                 );
                 if case == "other-source" {
+                    // The allowance is for native MuseScore sources only.
                     request.input.source_format = "musicXml".into();
+                    request.input.source_bytes = ONE_PART_MUSICXML.as_bytes().to_vec();
+                    request.input.stem_plan.stems[0].source_part_id = "P1".into();
                 }
                 if case == "byte-limit" {
                     request.render_limits.max_output_bytes = 44 + 16 * 8;
@@ -6871,10 +7846,7 @@ pub(crate) mod tests {
             .iter()
             .map(|stem| project_audio_reference(&layout.stem_audio_relative_path(stem)))
             .collect::<Vec<_>>();
-        let renderer = Arc::new(FakeRenderer::with_parts(
-            FakeMode::Success,
-            stem_plan.stems.len(),
-        ));
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
         let result = export_bundle(BundleRequest {
             destination,
             input: BundleInput {
@@ -7001,7 +7973,7 @@ pub(crate) mod tests {
         );
 
         let stem_count = stem_plan.stems.len();
-        let renderer = Arc::new(FakeRenderer::with_parts(FakeMode::Success, stem_count));
+        let renderer = Arc::new(FakeRenderer::new(FakeMode::Success));
         let result = export_bundle(BundleRequest {
             destination,
             input: BundleInput {
@@ -7077,7 +8049,7 @@ pub(crate) mod tests {
                     ledger,
                     warnings: vec![],
                 },
-                renderer: successful_renderer(&stem_plan.stems),
+                renderer: successful_renderer(),
                 render_limits: RenderLimits {
                     timeout: Duration::from_secs(60),
                     max_output_bytes: 1024 * 1024,
@@ -7237,7 +8209,7 @@ pub(crate) mod tests {
                     ledger,
                     warnings: vec![],
                 },
-                renderer: successful_renderer(&stem_plan.stems),
+                renderer: successful_renderer(),
                 render_limits: RenderLimits {
                     timeout: Duration::from_secs(60),
                     max_output_bytes: 1024 * 1024,
@@ -7844,6 +8816,7 @@ pub(crate) mod tests {
             source_tracks: vec!["score-part".into()],
             source_notes: vec![],
             controllers: vec![],
+            contextual_sources: vec![],
             projected_notes: vec![],
             dependencies: vec![IntensityDependencySource {
                 owner: owner.clone(),
@@ -7990,6 +8963,260 @@ pub(crate) mod tests {
             matches!(bad.validate(&allowed), Err(BundleError::InvalidLedger(message)) if message == "performance evidence exceeds bounded storage")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A two-track file whose sung notes take their gain from another track's
+    /// CC7 on the same route, qualified by the given contextual events.
+    fn contextual_gain_midi(state: &[u8]) -> Vec<u8> {
+        let mut state_track = state.to_vec();
+        state_track.extend_from_slice(&[0x00, 0xb0, 7, 100, 0x00, 0xff, 0x2f, 0x00]);
+        let notes: &[u8] = &[
+            0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20, 0x00, 0xff, 0x21, 0x01, 0x00, 0x83, 0x60,
+            0xff, 0x05, 0x02, b'l', b'a', 0x00, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0x00, 0xff,
+            0x05, 0x02, b'l', b'o', 0x00, 0x90, 62, 90, 0x83, 0x60, 0x80, 62, 0, 0x00, 0xff, 0x2f,
+            0x00,
+        ];
+        let mut data = b"MThd\0\0\0\x06\0\x01\0\x02\x01\xe0".to_vec();
+        for track in [&state_track[..], notes] {
+            data.extend_from_slice(b"MTrk");
+            data.extend_from_slice(&(track.len() as u32).to_be_bytes());
+            data.extend_from_slice(track);
+        }
+        data
+    }
+
+    fn contextual_gain_ledger(state: &[u8]) -> (PreservationLedger, BTreeSet<String>) {
+        let midi =
+            crate::engine::midi::parse_with_karaoke_profile(&contextual_gain_midi(state)).unwrap();
+        let outcome = crate::engine::convert::convert_midi_with_target(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+        );
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        let layout = BundleLayout::new(
+            Path::new("/nonexistent/Context.versebundle"),
+            "source.kar",
+            ExportTarget::Ustx,
+        )
+        .unwrap();
+        let stems = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
+        let allowed = [
+            layout.source_relative_path.clone(),
+            layout.project_relative_path.clone(),
+        ]
+        .into_iter()
+        .chain(
+            stems
+                .stems
+                .iter()
+                .map(|s| layout.stem_audio_relative_path(s)),
+        )
+        .collect();
+        (
+            build_preservation_ledger(&midi, &outcome.projection, &layout, &stems),
+            allowed,
+        )
+    }
+
+    fn span_contributors(ledger: &PreservationLedger, index: usize) -> Vec<&str> {
+        ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.performance_refs.contains(&index))
+            .map(|entry| entry.source_id.as_str())
+            .collect()
+    }
+
+    fn add_contributor(ledger: &mut PreservationLedger, id: &str, span: usize) {
+        ledger
+            .entries
+            .iter_mut()
+            .find(|entry| entry.source_id == id)
+            .expect("an inventoried source event")
+            .performance_refs
+            .push(span);
+    }
+
+    #[test]
+    fn contextual_gain_contributors_are_authenticated_by_route_and_time() {
+        // A port declaration, SysEx with a port declaration and a CC121 reset
+        // are folded into another track's CC7 gain on the sung notes' route.
+        for (state, role) in [
+            (&[0x00u8, 0xff, 0x21, 0x01, 0x00][..], "portDeclaration"),
+            (
+                &[
+                    0x00, 0xff, 0x21, 0x01, 0x00, 0x00, 0xf0, 0x05, 0x7e, 0x7f, 0x09, 0x01, 0xf7,
+                ][..],
+                "systemExclusive",
+            ),
+            (&[0x00, 0xb0, 121, 0][..], "channelMode"),
+        ] {
+            let (ledger, allowed) = contextual_gain_ledger(state);
+            ledger.validate(&allowed).unwrap();
+            let context = ledger.intensity_context.as_ref().unwrap();
+            let span = ledger
+                .performance_spans
+                .iter()
+                .position(|span| span.intensity.is_some())
+                .unwrap();
+            let contributors = span_contributors(&ledger, span);
+            assert!(
+                context.contextual_sources.iter().any(|row| {
+                    serde_json::to_value(row.role).unwrap()["kind"] == role
+                        && contributors.contains(&row.source_id.as_str())
+                }),
+                "{role}: {contributors:?}"
+            );
+
+            // A lyric event is inventoried but has no contributor role.
+            let mut unrelated = ledger.clone();
+            add_contributor(&mut unrelated, "event:midi-track-1:2", span);
+            assert!(matches!(
+                unrelated.validate(&allowed),
+                Err(BundleError::InvalidLedger(message))
+                    if message == "intensity backlink has no authenticated contributor role"
+            ));
+        }
+
+        // A reset on another channel, and SysEx after the note, are real
+        // contextual events that cannot qualify this span.
+        let mut state = vec![0x00, 0xb5, 121, 0];
+        state.extend_from_slice(&[0x8f, 0x00, 0xf0, 0x02, 0x7e, 0xf7]);
+        let (ledger, allowed) = contextual_gain_ledger(&state);
+        ledger.validate(&allowed).unwrap();
+        let context = ledger.intensity_context.as_ref().unwrap();
+        let span = ledger
+            .performance_spans
+            .iter()
+            .position(|span| span.intensity.is_some() && !span.note_ids.is_empty())
+            .unwrap();
+        for role in ["channelMode", "systemExclusive"] {
+            let row = context
+                .contextual_sources
+                .iter()
+                .find(|row| serde_json::to_value(row.role).unwrap()["kind"] == role)
+                .unwrap();
+            assert!(!span_contributors(&ledger, span).contains(&row.source_id.as_str()));
+            let mut forged = ledger.clone();
+            add_contributor(&mut forged, &row.source_id, span);
+            assert!(
+                matches!(
+                    forged.validate(&allowed),
+                    Err(BundleError::InvalidLedger(message))
+                        if message == "intensity backlink has no authenticated contributor role"
+                ),
+                "{role}"
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_sources_on_another_port_cannot_qualify_a_span() {
+        // Port 1 declaration and SysEx in another track; the sung notes use port 0.
+        let state = [0x00, 0xff, 0x21, 0x01, 0x01, 0x00, 0xf0, 0x02, 0x7e, 0xf7];
+        let (ledger, allowed) = contextual_gain_ledger(&state);
+        ledger.validate(&allowed).unwrap();
+        let context = ledger.intensity_context.as_ref().unwrap();
+        let span = ledger
+            .performance_spans
+            .iter()
+            .position(|span| span.intensity.is_some() && !span.note_ids.is_empty())
+            .unwrap();
+        for role in [
+            IntensityContextRole::PortDeclaration { port: 1 },
+            IntensityContextRole::SystemExclusive { port: 1 },
+        ] {
+            let row = context
+                .contextual_sources
+                .iter()
+                .find(|row| row.role == role)
+                .unwrap();
+            let mut forged = ledger.clone();
+            add_contributor(&mut forged, &row.source_id, span);
+            assert!(
+                matches!(
+                    forged.validate(&allowed),
+                    Err(BundleError::InvalidLedger(message))
+                        if message == "intensity backlink has no authenticated contributor role"
+                ),
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_contextual_source_rows_are_validated_as_a_table() {
+        let (ledger, allowed) = contextual_gain_ledger(&[0x00, 0xb0, 121, 0]);
+        ledger.validate(&allowed).unwrap();
+        let context = ledger.intensity_context.as_ref().unwrap();
+        let reset = context
+            .contextual_sources
+            .iter()
+            .position(|row| matches!(row.role, IntensityContextRole::ChannelMode { .. }))
+            .unwrap();
+        let controller = context.controllers[0].clone();
+        let other_track = context
+            .source_tracks
+            .iter()
+            .find(|track| **track != context.contextual_sources[reset].source_track_id)
+            .unwrap()
+            .clone();
+        type Mutation<'a> = Box<dyn Fn(&mut serde_json::Value) + 'a>;
+        let mutations: [Mutation; 4] = [
+            Box::new(|row| row["role"]["controller"] = serde_json::json!(7)),
+            Box::new(|row| row["sourceTrackId"] = serde_json::json!("unknown-track")),
+            Box::new(|row| {
+                row["sourceId"] = serde_json::json!(controller.source_id);
+                row["sourceTrackId"] = serde_json::json!(controller.source_track_id);
+            }),
+            Box::new(|row| row["sourceTrackId"] = serde_json::json!(other_track)),
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut saved = serde_json::to_value(&ledger).unwrap();
+            mutate(&mut saved["intensityContext"]["contextualSources"][reset]);
+            let saved: PreservationLedger = serde_json::from_value(saved).unwrap();
+            assert!(
+                matches!(
+                    saved.validate(&allowed),
+                    Err(BundleError::InvalidLedger(message))
+                        if message == "invalid intensity contextual source table"
+                ),
+                "mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn contextual_contributors_alone_never_support_a_controller_curve() {
+        let (ledger, _) = contextual_gain_ledger(&[0x00, 0xff, 0x21, 0x01, 0x00]);
+        let context = ledger.intensity_context.as_ref().unwrap();
+        let entries: BTreeMap<_, _> = ledger
+            .entries
+            .iter()
+            .map(|entry| (entry.source_id.as_str(), entry))
+            .collect();
+        let mut budget = LedgerValidationBudget::new(LedgerValidationLimits::default());
+        let ownership = IntensityOwnership::new(context, &entries, &mut budget).unwrap();
+        let span = ledger
+            .performance_spans
+            .iter()
+            .find(|span| span.intensity.is_some())
+            .unwrap();
+        let port = context.contextual_sources[0].source_id.as_str();
+        let controller = context.controllers[0].source_id.as_str();
+        assert!(!ownership
+            .validate_controllers(span, &BTreeSet::from([port]), &BTreeSet::new(), &mut budget)
+            .unwrap());
+        assert!(ownership
+            .validate_controllers(
+                span,
+                &BTreeSet::from([port, controller]),
+                &BTreeSet::new(),
+                &mut budget
+            )
+            .unwrap());
     }
 
     #[test]
@@ -8462,10 +9689,7 @@ pub(crate) mod tests {
                     ledger,
                     warnings: vec![],
                 },
-                renderer: Arc::new(FakeRenderer::with_stems(
-                    FakeMode::Success,
-                    &stem_plan.stems,
-                )),
+                renderer: Arc::new(FakeRenderer::new(FakeMode::Success)),
                 render_limits: RenderLimits {
                     timeout: std::time::Duration::from_secs(60),
                     max_output_bytes: 1024 * 1024,
@@ -8598,8 +9822,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// Sorted keys of every sounding note a source Part owns.
+    fn part_keys(midi: &Midi, part_index: usize) -> Vec<u8> {
+        let part = &midi.topology.parts[part_index];
+        let mut keys: Vec<u8> = midi
+            .tracks
+            .iter()
+            .filter(|track| part.source_track_ids.contains(&track.id))
+            .flat_map(|track| &track.events)
+            .filter_map(|event| match &event.kind {
+                Kind::NoteOn(note) if note.velocity != Some(0) => note.key,
+                _ => None,
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
     #[test]
-    fn configured_real_renderer_part_count_matches_source_topology() {
+    fn configured_real_renderer_maps_every_stem_onto_one_source_part() {
         let (Ok(executable), Ok(gate_path)) = (
             std::env::var("VERSE_MUSESCORE_GATE"),
             std::env::var("VERSE_PART_MAPPING_GATE"),
@@ -8649,33 +9890,84 @@ pub(crate) mod tests {
                 "mxl" | "xml" | "musicxml" => {
                     crate::engine::musicxml::parse(&source_bytes).unwrap()
                 }
-                "kar" | "mid" | "midi" => crate::engine::midi::parse(&source_bytes).unwrap(),
+                "kar" => crate::engine::midi::parse_with_karaoke_profile(&source_bytes).unwrap(),
+                "mid" | "midi" => crate::engine::midi::parse(&source_bytes).unwrap(),
                 _ => panic!("unsupported gate extension"),
             };
             let outcome = crate::engine::convert::convert_midi(&midi, "english");
             assert!(outcome.ok);
             let stem_plan = StemPlan::from_source(&midi, &outcome.tracks).unwrap();
-            let parts = renderer
-                .extract_score_parts(
-                    &source_path,
-                    &RenderLimits {
-                        timeout: std::time::Duration::from_secs(2 * 60),
-                        max_output_bytes: 512 * 1024 * 1024,
-                    },
+            let format = source_format_name(midi.source_format);
+            let limits = RenderLimits {
+                timeout: std::time::Duration::from_secs(2 * 60),
+                max_output_bytes: 512 * 1024 * 1024,
+            };
+            let work = temp_dir("part-mapping-gate");
+            let sources = if is_midi_source(format) {
+                let (sources, warnings) =
+                    midi_stem_sources(&renderer, &source_bytes, &stem_plan.stems, &work, &limits)
+                        .unwrap();
+                eprintln!("  {} {warnings:?}", sources.isolation_method());
+                sources
+            } else {
+                StemSources::Score(
+                    score_stem_sources(
+                        &renderer,
+                        &source_path,
+                        format,
+                        &source_bytes,
+                        &stem_plan.stems,
+                        &work.join("converted.mscz"),
+                        &limits,
+                    )
+                    .unwrap(),
                 )
-                .unwrap();
-            assert_eq!(
-                parts.len(),
-                stem_plan.stems.len(),
-                "{}: MuseScore Parts {:?} differ from source stems {:?}",
-                source_path.display(),
-                parts.iter().map(|part| &part.name).collect::<Vec<_>>(),
-                stem_plan
-                    .stems
-                    .iter()
-                    .map(|stem| &stem.display_name)
-                    .collect::<Vec<_>>()
-            );
+            };
+            for (stem_index, stem) in stem_plan.stems.iter().enumerate() {
+                let (container, _) = sources.container(stem_index, stem).unwrap();
+                let (kept, silenced) = match &sources {
+                    StemSources::MidiTracks(_) => continue,
+                    StemSources::MidiImport { parts, .. } => {
+                        (parts[stem_index], ScoreStems::read(&container).unwrap())
+                    }
+                    StemSources::Score(_) => (
+                        stem.source_part_index,
+                        ScoreStems::read(&container).unwrap(),
+                    ),
+                };
+                for (index, part) in silenced.parts().iter().enumerate() {
+                    assert_eq!(
+                        part.audible_elements() > 0,
+                        index == kept,
+                        "{}: stem {} leaves Part {} audible",
+                        source_path.display(),
+                        stem.stem_id,
+                        index + 1
+                    );
+                }
+                // A positional swap would keep another Part's pitches audible.
+                // A native score is compared note for note. A converted score
+                // or MIDI import is read by another adapter than the source
+                // (MuseScore drops duplicate overlapping MIDI notes; ties and
+                // repeats merge differently), so it is compared by distinct keys.
+                let isolated = crate::engine::musescore::parse(&container).unwrap();
+                let (mut kept_keys, mut source_keys) = (
+                    part_keys(&isolated, kept),
+                    part_keys(&midi, stem.source_part_index),
+                );
+                if format != "museScore" {
+                    kept_keys.dedup();
+                    source_keys.dedup();
+                }
+                assert_eq!(
+                    kept_keys,
+                    source_keys,
+                    "{}: stem {} keeps another Part's pitches",
+                    source_path.display(),
+                    stem.stem_id
+                );
+            }
+            fs::remove_dir_all(work).unwrap();
         }
     }
 }
