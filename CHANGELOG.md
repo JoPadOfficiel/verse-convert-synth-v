@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.8.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.2...v0.8.3) (2026-09-23)
+
+
+### Bug Fixes
+
+* render faithful stems for every source format ([049ef94](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/049ef94ffed1940630230646d3b451335d53b37e))
+* render faithful stems for every source format ([9a12a62](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/9a12a62522fbefcde5ebe98ea55b89006536f298))
+
 ## [0.8.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.1...v0.8.2) (2026-09-23)
 
 
