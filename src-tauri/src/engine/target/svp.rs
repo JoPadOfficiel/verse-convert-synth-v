@@ -245,6 +245,7 @@ fn lyric_text(lyric: &ProjectedLyric) -> String {
 /// The single entry point of this target: one neutral projection in, one
 /// Synthesizer V v113 project out.
 pub fn serialize(project: &ProjectedProject) -> Result<SvpProject, String> {
+    project.validate_vocal_ownership()?;
     if let Some(violation) = project.continuity_violation() {
         return Err(violation);
     }

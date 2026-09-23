@@ -46,6 +46,27 @@ pub struct ProjectedProject {
 }
 
 impl ProjectedProject {
+    /// Shared by analysis and both writers, including their direct APIs.
+    /// Numeric playback keys do not authorize a vocal pitch.
+    pub fn validate_vocal_ownership(&self) -> Result<(), String> {
+        for track in &self.tracks {
+            for note in &track.notes {
+                if let Some(origin) = note
+                    .source_evidence
+                    .as_ref()
+                    .and_then(|e| e.origin.as_ref())
+                {
+                    if !origin.source.instrument_role.allows_vocal()
+                        || origin.source.unpitched.is_some()
+                    {
+                        return Err(format!("SOURCE_INSTRUMENT_NOT_VOCAL: note {:?} has percussion or unresolved source ownership", origin.source.id));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A proven continuation must still follow its actual retained predecessor
     /// after filtering, pronunciation and technical lane splitting.
     pub fn continuity_violation(&self) -> Option<String> {

@@ -6,12 +6,13 @@ Verse projects only source-backed musical evidence. It never invents lyrics,
 notes, pitches, voices, tracks, instruments, or audio.
 
 - A genuine source lyric such as `la` is retained.
-- A note without a lyric is not written into the vocal project; it stays in
-  the preserved source and its rendered stem.
+- Without an explicit vocal override, a note without a lyric is not written
+  into the vocal project; it stays in the preserved source and its rendered stem.
 - A continuation is emitted only when the source contains continuation or
   extension evidence.
-- Instrumental and percussion material is not serialized as vocal-shaped notes
-  in either target.
+- Percussion is never serialized as vocal-shaped notes in either target,
+  including when it has lyrics or a vocal override. Pitched accompaniment
+  remains in source/audio unless explicitly selected for vocal export.
 - Ambiguous ownership remains source-only or causes an explicit failure.
 - The byte-identical source remains the final authority inside a complete
   bundle.
@@ -19,6 +20,30 @@ notes, pitches, voices, tracks, instruments, or audio.
 Neither `.svp` nor `.ustx` is a lossless notation container. “Source-faithful”
 means exact source preservation, evidence-backed projection, an auditable
 disposition ledger, and fail-closed handling of unrepresentable semantics.
+
+### Source instrument ownership
+
+The same ownership gate covers `.mid`, `.midi`, `.kar`, `.xml`, `.musicxml`,
+`.mxl`, `.mscx`, and `.mscz`, through analysis, batch export, direct export,
+and both SVP/USTX writers. Classification follows the instruments actually
+owning each note. An unused drum declaration does not suppress a proven pitched
+voice, guitar or bass. Multiple references, unknown owners and contradictory
+declarations never select the first available instrument as a substitute.
+
+Explicit unpitched notation, percussion staff/clef evidence and MIDI percussion
+channel 10 remain non-vocal. The shared IR retains source instrument references
+alongside the resolved per-note role. `SOURCE_PERCUSSION_NOT_VOCAL` explains an
+exclusion; `SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED` identifies uncertain ownership
+or a refused declaration. Both target validators and writers also reject
+projected notes carrying non-vocal source evidence with
+`SOURCE_INSTRUMENT_NOT_VOCAL`.
+
+Present malformed channel, program, bank, port or drum mappings are not treated
+as absent metadata. MusicXML one-based values and native MuseScore zero-based
+values are retained separately from normalized values. Native `midiChannel`,
+`midiPort`, attribute/text program forms and unassigned `-1` values are handled
+explicitly. The initial channel of one native Instrument is channel index zero;
+unused channel variants do not take ownership of its notes.
 
 ## Which source carries the most
 
@@ -705,10 +730,19 @@ its Part list answers a different question than "which source track is this".
 
 Verse therefore divides a MIDI itself, along the `MTrk` chunks the format
 already separates. Each stem is the source track copied byte for byte, preceded
-by a rebuilt meta track carrying only the marks that govern the whole file —
-tempo, meter, key, SMPTE offset — so it renders on the reference mix's timeline.
-Nothing is transposed, quantised, or invented, a stem is a subset of the source,
-and the source track it holds is known because Verse chose it.
+by a rebuilt context track carrying tempo, meter, key and SMPTE offset, plus
+source-owned bank/program changes, controllers, pitch bend and pressure from
+other tracks on the exact port/channel used by its notes. Port routing is
+stated before copied channel state; unrelated routes do not leak into a stem.
+The selected `MTrk` remains byte-identical. Nothing is transposed, quantised or
+assigned a replacement instrument.
+
+Extraction refuses simultaneous cross-track state with unproven ordering,
+overlapping same-key note ownership between tracks, conflicting simultaneous
+global marks, shared system-exclusive state and an unrepresentable context
+delta. These use stable `MIDI_STEM_*` diagnostics. Raw source events preserve
+the full program/bank/port timeline; a single initial instrument summary is not
+a claim that the timbre stays constant throughout the track.
 
 A stem may therefore be shorter than the reference mix when its track falls
 silent before the end. Both start at zero, so it stays in step for every frame
@@ -721,6 +755,9 @@ it has; a stem running past the end of the whole score is still refused.
 - More than 4,096 tracks or 2,000,000 events is rejected.
 - Malformed running status, chunks, lengths, ticks, or channel events is
   rejected.
+- A physical track reusing a channel/key on overlapping MIDI ports is refused
+  because the channel/key note queues cannot prove that ownership. Independent
+  and sequential routes retain separate port/channel instrument summaries.
 
 ## MusicXML and MXL
 
@@ -759,6 +796,9 @@ it has; a stem running past the end of the whole score is still refused.
 - XML encodings outside the documented set.
 - A timing grid whose exact common PPQ exceeds the supported `u16` range.
 - Ambiguous or non-convergent playback navigation.
+- Instrument/device changes inside `<sound>` are refused until their playback
+  ownership timeline is represented. Initial declarations and used note-level
+  instrument references remain supported.
 
 ## Native MuseScore
 
@@ -775,6 +815,12 @@ it has; a stem running past the end of the whole score is still refused.
 
 The parser rejects archive traversal, ambiguous masters, a package containing
 only Excerpts, malformed XML, and unsafe timing/pitch values.
+
+Native `InstrumentChange`, `channelSwitch`, `articulationChange`, and
+`StaffTypeChange` inside the master score's staff bodies are explicitly refused
+until their ownership timeline can be represented. An initial instrument must
+not silently own the notes after a change. Excerpt-only changes do not change
+the selected master score's ownership.
 
 ### Lyrics on chords
 

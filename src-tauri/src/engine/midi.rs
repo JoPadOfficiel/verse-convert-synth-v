@@ -293,6 +293,36 @@ const SINGING_INSTRUMENT_NAMES: &[&str] = &[
 /// and Synth Voice, zero-based.
 const SINGING_MIDI_PROGRAMS: std::ops::RangeInclusive<u8> = 52..=54;
 
+/// Whether a notation taxonomy identifier explicitly names percussion.
+///
+/// MuseScore `<instrumentId>` and MusicXML `<instrument-sound>` use dotted
+/// taxonomy identifiers. Match only known percussion families, never display
+/// names or arbitrary source IDs, so a localized part name cannot change
+/// ownership.
+pub(crate) fn instrument_taxonomy_is_percussion(identifier: Option<&str>) -> bool {
+    let Some(identifier) = identifier.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let identifier = identifier.to_ascii_lowercase();
+    let family = identifier
+        .split_once('.')
+        .map_or(identifier.as_str(), |(family, _)| family);
+    matches!(
+        family,
+        "drum" | "percussion" | "pitched-percussion" | "unpitched-percussion"
+    )
+}
+
+fn source_reference_matches_owner(source_reference: &str, owner: &str) -> bool {
+    if source_reference == owner {
+        return true;
+    }
+    owner
+        .strip_prefix(source_reference)
+        .and_then(|suffix| suffix.strip_prefix(":channel:"))
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 impl InstrumentInfo {
     /// Whether this instrument is one that sings, according to what the source
     /// declares and nothing else.
@@ -363,6 +393,9 @@ pub struct InstrumentInfo {
     /// channel/program values while MIDI and MuseScore use zero-based values.
     pub source_channel: Option<i32>,
     pub source_program: Option<i32>,
+    pub source_port: Option<i32>,
+    /// Zero-based port when assigned. Native MuseScore uses -1 for unassigned.
+    pub port: Option<i32>,
     /// Zero-based MIDI channel when the source supplies one.
     pub channel: Option<u8>,
     /// Zero-based MIDI program when the source supplies one.
@@ -375,6 +408,14 @@ pub struct InstrumentInfo {
     /// Raw MusicXML playback mapping (1..=128), when present.
     pub midi_unpitched: Option<u8>,
     pub percussion: bool,
+}
+
+impl InstrumentInfo {
+    pub fn has_invalid_ownership(&self) -> bool {
+        (self.source_channel.is_some_and(|value| value != -1) && self.channel.is_none())
+            || (self.source_program.is_some_and(|value| value != -1) && self.program.is_none())
+            || (self.source_port.is_some_and(|value| value != -1) && self.port.is_none())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -399,6 +440,134 @@ pub struct Track {
 }
 
 impl Track {
+    /// Resolve the owner of this note, never the union of a Part's inventory.
+    pub fn note_instrument_role(&self, note: &NoteOn) -> NoteInstrumentRole {
+        if note.source.unpitched.is_some()
+            || note.channel == Some(9)
+            || note.source.instrument_role == NoteInstrumentRole::Percussion
+        {
+            return NoteInstrumentRole::Percussion;
+        }
+        if note.source.instrument_role == NoteInstrumentRole::Unresolved {
+            return NoteInstrumentRole::Unresolved;
+        }
+        if note.source.instrument_id.as_ref().is_some_and(|owner| {
+            !note.source.instrument_ids.is_empty()
+                && !note
+                    .source
+                    .instrument_ids
+                    .iter()
+                    .any(|source_reference| source_reference_matches_owner(source_reference, owner))
+        }) {
+            return NoteInstrumentRole::Unresolved;
+        }
+        let ids: std::collections::BTreeSet<_> = if let Some(owner) = &note.source.instrument_id {
+            std::iter::once(owner).collect()
+        } else {
+            note.source.instrument_ids.iter().collect()
+        };
+        if !ids.is_empty() {
+            let mut percussion = false;
+            let mut pitched = false;
+            for id in ids {
+                let mut matches = self
+                    .instruments
+                    .iter()
+                    .filter(|instrument| instrument.id.as_ref() == Some(id));
+                let Some(instrument) = matches.next() else {
+                    return NoteInstrumentRole::Unresolved;
+                };
+                if matches.next().is_some()
+                    || instrument.has_invalid_ownership()
+                    || matches!((note.channel, instrument.channel), (Some(a), Some(b)) if a != b)
+                {
+                    return NoteInstrumentRole::Unresolved;
+                }
+                if instrument.percussion || instrument.channel == Some(9) {
+                    percussion = true;
+                } else {
+                    pitched = true;
+                }
+            }
+            return match (percussion, pitched) {
+                (true, true) => NoteInstrumentRole::Unresolved,
+                (true, false) => NoteInstrumentRole::Percussion,
+                _ => NoteInstrumentRole::Pitched,
+            };
+        }
+        // With no explicit references the adapter's per-note proof carries the
+        // active channel variant, including unnamed native channels.
+        if note.source.instrument_role == NoteInstrumentRole::Pitched {
+            return NoteInstrumentRole::Pitched;
+        }
+        if self.role_hint == TrackRoleHint::Percussion {
+            return NoteInstrumentRole::Percussion;
+        }
+        let instrument = if let Some(channel) = note.channel {
+            let mut matches = self
+                .instruments
+                .iter()
+                .filter(|i| i.channel == Some(channel));
+            let first = matches.next();
+            if matches.next().is_some() || (first.is_none() && !self.instruments.is_empty()) {
+                return NoteInstrumentRole::Unresolved;
+            }
+            first
+        } else if self.instruments.len() == 1 {
+            self.instruments.first()
+        } else if self.instruments.len() > 1 {
+            return NoteInstrumentRole::Unresolved;
+        } else {
+            None
+        };
+        if instrument.is_some_and(|i| {
+            i.has_invalid_ownership()
+                || matches!((note.channel, i.channel), (Some(a), Some(b)) if a != b)
+        }) {
+            return NoteInstrumentRole::Unresolved;
+        }
+        if instrument.is_some_and(|i| i.percussion || i.channel == Some(9)) {
+            NoteInstrumentRole::Percussion
+        } else {
+            NoteInstrumentRole::Pitched
+        }
+    }
+
+    /// Source role follows used note owners. Lyrics cannot promote drums, and
+    /// an unused instrument declaration cannot suppress a melodic lane.
+    pub fn note_role_hint(&self, fallback: TrackRoleHint) -> TrackRoleHint {
+        let mut pitched = false;
+        let mut percussion = false;
+        let mut unresolved = false;
+        let mut lyrics = false;
+        for event in &self.events {
+            if let Kind::NoteOn(note) = &event.kind {
+                if note.velocity == Some(0) {
+                    continue;
+                }
+                match self.note_instrument_role(note) {
+                    NoteInstrumentRole::Percussion => percussion = true,
+                    NoteInstrumentRole::Unresolved => unresolved = true,
+                    NoteInstrumentRole::Pitched | NoteInstrumentRole::Unspecified => {
+                        pitched = true;
+                        lyrics |= !note.lyrics.is_empty();
+                    }
+                }
+            }
+        }
+        if percussion && (pitched || unresolved) {
+            TrackRoleHint::Mixed
+        } else if percussion {
+            TrackRoleHint::Percussion
+        } else if unresolved {
+            TrackRoleHint::Ambiguous
+        } else if lyrics {
+            TrackRoleHint::Vocal
+        } else {
+            fallback
+        }
+    }
+
     pub fn new(id: impl Into<String>, source_track: usize) -> Self {
         Self {
             id: id.into(),
@@ -806,6 +975,24 @@ pub struct UnpitchedInfo {
     pub midi_unpitched: Option<u8>,
 }
 
+/// Source-backed note ownership, independent of its numeric playback key and
+/// of the user's requested export representation. Unspecified supports callers
+/// constructing the IR; adapters resolve their own note declarations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteInstrumentRole {
+    #[default]
+    Unspecified,
+    Pitched,
+    Percussion,
+    Unresolved,
+}
+
+impl NoteInstrumentRole {
+    pub fn allows_vocal(self) -> bool {
+        matches!(self, Self::Unspecified | Self::Pitched)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NoteSource {
     pub id: String,
@@ -814,6 +1001,10 @@ pub struct NoteSource {
     pub voice: Option<String>,
     pub chord_id: Option<String>,
     pub instrument_id: Option<String>,
+    /// All explicit note-level references, in source order. MusicXML permits
+    /// more than one; the singular owner is populated only when unambiguous.
+    pub instrument_ids: Vec<String>,
+    pub instrument_role: NoteInstrumentRole,
     pub occurrence: u32,
     /// Source measure index, identical across repeat passes. Notation scopes a
     /// lyric lane to the passage it is written under, so this is what tells a
@@ -1264,6 +1455,9 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
                     }
                     let d1 = data[p];
                     p += 1;
+                    if d1 > 127 {
+                        return Err("invalid MIDI channel data byte".into());
+                    }
                     let kind = if hi == 0xC0 {
                         Kind::ProgramChange {
                             channel,
@@ -1284,6 +1478,9 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
                     let d1 = data[p];
                     let d2 = data[p + 1];
                     p += 2;
+                    if d1 > 127 || d2 > 127 {
+                        return Err("invalid MIDI channel data byte".into());
+                    }
                     let kind = match hi {
                         0x80 => Kind::NoteOff(NoteOff {
                             channel: Some(channel),
@@ -1298,6 +1495,11 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
                             source: NoteSource {
                                 id: format!("midi-t{track_index}-e{order}-note"),
                                 voice: Some((channel + 1).to_string()),
+                                instrument_role: if channel == 9 {
+                                    NoteInstrumentRole::Percussion
+                                } else {
+                                    NoteInstrumentRole::Pitched
+                                },
                                 ..NoteSource::default()
                             },
                             lyrics: Vec::new(),
@@ -1339,64 +1541,60 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
                 _ => None,
             })
             .unwrap_or_default();
-        let mut channels = std::collections::BTreeSet::new();
-        let mut first_program = None;
-        let mut bank_msb = None;
-        let mut bank_lsb = None;
+        validate_port_note_ownership(&events)?;
+        // Summaries belong to one port/channel. The complete program/bank timeline
+        // remains in the original events, including later instrument changes.
+        let mut instruments = std::collections::BTreeMap::<(u8, u8), InstrumentInfo>::new();
+        let mut port = 0;
         for event in &events {
-            match event.kind {
-                Kind::NoteOn(ref note) => {
-                    if let Some(channel) = note.channel {
-                        channels.insert(channel);
-                    }
+            if let Kind::Port(value) = event.kind {
+                port = value;
+            }
+            let channel = match &event.kind {
+                Kind::NoteOn(note) => note.channel,
+                Kind::ProgramChange { channel, .. } | Kind::ControlChange { channel, .. } => {
+                    Some(*channel)
                 }
-                Kind::ProgramChange { channel, program } => {
-                    channels.insert(channel);
-                    first_program.get_or_insert(program);
+                _ => None,
+            };
+            let Some(channel) = channel else { continue };
+            let instrument = instruments
+                .entry((port, channel))
+                .or_insert_with(|| InstrumentInfo {
+                    source_channel: Some(i32::from(channel)),
+                    source_port: Some(i32::from(port)),
+                    port: Some(i32::from(port)),
+                    channel: Some(channel),
+                    percussion: channel == 9,
+                    ..InstrumentInfo::default()
+                });
+            match event.kind {
+                Kind::ProgramChange { program, .. } => {
+                    instrument.program.get_or_insert(program);
+                    instrument.source_program.get_or_insert(i32::from(program));
                 }
                 Kind::ControlChange {
-                    channel,
-                    controller,
+                    controller: 0,
                     value,
+                    ..
                 } => {
-                    channels.insert(channel);
-                    if controller == 0 {
-                        bank_msb.get_or_insert(value);
-                    } else if controller == 32 {
-                        bank_lsb.get_or_insert(value);
-                    }
+                    instrument.bank_msb.get_or_insert(value);
+                }
+                Kind::ControlChange {
+                    controller: 32,
+                    value,
+                    ..
+                } => {
+                    instrument.bank_lsb.get_or_insert(value);
                 }
                 _ => {}
             }
         }
-        let channel = (channels.len() == 1)
-            .then(|| channels.iter().next().copied())
-            .flatten();
-        let percussion = channels.contains(&9);
-        if percussion {
-            track.role_hint = if channels.len() == 1 {
-                TrackRoleHint::Percussion
-            } else {
-                TrackRoleHint::Mixed
-            };
-        }
-        if channel.is_some() || first_program.is_some() || bank_msb.is_some() || bank_lsb.is_some()
-        {
-            let instrument = InstrumentInfo {
-                source_channel: channel.map(i32::from),
-                source_program: first_program.map(i32::from),
-                channel,
-                program: first_program,
-                bank_msb,
-                bank_lsb,
-                percussion,
-                ..InstrumentInfo::default()
-            };
-            track.instrument = Some(instrument.clone());
-            track.instruments.push(instrument);
-        }
+        track.instruments = instruments.into_values().collect();
+        track.instrument = (track.instruments.len() == 1).then(|| track.instruments[0].clone());
         track.text_profile = classify_text_profile(&events);
         track.events = events;
+        track.role_hint = track.note_role_hint(TrackRoleHint::Ambiguous);
         tracks.extend(split_polyphonic_voices(track)?);
         declared_tracks += 1;
     }
@@ -1424,6 +1622,54 @@ fn parse_smf(data: &[u8]) -> Result<Midi, String> {
         topology,
         tracks,
     })
+}
+
+/// The existing note queues are channel/key based. Refuse the cross-port
+/// collisions they cannot represent, while preserving independent and
+/// sequential port routes in the original event timeline.
+fn validate_port_note_ownership(events: &[Event]) -> Result<(), String> {
+    let mut port = 0;
+    let mut open = std::collections::BTreeMap::<(Option<u8>, Option<u8>), (u8, usize)>::new();
+    for event in events {
+        let (channel, key, starts) = match &event.kind {
+            Kind::Port(value) => {
+                if *value > 127 {
+                    return Err(
+                        "SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: invalid MIDI port declaration"
+                            .into(),
+                    );
+                }
+                port = *value;
+                continue;
+            }
+            Kind::Meta {
+                meta_type: 0x21, ..
+            } => {
+                return Err(
+                    "SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: invalid MIDI port declaration".into(),
+                )
+            }
+            Kind::NoteOn(note) => (note.channel, note.key, note.velocity != Some(0)),
+            Kind::NoteOff(note) => (note.channel, note.key, false),
+            _ => continue,
+        };
+        let route = (channel, key);
+        if open
+            .get(&route)
+            .is_some_and(|&(other_port, _)| other_port != port)
+        {
+            return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: overlapping MIDI port routes reuse a channel/key; note ownership cannot be assigned safely".into());
+        }
+        if starts {
+            open.entry(route).or_insert((port, 0)).1 += 1;
+        } else if let Some((_, count)) = open.get_mut(&route) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&route);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Splits one MIDI track into monophonic lanes, one per simultaneous voice.
@@ -1619,8 +1865,10 @@ mod tests {
         // split would clone the track once per stuck voice and exhaust memory
         // on a malformed or hostile file.
         let mut track: Vec<u8> = Vec::new();
-        for key in 0..200u8 {
-            track.extend_from_slice(&[0x00, 0x90, key, 100]);
+        for voice in 0..=128u16 {
+            let channel = u8::try_from(voice / 128).unwrap();
+            let key = u8::try_from(voice % 128).unwrap();
+            track.extend_from_slice(&[0x00, 0x90 | channel, key, 100]);
         }
         track.extend_from_slice(&[0x00, 0xff, 0x2f, 0x00]);
         let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();

@@ -5,10 +5,10 @@
 //! Rest (including full measures), location, and all source lyric lanes.
 use crate::engine::midi::{
     merge_measure_marks, unroll_with_passes, ChordReading, Event, InstrumentInfo, Jump, Kind,
-    Lyric, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff, NoteOn,
-    NoteSource, SourceContinuity, SourceContinuityIssue, SourceEvidenceRef, SourceExtension,
-    SourceFormat, SourceNoteRef, SourcePart, SourceStaff, SourceTie, SourceTopology, SourceVoice,
-    StaffLink, Syllabic, TimeBase, Track, TrackRoleHint, TrackSource,
+    Lyric, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteInstrumentRole,
+    NoteOff, NoteOn, NoteSource, SourceContinuity, SourceContinuityIssue, SourceEvidenceRef,
+    SourceExtension, SourceFormat, SourceNoteRef, SourcePart, SourceStaff, SourceTie,
+    SourceTopology, SourceVoice, StaffLink, Syllabic, TimeBase, Track, TrackRoleHint, TrackSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
@@ -1918,6 +1918,34 @@ fn normalized_staff_content(staff: roxmltree::Node) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// A present malformed declaration is evidence of uncertainty, not absence.
+/// This also handles native program attributes and their legacy text form.
+fn instrument_integer<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    field: &str,
+    min: i32,
+    max: i32,
+) -> Result<Option<i32>, String> {
+    let mut result = None;
+    for raw in values {
+        let value = raw
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|value| (min..=max).contains(value))
+            .ok_or_else(|| {
+                format!(
+                    "SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: invalid MuseScore {field}: {raw:?}"
+                )
+            })?;
+        if result.is_some_and(|previous| previous != value) {
+            return Err(format!("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: contradictory MuseScore {field} declarations"));
+        }
+        result = Some(value);
+    }
+    Ok(result)
+}
+
 pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     crate::engine::musicxml::check_nesting(xml)?;
     let opts = roxmltree::ParsingOptions {
@@ -1953,6 +1981,24 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         name: String,
         role: TrackRoleHint,
         instruments: Vec<InstrumentInfo>,
+        instrument_count: usize,
+    }
+
+    // These declarations change the active owner over time. Until their
+    // staff/voice timeline is represented, retaining the initial instrument
+    // would silently reassign later notes. Refuse rather than guess.
+    if score
+        .children()
+        .filter(|node| node.has_tag_name("Staff"))
+        .flat_map(|staff| staff.descendants())
+        .any(|node| {
+            matches!(
+                node.tag_name().name(),
+                "InstrumentChange" | "channelSwitch" | "articulationChange" | "StaffTypeChange"
+            )
+        })
+    {
+        return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: native instrument, channel or staff-type changes cannot be assigned safely; the original source remains unchanged".into());
     }
 
     let top_level_staff_ids: Vec<&str> = score
@@ -2004,9 +2050,13 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                     .filter(|s| !s.is_empty())
             })
             .unwrap_or_default();
-        let instrument_node = part.children().find(|c| c.has_tag_name("Instrument"));
+        let instrument_nodes: Vec<_> = part
+            .children()
+            .filter(|c| c.has_tag_name("Instrument"))
+            .collect();
+        let instrument_count = instrument_nodes.len();
         let mut instruments = Vec::new();
-        if let Some(instrument_node) = instrument_node {
+        for instrument_node in instrument_nodes {
             let id = instrument_node
                 .attribute("id")
                 .map(str::to_string)
@@ -2021,10 +2071,19 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 .map(|node| collapse_ws(&deep_text(node)))
                 .filter(|value| !value.is_empty())
                 .or_else(|| child_text(instrument_node, "trackName").map(str::to_string));
-            let percussion = child_text(instrument_node, "useDrumset") == Some("1")
+            let percussion = instrument_integer(
+                instrument_node
+                    .children()
+                    .filter(|node| node.has_tag_name("useDrumset"))
+                    .map(|node| node.text().unwrap_or("")),
+                "useDrumset",
+                0,
+                1,
+            )? == Some(1)
                 || instrument_node
                     .descendants()
-                    .any(|node| node.has_tag_name("Drum"));
+                    .any(|node| node.has_tag_name("Drum"))
+                || crate::engine::midi::instrument_taxonomy_is_percussion(sound_id.as_deref());
             let channels: Vec<_> = instrument_node
                 .children()
                 .filter(|node| node.has_tag_name("Channel"))
@@ -2039,28 +2098,74 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 });
             } else {
                 for (channel_index, channel_node) in channels.into_iter().enumerate() {
-                    let source_channel = channel_node
-                        .attribute("channel")
-                        .and_then(|value| value.parse::<i32>().ok())
-                        .or_else(|| {
-                            child_text(channel_node, "channel")
-                                .and_then(|value| value.parse::<i32>().ok())
-                        });
-                    let source_program = child(channel_node, "program")
-                        .and_then(|program| program.attribute("value"))
-                        .and_then(|value| value.parse::<i32>().ok());
+                    // MuseScore 4.7.5 read400/tread.cpp reads midiChannel and
+                    // midiPort directly; -1 means unassigned, not channel 0.
+                    let source_channel = instrument_integer(
+                        channel_node.attribute("channel").into_iter().chain(
+                            channel_node
+                                .children()
+                                .filter(|node| {
+                                    matches!(node.tag_name().name(), "midiChannel" | "channel")
+                                })
+                                .map(|node| node.text().unwrap_or("")),
+                        ),
+                        "midiChannel",
+                        -1,
+                        15,
+                    )?;
+                    let source_port = instrument_integer(
+                        channel_node
+                            .children()
+                            .filter(|node| node.has_tag_name("midiPort"))
+                            .map(|node| node.text().unwrap_or("")),
+                        "midiPort",
+                        -1,
+                        i32::MAX,
+                    )?;
+                    let mut program_values = Vec::new();
+                    for program in channel_node
+                        .children()
+                        .filter(|node| node.has_tag_name("program"))
+                    {
+                        let attribute = program.attribute("value");
+                        let text = program.text().filter(|text| !text.trim().is_empty());
+                        // Native -1 in the attribute selects the text fallback.
+                        if attribute.is_some_and(|value| value.trim() == "-1") && text.is_some() {
+                            program_values.extend(text);
+                        } else {
+                            program_values.extend(attribute);
+                            program_values.extend(text);
+                            if attribute.is_none() && text.is_none() {
+                                program_values.push("");
+                            }
+                        }
+                    }
+                    let source_program = instrument_integer(program_values, "program", -1, 127)?;
                     let controllers: Vec<(u8, u8)> = channel_node
                         .children()
                         .filter(|node| node.has_tag_name("controller"))
-                        .filter_map(|node| {
-                            let controller = node.attribute("ctrl")?.parse::<u8>().ok()?;
-                            let value = node.attribute("value")?.parse::<u8>().ok()?;
-                            Some((controller, value))
+                        .map(|node| {
+                            let controller = instrument_integer(
+                                [node.attribute("ctrl").unwrap_or("")],
+                                "controller number",
+                                0,
+                                127,
+                            )?
+                            .unwrap();
+                            let value = instrument_integer(
+                                [node.attribute("value").unwrap_or("")],
+                                "controller value",
+                                0,
+                                127,
+                            )?
+                            .unwrap();
+                            Ok((controller as u8, value as u8))
                         })
-                        .collect();
+                        .collect::<Result<_, String>>()?;
                     let controller = |number| {
                         controllers
                             .iter()
+                            .rev()
                             .find_map(|&(key, value)| (key == number).then_some(value))
                     };
                     instruments.push(InstrumentInfo {
@@ -2071,14 +2176,20 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                         name: instrument_name.clone(),
                         source_channel,
                         source_program,
-                        channel: source_channel.and_then(|value| u8::try_from(value).ok()),
-                        program: source_program.and_then(|value| u8::try_from(value).ok()),
+                        source_port,
+                        port: source_port.filter(|value| *value >= 0),
+                        channel: source_channel
+                            .and_then(|value| u8::try_from(value).ok())
+                            .filter(|value| *value < 16),
+                        program: source_program
+                            .and_then(|value| u8::try_from(value).ok())
+                            .filter(|value| *value < 128),
                         bank_msb: controller(0),
                         bank_lsb: controller(32),
                         volume: controller(7).map(f64::from),
                         pan: controller(10).map(f64::from),
                         controllers,
-                        percussion,
+                        percussion: percussion || source_channel == Some(9),
                         ..InstrumentInfo::default()
                     });
                 }
@@ -2134,8 +2245,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 .children()
                 .find(|node| node.has_tag_name("StaffType"))
                 .and_then(|node| node.attribute("group"));
-            let percussion = matches!(group, Some("percussion" | "unpitched"))
-                || instruments.iter().any(|instrument| instrument.percussion);
+            let percussion = matches!(group, Some("percussion" | "unpitched"));
             staff_info.insert(
                 staff_id,
                 StaffInfo {
@@ -2147,6 +2257,7 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                         TrackRoleHint::Ambiguous
                     },
                     instruments: instruments.clone(),
+                    instrument_count,
                 },
             );
         }
@@ -2659,10 +2770,67 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                             super::score_intensity::source::time(pos, tpb)?,
                                         )?;
                                     }
-                                    let channel = info
-                                        .instruments
-                                        .first()
-                                        .and_then(|instrument| instrument.channel);
+                                    let instrument_refs: Vec<_> = note
+                                        .children()
+                                        .filter(|node| node.has_tag_name("instrument"))
+                                        .map(|node| node.attribute("id").unwrap_or("").to_string())
+                                        .collect();
+                                    let subchannel = child_text(note, "subchannel")
+                                        .or_else(|| child_text(el, "subchannel"));
+                                    let explicit_channel =
+                                        subchannel.and_then(|value| value.parse::<usize>().ok());
+                                    let instrument = if instrument_refs.len() == 1 {
+                                        let reference = &instrument_refs[0];
+                                        let variant_id = format!(
+                                            "{reference}:channel:{}",
+                                            explicit_channel.unwrap_or(0)
+                                        );
+                                        let mut matches =
+                                            info.instruments.iter().filter(|instrument| {
+                                                let id = instrument.id.as_deref();
+                                                (subchannel.is_none()
+                                                    && id == Some(reference.as_str()))
+                                                    || id == Some(variant_id.as_str())
+                                            });
+                                        let first = matches.next();
+                                        if (subchannel.is_none() || explicit_channel.is_some())
+                                            && matches.next().is_none()
+                                        {
+                                            first
+                                        } else {
+                                            None
+                                        }
+                                    } else if instrument_refs.is_empty()
+                                        && info.instrument_count == 1
+                                    {
+                                        // Channel zero is the initial native Instrument channel;
+                                        // unused playback variants do not own this note.
+                                        if subchannel.is_some() && explicit_channel.is_none() {
+                                            None
+                                        } else {
+                                            info.instruments.get(explicit_channel.unwrap_or(0))
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let unresolved = (!info.instruments.is_empty()
+                                        || !instrument_refs.is_empty()
+                                        || subchannel.is_some())
+                                        && instrument.is_none()
+                                        || instrument
+                                            .is_some_and(InstrumentInfo::has_invalid_ownership);
+                                    let instrument_role = if info.role == TrackRoleHint::Percussion
+                                    {
+                                        NoteInstrumentRole::Percussion
+                                    } else if unresolved {
+                                        NoteInstrumentRole::Unresolved
+                                    } else if instrument.is_some_and(|i| i.percussion) {
+                                        NoteInstrumentRole::Percussion
+                                    } else {
+                                        NoteInstrumentRole::Pitched
+                                    };
+                                    let channel =
+                                        instrument.and_then(|instrument| instrument.channel);
                                     // The note the word goes to under a
                                     // reduction joins its voice's own lane, so
                                     // the sung line is continuous; every other
@@ -2844,10 +3012,14 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                                 staff_id: Some(staff_id.clone()),
                                                 voice: Some((voice_index + 1).to_string()),
                                                 chord_id: Some(chord_id.clone()),
-                                                instrument_id: info
-                                                    .instruments
-                                                    .first()
-                                                    .and_then(|instrument| instrument.id.clone()),
+                                                instrument_id: instrument
+                                                    .and_then(|i| i.id.clone())
+                                                    .or_else(|| {
+                                                        (instrument_refs.len() == 1)
+                                                            .then(|| instrument_refs[0].clone())
+                                                    }),
+                                                instrument_ids: instrument_refs,
+                                                instrument_role,
                                                 occurrence: pass,
                                                 measure: u32::try_from(mi).ok(),
                                                 grace,
@@ -3047,18 +3219,13 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 role_hint: info.role,
                 text_profile: MidiTextProfile::Generic,
                 instruments: info.instruments.clone(),
-                instrument: info.instruments.first().cloned(),
+                instrument: (info.instruments.len() == 1).then(|| info.instruments[0].clone()),
                 chord_reading: chord_reading_decided
                     .then(|| (chord_reading, chord_reading_evidence.clone())),
                 events,
             };
-            if track
-                .events
-                .iter()
-                .any(|event| matches!(&event.kind, Kind::NoteOn(note) if !note.lyrics.is_empty()))
-            {
-                track.role_hint = TrackRoleHint::Vocal;
-            } else {
+            track.role_hint = track.note_role_hint(TrackRoleHint::Instrumental);
+            if track.role_hint != TrackRoleHint::Vocal {
                 // The reading is a statement about what is sung, so only a lane
                 // that sings reports it. Repeating it on every silent member of
                 // every chord would bury it.

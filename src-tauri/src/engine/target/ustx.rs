@@ -549,6 +549,7 @@ pub fn lyric_reinterpretation(text: &str) -> Option<String> {
 /// The single entry point of this target: one neutral projection in, one
 /// OpenUtau 0.6 project out.
 pub fn serialize(project: &ProjectedProject) -> Result<UstxProject, String> {
+    project.validate_vocal_ownership()?;
     if let Some(violation) = project.continuity_violation() {
         return Err(violation);
     }
