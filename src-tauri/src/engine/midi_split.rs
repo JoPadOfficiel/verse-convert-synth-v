@@ -8,10 +8,13 @@
 //!
 //! A MIDI file, unlike a score, can be divided exactly: its tracks are already
 //! separate `MTrk` chunks. Each stem is therefore the source chunk copied byte
-//! for byte, preceded by a rebuilt meta track carrying only the marks that
-//! govern the whole file — tempo, meter, key, SMPTE offset. Nothing is
+//! for byte, preceded by a rebuilt context track carrying the global marks
+//! and attributable channel state from other source tracks. Nothing is
 //! transposed, quantised, or invented; a stem is a subset of the source, and
-//! which source track it holds is known because this code chose it.
+//! which source track it holds is known because this code chose it. Ambiguous
+//! cross-track ordering and unattributable system state are explicitly refused.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A single-track Standard MIDI File carrying one source track and the meta
 /// marks that place it on the score's timeline.
@@ -117,6 +120,9 @@ fn read_header(data: &[u8]) -> Result<Header, String> {
     if length < 6 {
         return Err("MIDI header chunk is too short".into());
     }
+    if u16::from_be_bytes([data[8], data[9]]) > 1 {
+        return Err("MIDI_STEM_INDEPENDENT_SEQUENCES: independent MIDI sequences cannot share a stem timeline".into());
+    }
     let division = u16::from_be_bytes([data[12], data[13]]);
     let track_count = usize::from(u16::from_be_bytes([data[10], data[11]]));
     let body_offset = 8usize
@@ -159,13 +165,31 @@ fn track_bodies(data: &[u8], header: &Header) -> Result<Vec<(usize, usize)>, Str
 /// A global meta event and the absolute tick it sits on.
 type TimedMeta = (u32, Vec<u8>);
 
+struct ChannelEvent {
+    tick: u32,
+    port: u8,
+    channel: u8,
+    note: bool,
+    bytes: Vec<u8>,
+}
+
+struct TrackScan {
+    metas: Vec<TimedMeta>,
+    end_tick: u32,
+    channels: Vec<ChannelEvent>,
+    system_ports: BTreeSet<u8>,
+}
+
 /// Absolute-tick global meta events of one track, plus the tick its last event
 /// sits on. Running status is honoured so channel events are skipped exactly.
-fn scan_track(body: &[u8]) -> Result<(Vec<TimedMeta>, u32), String> {
+fn scan_track(body: &[u8]) -> Result<TrackScan, String> {
     let mut reader = Reader::new(body);
     let mut tick: u32 = 0;
     let mut metas = Vec::new();
     let mut running: Option<u8> = None;
+    let mut port = 0;
+    let mut channels = Vec::new();
+    let mut system_ports = BTreeSet::new();
     while !reader.done() {
         let delta = reader.varint()?;
         tick = tick
@@ -177,12 +201,22 @@ fn scan_track(body: &[u8]) -> Result<(Vec<TimedMeta>, u32), String> {
             reader.byte()?;
             let kind = reader.byte()?;
             let length = reader.varint()? as usize;
-            reader.take(length)?;
+            let payload = reader.take(length)?;
+            if kind == 0x21 {
+                if payload.len() != 1 || payload[0] > 127 {
+                    return Err("MIDI_STEM_PORT_UNRESOLVED: invalid MIDI port declaration".into());
+                }
+                port = payload[0];
+            }
             if GLOBAL_META.contains(&kind) {
                 metas.push((tick, body[start..reader.position].to_vec()));
             }
             running = None;
+            if kind == 0x2f {
+                break;
+            }
         } else if status == 0xf0 || status == 0xf7 {
+            system_ports.insert(port);
             reader.byte()?;
             let length = reader.varint()? as usize;
             reader.take(length)?;
@@ -201,23 +235,147 @@ fn scan_track(body: &[u8]) -> Result<(Vec<TimedMeta>, u32), String> {
                 0x80 | 0x90 | 0xa0 | 0xb0 | 0xe0 => 2,
                 _ => return Err(format!("unsupported MIDI status byte {status:#04x}")),
             };
-            reader.take(data_bytes)?;
+            let payload = reader.take(data_bytes)?;
+            if payload.iter().any(|byte| *byte > 127) {
+                return Err("MIDI channel event has an invalid data byte".into());
+            }
+            let mut bytes = vec![status];
+            bytes.extend_from_slice(payload);
+            channels.push(ChannelEvent {
+                tick,
+                port,
+                channel: status & 0x0f,
+                note: matches!(status & 0xf0, 0x80 | 0x90),
+                bytes,
+            });
         }
     }
-    Ok((metas, tick))
+    Ok(TrackScan {
+        metas,
+        end_tick: tick,
+        channels,
+        system_ports,
+    })
 }
 
-fn meta_track(metas: &[TimedMeta], end_tick: u32) -> Vec<u8> {
+/// Retain state only on the port/channel actually used by the selected notes.
+/// SMF does not establish a total order between events in different tracks at
+/// the same tick. Moving such a state change before a note would guess a patch,
+/// bank, sustain or bend, so those dependencies are refused explicitly.
+fn context_for_track(
+    scans: &[TrackScan],
+    selected: usize,
+    metas: &[TimedMeta],
+    end_tick: u32,
+) -> Result<Vec<u8>, String> {
+    let own = &scans[selected];
+    let used: BTreeSet<_> = own
+        .channels
+        .iter()
+        .filter(|event| event.note)
+        .map(|event| (event.port, event.channel))
+        .collect();
+    let own_ticks: BTreeSet<_> = own
+        .channels
+        .iter()
+        .map(|event| (event.port, event.channel, event.tick))
+        .collect();
+    let mut state_owners = BTreeMap::new();
+    let mut context = metas.to_vec();
+    for (track_index, scan) in scans.iter().enumerate() {
+        if track_index == selected {
+            continue;
+        }
+        if scan
+            .system_ports
+            .iter()
+            .any(|port| used.iter().any(|(used_port, _)| port == used_port))
+        {
+            return Err(format!("MIDI_STEM_SYSTEM_STATE_UNRESOLVED: source track {selected} shares a port with system-exclusive state in track {track_index}"));
+        }
+        for event in scan
+            .channels
+            .iter()
+            .filter(|event| !event.note && used.contains(&(event.port, event.channel)))
+        {
+            let key = (event.port, event.channel, event.tick);
+            if own_ticks.contains(&key)
+                || state_owners
+                    .insert(key, track_index)
+                    .is_some_and(|owner| owner != track_index)
+            {
+                return Err(format!("MIDI_STEM_SHARED_STATE_ORDER_UNRESOLVED: source track {selected}, port {}, channel {}, tick {} has simultaneous state in another track", event.port, event.channel, event.tick));
+            }
+            context.push((event.tick, vec![0xff, 0x21, 1, event.port]));
+            context.push((event.tick, event.bytes.clone()));
+        }
+    }
+    context.sort_by_key(|(tick, _)| *tick);
+    meta_track(&context, end_tick)
+}
+
+fn meta_track(metas: &[TimedMeta], end_tick: u32) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     let mut previous = 0u32;
     for (tick, event) in metas {
-        write_varint(&mut body, tick.saturating_sub(previous));
+        let delta = tick
+            .checked_sub(previous)
+            .filter(|delta| *delta <= 0x0fff_ffff)
+            .ok_or(
+                "MIDI_STEM_TIMING_UNREPRESENTABLE: context delta exceeds the MIDI timing range",
+            )?;
+        write_varint(&mut body, delta);
         body.extend_from_slice(event);
         previous = *tick;
     }
-    write_varint(&mut body, end_tick.saturating_sub(previous));
+    let delta = end_tick
+        .checked_sub(previous)
+        .filter(|delta| *delta <= 0x0fff_ffff)
+        .ok_or("MIDI_STEM_TIMING_UNREPRESENTABLE: context tail exceeds the MIDI timing range")?;
+    write_varint(&mut body, delta);
     body.extend_from_slice(&[0xff, 0x2f, 0x00]);
-    chunk(b"MTrk", &body)
+    Ok(chunk(b"MTrk", &body))
+}
+
+/// Removing another track's note-off must never lengthen a selected note.
+/// Same-key cross-track overlaps and simultaneous boundaries have no proven
+/// track-local ownership; sequential independent uses remain supported.
+fn validate_shared_note_ownership(scans: &[TrackScan]) -> Result<(), String> {
+    let mut routes: BTreeMap<_, Vec<(usize, &ChannelEvent)>> = BTreeMap::new();
+    for (owner, scan) in scans.iter().enumerate() {
+        for event in scan.channels.iter().filter(|event| event.note) {
+            routes
+                .entry((event.port, event.channel, event.bytes[1]))
+                .or_default()
+                .push((owner, event));
+        }
+    }
+    for events in routes.values_mut() {
+        if events.iter().all(|(owner, _)| *owner == events[0].0) {
+            continue;
+        }
+        events.sort_by_key(|(_, event)| event.tick);
+        let mut previous: Option<(u32, usize)> = None;
+        let mut active: Option<(usize, usize)> = None;
+        for &(owner, event) in events.iter() {
+            if previous
+                .is_some_and(|(tick, previous_owner)| tick == event.tick && owner != previous_owner)
+                || active.is_some_and(|(active_owner, _)| active_owner != owner)
+            {
+                return Err("MIDI_STEM_NOTE_OWNERSHIP_UNRESOLVED: tracks share overlapping notes or note-offs on the same port/channel/key".into());
+            }
+            previous = Some((event.tick, owner));
+            if event.bytes[0] & 0xf0 == 0x90 && event.bytes[2] != 0 {
+                active.get_or_insert((owner, 0)).1 += 1;
+            } else if let Some((_, count)) = &mut active {
+                *count -= 1;
+                if *count == 0 {
+                    active = None;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -231,7 +389,8 @@ fn chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
 /// One playable single-track file per source track, in source order.
 ///
 /// Every slice keeps its source chunk byte for byte and gains a meta track
-/// holding the file's tempo, meter, key and SMPTE marks so it renders on the
+/// holding the file's tempo, meter, key, SMPTE marks and attributable external
+/// channel state so it renders on the
 /// same timeline as the whole file. A track carrying no events of its own is
 /// still returned, so callers can index slices by source track number.
 pub fn split_tracks(data: &[u8]) -> Result<Vec<MidiTrackSlice>, String> {
@@ -239,15 +398,31 @@ pub fn split_tracks(data: &[u8]) -> Result<Vec<MidiTrackSlice>, String> {
     let bodies = track_bodies(data, &header)?;
     let mut metas: Vec<TimedMeta> = Vec::new();
     let mut end_tick = 0u32;
+    let mut scans = Vec::with_capacity(bodies.len());
     for (start, end) in &bodies {
-        let (track_metas, last_tick) = scan_track(&data[*start..*end])?;
-        metas.extend(track_metas);
-        end_tick = end_tick.max(last_tick);
+        let scan = scan_track(&data[*start..*end])?;
+        metas.extend(scan.metas.iter().cloned());
+        end_tick = end_tick.max(scan.end_tick);
+        scans.push(scan);
+    }
+    validate_shared_note_ownership(&scans)?;
+    let mut global_owners = BTreeMap::new();
+    for (owner, scan) in scans.iter().enumerate() {
+        for (tick, bytes) in &scan.metas {
+            let key = (*tick, bytes[1]);
+            let (first_owner, first_bytes, multiple_owners, different_values) = global_owners
+                .entry(key)
+                .or_insert((owner, bytes, false, false));
+            *multiple_owners |= *first_owner != owner;
+            *different_values |= *first_bytes != bytes;
+            if *multiple_owners && *different_values {
+                return Err("MIDI_STEM_GLOBAL_STATE_ORDER_UNRESOLVED: conflicting simultaneous global playback marks in different tracks".into());
+            }
+        }
     }
     // A stable sort keeps two marks written on the same tick in file order, so
     // the meta track reads exactly as the source does.
     metas.sort_by_key(|(tick, _)| *tick);
-    let meta = meta_track(&metas, end_tick);
 
     let mut header_body = Vec::with_capacity(6);
     header_body.extend_from_slice(&1u16.to_be_bytes()); // format 1: parallel tracks
@@ -255,19 +430,20 @@ pub fn split_tracks(data: &[u8]) -> Result<Vec<MidiTrackSlice>, String> {
     header_body.extend_from_slice(&header.division.to_be_bytes());
     let prefix = chunk(b"MThd", &header_body);
 
-    Ok(bodies
+    bodies
         .iter()
         .enumerate()
         .map(|(source_track, (start, end))| {
+            let meta = context_for_track(&scans, source_track, &metas, end_tick)?;
             let mut bytes = prefix.clone();
             bytes.extend_from_slice(&meta);
             bytes.extend_from_slice(&chunk(b"MTrk", &data[*start..*end]));
-            MidiTrackSlice {
+            Ok(MidiTrackSlice {
                 source_track,
                 bytes,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]

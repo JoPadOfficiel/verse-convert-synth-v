@@ -3,9 +3,10 @@
 //! whole multi-track conversion logic can be reused.
 use crate::engine::midi::{
     merge_measure_marks, unroll_with_passes, Event, InstrumentInfo, Jump, Kind, Lyric,
-    LyricExtension, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile, NoteOff,
-    NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff, SourceTopology, SourceVoice,
-    Syllabic, TimeBase, Track, TrackRoleHint, TrackSource, UnpitchedInfo,
+    LyricExtension, LyricFragment, LyricState, MeasureMarks, Midi, MidiTextProfile,
+    NoteInstrumentRole, NoteOff, NoteOn, NoteSource, SourceFormat, SourcePart, SourceStaff,
+    SourceTopology, SourceVoice, Syllabic, TimeBase, Track, TrackRoleHint, TrackSource,
+    UnpitchedInfo,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -1000,6 +1001,58 @@ fn resolve_jump_targets(marks: &mut [MeasureMarks]) {
     }
 }
 
+fn instrument_integer(
+    node: roxmltree::Node,
+    tag: &str,
+    maximum: i32,
+) -> Result<Option<i32>, String> {
+    if node
+        .children()
+        .filter(|child| child.has_tag_name(tag))
+        .count()
+        > 1
+    {
+        return Err(format!(
+            "SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: duplicate MusicXML {tag}"
+        ));
+    }
+    strict_child_i64(
+        node,
+        tag,
+        "SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: MusicXML instrument",
+    )?
+    .map(|value| {
+        i32::try_from(value)
+            .ok()
+            .filter(|value| (1..=maximum).contains(value))
+            .ok_or_else(|| {
+                format!("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: invalid MusicXML {tag}: {value}")
+            })
+    })
+    .transpose()
+}
+
+fn update_percussion_clefs(
+    attributes: roxmltree::Node<'_, '_>,
+    roles: &mut BTreeMap<String, bool>,
+) {
+    for clef in attributes
+        .children()
+        .filter(|node| node.has_tag_name("clef"))
+    {
+        if let Some(sign) = clef
+            .children()
+            .find(|node| node.has_tag_name("sign"))
+            .and_then(|node| node.text())
+        {
+            roles.insert(
+                clef.attribute("number").unwrap_or("1").to_string(),
+                sign.trim() == "percussion",
+            );
+        }
+    }
+}
+
 fn parse_musicxml(xml: &str) -> Result<Midi, String> {
     check_nesting(xml)?;
     let safe_xml = mask_external_musicxml_doctype(xml)?;
@@ -1024,9 +1077,10 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
     let mut part_info: HashMap<String, PartInfo> = HashMap::new();
     if let Some(list) = root.children().find(|n| n.has_tag_name("part-list")) {
         for sp in list.children().filter(|n| n.has_tag_name("score-part")) {
-            let Some(part_id) = sp.attribute("id") else {
-                continue;
-            };
+            let part_id = sp
+                .attribute("id")
+                .filter(|id| !id.trim().is_empty())
+                .ok_or("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: MusicXML score-part has no ID")?;
             let name = sp
                 .children()
                 .find(|node| node.has_tag_name("part-name"))
@@ -1038,9 +1092,8 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 .children()
                 .filter(|node| node.has_tag_name("score-instrument"))
             {
-                let Some(id) = score_instrument.attribute("id") else {
-                    continue;
-                };
+                let id = score_instrument.attribute("id").filter(|id| !id.trim().is_empty())
+                    .ok_or("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: MusicXML score-instrument has no ID")?;
                 let instrument_name = score_instrument
                     .children()
                     .find(|node| node.has_tag_name("instrument-name"))
@@ -1055,23 +1108,34 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                     .find(|node| node.has_tag_name("instrument-sound"))
                     .map(crate::engine::musescore::deep_text)
                     .filter(|value| !value.is_empty());
-                instruments.insert(
-                    id.to_string(),
-                    InstrumentInfo {
-                        id: Some(id.to_string()),
-                        sound_id,
-                        name: instrument_name,
-                        ..InstrumentInfo::default()
-                    },
-                );
+                let percussion =
+                    crate::engine::midi::instrument_taxonomy_is_percussion(sound_id.as_deref());
+                if instruments
+                    .insert(
+                        id.to_string(),
+                        InstrumentInfo {
+                            id: Some(id.to_string()),
+                            sound_id,
+                            name: instrument_name,
+                            percussion,
+                            ..InstrumentInfo::default()
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(format!("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: duplicate MusicXML instrument {id:?}"));
+                }
             }
+            let mut midi_instrument_ids = BTreeSet::new();
             for midi_instrument in sp
                 .children()
                 .filter(|node| node.has_tag_name("midi-instrument"))
             {
-                let Some(id) = midi_instrument.attribute("id") else {
-                    continue;
-                };
+                let id = midi_instrument.attribute("id").filter(|id| !id.trim().is_empty())
+                    .ok_or("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: MusicXML midi-instrument has no ID")?;
+                if !midi_instrument_ids.insert(id) {
+                    return Err(format!("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: duplicate MusicXML MIDI instrument {id:?}"));
+                }
                 let instrument =
                     instruments
                         .entry(id.to_string())
@@ -1079,21 +1143,20 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                             id: Some(id.to_string()),
                             ..InstrumentInfo::default()
                         });
-                instrument.source_channel = child_i64(midi_instrument, "midi-channel")
-                    .and_then(|value| i32::try_from(value).ok());
+                instrument.source_channel =
+                    instrument_integer(midi_instrument, "midi-channel", 16)?;
                 instrument.channel = instrument
                     .source_channel
                     .filter(|value| (1..=16).contains(value))
                     .and_then(|value| u8::try_from(value - 1).ok());
-                instrument.source_program = child_i64(midi_instrument, "midi-program")
-                    .and_then(|value| i32::try_from(value).ok());
+                instrument.source_program =
+                    instrument_integer(midi_instrument, "midi-program", 128)?;
                 instrument.program = instrument
                     .source_program
                     .filter(|value| (1..=128).contains(value))
                     .and_then(|value| u8::try_from(value - 1).ok());
-                if let Some(bank) = child_i64(midi_instrument, "midi-bank")
-                    .filter(|value| (1..=16_384).contains(value))
-                    .and_then(|value| u16::try_from(value - 1).ok())
+                if let Some(bank) = instrument_integer(midi_instrument, "midi-bank", 16_384)?
+                    .map(|value| (value - 1) as u16)
                 {
                     instrument.bank_msb = Some((bank >> 7) as u8);
                     instrument.bank_lsb = Some((bank & 0x7f) as u8);
@@ -1108,13 +1171,48 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                     .find(|node| node.has_tag_name("pan"))
                     .and_then(|node| node.text())
                     .and_then(|value| value.trim().parse::<f64>().ok());
-                instrument.midi_unpitched = child_i64(midi_instrument, "midi-unpitched")
-                    .filter(|value| (1..=128).contains(value))
-                    .and_then(|value| u8::try_from(value).ok());
-                instrument.percussion =
-                    instrument.channel == Some(9) || instrument.midi_unpitched.is_some();
+                instrument.midi_unpitched =
+                    instrument_integer(midi_instrument, "midi-unpitched", 128)?
+                        .map(|value| value as u8);
+                instrument.percussion = instrument.percussion
+                    || instrument.channel == Some(9)
+                    || instrument.midi_unpitched.is_some();
             }
-            part_info.insert(part_id.to_string(), PartInfo { name, instruments });
+            for device in sp
+                .children()
+                .filter(|node| node.has_tag_name("midi-device"))
+            {
+                let id = device.attribute("id");
+                if id.is_some_and(|id| !instruments.contains_key(id)) {
+                    return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: MusicXML MIDI device references an unknown instrument".into());
+                }
+                let Some(raw) = device.attribute("port") else {
+                    continue;
+                };
+                let port = raw.trim().parse::<i32>().ok().filter(|port| (1..=16).contains(port))
+                    .ok_or_else(|| format!("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: invalid MusicXML MIDI port: {raw:?}"))?;
+                for (instrument_id, instrument) in &mut instruments {
+                    if id.is_some_and(|id| id != instrument_id) {
+                        continue;
+                    }
+                    if instrument
+                        .source_port
+                        .is_some_and(|previous| previous != port)
+                    {
+                        return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: contradictory MusicXML MIDI device ports".into());
+                    }
+                    instrument.source_port = Some(port);
+                    instrument.port = Some(port - 1);
+                }
+            }
+            if part_info
+                .insert(part_id.to_string(), PartInfo { name, instruments })
+                .is_some()
+            {
+                return Err(format!(
+                    "SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: duplicate MusicXML Part {part_id:?}"
+                ));
+            }
         }
     }
 
@@ -1139,6 +1237,20 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
         .filter(|n| n.has_tag_name("part"))
         .enumerate()
     {
+        if part
+            .descendants()
+            .filter(|node| node.has_tag_name("sound"))
+            .any(|sound| {
+                sound.children().any(|node| {
+                    matches!(
+                        node.tag_name().name(),
+                        "midi-instrument" | "midi-device" | "instrument-change"
+                    )
+                })
+            })
+        {
+            return Err("SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED: MusicXML playback instrument changes cannot be assigned safely; the original source remains unchanged".into());
+        }
         let part_id = part
             .attribute("id")
             .map(str::to_string)
@@ -1226,14 +1338,18 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 .collect(),
         });
         let mut divisions_at_measure = Vec::with_capacity(measures.len());
+        let mut staff_roles_at_measure = Vec::with_capacity(measures.len());
+        let mut carried_staff_roles = BTreeMap::new();
         let mut carried_divisions = 1u32;
         for measure in &measures {
+            staff_roles_at_measure.push(carried_staff_roles.clone());
             divisions_at_measure.push(carried_divisions);
             let mut declared_divisions = None;
             for attributes in measure
                 .children()
                 .filter(|node| node.has_tag_name("attributes"))
             {
+                update_percussion_clefs(attributes, &mut carried_staff_roles);
                 if let Some(value) =
                     strict_child_i64(attributes, "divisions", "MusicXML attributes")?
                 {
@@ -1290,6 +1406,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 )?);
             }
             let mut local_div = divisions_at_measure[mi];
+            let mut staff_roles = staff_roles_at_measure[mi].clone();
             let mut pos: i64 = mstart;
             let mut maxpos: i64 = mstart;
             let mut last_onset: i64 = mstart;
@@ -1299,6 +1416,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
             for (element_index, node) in measure.children().filter(|n| n.is_element()).enumerate() {
                 match node.tag_name().name() {
                     "attributes" => {
+                        update_percussion_clefs(node, &mut staff_roles);
                         if let Some(value) =
                             strict_child_i64(node, "divisions", "MusicXML attributes")?
                         {
@@ -1389,22 +1507,57 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                     super::score_intensity::source::time(onset, tpb)?,
                                 )?;
                             }
-                            let instrument_id = node
+                            let instrument_ids: Vec<String> = node
                                 .children()
-                                .find(|child| child.has_tag_name("instrument"))
-                                .and_then(|child| child.attribute("id"))
-                                .map(str::to_string);
+                                .filter(|child| child.has_tag_name("instrument"))
+                                .map(|child| child.attribute("id").unwrap_or("").to_string())
+                                .collect();
+                            let distinct_ids: BTreeSet<_> = instrument_ids.iter().collect();
+                            let instrument_id = if distinct_ids.len() == 1 {
+                                distinct_ids.first().map(|id| (*id).clone())
+                            } else if distinct_ids.is_empty() && info.instruments.len() == 1 {
+                                info.instruments.keys().next().cloned()
+                            } else {
+                                None
+                            };
+                            let owners: Vec<_> = if instrument_ids.is_empty() {
+                                instrument_id
+                                    .as_ref()
+                                    .and_then(|id| info.instruments.get(id))
+                                    .into_iter()
+                                    .collect()
+                            } else {
+                                instrument_ids
+                                    .iter()
+                                    .filter_map(|id| info.instruments.get(id))
+                                    .collect()
+                            };
+                            let missing_owner = (!instrument_ids.is_empty()
+                                && owners.len() != instrument_ids.len())
+                                || (instrument_ids.is_empty() && info.instruments.len() > 1)
+                                || owners.iter().any(|i| {
+                                    i.source_channel.is_some() && i.channel.is_none()
+                                        || i.source_program.is_some() && i.program.is_none()
+                                });
+                            let has_drums = owners.iter().any(|i| i.percussion);
+                            let has_pitched = owners.iter().any(|i| !i.percussion);
                             let instrument = instrument_id
                                 .as_ref()
-                                .and_then(|id| info.instruments.get(id))
-                                .or_else(|| {
-                                    (info.instruments.len() == 1)
-                                        .then(|| info.instruments.values().next())
-                                        .flatten()
-                                });
+                                .and_then(|id| info.instruments.get(id));
                             let unpitched_node = node
                                 .children()
                                 .find(|child| child.has_tag_name("unpitched"));
+                            let instrument_role = if unpitched_node.is_some()
+                                || staff_roles.get(&staff) == Some(&true)
+                            {
+                                NoteInstrumentRole::Percussion
+                            } else if missing_owner || has_drums && has_pitched {
+                                NoteInstrumentRole::Unresolved
+                            } else if has_drums {
+                                NoteInstrumentRole::Percussion
+                            } else {
+                                NoteInstrumentRole::Pitched
+                            };
                             let unpitched = unpitched_node.map(|unpitched| UnpitchedInfo {
                                 instrument_id: instrument_id.clone(),
                                 display_step: unpitched
@@ -1539,6 +1692,8 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                                         voice: Some(voice),
                                         chord_id: Some(last_chord_id.clone()),
                                         instrument_id,
+                                        instrument_ids,
+                                        instrument_role,
                                         occurrence: pass,
                                         measure: u32::try_from(mi).ok(),
                                         grace: is_grace,
@@ -1626,24 +1781,6 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
             {
                 continue;
             }
-            let has_lyrics = events
-                .iter()
-                .any(|event| matches!(&event.kind, Kind::NoteOn(note) if !note.lyrics.is_empty()));
-            let has_unpitched = events.iter().any(|event| {
-                matches!(&event.kind, Kind::NoteOn(note) if note.source.unpitched.is_some())
-            });
-            let has_pitched = events
-                .iter()
-                .any(|event| matches!(&event.kind, Kind::NoteOn(note) if note.key.is_some() && note.source.unpitched.is_none()));
-            let role_hint = if has_lyrics {
-                TrackRoleHint::Vocal
-            } else if has_unpitched && has_pitched {
-                TrackRoleHint::Mixed
-            } else if has_unpitched {
-                TrackRoleHint::Percussion
-            } else {
-                TrackRoleHint::Instrumental
-            };
             let suffix = if track_count > 1 {
                 if chord_member == 0 {
                     format!(" — staff {staff}, voice {voice}")
@@ -1657,7 +1794,7 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 String::new()
             };
             let instruments: Vec<_> = info.instruments.values().cloned().collect();
-            tracks.push(Track {
+            let mut track = Track {
                 id: if chord_member == 0 {
                     format!("musicxml:{part_id}:staff:{staff}:voice:{voice}")
                 } else {
@@ -1680,9 +1817,9 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                     staff_id: Some(staff),
                     voice: Some(voice),
                 },
-                role_hint,
+                role_hint: TrackRoleHint::Ambiguous,
                 text_profile: MidiTextProfile::Generic,
-                instrument: instruments.first().cloned(),
+                instrument: (instruments.len() == 1).then(|| instruments[0].clone()),
                 instruments,
                 // MusicXML attaches `<lyric>` to a `<note>`, never to the chord,
                 // so it already states which member sings and there is no
@@ -1690,7 +1827,9 @@ fn parse_musicxml(xml: &str) -> Result<Midi, String> {
                 // for anything that needs to know what the part is.
                 chord_reading: None,
                 events,
-            });
+            };
+            track.role_hint = track.note_role_hint(TrackRoleHint::Instrumental);
+            tracks.push(track);
         }
     }
 

@@ -943,6 +943,10 @@ pub fn run() {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/percussion_fixtures.rs"]
+mod percussion_fixtures;
+
+#[cfg(test)]
 mod output_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1235,6 +1239,143 @@ mod output_tests {
         bytes.extend_from_slice(b"MTrk\x00\x00\x00\x0d");
         bytes.extend_from_slice(melody_track);
         bytes
+    }
+
+    #[test]
+    fn instrument_fidelity_reaches_analysis_batch_and_direct_exports_for_every_extension() {
+        let root = temp_dir();
+        let cases = percussion_fixtures::cases();
+        let extensions: std::collections::BTreeSet<_> =
+            cases.iter().map(|(extension, _)| *extension).collect();
+        assert_eq!(extensions, SUPPORTED_EXT.iter().copied().collect());
+        for (extension, bytes) in cases {
+            let source = root.join(format!("source.{extension}"));
+            std::fs::write(&source, &bytes).unwrap();
+            for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+                for force in [false, true] {
+                    let destination =
+                        root.join(format!("{extension}-{}-{force}", target.extension()));
+                    std::fs::create_dir(&destination).unwrap();
+                    let midi = parse_source_snapshot(&bytes, extension).unwrap();
+                    let overrides: HashMap<_, _> =
+                        (0..midi.tracks.len()).map(|id| (id, true)).collect();
+                    let expected: Vec<i64> = if force {
+                        vec![36, 40, 48, 52, 60, 64]
+                    } else {
+                        vec![60, 64]
+                    };
+                    let analysis = process_one(
+                        source.to_str().unwrap(),
+                        false,
+                        None,
+                        "english",
+                        force.then_some(&overrides),
+                        target,
+                        PronunciationProfile::Default,
+                    );
+                    assert!(analysis.ok, "{extension} {target:?}: {:?}", analysis.msg);
+                    // `placed` counts source lyrics, including when wordless
+                    // guitar/bass notes are explicitly selected for export.
+                    assert_eq!(analysis.placed, 2);
+                    assert_eq!(analysis.n_parts, 4);
+                    assert!(analysis
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.code == "SOURCE_PERCUSSION_NOT_VOCAL"));
+                    let batch = process_one(
+                        source.to_str().unwrap(),
+                        true,
+                        destination.to_str(),
+                        "english",
+                        force.then_some(&overrides),
+                        target,
+                        PronunciationProfile::Default,
+                    );
+                    assert!(batch.ok, "{:?}", batch.msg);
+                    assert_eq!(batch.placed, 2);
+                    let direct = destination.join(format!("direct.{}", target.extension()));
+                    export_svp(
+                        source.to_string_lossy().into_owned(),
+                        direct.to_string_lossy().into_owned(),
+                        Some("english".into()),
+                        force.then(|| {
+                            overrides
+                                .iter()
+                                .map(|(id, value)| (id.to_string(), *value))
+                                .collect()
+                        }),
+                        Some(target),
+                        None,
+                    )
+                    .unwrap();
+                    for path in [PathBuf::from(batch.out.unwrap()), direct] {
+                        let output = std::fs::read(&path).unwrap();
+                        let mut pitches: Vec<i64> = match target {
+                            ExportTarget::Svp => {
+                                let value: serde_json::Value =
+                                    serde_json::from_slice(&output).unwrap();
+                                value["tracks"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .flat_map(|track| {
+                                        track["mainGroup"]["notes"].as_array().unwrap()
+                                    })
+                                    .map(|note| {
+                                        assert_eq!(note["duration"], 705_600_000u64);
+                                        assert!([0, 705_600_000]
+                                            .contains(&note["onset"].as_i64().unwrap()));
+                                        note["pitch"].as_i64().unwrap()
+                                    })
+                                    .collect()
+                            }
+                            ExportTarget::Ustx => {
+                                let text = std::str::from_utf8(&output).unwrap();
+                                engine::target::ustx::audit(text).unwrap();
+                                assert_eq!(
+                                    text.lines()
+                                        .filter_map(|line| line.trim().strip_prefix("duration: "))
+                                        .collect::<Vec<_>>(),
+                                    vec!["480"; expected.len()]
+                                );
+                                text.lines()
+                                    .filter_map(|line| line.trim().strip_prefix("tone: "))
+                                    .map(|value| value.parse().unwrap())
+                                    .collect()
+                            }
+                        };
+                        pitches.sort_unstable();
+                        assert_eq!(pitches, expected, "{extension} {target:?}, force={force}");
+                        let text = std::str::from_utf8(&output).unwrap();
+                        match target {
+                            ExportTarget::Svp => {
+                                assert!(
+                                    text.contains("\"Hello\"") && text.contains("\"World\""),
+                                    "missing source lyric for {extension} {target:?}, force={force}: {text}"
+                                );
+                                assert!(!text.contains("\"drum\"") && !text.contains("\"beat\""));
+                            }
+                            ExportTarget::Ustx => {
+                                let lowercase = text.to_ascii_lowercase();
+                                assert!(
+                                    (lowercase.contains("lyric: \"hello\"")
+                                        || lowercase.contains("lyric: \"hello["))
+                                        && (lowercase.contains("lyric: \"world\"")
+                                            || lowercase.contains("lyric: \"world[")),
+                                    "missing source lyric for {extension} {target:?}, force={force}: {text}"
+                                );
+                                assert!(
+                                    !lowercase.contains("lyric: \"drum")
+                                        && !lowercase.contains("lyric: \"beat")
+                                );
+                            }
+                        }
+                    }
+                    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

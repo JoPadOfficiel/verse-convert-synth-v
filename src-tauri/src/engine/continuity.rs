@@ -531,7 +531,11 @@ pub(super) fn candidate_projections(
             let Some(domain) = scope(&note.source) else {
                 continue;
             };
-            if note.pitch.is_none() || note.duration == 0 || !scopes.contains(&domain) {
+            if !note.allows_vocal()
+                || note.pitch.is_none()
+                || note.duration == 0
+                || !scopes.contains(&domain)
+            {
                 continue;
             }
             let continuity = note.source.continuity.as_ref().unwrap();
@@ -763,13 +767,17 @@ pub(super) fn resolve_bounded(
             }
             // A bare tail already absorbed into its source head is not an unmapped
             // pitch. Its validated relation and source provenance remain intact.
-            let merged_tail = source.pitch.is_none()
+            let merged_tail = source.allows_vocal()
+                && source.pitch.is_none()
                 && source
                     .source
                     .continuity
                     .as_ref()
                     .is_some_and(|c| c.incoming_tie.is_some());
-            if (source.pitch.is_none() && !merged_tail) || source.duration == 0 {
+            if !source.allows_vocal()
+                || (source.pitch.is_none() && !merged_tail)
+                || source.duration == 0
+            {
                 reserve_domain(&source.source, budget)?;
                 if let Some(scope) = domain(&source.source) {
                     budget.reserve(128)?;
@@ -932,7 +940,8 @@ pub(super) fn resolve_bounded(
                             .into_iter()
                             .flatten()
                             .any(|n| {
-                                n.pitch.is_none()
+                                n.allows_vocal()
+                                    && n.pitch.is_none()
                                     && n.source
                                         .continuity
                                         .as_ref()

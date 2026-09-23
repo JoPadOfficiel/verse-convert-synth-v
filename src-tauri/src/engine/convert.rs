@@ -166,6 +166,16 @@ pub(crate) struct SourceNote {
     pub(crate) lyrics: Vec<Lyric>,
 }
 
+impl SourceNote {
+    pub(crate) fn allows_vocal(&self) -> bool {
+        self.source.instrument_role.allows_vocal() && self.source.unpitched.is_none()
+    }
+
+    fn projectable(&self) -> bool {
+        self.allows_vocal() && self.pitch.is_some() && self.duration > 0
+    }
+}
+
 /// Native MIDI notes are paired FIFO by `(channel, key)`. XML adapters also
 /// supply an exact source ID so overlapping same-key voices close correctly.
 pub(crate) fn extract_notes(track: &Track) -> Vec<SourceNote> {
@@ -187,7 +197,9 @@ pub(crate) fn extract_notes(track: &Track) -> Vec<SourceNote> {
             }
             Kind::NoteOn(note) => {
                 let id = note.source.id.clone();
-                active.insert(id.clone(), (event.tick, event.order, note.clone()));
+                let mut owned = note.clone();
+                owned.source.instrument_role = track.note_instrument_role(note);
+                active.insert(id.clone(), (event.tick, event.order, owned));
                 by_key.entry((note.channel, note.key)).or_default().push(id);
             }
             Kind::NoteOff(note) => {
@@ -559,6 +571,7 @@ fn lane_words_by_measure(notes: &[SourceNote]) -> BTreeSet<(u32, &str)> {
 fn word_lanes(note: &SourceNote) -> impl Iterator<Item = &str> {
     note.lyrics
         .iter()
+        .filter(move |_| note.allows_vocal())
         .filter(
             |lyric| matches!(&lyric.state, midi::LyricState::Text(text) if !text.trim().is_empty()),
         )
@@ -573,6 +586,9 @@ fn blank_lyric(lyric: &Lyric) -> bool {
 /// One source row and one playback priority class, shared by selection and
 /// diagnostics. Different time-only lists can be eligible on the same pass.
 fn eligible_attached_lyrics<'a>(note: &'a SourceNote, lane: &str) -> Vec<&'a Lyric> {
+    if !note.allows_vocal() {
+        return Vec::new();
+    }
     let playback = note.source.occurrence + 1;
     let specific = note
         .lyrics
@@ -985,6 +1001,35 @@ mod candidate_preparation_review_tests {
     }
 
     #[test]
+    fn excluded_non_vocal_note_does_not_break_source_lyric_extension() {
+        let mut head = Lyric::text("head", "word".into());
+        head.extension = Some(midi::LyricExtension::Start);
+        let mut notes = vec![
+            source("head", 0, 0, vec![head]),
+            source("excluded", 1, 0, vec![]),
+            source("tail", 2, 0, vec![]),
+        ];
+        notes[1].source.instrument_role = midi::NoteInstrumentRole::Percussion;
+        let performance = crate::engine::performance::PerformanceIndex::default();
+        let standalone = HashMap::new();
+        let mut diagnostics = Vec::new();
+        let lanes = vec!["1".into()];
+        let projection = TrackProjection {
+            source_track_id: "mixed",
+            performance: &performance,
+            lanes: &lanes,
+            standalone: &standalone,
+            profile: PronunciationProfile::Default,
+            diagnostics: &mut diagnostics,
+        };
+        let track = prepare_track("Voice", &notes, projection);
+        assert_eq!(track.notes.len(), 2);
+        assert!(matches!(track.notes[0].lyric, ProjectedLyric::Source(_)));
+        assert!(matches!(track.notes[1].lyric, ProjectedLyric::Extension));
+        assert_eq!(track.notes[1].onset_ticks, 960);
+    }
+
+    #[test]
     fn candidate_selection_reuses_large_track_context_across_small_groups() {
         let notes: Vec<_> = (0..4096)
             .map(|i| source(&format!("source-{i}"), i, 0, vec![]))
@@ -1196,6 +1241,13 @@ fn prepare_track_indices(
     let mut musicxml_extension_open = false;
     for index in indices {
         let source_note = &notes[index];
+        if !source_note.allows_vocal() {
+            // Instrument ownership is orthogonal to lyric continuity. A drum
+            // or unresolved source note interleaved in the same source lane is
+            // excluded from vocals, but it cannot erase a source-authored
+            // extension carried by the surrounding vocal notes.
+            continue;
+        }
         let mut lyric_source_id = None;
         let mut lyric_event_id = None;
         let attached = selected_attached_lyric(
@@ -2019,7 +2071,7 @@ pub fn convert_midi_with_profile(
 
         let source_vocal = attached || !assignment.is_empty();
         let explicit_override = overrides.and_then(|map| map.get(&index).copied());
-        let sing = explicit_override.unwrap_or(source_vocal);
+        let sing = explicit_override.unwrap_or(source_vocal) && projectable_note_count(notes) > 0;
         let mut placed = 0usize;
         let mut lyric_diagnostics: Vec<Diagnostic> = Vec::new();
         if sing {
@@ -2106,7 +2158,8 @@ pub fn convert_midi_with_profile(
                     notes
                         .iter()
                         .filter(|note| {
-                            if note.pitch.is_some()
+                            if !note.allows_vocal()
+                                || note.pitch.is_some()
                                 || note.duration == 0
                                 || note.source.unpitched.is_some()
                             {
@@ -2756,7 +2809,9 @@ fn exact_assignment(tokens: &[TimedLyric], notes: &[SourceNote]) -> HashMap<usiz
     let mut notes_by_tick: HashMap<u32, Vec<usize>> = HashMap::new();
     let mut tokens_by_tick: HashMap<u32, Vec<&TimedLyric>> = HashMap::new();
     for (index, note) in notes.iter().enumerate() {
-        notes_by_tick.entry(note.onset).or_default().push(index);
+        if note.projectable() {
+            notes_by_tick.entry(note.onset).or_default().push(index);
+        }
     }
     for token in tokens {
         tokens_by_tick.entry(token.tick).or_default().push(token);
@@ -2790,9 +2845,7 @@ fn karaoke_assignment(
     let mut assignment = HashMap::new();
     let mut note_index = 0usize;
     for token in tokens {
-        while note_index < notes.len()
-            && (notes[note_index].pitch.is_none() || notes[note_index].duration == 0)
-        {
+        while note_index < notes.len() && !notes[note_index].projectable() {
             note_index += 1;
         }
         if note_index >= notes.len() {
@@ -2800,7 +2853,7 @@ fn karaoke_assignment(
         }
         while note_index + 1 < notes.len() {
             let mut next = note_index + 1;
-            while next < notes.len() && (notes[next].pitch.is_none() || notes[next].duration == 0) {
+            while next < notes.len() && !notes[next].projectable() {
                 next += 1;
             }
             if next >= notes.len()
@@ -2886,6 +2939,14 @@ fn resolve_external_lyrics(
         if tokens.is_empty() {
             continue;
         }
+        // A drum's words are not a detached vocal lyric stream. Keep them on
+        // their source even when another instrument happens to share its timing.
+        if notes_by_track[source_index]
+            .iter()
+            .any(|note| !note.allows_vocal())
+        {
+            continue;
+        }
         let has_text = tokens
             .iter()
             .any(|token| token.origin == TimedLyricOrigin::KaraokeText);
@@ -2924,7 +2985,6 @@ fn resolve_external_lyrics(
         for (target_index, notes) in notes_by_track.iter().enumerate() {
             if target_index == source_index
                 || projectable_note_count(notes) == 0
-                || is_percussion_candidate(&midi.tracks[target_index])
                 || !tokens_by_track[target_index].is_empty()
                 || !attached_lanes(notes).is_empty()
             {
@@ -3053,28 +3113,7 @@ fn resolve_external_lyrics(
 }
 
 fn projectable_note_count(notes: &[SourceNote]) -> usize {
-    notes
-        .iter()
-        .filter(|note| note.pitch.is_some() && note.duration > 0)
-        .count()
-}
-
-fn is_percussion_candidate(track: &Track) -> bool {
-    matches!(
-        track.role_hint,
-        TrackRoleHint::Percussion | TrackRoleHint::Mixed
-    ) || track
-        .instruments
-        .iter()
-        .any(|instrument| instrument.percussion || instrument.channel == Some(9))
-        || track.events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                Kind::NoteOn(note)
-                    if note.velocity != Some(0)
-                        && (note.channel == Some(9) || note.source.unpitched.is_some())
-            )
-        })
+    notes.iter().filter(|note| note.projectable()).count()
 }
 
 fn remove_chord_ambiguities(
@@ -3082,10 +3121,7 @@ fn remove_chord_ambiguities(
     notes: &[SourceNote],
 ) -> usize {
     let mut notes_per_onset: HashMap<u32, usize> = HashMap::new();
-    for note in notes
-        .iter()
-        .filter(|note| note.pitch.is_some() && note.duration > 0)
-    {
+    for note in notes.iter().filter(|note| note.projectable()) {
         *notes_per_onset.entry(note.onset).or_default() += 1;
     }
     let ambiguous: Vec<usize> = assignment
@@ -3117,7 +3153,7 @@ fn projected_lyric_count(
         .iter()
         .enumerate()
         .filter(|(index, note)| {
-            if note.pitch.is_none() || note.duration == 0 {
+            if !note.projectable() {
                 return false;
             }
             selected_attached_lyric(note, lanes, &replayed, &lane_words, profile)
@@ -3299,6 +3335,14 @@ fn track_warnings(
     explicit_override: Option<bool>,
 ) -> Vec<Diagnostic> {
     let mut warnings = Vec::new();
+    for (role, code, message) in [
+        (midi::NoteInstrumentRole::Percussion, "SOURCE_PERCUSSION_NOT_VOCAL", "Source percussion remains in the source evidence and applicable reference audio. Lyrics and vocal overrides do not turn drum keys into vocal pitches."),
+        (midi::NoteInstrumentRole::Unresolved, "SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED", "Missing or conflicting source instrument references prevent vocal projection. Original notes and instrument declarations remain in the source evidence."),
+    ] {
+        if track.events.iter().any(|event| matches!(&event.kind, Kind::NoteOn(note) if note.velocity != Some(0) && track.note_instrument_role(note) == role)) {
+            warnings.push(report_warning(code, DiagnosticSeverity::Warning, message, &track.id));
+        }
+    }
     if status.state == LyricStatusState::MetadataOnly {
         warnings.push(report_warning(
             "GENERIC_MIDI_TEXT_NOT_LYRICS",
@@ -3344,7 +3388,7 @@ fn track_warnings(
             &track.id,
         ));
     }
-    if explicit_override == Some(true) && !source_vocal {
+    if explicit_override == Some(true) && !source_vocal && notes.projectable > 0 {
         warnings.push(report_warning(
             "USER_VOCAL_OVERRIDE",
             DiagnosticSeverity::Info,
@@ -3466,6 +3510,7 @@ fn append_external_warnings(
 fn attached_lanes(notes: &[SourceNote]) -> BTreeSet<String> {
     notes
         .iter()
+        .filter(|note| note.allows_vocal())
         .flat_map(|note| note.lyrics.iter().map(|lyric| lyric.lane.clone()))
         .collect()
 }
