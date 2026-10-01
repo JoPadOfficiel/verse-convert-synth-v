@@ -134,6 +134,38 @@ note-bearing source tracks; otherwise it is one byte-identical source track
 after the file's global marks. See
 [Formats and fidelity](formats-and-fidelity.md#audio-stems).
 
+### Qualified legacy drum template compatibility
+
+MuseScore 4 can resolve a native `Instrument id="piano"` as piano before
+consulting its explicit drumset evidence. Verse permits one bounded exception
+in private renderer intermediates: change that template ID to `drumset` only
+when one instrument owns one explicitly percussion staff, `useDrumset` is 1,
+the source supplies a unique Standard-range drum map covering every played key,
+and one channel explicitly declares native channel 9, bank MSB 1/LSB 0 (128),
+and program 0. The taxonomy must be absent, `keyboard.piano`, or
+`drum.group.set`; nonempty playback `soundId`, extra channels/instruments,
+ownership changes and unsupported native layouts are refused.
+
+The same prepared native master feeds the full-score reference and all stems,
+including qualified MusicXML/MXL and MIDI/KAR imports. A mapped MIDI import
+whose Part mapping cannot be proven is refused rather than combined with
+per-track fallback stems. Inputs without this conflict keep the existing render
+paths. MuseScore 3 receives unchanged templates.
+
+`MUSESCORE_DRUM_TEMPLATE_MAPPED` records the exception in the manifest;
+`MUSESCORE_DRUM_TEMPLATE_UNPROVEN` refuses an unqualified conflict before bundle
+publication. Only the template attribute changes. Original source snapshots,
+Part/stem identities, drum mappings, MIDI state, notes and mute defaults remain
+unchanged. Other archive entries retain their compressed payloads, compression
+method, modification timestamps and Unix permissions. The archive comment is
+also retained; individual entry comments and extra fields are not preserved by
+the existing ZIP copy path.
+
+The authored real-renderer control compares complete corrected/canonical WAV
+sample payloads byte for byte and distinguishes kick, snare and hi-hat from an
+ordinary piano control. This qualifies the installed renderer and its sound
+resources; it does not promise acoustic quality across banks or installations.
+
 ## Conversion limits
 
 - Converted `.mscz`: 32 MiB, and never more than the WAV limit

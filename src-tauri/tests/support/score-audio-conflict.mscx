@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<museScore version="3.02">
+  <Score>
+    <Division>480</Division>
+    <Style><concertPitch>0</concertPitch></Style>
+    <Part>
+      <Staff id="1"><StaffType group="pitched"><name>stdNormal</name></StaffType></Staff>
+      <trackName>Voice</trackName>
+      <Instrument id="piano"><instrumentId>keyboard.piano</instrumentId><longName>Voice</longName>
+        <Channel><program value="0"/><midiChannel>0</midiChannel></Channel>
+      </Instrument>
+    </Part>
+    <Part>
+      <Staff id="2"><StaffType group="pitched"><name>stdNormal</name></StaffType><defaultConcertClef>F8vb</defaultConcertClef></Staff>
+      <trackName>Bass</trackName>
+      <Instrument id="electric-bass"><instrumentId>pluck.bass.electric</instrumentId><longName>Bass</longName>
+        <transposeDiatonic>-7</transposeDiatonic><transposeChromatic>-12</transposeChromatic>
+        <Channel><program value="33"/><midiChannel>2</midiChannel></Channel>
+      </Instrument>
+    </Part>
+    <Part>
+      <Staff id="3"><StaffType group="percussion"><name>perc5Line</name></StaffType></Staff>
+      <trackName>Drums</trackName>
+      <Instrument id="piano"><instrumentId>keyboard.piano</instrumentId><longName>Drums</longName>
+        <useDrumset>1</useDrumset>
+        <Drum pitch="36"><head>normal</head><line>7</line><voice>0</voice><name>Kick</name><stem>2</stem></Drum>
+        <Drum pitch="38"><head>normal</head><line>3</line><voice>0</voice><name>Snare</name><stem>1</stem></Drum>
+        <Drum pitch="42"><head>cross</head><line>-1</line><voice>0</voice><name>Hi-hat</name><stem>1</stem></Drum>
+        <Channel><controller ctrl="0" value="1"/><controller ctrl="32" value="0"/><program value="0"/><midiPort>0</midiPort><midiChannel>9</midiChannel></Channel>
+      </Instrument>
+    </Part>
+    <Staff id="1"><Measure><voice>
+      <TimeSig><sigN>4</sigN><sigD>4</sigD></TimeSig>
+      <Tempo><tempo>2</tempo><text>120</text></Tempo>
+      <Chord><durationType>quarter</durationType><Lyrics><text>Hello</text></Lyrics><Note><pitch>48</pitch><tpc>14</tpc></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>World</text></Lyrics><Note><pitch>57</pitch><tpc>17</tpc></Note></Chord>
+      <Chord><durationType>quarter</durationType><Lyrics><text>Light</text></Lyrics><Note><pitch>60</pitch><tpc>14</tpc></Note></Chord>
+      <Rest><durationType>quarter</durationType></Rest>
+    </voice></Measure></Staff>
+    <Staff id="2"><Measure><voice>
+      <Clef><concertClefType>F8vb</concertClefType><transposingClefType>F</transposingClefType></Clef>
+      <Chord><durationType>half</durationType><Note><pitch>36</pitch><tpc>14</tpc><tpc2>14</tpc2></Note></Chord>
+      <Chord><durationType>half</durationType><Note><pitch>40</pitch><tpc>18</tpc><tpc2>18</tpc2></Note></Chord>
+    </voice></Measure></Staff>
+    <Staff id="3"><Measure><voice>
+      <Clef><concertClefType>PERC</concertClefType><transposingClefType>PERC</transposingClefType></Clef>
+      <Chord><durationType>quarter</durationType><Note><pitch>36</pitch><tpc>14</tpc></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>38</pitch><tpc>16</tpc></Note></Chord>
+      <Chord><durationType>quarter</durationType><Note><pitch>42</pitch><tpc>20</tpc></Note></Chord>
+      <Rest><durationType>quarter</durationType></Rest>
+    </voice></Measure></Staff>
+  </Score>
+</museScore>

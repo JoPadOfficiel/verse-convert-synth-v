@@ -728,7 +728,8 @@ MuseScore reference mix.
 
 A score stem is rendered from the whole source score. Verse inserts
 `<play>0</play>` into every note and chord symbol of the other Parts'
-main-score staves and changes no other byte; excerpts and every other container
+main-score staves; apart from the qualified renderer compatibility exception
+below, it changes no other byte. Excerpts and every other container
 entry stay untouched. Tempo marks, fermatas, breaths and every other timing
 mark therefore stay in each stem exactly as in the reference mix, including
 when only some Parts write them. Rendering a Part on its own would lose that
@@ -736,6 +737,18 @@ timing: a fermata written on one Part holds every Part. A MusicXML or MXL
 source is first converted by MuseScore to `.mscz`, which renders identically to
 the MusicXML itself, and is then silenced Part by Part. A native MuseScore
 score with nothing else audible is rendered from its own bytes.
+
+For MuseScore 4 only, a source-proven Standard drumset carrying a legacy
+`piano` template may use a private render copy with that single template ID
+changed to `drumset`. Qualification requires explicit percussion staff,
+`useDrumset`, drum map, channel 9, bank 128 and program 0, without an overriding
+playback sound ID or unsupported ownership layout. Reference and stems consume
+the same prepared master, including applicable imports. The byte-identical
+source snapshot remains authoritative. Stable diagnostics distinguish
+`MUSESCORE_DRUM_TEMPLATE_MAPPED` from the fail-closed
+`MUSESCORE_DRUM_TEMPLATE_UNPROVEN`; no kit is inferred from display names.
+See [the renderer contract](musescore-renderer.md#qualified-legacy-drum-template-compatibility)
+for the exact bounds and acoustic limitations.
 
 Each score stem maps onto exactly one source Part, by position and, for a native
 score, by Part ID. A Part count, Part identity or staff count that differs from
@@ -891,6 +904,12 @@ with `SOURCE_INSTRUMENT_OWNERSHIP_UNRESOLVED`:
 Changes between pitched instruments, channels or staff types parse as they did
 before ownership was checked. `articulationChange` alters playback only.
 Excerpt-only changes do not change the selected master score's ownership.
+
+Native `<pitch>` is the source's sounding MIDI pitch. Concert-pitch display
+settings, octave clefs and instrument transposition metadata do not transpose
+that value again in USTX. Low-tone regressions inspect actual output tones
+48, 57 and 60 under concert/transposed displays and ±12-semitone instrument
+metadata; no singer-specific pitch correction is performed.
 
 ### Lyrics on chords
 
