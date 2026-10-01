@@ -3712,7 +3712,7 @@ fn export_bundle_with_hook_and_progress(
         stem_id: None,
         stem_name: None,
     });
-    let (stem_sources, preparation_warnings) = if midi_source {
+    let (mut stem_sources, mut preparation_warnings) = if midi_source {
         midi_stem_sources(
             request.renderer.as_ref(),
             &request.input.source_bytes,
@@ -3732,6 +3732,26 @@ fn export_bundle_with_hook_and_progress(
         )?;
         (StemSources::Score(scores), Vec::new())
     };
+    // Prepare one native master for both the reference and all stems. Ordinary
+    // inputs keep their existing reference path and bytes. Converted inputs
+    // need the same master only when the compatibility mapping applies.
+    let mut reference_path = source_path.clone();
+    if let Some(scores) = stem_sources.scores_mut() {
+        let warnings = scores
+            .prepare_for_renderer(request.renderer.capabilities().identity.major)
+            .map_err(BundleError::Integrity)?;
+        if scores.has_template_mapping() {
+            reference_path = render_work
+                .path()
+                .join(format!("prepared.{}", scores.extension()));
+            write_new(
+                &reference_path,
+                scores.render_container(),
+                "write compatible render score",
+            )?;
+            preparation_warnings.extend(warnings);
+        }
+    }
 
     progress(BundleProgressEvent {
         phase: BundleProgressPhase::RenderingReference,
@@ -3744,7 +3764,7 @@ fn export_bundle_with_hook_and_progress(
     let render_output = render_work.path().join("full-score.wav");
     let rendered = render_owned(
         request.renderer.as_ref(),
-        &source_path,
+        &reference_path,
         &render_output,
         &remaining_render_limits(render_started, &request.render_limits)?,
     )?;
@@ -4221,6 +4241,12 @@ enum StemSources {
 }
 
 impl StemSources {
+    fn scores_mut(&mut self) -> Option<&mut ScoreStems> {
+        match self {
+            Self::Score(scores) | Self::MidiImport { scores, .. } => Some(scores),
+            Self::MidiTracks(_) => None,
+        }
+    }
     fn isolation_method(&self) -> &'static str {
         match self {
             Self::MidiTracks(_) => MIDI_TRACK_ISOLATION,
@@ -4299,10 +4325,13 @@ fn midi_stem_sources(
     }
     let mut warnings = Vec::new();
     let sources = match midi_import(renderer, source_bytes, &tracks, &split, work, limits)? {
-        Ok(scores) => StemSources::MidiImport {
-            scores,
-            parts: (0..stems.len()).collect(),
-        },
+        Ok((scores, diagnostics)) => {
+            warnings.extend(diagnostics);
+            StemSources::MidiImport {
+                scores,
+                parts: (0..stems.len()).collect(),
+            }
+        }
         Err(reason) => {
             warnings.push(format!(
                 "[{MIDI_STEM_IMPORT_MAPPING_UNPROVEN}] MuseScore's import of this MIDI cannot be mapped onto its note-bearing tracks ({reason}); each stem is its own source track after the file's global marks, and MuseScore may quantize a track alone differently than inside the file."
@@ -4345,7 +4374,7 @@ fn midi_import(
     split: &crate::engine::midi_split::MidiSplit,
     work: &Path,
     limits: &RenderLimits,
-) -> Result<Result<ScoreStems, String>, BundleError> {
+) -> Result<Result<(ScoreStems, Vec<String>), String>, BundleError> {
     if !stem_tracks
         .iter()
         .copied()
@@ -4375,17 +4404,29 @@ fn midi_import(
             )))
         }
     };
-    let scores = match ScoreStems::read(&converted) {
+    let mut scores = match ScoreStems::read(&converted) {
         Ok(scores) => scores,
         Err(error) => return Ok(Err(error)),
     };
+    let warnings = scores
+        .prepare_for_renderer(renderer.capabilities().identity.major)
+        .map_err(BundleError::Integrity)?;
+    // A mapped reference cannot be paired with fallback MIDI slices. If its
+    // Part mapping fails, refuse rather than publish incoherent instruments.
+    let unproven = |reason: String| {
+        if warnings.is_empty() {
+            Ok(Err(reason))
+        } else {
+            Err(BundleError::Integrity(format!("MUSESCORE_DRUM_TEMPLATE_UNPROVEN: the compatible MIDI import cannot be used coherently: {reason}")))
+        }
+    };
     let parts = scores.parts();
     if parts.len() != split.note_tracks.len() {
-        return Ok(Err(format!(
+        return unproven(format!(
             "MuseScore made {} Parts from {} note-bearing tracks",
             parts.len(),
             split.note_tracks.len()
-        )));
+        ));
     }
     for (index, (part, track)) in parts.iter().zip(&split.note_tracks).enumerate() {
         if let Some(name) = track
@@ -4401,18 +4442,18 @@ fn midi_import(
                 .chain([name.iter().map(|byte| char::from(*byte)).collect()])
                 .any(|candidate| track_name.ends_with(&format!(", {candidate}")));
             if !named {
-                return Ok(Err(format!(
+                return unproven(format!(
                     "Part {} is named {track_name:?}, not after source track {}",
                     index + 1,
                     track.source_track
-                )));
+                ));
             }
         }
         if part.audible_elements() == 0 {
-            return Ok(Err(format!("Part {} holds no playable note", index + 1)));
+            return unproven(format!("Part {} holds no playable note", index + 1));
         }
     }
-    Ok(Ok(scores))
+    Ok(Ok((scores, warnings)))
 }
 
 /// The source score as MuseScore reads it (a MusicXML source is converted to
@@ -5554,6 +5595,7 @@ pub(crate) mod tests {
         mode: FakeMode,
         capabilities: RendererCapabilities,
         stem_inputs: Mutex<Vec<(String, Vec<u8>)>>,
+        reference_inputs: Mutex<Vec<Vec<u8>>>,
         converted_inputs: Mutex<Vec<String>>,
         converted: Option<Vec<u8>>,
     }
@@ -5606,6 +5648,7 @@ pub(crate) mod tests {
                     score_parts: true,
                 },
                 stem_inputs: Mutex::new(Vec::new()),
+                reference_inputs: Mutex::new(Vec::new()),
                 converted_inputs: Mutex::new(Vec::new()),
                 converted: None,
             }
@@ -5690,6 +5733,9 @@ pub(crate) mod tests {
             output: &Path,
             limits: &RenderLimits,
         ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+            if input.parent().and_then(Path::file_name) != Some("parts".as_ref()) {
+                self.reference_inputs.lock().unwrap().push(fs::read(input)?);
+            }
             match self.mode {
                 FakeMode::Missing => return Err(RenderError::MissingOutput),
                 FakeMode::Timeout => {
@@ -6257,6 +6303,213 @@ pub(crate) mod tests {
                 timeout: Duration::from_secs(60),
                 max_output_bytes: 1024 * 1024,
             },
+        }
+    }
+
+    const DRUM_CONFLICT: &str = include_str!("../tests/support/score-audio-conflict.mscx");
+
+    fn master_text(bytes: &[u8]) -> String {
+        if !crate::engine::musicxml::is_zip(bytes) {
+            return String::from_utf8(bytes.to_vec()).unwrap();
+        }
+        let path = crate::engine::musescore::master_mscx_path(bytes).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(&path).unwrap(), &mut text).unwrap();
+        text
+    }
+
+    #[test]
+    fn drum_template_bundle_mapping_is_coherent_for_native_and_imported_sources_in_both_targets() {
+        let musicxml = format!("<score-partwise><part-list>{}</part-list>{}</score-partwise>",
+            (1..=3).map(|i| format!("<score-part id=\"P{i}\"><part-name>Part {i}</part-name></score-part>")).collect::<String>(),
+            (1..=3).map(|i| format!("<part id=\"P{i}\"><measure><attributes><divisions>480</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><voice>1</voice><type>quarter</type>{}</note></measure></part>", if i == 1 { "<lyric><text>Hello</text></lyric>" } else { "" })).collect::<String>());
+        let bass = [0, 0x92, 36, 96, 0x83, 0x60, 0x82, 36, 0, 0, 0xff, 0x2f, 0];
+        let drums = [0, 0x99, 36, 96, 0x83, 0x60, 0x89, 36, 0, 0, 0xff, 0x2f, 0];
+        let midi = midi_file(&[CONDUCTOR, SUNG, &bass, &drums]);
+        for (name, source) in [
+            ("source.mscx", DRUM_CONFLICT.as_bytes().to_vec()),
+            ("source.mscz", zipped_score(DRUM_CONFLICT)),
+            ("source.musicxml", musicxml.as_bytes().to_vec()),
+            ("source.mxl", mxl(&musicxml)),
+            ("source.mid", midi.clone()),
+            ("source.kar", midi),
+        ] {
+            for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+                let root = temp_dir("drum-template-bundle");
+                let renderer = Arc::new(FakeRenderer::converting_to(
+                    FakeMode::Success,
+                    zipped_score(DRUM_CONFLICT),
+                ));
+                let request = real_request(&root, target, name, source.clone(), renderer.clone());
+                let layout = BundleLayout::new(&request.destination, name, target).unwrap();
+                let result = export_bundle(request).unwrap();
+                assert_eq!(fs::read(&result.source_path).unwrap(), source);
+                let manifest: BundleManifest =
+                    serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
+                assert_eq!(manifest.audio.stems.len(), 3);
+                assert_eq!(manifest.source.sha256, sha256_bytes(&source));
+                assert_eq!(
+                    manifest
+                        .warnings
+                        .iter()
+                        .filter(|w| w.starts_with("[MUSESCORE_DRUM_TEMPLATE_MAPPED]"))
+                        .count(),
+                    1
+                );
+                assert!(manifest.audio.reference_mix.muted_by_default);
+                verify_bundle(&result.bundle_path, &layout).unwrap();
+                let reference = renderer.reference_inputs.lock().unwrap();
+                assert_eq!(reference.len(), 1);
+                let prepared = master_text(&reference[0]);
+                assert_eq!(prepared.matches("id=\"drumset\"").count(), 1);
+                assert_eq!(
+                    prepared.replace("id=\"drumset\"", "id=\"piano\""),
+                    DRUM_CONFLICT
+                );
+                for (index, (_, stem)) in renderer.stem_inputs().iter().enumerate() {
+                    let master = master_text(stem);
+                    assert_eq!(master.matches("id=\"drumset\"").count(), 1);
+                    let isolated = ScoreStems::read(stem).unwrap();
+                    for (part_index, part) in isolated.parts().iter().enumerate() {
+                        assert_eq!(part.audible_elements() > 0, part_index == index);
+                    }
+                }
+                if name.ends_with("mscx") || name.ends_with("mscz") {
+                    let saved = fs::read_to_string(&result.project_path).unwrap();
+                    match target {
+                        ExportTarget::Ustx => {
+                            assert_eq!(
+                                saved
+                                    .lines()
+                                    .filter_map(|l| l.trim().strip_prefix("tone: "))
+                                    .collect::<Vec<_>>(),
+                                ["48", "57", "60"]
+                            );
+                            let audited = ustx::audit(&saved).unwrap();
+                            assert_eq!(audited.wave_parts.len(), 4);
+                            assert_eq!(audited.track_mutes, [false, true, false, false, true]);
+                        }
+                        ExportTarget::Svp => {
+                            let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+                            assert_eq!(
+                                saved["tracks"][0]["mainGroup"]["notes"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|n| n["pitch"].as_u64().unwrap())
+                                    .collect::<Vec<_>>(),
+                                [48, 57, 60]
+                            );
+                            assert_eq!(
+                                saved["tracks"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|t| t["mixer"]["mute"].as_bool().unwrap())
+                                    .collect::<Vec<_>>(),
+                                [false, true, false, false, true]
+                            );
+                        }
+                    }
+                }
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn drum_template_refusal_and_renderer_failure_roll_back_both_bundle_targets() {
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            for mode in [FakeMode::Success, FakeMode::Corrupt] {
+                let root = temp_dir("drum-template-rollback");
+                let source = if matches!(mode, FakeMode::Success) {
+                    DRUM_CONFLICT
+                        .replace("ctrl=\"0\" value=\"1\"", "ctrl=\"0\" value=\"0\"")
+                        .into_bytes()
+                } else {
+                    DRUM_CONFLICT.as_bytes().to_vec()
+                };
+                let input = root.join("input.mscx");
+                fs::write(&input, &source).unwrap();
+                let renderer = Arc::new(FakeRenderer::new(mode));
+                let request = real_request(
+                    &root,
+                    target,
+                    "input.mscx",
+                    source.clone(),
+                    renderer.clone(),
+                );
+                let destination = request.destination.clone();
+                let error = export_bundle(request).unwrap_err();
+                if matches!(mode, FakeMode::Success) {
+                    assert!(error
+                        .to_string()
+                        .contains("MUSESCORE_DRUM_TEMPLATE_UNPROVEN"));
+                    assert!(renderer.reference_inputs.lock().unwrap().is_empty());
+                }
+                assert!(!destination.exists());
+                assert_eq!(fs::read(&input).unwrap(), source);
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn drum_template_midi_import_refuses_unknown_kit_or_unproven_part_mapping() {
+        let drums = [0, 0x99, 36, 96, 0x83, 0x60, 0x89, 36, 0, 0, 0xff, 0x2f, 0];
+        let two_parts = midi_file(&[CONDUCTOR, SUNG, &drums]);
+        let three_parts = midi_file(&[CONDUCTOR, SUNG, SUNG, &drums]);
+        let mut named = vec![0, 0xff, 3, 5];
+        named.extend_from_slice(b"Voice");
+        named.extend_from_slice(SUNG);
+        let named_parts = midi_file(&[CONDUCTOR, &named, SUNG, &drums]);
+        let silent_voice = DRUM_CONFLICT
+            .replace("<pitch>48</pitch>", "<play>0</play><pitch>48</pitch>")
+            .replace("<pitch>57</pitch>", "<play>0</play><pitch>57</pitch>")
+            .replace("<pitch>60</pitch>", "<play>0</play><pitch>60</pitch>");
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            for (reason, source, converted) in [
+                ("Part count", two_parts.clone(), DRUM_CONFLICT.to_string()),
+                (
+                    "kit",
+                    three_parts.clone(),
+                    DRUM_CONFLICT.replace("ctrl=\"0\" value=\"1\"", "ctrl=\"0\" value=\"0\""),
+                ),
+                (
+                    "name",
+                    named_parts.clone(),
+                    DRUM_CONFLICT.replace(
+                        "<trackName>Voice</trackName>",
+                        "<trackName>Piano, Other</trackName>",
+                    ),
+                ),
+                ("silent Part", three_parts.clone(), silent_voice.clone()),
+            ] {
+                let root = temp_dir("drum-template-midi-refusal");
+                let renderer = Arc::new(FakeRenderer::converting_to(
+                    FakeMode::Success,
+                    zipped_score(&converted),
+                ));
+                let request = real_request(&root, target, "source.mid", source, renderer.clone());
+                let destination = request.destination.clone();
+                let error = export_bundle(request).unwrap_err().to_string();
+                assert!(
+                    error.contains("MUSESCORE_DRUM_TEMPLATE_UNPROVEN"),
+                    "{reason}: {error}"
+                );
+                if reason == "name" {
+                    assert!(error.contains("not after source track"), "{error}");
+                } else if reason == "silent Part" {
+                    assert!(error.contains("holds no playable note"), "{error}");
+                }
+                assert!(!destination.exists());
+                assert!(renderer.stem_inputs().is_empty());
+                assert!(renderer.reference_inputs.lock().unwrap().is_empty());
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+                fs::remove_dir_all(root).unwrap();
+            }
         }
     }
 

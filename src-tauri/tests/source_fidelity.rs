@@ -4,6 +4,78 @@ use verse_lib::engine::convert::convert_auto;
 use verse_lib::engine::midi::{self, Kind, LyricState, SourceFormat};
 use verse_lib::engine::{musescore, musicxml, target};
 
+#[test]
+fn native_low_sounding_tones_ignore_concert_display_and_octave_transposition() {
+    let fixture = include_str!("support/score-audio-conflict.mscx");
+    for concert in [0, 1] {
+        for transpose in [0, -12, 12] {
+            let source = fixture.replace("<concertPitch>0</concertPitch>", &format!("<concertPitch>{concert}</concertPitch>"))
+                .replacen("<longName>Voice</longName>", &format!("<longName>Voice</longName><transposeDiatonic>{}</transposeDiatonic><transposeChromatic>{transpose}</transposeChromatic>", transpose / 12 * 7), 1);
+            let midi = musescore::parse(source.as_bytes()).unwrap();
+            let result = verse_lib::engine::convert::convert_midi_with_target(
+                &midi,
+                "english",
+                None,
+                target::ExportTarget::Ustx,
+            );
+            assert!(result.ok, "{:?}", result.msg);
+            let output =
+                target::serialize_to(target::ExportTarget::Ustx, result.svp.as_ref().unwrap())
+                    .unwrap();
+            let output = std::str::from_utf8(&output).unwrap();
+            target::ustx::audit(output).unwrap();
+            let values = |prefix: &str| {
+                output
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix(prefix))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                values("tone: "),
+                ["48", "57", "60"],
+                "concert={concert} transpose={transpose}"
+            );
+            assert_eq!(values("duration: "), ["480", "480", "480"]);
+            for tick in [0, 480, 960] {
+                assert!(
+                    output.contains(&format!("      - position: {tick}\n        duration: 480"))
+                );
+            }
+            for note in result
+                .svp
+                .as_ref()
+                .unwrap()
+                .tracks
+                .iter()
+                .flat_map(|t| &t.notes)
+            {
+                let source = note
+                    .source_evidence
+                    .as_ref()
+                    .unwrap()
+                    .origin
+                    .as_ref()
+                    .unwrap();
+                let track = midi
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == source.track_id)
+                    .unwrap();
+                let event = track
+                    .events
+                    .iter()
+                    .find(|e| e.order == source.note_on_order)
+                    .unwrap();
+                let Kind::NoteOn(original) = &event.kind else {
+                    panic!("note origin")
+                };
+                assert_eq!(Some(note.pitch), original.key);
+                assert_eq!(note.onset_ticks, event.tick);
+            }
+        }
+    }
+}
+
 fn smf(track: &[u8]) -> Vec<u8> {
     let mut data = b"MThd\0\0\0\x06\0\0\0\x01\x01\xe0MTrk".to_vec();
     data.extend_from_slice(&(track.len() as u32).to_be_bytes());

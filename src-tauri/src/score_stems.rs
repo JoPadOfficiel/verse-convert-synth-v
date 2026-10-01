@@ -51,6 +51,7 @@ pub struct ScoreStems {
     container: Container,
     master: Vec<u8>,
     parts: Vec<ScorePart>,
+    template_mapped: bool,
 }
 
 impl ScoreStems {
@@ -85,6 +86,7 @@ impl ScoreStems {
             container,
             master,
             parts,
+            template_mapped: false,
         })
     }
 
@@ -97,6 +99,46 @@ impl ScoreStems {
         match self.container {
             Container::Zip { .. } => "mscz",
             Container::Mscx => "mscx",
+        }
+    }
+
+    /// Qualify the MuseScore 4 legacy piano/drumset template conflict. This
+    /// changes only the template ID in a private render copy, never the source
+    /// snapshot or its musical/instrument evidence. MuseScore 3 stays unchanged.
+    pub fn prepare_for_renderer(&mut self, major: u32) -> Result<Vec<String>, String> {
+        if major != 4 {
+            return Ok(Vec::new());
+        }
+        let (master, warnings) = crate::score_stems::prepare_drum_templates(&self.master)?;
+        if warnings.is_empty() {
+            return Ok(warnings);
+        }
+        let parts = score_parts(&master)?;
+        match &mut self.container {
+            Container::Mscx => {}
+            Container::Zip {
+                archive,
+                master_path,
+            } => {
+                *archive = replace_entry(archive, master_path, &master)
+                    .map_err(|error| format!("MUSESCORE_DRUM_TEMPLATE_UNPROVEN: {error}"))?;
+            }
+        }
+        self.master = master;
+        self.parts = parts;
+        self.template_mapped = true;
+        Ok(warnings)
+    }
+
+    pub fn has_template_mapping(&self) -> bool {
+        self.template_mapped
+    }
+
+    /// The coherent full-score render input, before Part silencing.
+    pub fn render_container(&self) -> &[u8] {
+        match &self.container {
+            Container::Zip { archive, .. } => archive,
+            Container::Mscx => &self.master,
         }
     }
 
@@ -194,15 +236,298 @@ fn too_large() -> String {
     "SCORE_STEM_UNSILENCEABLE: abnormally large MuseScore score (rejected for safety)".into()
 }
 
+/// A narrowly qualified compatibility exception, not instrument inference.
+/// Pinned MuseScore 4 resolves `piano` before consulting percussion evidence;
+/// its `drumset` template selects the Standard kit without replacing the map.
+fn prepare_drum_templates(master: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+    let offset = usize::from(master.starts_with(&[0xef, 0xbb, 0xbf])) * 3;
+    let xml = std::str::from_utf8(&master[offset..]).map_err(|e| e.to_string())?;
+    let document = roxmltree::Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 5_000_000,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let score = document
+        .descendants()
+        .find(|n| n.has_tag_name("Score"))
+        .ok_or("SCORE_STEM_UNSILENCEABLE: MuseScore Score element not found")?;
+    fn children<'a, 'input>(
+        node: roxmltree::Node<'a, 'input>,
+        name: &str,
+    ) -> Vec<roxmltree::Node<'a, 'input>> {
+        node.children().filter(|n| n.has_tag_name(name)).collect()
+    }
+    // Match the native note's instrument/subchannel selection. Channel zero
+    // owns notes without a selector; unused variants cannot supply evidence.
+    fn uses_channel(
+        note: roxmltree::Node,
+        instrument: roxmltree::Node,
+        instrument_count: usize,
+        channel_index: usize,
+    ) -> bool {
+        fn text<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> Option<&'a str> {
+            node.children()
+                .find(|n| n.has_tag_name(name))
+                .and_then(|n| n.text())
+                .map(str::trim)
+        }
+        let subchannel = text(note, "subchannel")
+            .or_else(|| note.parent().and_then(|chord| text(chord, "subchannel")));
+        let selected = subchannel.and_then(|s| s.parse::<usize>().ok());
+        if subchannel.is_some() && selected.is_none() {
+            return false;
+        }
+        let references = children(note, "instrument");
+        if references.is_empty() {
+            return instrument_count == 1 && selected.unwrap_or(0) == channel_index;
+        }
+        if references.len() != 1 {
+            return false;
+        }
+        let id = instrument
+            .attribute("id")
+            .or_else(|| text(instrument, "instrumentId"));
+        let reference = references[0].attribute("id");
+        id.is_some_and(|id| {
+            (reference == Some(id) && selected.unwrap_or(0) == channel_index)
+                || (subchannel.is_none()
+                    && reference == Some(format!("{id}:channel:{channel_index}").as_str()))
+        })
+    }
+    let parts = score_parts(master)?;
+    let mut edits = Vec::new();
+    let mut warnings = Vec::new();
+    for (index, part) in score
+        .children()
+        .filter(|n| n.has_tag_name("Part"))
+        .enumerate()
+    {
+        let staves = children(part, "Staff");
+        let instruments = children(part, "Instrument");
+        let body_staves: Vec<_> = score
+            .children()
+            .filter(|n| {
+                n.has_tag_name("Staff")
+                    && n.attribute("id")
+                        .is_some_and(|id| parts[index].staff_ids.iter().any(|s| s == id))
+            })
+            .collect();
+        let percussion_staff = staves.iter().any(|s| {
+            s.descendants().any(|n| {
+                n.has_tag_name("StaffType")
+                    && matches!(n.attribute("group"), Some("percussion" | "unpitched"))
+            })
+        });
+        for instrument in &instruments {
+            if instrument.attribute("id") == Some("drumset") {
+                continue;
+            }
+            let taxonomy = children(*instrument, "instrumentId");
+            let channels: Vec<_> = instrument
+                .children()
+                .filter(|n| matches!(n.tag_name().name(), "Channel" | "channel"))
+                .collect();
+            let pitched_taxonomy = taxonomy.iter().any(|n| {
+                let family = n
+                    .text()
+                    .unwrap_or("")
+                    .trim()
+                    .split('.')
+                    .next()
+                    .unwrap_or("");
+                matches!(
+                    family,
+                    "keyboard" | "wind" | "strings" | "pluck" | "voice" | "vocal"
+                )
+            });
+            let drum_evidence = percussion_staff
+                || taxonomy
+                    .iter()
+                    .any(|n| crate::engine::midi::instrument_taxonomy_is_percussion(n.text()))
+                || instrument.descendants().any(|n| {
+                    n.has_tag_name("Drum")
+                        || (n.has_tag_name("useDrumset")
+                            && n.text().is_some_and(|t| t.trim() == "1"))
+                })
+                || channels.iter().enumerate().any(|(channel_index, channel)| {
+                    let percussion = channel
+                        .attribute("channel")
+                        .into_iter()
+                        .chain(
+                            channel
+                                .children()
+                                .filter(|n| {
+                                    matches!(n.tag_name().name(), "midiChannel" | "channel")
+                                })
+                                .map(|n| n.text().unwrap_or("")),
+                        )
+                        .any(|v| v.trim().parse::<i32>().ok() == Some(9));
+                    percussion
+                        && body_staves.iter().any(|staff| {
+                            staff
+                                .descendants()
+                                .filter(|n| n.has_tag_name("Note") && musescore::plays(*n))
+                                .any(|note| {
+                                    uses_channel(
+                                        note,
+                                        *instrument,
+                                        instruments.len(),
+                                        channel_index,
+                                    )
+                                })
+                        })
+                });
+            if !drum_evidence || !(instrument.attribute("id") == Some("piano") || pitched_taxonomy)
+            {
+                continue;
+            }
+            let refuse = |reason: &str| {
+                format!(
+                "MUSESCORE_DRUM_TEMPLATE_UNPROVEN: Part {} has conflicting percussion/template evidence ({reason}); no replacement kit is inferred", index + 1)
+            };
+            let version = document.root_element().attribute("version").unwrap_or("");
+            if !matches!(version.split('.').next(), Some("2" | "3" | "4"))
+                || !document.root_element().has_tag_name("museScore")
+                || score.parent() != Some(document.root_element())
+                || instruments.len() != 1
+                || staves.len() != 1
+                || instrument.attribute("id") != Some("piano")
+                || taxonomy.len() > 1
+                || taxonomy.first().is_some_and(|n| {
+                    !matches!(
+                        n.text().map(str::trim),
+                        Some("keyboard.piano" | "drum.group.set")
+                    )
+                })
+                || children(*instrument, "useDrumset").len() != 1
+                || children(*instrument, "useDrumset")[0].text().map(str::trim) != Some("1")
+                || children(staves[0], "StaffType").len() != 1
+                || children(staves[0], "StaffType")[0].attribute("group") != Some("percussion")
+                || instrument
+                    .descendants()
+                    .any(|n| n.has_tag_name("soundId") && !n.text().unwrap_or("").trim().is_empty())
+                || body_staves.iter().any(|s| {
+                    s.descendants().any(|n| {
+                        matches!(
+                            n.tag_name().name(),
+                            "InstrumentChange" | "StaffTypeChange" | "channelSwitch"
+                        )
+                    })
+                })
+            {
+                return Err(refuse(
+                    "unsupported template, staff, sound ID or ownership layout",
+                ));
+            }
+            if channels.len() != 1 {
+                return Err(refuse("exactly one Standard-kit channel is required"));
+            }
+            let channel = channels[0];
+            let channel_values: Vec<_> = channel
+                .attribute("channel")
+                .into_iter()
+                .chain(
+                    channel
+                        .children()
+                        .filter(|n| matches!(n.tag_name().name(), "midiChannel" | "channel"))
+                        .map(|n| n.text().unwrap_or("")),
+                )
+                .collect();
+            let programs = children(channel, "program");
+            let program_values: Vec<_> = programs
+                .iter()
+                .flat_map(|n| {
+                    let attribute = n.attribute("value");
+                    let text = n.text().filter(|t| !t.trim().is_empty());
+                    // Native -1 selects the text fallback, as in musescore.rs.
+                    attribute
+                        .filter(|value| !(value.trim() == "-1" && text.is_some()))
+                        .into_iter()
+                        .chain(text)
+                })
+                .collect();
+            let controllers = children(channel, "controller");
+            let bank = |number: &str, expected: &str| {
+                let values: Vec<_> = controllers
+                    .iter()
+                    .filter(|n| n.attribute("ctrl") == Some(number))
+                    .collect();
+                values.len() == 1 && values[0].attribute("value") == Some(expected)
+            };
+            if channel_values.is_empty()
+                || channel_values.iter().any(|v| v.trim() != "9")
+                || programs.len() != 1
+                || program_values.is_empty()
+                || program_values.iter().any(|v| v.trim() != "0")
+                || !bank("0", "1")
+                || !bank("32", "0")
+            {
+                return Err(refuse(
+                    "channel 9, bank 128 (MSB 1/LSB 0) and program 0 must be explicit",
+                ));
+            }
+            let drums = children(*instrument, "Drum");
+            let mut pitches = std::collections::BTreeSet::new();
+            if drums.is_empty()
+                || drums.iter().any(|n| {
+                    n.attribute("pitch")
+                        .and_then(|s| s.parse::<u8>().ok())
+                        .is_none_or(|pitch| !(35..=81).contains(&pitch) || !pitches.insert(pitch))
+                })
+            {
+                return Err(refuse("an explicit, unique Standard drum map is required"));
+            }
+            // Body IDs use the same resolution as stem topology (including 4.x
+            // implicit declaration IDs); every played key must be in this map.
+            for staff in &body_staves {
+                if staff
+                    .descendants()
+                    .filter(|n| n.has_tag_name("Note") && musescore::plays(*n))
+                    .any(|n| {
+                        let keys = children(n, "pitch");
+                        keys.len() != 1
+                            || keys[0]
+                                .text()
+                                .and_then(|s| s.trim().parse::<u8>().ok())
+                                .is_none_or(|p| !pitches.contains(&p))
+                    })
+                {
+                    return Err(refuse("a played key is outside the source drum map"));
+                }
+            }
+            let range = instrument.attribute_node("id").unwrap().range_value();
+            edits.push((range.start + offset, range.end + offset));
+            warnings.push(format!(
+                "[MUSESCORE_DRUM_TEMPLATE_MAPPED] Part {} ({}) uses source-proven Standard drums: the private MuseScore 4 reference/stem inputs map template piano to drumset; source bytes, drum map and MIDI state are unchanged.",
+                index + 1, parts[index].id));
+        }
+    }
+    let mut prepared = master.to_vec();
+    for (start, end) in edits.into_iter().rev() {
+        prepared.splice(start..end, b"drumset".iter().copied());
+    }
+    if prepared.len() as u64 > MAX_MASTER_BYTES {
+        return Err(too_large());
+    }
+    Ok((prepared, warnings))
+}
+
 fn replace_entry(archive: &[u8], path: &str, master: &[u8]) -> Result<Vec<u8>, String> {
     let mut source = zip::ZipArchive::new(Cursor::new(archive)).map_err(|e| e.to_string())?;
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer.set_raw_comment(source.comment().into());
     for index in 0..source.len() {
         let entry = source.by_index_raw(index).map_err(|e| e.to_string())?;
         if entry.name() == path {
-            let options = zip::write::SimpleFileOptions::default()
+            let mut options = zip::write::SimpleFileOptions::default()
                 .compression_method(entry.compression())
                 .last_modified_time(entry.last_modified().unwrap_or_default());
+            if let Some(mode) = entry.unix_mode() {
+                options = options.unix_permissions(mode);
+            }
             let name = entry.name().to_string();
             drop(entry);
             writer
@@ -336,6 +661,557 @@ fn closing_tag_offset(xml: &str, node: roxmltree::Node) -> Result<usize, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DRUM_CONFLICT: &str = include_str!("../tests/support/score-audio-conflict.mscx");
+
+    #[test]
+    fn drum_template_mapping_changes_only_one_template_in_bounded_render_copies() {
+        for bom in [false, true] {
+            let original = [
+                if bom { &[0xef, 0xbb, 0xbf][..] } else { &[] },
+                DRUM_CONFLICT.as_bytes(),
+            ]
+            .concat();
+            let mut score = ScoreStems::read(&original).unwrap();
+            let topology = musescore::parse(&original).unwrap().topology;
+            let before = score.parts().to_vec();
+            assert!(score.prepare_for_renderer(3).unwrap().is_empty());
+            assert_eq!(score.render_container(), original);
+            let warnings = score.prepare_for_renderer(4).unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].starts_with("[MUSESCORE_DRUM_TEMPLATE_MAPPED]"));
+            assert_eq!(
+                String::from_utf8_lossy(score.render_container())
+                    .replace("id=\"drumset\"", "id=\"piano\""),
+                String::from_utf8_lossy(&original)
+            );
+            score.validate_topology(&topology, true).unwrap();
+            assert_eq!(
+                score
+                    .parts()
+                    .iter()
+                    .map(|p| (&p.id, &p.staff_ids, p.audible_elements()))
+                    .collect::<Vec<_>>(),
+                before
+                    .iter()
+                    .map(|p| (&p.id, &p.staff_ids, p.audible_elements()))
+                    .collect::<Vec<_>>()
+            );
+            assert!(score.prepare_for_renderer(4).unwrap().is_empty());
+            for keep in 0..3 {
+                let stem = score.silenced(keep).unwrap();
+                assert!(String::from_utf8_lossy(&stem).contains("id=\"drumset\""));
+                let isolated = ScoreStems::read(&stem).unwrap();
+                for (index, part) in isolated.parts().iter().enumerate() {
+                    assert_eq!(part.audible_elements() > 0, index == keep);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drum_template_ownership_changes_are_scoped_to_resolved_part_staves() {
+        for version in ["3.02", "4.20"] {
+            let fixture =
+                DRUM_CONFLICT.replace("version=\"3.02\"", &format!("version=\"{version}\""));
+            let fixture = if version.starts_with('4') {
+                fixture
+                    .replace("<Staff id=\"1\"><StaffType", "<Staff><StaffType")
+                    .replace("<Staff id=\"2\"><StaffType", "<Staff><StaffType")
+                    .replace("<Staff id=\"3\"><StaffType", "<Staff><StaffType")
+            } else {
+                fixture
+            };
+            for change in [
+                "<InstrumentChange><Instrument id=\"flute\"><instrumentId>wind.flutes.flute</instrumentId></Instrument></InstrumentChange>",
+                "<StaffTypeChange><StaffType group=\"pitched\"/></StaffTypeChange>",
+                "<channelSwitch voice=\"0\" name=\"open\"/>",
+            ] {
+                let unrelated = fixture.replace("<Staff id=\"1\"><Measure><voice>", &format!("<Staff id=\"1\"><Measure><voice>{change}"));
+                let topology = musescore::parse(unrelated.as_bytes()).unwrap().topology;
+                let mut score = ScoreStems::read(unrelated.as_bytes()).unwrap();
+                assert_eq!(score.prepare_for_renderer(4).unwrap().len(), 1, "{version}: {change}");
+                assert_eq!(String::from_utf8_lossy(score.render_container()).replace("id=\"drumset\"", "id=\"piano\""), unrelated);
+                score.validate_topology(&topology, true).unwrap();
+
+                let owned = fixture.replace("<Staff id=\"3\"><Measure><voice>", &format!("<Staff id=\"3\"><Measure><voice>{change}"));
+                let mut score = ScoreStems::read(owned.as_bytes()).unwrap();
+                assert!(score.prepare_for_renderer(4).unwrap_err().starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"), "{version}: {change}");
+                assert_eq!(score.render_container(), owned.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn drum_template_program_sentinel_uses_native_text_fallback() {
+        let source = DRUM_CONFLICT.replace(
+            "<program value=\"0\"/>",
+            "<program value=\"-1\">0</program>",
+        );
+        musescore::parse(source.as_bytes()).unwrap();
+        let mut score = ScoreStems::read(source.as_bytes()).unwrap();
+        assert_eq!(score.prepare_for_renderer(4).unwrap().len(), 1);
+        assert_eq!(
+            String::from_utf8_lossy(score.render_container())
+                .replace("id=\"drumset\"", "id=\"piano\""),
+            source
+        );
+        for program in [
+            "<program value=\"0\">8</program>",
+            "<program value=\"8\">0</program>",
+            "<program value=\"-1\">8</program>",
+            "<program value=\"-1\"/>",
+        ] {
+            let source = DRUM_CONFLICT.replace("<program value=\"0\"/>", program);
+            let mut score = ScoreStems::read(source.as_bytes()).unwrap();
+            assert!(
+                score
+                    .prepare_for_renderer(4)
+                    .unwrap_err()
+                    .starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"),
+                "{program}"
+            );
+            assert_eq!(score.render_container(), source.as_bytes());
+        }
+    }
+
+    #[test]
+    fn drum_template_recognizes_alternate_percussion_evidence_and_channel_spellings() {
+        for channel in [
+            "<Channel channel=\"9\"><program value=\"0\"/></Channel>",
+            "<Channel><channel>9</channel><program value=\"0\"/></Channel>",
+            "<channel><midiChannel>9</midiChannel><program value=\"0\"/></channel>",
+        ] {
+            let source = score("3.02", &format!("<Part><Staff id=\"1\"/><Instrument id=\"piano\"><instrumentId>keyboard.piano</instrumentId>{channel}</Instrument></Part>"), "<Staff id=\"1\"><Measure><voice><Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord></voice></Measure></Staff>");
+            let mut score = ScoreStems::read(source.as_bytes()).unwrap();
+            assert!(
+                score
+                    .prepare_for_renderer(4)
+                    .unwrap_err()
+                    .starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"),
+                "{channel}"
+            );
+            assert_eq!(score.render_container(), source.as_bytes());
+        }
+        for taxonomy in [
+            "drum.group",
+            "percussion",
+            "pitched-percussion",
+            "unpitched-percussion",
+        ] {
+            let source = score("3.02", &format!("<Part><Staff id=\"1\"/><Instrument id=\"piano\"><instrumentId>{taxonomy}</instrumentId></Instrument></Part>"), "<Staff id=\"1\"><Measure><voice><Chord><Note><pitch>60</pitch></Note></Chord></voice></Measure></Staff>");
+            let mut score = ScoreStems::read(source.as_bytes()).unwrap();
+            assert!(
+                score
+                    .prepare_for_renderer(4)
+                    .unwrap_err()
+                    .starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"),
+                "{taxonomy}"
+            );
+            assert_eq!(score.render_container(), source.as_bytes());
+        }
+        for extra in [
+            "<channel/>",
+            "<channel channel=\"9\"><program value=\"8\"/></channel>",
+        ] {
+            let source = DRUM_CONFLICT.replace(
+                "<useDrumset>1</useDrumset>",
+                &format!("<useDrumset>1</useDrumset>{extra}"),
+            );
+            let mut score = ScoreStems::read(source.as_bytes()).unwrap();
+            assert!(
+                score
+                    .prepare_for_renderer(4)
+                    .unwrap_err()
+                    .starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"),
+                "{extra}"
+            );
+            assert_eq!(score.render_container(), source.as_bytes());
+        }
+    }
+
+    #[test]
+    fn drum_template_unused_secondary_percussion_channels_do_not_own_piano_notes() {
+        for secondary in [
+            "<Channel><midiChannel>9</midiChannel><program value=\"0\"/></Channel>",
+            "<Channel channel=\"9\"><program value=\"0\"/></Channel>",
+            "<channel><midiChannel>9</midiChannel><program value=\"0\"/></channel>",
+        ] {
+            let source = score("3.02", &format!("<Part><Staff id=\"1\"/><Instrument id=\"piano\"><instrumentId>keyboard.piano</instrumentId><Channel><midiChannel>0</midiChannel><program value=\"0\"/></Channel>{secondary}</Instrument></Part>"), "<Staff id=\"1\"><Measure><voice><Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord></voice></Measure></Staff>");
+            let mut unchanged = ScoreStems::read(source.as_bytes()).unwrap();
+            assert!(
+                unchanged.prepare_for_renderer(4).unwrap().is_empty(),
+                "{secondary}"
+            );
+            assert!(!unchanged.has_template_mapping());
+            assert_eq!(unchanged.render_container(), source.as_bytes());
+            let midi = musescore::parse(source.as_bytes()).unwrap();
+            assert!(midi
+                .tracks
+                .iter()
+                .flat_map(|t| &t.events)
+                .filter_map(|e| match &e.kind {
+                    crate::engine::midi::Kind::NoteOn(note) => Some(note),
+                    _ => None,
+                })
+                .all(|n| n.source.instrument_role
+                    == crate::engine::midi::NoteInstrumentRole::Pitched));
+            for selection in [
+                "<subchannel>1</subchannel>",
+                "<instrument id=\"piano\"/><subchannel>1</subchannel>",
+                "<instrument id=\"piano:channel:1\"/>",
+            ] {
+                let source = source.replace(
+                    "<Note><pitch>60</pitch>",
+                    &format!("<Note><pitch>60</pitch>{selection}"),
+                );
+                let mut selected = ScoreStems::read(source.as_bytes()).unwrap();
+                assert!(
+                    selected
+                        .prepare_for_renderer(4)
+                        .unwrap_err()
+                        .starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"),
+                    "{secondary}: {selection}"
+                );
+                assert_eq!(selected.render_container(), source.as_bytes());
+            }
+            let chord_selected = source.replace(
+                "<Chord><durationType>",
+                "<Chord><subchannel>1</subchannel><durationType>",
+            );
+            let mut selected = ScoreStems::read(chord_selected.as_bytes()).unwrap();
+            assert!(selected
+                .prepare_for_renderer(4)
+                .unwrap_err()
+                .starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"));
+            assert_eq!(selected.render_container(), chord_selected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn drum_template_edits_the_qualified_native_attribute_not_a_namespaced_id() {
+        let source = DRUM_CONFLICT.replace(
+            "<Instrument id=\"piano\">",
+            "<Instrument xmlns:x=\"urn:source\" x:id=\"evidence\" id=\"piano\">",
+        );
+        let mut score = ScoreStems::read(source.as_bytes()).unwrap();
+        assert_eq!(score.prepare_for_renderer(4).unwrap().len(), 1);
+        let prepared = std::str::from_utf8(score.render_container()).unwrap();
+        let doc = roxmltree::Document::parse(prepared).unwrap();
+        let instruments: Vec<_> = doc
+            .descendants()
+            .filter(|n| n.has_tag_name("Instrument"))
+            .collect();
+        assert_eq!(instruments[0].attribute("id"), Some("piano"));
+        assert_eq!(instruments[2].attribute("id"), Some("drumset"));
+        assert_eq!(
+            instruments[2].attribute(("urn:source", "id")),
+            Some("evidence")
+        );
+        assert_eq!(prepared.replace("id=\"drumset\"", "id=\"piano\""), source);
+    }
+
+    #[test]
+    fn drum_template_multiple_conflicting_parts_preserve_xml_topology_and_stems() {
+        let document = roxmltree::Document::parse(DRUM_CONFLICT).unwrap();
+        let score = document
+            .descendants()
+            .find(|n| n.has_tag_name("Score"))
+            .unwrap();
+        let drum_part = score
+            .children()
+            .filter(|n| n.has_tag_name("Part"))
+            .nth(2)
+            .unwrap();
+        let drum_staff = score
+            .children()
+            .find(|n| n.has_tag_name("Staff") && n.attribute("id") == Some("3"))
+            .unwrap();
+        let extra_part = DRUM_CONFLICT[drum_part.range()].replace("id=\"3\"", "id=\"4\"");
+        let extra_staff = DRUM_CONFLICT[drum_staff.range()].replace("id=\"3\"", "id=\"4\"");
+        let source = DRUM_CONFLICT
+            .replace(
+                "<Staff id=\"1\"><Measure>",
+                &format!("{extra_part}<Staff id=\"1\"><Measure>"),
+            )
+            .replace("</Score>", &format!("{extra_staff}</Score>"));
+        let topology = musescore::parse(source.as_bytes()).unwrap().topology;
+        let mut scores = ScoreStems::read(source.as_bytes()).unwrap();
+        let before = scores.parts().to_vec();
+        assert_eq!(scores.prepare_for_renderer(4).unwrap().len(), 2);
+        let prepared = std::str::from_utf8(scores.render_container()).unwrap();
+        let doc = roxmltree::Document::parse(prepared).unwrap();
+        assert_eq!(
+            doc.descendants()
+                .filter(|n| n.has_tag_name("Instrument"))
+                .map(|n| n.attribute("id").unwrap())
+                .collect::<Vec<_>>(),
+            ["piano", "electric-bass", "drumset", "drumset"]
+        );
+        assert_eq!(prepared.replace("id=\"drumset\"", "id=\"piano\""), source);
+        scores.validate_topology(&topology, true).unwrap();
+        assert_eq!(
+            scores
+                .parts()
+                .iter()
+                .map(|p| (&p.id, &p.staff_ids, p.audible_elements()))
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|p| (&p.id, &p.staff_ids, p.audible_elements()))
+                .collect::<Vec<_>>()
+        );
+        for keep in 0..4 {
+            let stem = scores.silenced(keep).unwrap();
+            roxmltree::Document::parse(std::str::from_utf8(&stem).unwrap()).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&stem)
+                    .matches("id=\"drumset\"")
+                    .count(),
+                2
+            );
+            let isolated = ScoreStems::read(&stem).unwrap();
+            isolated.validate_topology(&topology, true).unwrap();
+            for (index, part) in isolated.parts().iter().enumerate() {
+                assert_eq!(part.audible_elements() > 0, index == keep);
+            }
+        }
+    }
+
+    #[test]
+    fn drum_template_archive_keeps_unrelated_compressed_entries_and_metadata() {
+        let container =
+            b"<container><rootfiles><rootfile full-path=\"score.mscx\"/></rootfiles></container>";
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer.set_comment("preserve archive metadata");
+        for (name, bytes) in [
+            ("META-INF/container.xml", &container[..]),
+            ("score.mscx", DRUM_CONFLICT.as_bytes()),
+            ("Excerpts/score.mscx", DRUM_CONFLICT.as_bytes()),
+            ("audio/settings.json", b"{\"source\":true}"),
+        ] {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated)
+                        .unix_permissions(0o640),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        let original = writer.finish().unwrap().into_inner();
+        let mut scores = ScoreStems::read(&original).unwrap();
+        scores.prepare_for_renderer(4).unwrap();
+        let mut before = zip::ZipArchive::new(Cursor::new(&original)).unwrap();
+        let mut after = zip::ZipArchive::new(Cursor::new(scores.render_container())).unwrap();
+        assert_eq!(before.comment(), after.comment());
+        assert_eq!(
+            before.file_names().collect::<Vec<_>>(),
+            after.file_names().collect::<Vec<_>>()
+        );
+        for i in 0..before.len() {
+            let mut a = before.by_index_raw(i).unwrap();
+            let mut b = after.by_index_raw(i).unwrap();
+            assert_eq!(a.unix_mode(), b.unix_mode());
+            assert_eq!(a.last_modified(), b.last_modified());
+            if a.name() == "score.mscx" {
+                continue;
+            }
+            assert_eq!(a.crc32(), b.crc32());
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            a.read_to_end(&mut x).unwrap();
+            b.read_to_end(&mut y).unwrap();
+            assert_eq!(x, y, "unchanged compressed entry");
+        }
+    }
+
+    #[test]
+    fn drum_template_refuses_unproven_conflicts_without_mutating_input() {
+        for (from, to) in [
+            ("ctrl=\"0\" value=\"1\"", "ctrl=\"0\" value=\"0\""),
+            ("ctrl=\"32\" value=\"0\"", "ctrl=\"32\" value=\"1\""),
+            (
+                "<midiChannel>9</midiChannel>",
+                "<midiChannel>8</midiChannel>",
+            ),
+            ("<useDrumset>1</useDrumset>", "<useDrumset>0</useDrumset>"),
+            ("group=\"percussion\"", "group=\"pitched\""),
+            (
+                "<useDrumset>1</useDrumset>",
+                "<useDrumset>1</useDrumset><soundId>piano.keyboards</soundId>",
+            ),
+            (
+                "<midiChannel>9</midiChannel>",
+                "<midiChannel>9</midiChannel><program value=\"8\"/>",
+            ),
+            (
+                "<useDrumset>1</useDrumset>",
+                "<useDrumset>1</useDrumset><Channel/>",
+            ),
+            ("<Drum pitch=\"42\">", "<Drum pitch=\"82\">"),
+            ("<Drum pitch=\"42\">", "<Drum pitch=\"43\">"),
+            ("<program value=\"0\"/>", "<program value=\"8\"/>"),
+            ("<controller ctrl=\"0\" value=\"1\"/>", ""),
+            ("<Instrument id=\"piano\">", "<Instrument id=\"flute\">"),
+            (
+                "<useDrumset>1</useDrumset>",
+                "<useDrumset>1</useDrumset><Drum pitch=\"42\"/>",
+            ),
+            (
+                "<trackName>Drums</trackName>",
+                "<trackName>Drums</trackName><Staff id=\"9\"/>",
+            ),
+            ("version=\"3.02\"", "version=\"5.0\""),
+        ] {
+            let source = DRUM_CONFLICT.replace(from, to).into_bytes();
+            let mut score = ScoreStems::read(&source).unwrap();
+            assert!(
+                score
+                    .prepare_for_renderer(4)
+                    .unwrap_err()
+                    .starts_with("MUSESCORE_DRUM_TEMPLATE_UNPROVEN:"),
+                "{to}"
+            );
+            assert_eq!(score.render_container(), source);
+        }
+    }
+
+    #[test]
+    fn drum_template_leaves_ordinary_piano_and_canonical_drums_byte_exact() {
+        let mut prepared = ScoreStems::read(DRUM_CONFLICT.as_bytes()).unwrap();
+        prepared.prepare_for_renderer(4).unwrap();
+        let canonical = prepared.render_container().to_vec();
+        let mut canonical_score = ScoreStems::read(&canonical).unwrap();
+        assert!(canonical_score.prepare_for_renderer(4).unwrap().is_empty());
+        assert_eq!(canonical_score.render_container(), canonical);
+        // Display names cannot authorize a mapping.
+        let piano = score("3.02", "<Part><Staff id=\"1\"/><trackName>Drum Kit</trackName><Instrument id=\"piano\"><instrumentId>keyboard.piano</instrumentId></Instrument></Part>", "<Staff id=\"1\"><Measure><voice><Chord><Note><pitch>48</pitch></Note></Chord></voice></Measure></Staff>");
+        let mut ordinary = ScoreStems::read(piano.as_bytes()).unwrap();
+        assert!(ordinary.prepare_for_renderer(4).unwrap().is_empty());
+        assert_eq!(ordinary.render_container(), piano.as_bytes());
+    }
+
+    #[test]
+    fn configured_real_renderer_drum_template_matches_canonical_control() {
+        use crate::renderer::{AudioRenderer, MuseScoreRenderer, RenderLimits};
+        use std::{fs, path::Path, time::Duration};
+        let Ok(executable) = std::env::var("VERSE_MUSESCORE_GATE") else {
+            return;
+        };
+        let renderer = MuseScoreRenderer::probe(Path::new(&executable)).unwrap();
+        if renderer.capabilities().identity.major == 3 {
+            return;
+        }
+        assert_eq!(
+            renderer.capabilities().identity.major,
+            4,
+            "this acoustic qualification is for MuseScore 4"
+        );
+        let retained = std::env::var_os("VERSE_DRUM_OUTPUT_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("verse-drum-control-{}", std::process::id()))
+        });
+        fs::create_dir(&root).expect("control output directory must be new");
+        let mut compatible = ScoreStems::read(DRUM_CONFLICT.as_bytes()).unwrap();
+        compatible.prepare_for_renderer(4).unwrap();
+        let corrected = compatible.silenced(2).unwrap();
+        // Canonical control independently states both the native template and
+        // percussion taxonomy; the compatibility edit changes only the former.
+        let canonical = String::from_utf8(corrected.clone())
+            .unwrap()
+            .replacen(
+                "<Instrument id=\"drumset\"><instrumentId>keyboard.piano</instrumentId>",
+                "<Instrument id=\"drumset\"><instrumentId>drum.group.set</instrumentId>",
+                1,
+            )
+            .into_bytes();
+        assert_ne!(canonical, corrected);
+        let piano = String::from_utf8(corrected.clone())
+            .unwrap()
+            .replace("id=\"drumset\"", "id=\"piano\"")
+            .replace("group=\"percussion\"", "group=\"pitched\"")
+            .replace("<useDrumset>1</useDrumset>", "<useDrumset>0</useDrumset>")
+            .replace(
+                "<midiChannel>9</midiChannel>",
+                "<midiChannel>0</midiChannel>",
+            )
+            .replace("ctrl=\"0\" value=\"1\"", "ctrl=\"0\" value=\"0\"");
+        let doc = roxmltree::Document::parse(&piano).unwrap();
+        let mut piano_bytes = piano.as_bytes().to_vec();
+        for range in doc
+            .descendants()
+            .filter(|n| n.has_tag_name("Drum"))
+            .map(|n| n.range())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            piano_bytes.drain(range);
+        }
+        let limits = RenderLimits {
+            timeout: Duration::from_secs(5 * 60),
+            max_output_bytes: 64 * 1024 * 1024,
+        };
+        let mut outputs = Vec::new();
+        for (name, bytes) in [
+            ("corrected", corrected),
+            ("canonical", canonical),
+            ("piano", piano_bytes),
+        ] {
+            let input = root.join(format!("{name}.mscx"));
+            fs::write(&input, bytes).unwrap();
+            let rendered = renderer
+                .render(&input, &root.join(format!("{name}.wav")), &limits)
+                .unwrap();
+            outputs.push(rendered);
+        }
+        fn payload(bytes: &[u8]) -> &[u8] {
+            let mut offset = 12;
+            while offset + 8 <= bytes.len() {
+                let len =
+                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                if &bytes[offset..offset + 4] == b"data" {
+                    return &bytes[offset + 8..offset + 8 + len];
+                }
+                offset += 8 + len + len % 2;
+            }
+            panic!("validated WAV has no data chunk");
+        }
+        let samples: Vec<_> = outputs.iter().map(|o| fs::read(&o.path).unwrap()).collect();
+        assert_eq!(outputs[0].wav.sample_rate, outputs[1].wav.sample_rate);
+        assert_eq!(outputs[0].wav.channels, outputs[1].wav.channels);
+        assert!(
+            payload(&samples[0]) == payload(&samples[1]),
+            "corrected and canonical PCM must be byte-identical"
+        );
+        let frame_bytes =
+            usize::from(outputs[0].wav.channels) * usize::from(outputs[0].wav.bits_per_sample / 8);
+        let quarter = outputs[0].wav.sample_rate as usize / 2 * frame_bytes;
+        for (attack, name) in ["kick", "snare", "hi-hat"].into_iter().enumerate() {
+            let start = attack * quarter;
+            let end = start + quarter;
+            assert!(
+                payload(&samples[0])[start..end] != payload(&samples[2])[start..end],
+                "{name} must differ from piano"
+            );
+        }
+        let receipt = serde_json::json!({
+            "renderer": renderer.capabilities().identity,
+            "comparison": "byte-identical complete WAV data chunks; kick/snare/hi-hat each differ from ordinary piano over their 0.5-second source attack window",
+            "canonicalMatches": true, "pianoDiffers": true,
+            "wav": outputs.iter().map(|o| &o.wav).collect::<Vec<_>>(),
+        });
+        fs::write(
+            root.join("comparison.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+        eprintln!("{}", root.display());
+        if retained.is_none() {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     fn score(version: &str, parts: &str, staves: &str) -> String {
         format!(
