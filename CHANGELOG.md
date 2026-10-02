@@ -5,6 +5,13 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.8.5](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.4...v0.8.5) (2026-10-02)
+
+
+### Bug Fixes
+
+* preserve pronunciation coverage across vocal parts ([4bce220](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/4bce22067834534c4211aab88f0b9c3bc7875d35))
+
 ## [0.8.4](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.3...v0.8.4) (2026-10-01)
 
 
