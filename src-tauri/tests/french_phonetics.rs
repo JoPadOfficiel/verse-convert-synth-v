@@ -10,14 +10,127 @@ use verse_lib::engine::{musescore, musicxml};
 const FR: PronunciationProfile = PronunciationProfile::FrenchMillefeuille;
 
 #[test]
-fn explicit_french_keeps_unaudited_suis_moi_source_text_unchanged() {
+fn contracted_regardes_and_question_words_are_hinted_in_every_score_voice() {
+    use verse_lib::engine::midi::Syllabic;
+    let expected = [
+        "qu'est-ce[fr/k fr/ae fr/s]",
+        "que[fr/k fr/ee]",
+        "tu[fr/t fr/uh]",
+        "rgar[fr/r fr/g fr/ah fr/r]",
+        "des[fr/d fr/ee]",
+        "regardes[fr/r fr/ee fr/g fr/ah fr/r fr/d]",
+    ];
+    for native in [false, true] {
+        let mut midi = sab(
+            &["qu'est-ce", "que", "tu", "rgar", "des,", "regardes"],
+            native,
+            false,
+        );
+        for track in &mut midi.tracks {
+            for event in &mut track.events {
+                if let Kind::NoteOn(note) = &mut event.kind {
+                    for lyric in &mut note.lyrics {
+                        lyric.syllabic = match lyric.raw.as_str() {
+                            "que" => Some(Syllabic::Middle),
+                            "tu" => Some(Syllabic::End),
+                            "rgar" => Some(Syllabic::Begin),
+                            "des," => Some(Syllabic::End),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+        assert_lanes(&midi, &expected);
+        let before = format!("{midi:?}");
+        let automatic = convert_midi_with_profile(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            PronunciationProfile::Automatic,
+        );
+        assert!(automatic.ok, "{:?}", automatic.msg);
+        for part in &model(&automatic).voice_parts {
+            assert_eq!(
+                part.notes
+                    .iter()
+                    .map(|note| note.lyric.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(format!("{midi:?}"), before);
+        let svp = convert_midi_with_profile(&midi, "english", None, ExportTarget::Svp, FR);
+        let serialized = String::from_utf8(
+            target::serialize_to(ExportTarget::Svp, svp.svp.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(!serialized.contains("fr/"));
+        assert!(!serialized.contains("phonemizer"));
+    }
+}
+
+#[test]
+fn contracted_regardes_layout_keeps_manual_hints_and_source_boundaries() {
+    use verse_lib::engine::midi::Syllabic;
+    for boundary in [
+        "single",
+        "row",
+        "verse",
+        "manual",
+        "unknown",
+        "punctuation",
+        "overlap",
+    ] {
+        let mut notes = direct_notes(&["rgar", "des,"]);
+        edit_source(&mut notes[0]).syllabic = Some(Syllabic::Begin);
+        edit_source(&mut notes[1]).syllabic = Some(Syllabic::End);
+        match boundary {
+            "single" => edit_source(&mut notes[0]).syllabic = Some(Syllabic::Single),
+            "row" => edit_source(&mut notes[1]).lane = "other".into(),
+            "verse" => edit_source(&mut notes[1]).verse = 2,
+            "manual" => {
+                edit_source(&mut notes[0]).state =
+                    verse_lib::engine::midi::LyricState::Text("rgar[fr/r fr/ah]".into())
+            }
+            "unknown" => {
+                edit_source(&mut notes[0]).state =
+                    verse_lib::engine::midi::LyricState::Text("zyx".into())
+            }
+            "punctuation" => {
+                edit_source(&mut notes[0]).state =
+                    verse_lib::engine::midi::LyricState::Text("rgar,".into())
+            }
+            "overlap" => notes[1].onset_ticks -= 1,
+            _ => unreachable!(),
+        }
+        let original = notes.clone();
+        direct_apply(&mut notes);
+        assert_eq!(notes[0], original[0], "{boundary}");
+        assert_ne!(phones(&notes[1]), Some("fr/d fr/ee"), "{boundary}");
+        // An independent des may retain its existing determiner reading.
+        if let ProjectedLyric::Pronounced { source, .. } = &notes[1].lyric {
+            assert_eq!(ProjectedLyric::Source(source.clone()), original[1].lyric);
+        } else {
+            assert_eq!(notes[1], original[1], "{boundary}");
+        }
+    }
+}
+
+#[test]
+fn explicit_french_suis_moi_uses_the_audited_reading() {
     let mut notes = direct_notes(&["suis-moi"]);
     let original = notes.clone();
     let diagnostics = direct_apply(&mut notes);
-    assert_eq!(notes, original);
+    assert_eq!(phones(&notes[0]), Some("fr/s fr/uy fr/ih fr/m fr/w fr/ah"));
+    let ProjectedLyric::Pronounced { source, .. } = &notes[0].lyric else {
+        panic!("missing audited hint")
+    };
+    assert_eq!(ProjectedLyric::Source(source.clone()), original[0].lyric);
     assert!(diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == french::UNSUPPORTED));
+        .all(|diagnostic| diagnostic.code == french::APPLIED));
 }
 
 #[test]
@@ -32,10 +145,291 @@ fn unaudited_known_word_compounds_do_not_invent_a_combined_reading() {
 }
 
 #[test]
+fn audited_layouts_never_start_inside_a_bound_unknown_word() {
+    use verse_lib::engine::midi::Syllabic;
+    for gap in [0, 240] {
+        let mut notes = direct_notes(&["zyx", "u", "ne"]);
+        for (note, syllabic) in
+            notes
+                .iter_mut()
+                .zip([Syllabic::Begin, Syllabic::Middle, Syllabic::End])
+        {
+            edit_source(note).syllabic = Some(syllabic);
+        }
+        for note in &mut notes[1..] {
+            note.onset_ticks += gap;
+        }
+        let original = notes.clone();
+        let diagnostics = direct_apply(&mut notes);
+        assert_eq!(notes, original);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.code == french::UNSUPPORTED)
+                .count(),
+            3
+        );
+    }
+    for words in [["zyx-", "u", "ne"], ["zyx‐", "‐u‐", "‐ne"]] {
+        let mut notes = direct_notes(&words);
+        let original = notes.clone();
+        direct_apply(&mut notes);
+        assert_eq!(&notes[..2], &original[..2], "{words:?}");
+        if words[2].starts_with('‐') {
+            assert_eq!(notes[2], original[2], "{words:?}");
+        } else {
+            // Independent unmarked ne keeps its existing dictionary reading.
+            assert_eq!(phones(&notes[2]), Some("fr/n fr/ee"));
+        }
+        for native in [false, true] {
+            let midi = sab(&words, native, false);
+            let before = format!("{midi:?}");
+            for profile in [FR, PronunciationProfile::Automatic] {
+                let result =
+                    convert_midi_with_profile(&midi, "english", None, ExportTarget::Ustx, profile);
+                assert!(result.ok);
+                for part in &model(&result).voice_parts {
+                    assert!(
+                        part.notes.iter().all(|note| !note.lyric.contains("fr/uh")),
+                        "{words:?}/{profile:?}: {:?}",
+                        part.notes
+                    );
+                }
+            }
+            assert_eq!(format!("{midi:?}"), before);
+        }
+    }
+}
+
+#[test]
+fn a_previously_pronounced_context_keeps_the_echo_eligible() {
+    use verse_lib::engine::midi::Syllabic;
+    let mut notes = direct_notes(&["que", "tu", "crois", "a"]);
+    edit_source(&mut notes[2]).syllabic = Some(Syllabic::Begin);
+    edit_source(&mut notes[3]).syllabic = Some(Syllabic::End);
+    direct_apply(&mut notes);
+    assert_eq!(phones(&notes[2]), Some("fr/k fr/r fr/w fr/ah"));
+    assert_eq!(phones(&notes[3]), Some("fr/ah"));
+    for native in [false, true] {
+        let mut midi = sab(&["que", "tu", "crois", "a"], native, false);
+        for track in &mut midi.tracks {
+            for event in &mut track.events {
+                if let Kind::NoteOn(note) = &mut event.kind {
+                    for lyric in &mut note.lyrics {
+                        lyric.syllabic = match lyric.raw.as_str() {
+                            "crois" => Some(Syllabic::Begin),
+                            "a" => Some(Syllabic::End),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
+        assert_lanes(
+            &midi,
+            &[
+                "que[fr/k fr/ee]",
+                "tu[fr/t fr/uh]",
+                "crois[fr/k fr/r fr/w fr/ah]",
+                "a[fr/ah]",
+            ],
+        );
+    }
+    let xml = r#"<score-partwise version="4.0"><part-list><score-part id="P1"><part-name>Choir</part-name></score-part></part-list><part id="P1"><measure number="1"><attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice></note><note><chord/><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><lyric><text>que</text></lyric></note><note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><lyric><text>tu</text></lyric></note><note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><lyric><syllabic>begin</syllabic><text>crois</text></lyric></note><note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><voice>1</voice><lyric><syllabic>end</syllabic><text>a</text></lyric></note></measure></part></score-partwise>"#;
+    let midi = musicxml::parse(xml.as_bytes()).unwrap();
+    let before = format!("{midi:?}");
+    let result = convert(&midi);
+    let notes: Vec<_> = result
+        .svp
+        .as_ref()
+        .unwrap()
+        .tracks
+        .iter()
+        .flat_map(|track| &track.notes)
+        .collect();
+    assert_eq!(notes.len(), 4);
+    assert_eq!(
+        phones(
+            notes
+                .iter()
+                .find(|note| note.onset_ticks == 2 * u32::from(midi.ticks_per_beat))
+                .unwrap()
+        ),
+        Some("fr/k fr/r fr/w fr/ah")
+    );
+    assert_eq!(
+        phones(
+            notes
+                .iter()
+                .find(|note| note.onset_ticks == 3 * u32::from(midi.ticks_per_beat))
+                .unwrap()
+        ),
+        Some("fr/ah")
+    );
+    assert_eq!(format!("{midi:?}"), before);
+}
+
+#[test]
+fn explicit_word_end_metadata_overrides_a_typed_trailing_dash() {
+    use verse_lib::engine::midi::Syllabic;
+    for prefix in ["tu-", "tu‐"] {
+        for metadata in [Syllabic::Single, Syllabic::End] {
+            let mut notes = direct_notes(&[prefix, "rgar", "des"]);
+            edit_source(&mut notes[0]).syllabic = Some(metadata.clone());
+            direct_apply(&mut notes);
+            assert_eq!(phones(&notes[1]), Some("fr/r fr/g fr/ah fr/r"));
+            assert_eq!(phones(&notes[2]), Some("fr/d fr/ee"));
+            for native in [false, true] {
+                let mut midi = sab(&[prefix, "rgar", "des"], native, false);
+                for track in &mut midi.tracks {
+                    for event in &mut track.events {
+                        if let Kind::NoteOn(note) = &mut event.kind {
+                            if note.lyrics[0].raw == prefix {
+                                note.lyrics[0].syllabic = Some(metadata.clone());
+                            }
+                        }
+                    }
+                }
+                let before = format!("{midi:?}");
+                for profile in [FR, PronunciationProfile::Automatic] {
+                    let result = convert_midi_with_profile(
+                        &midi,
+                        "english",
+                        None,
+                        ExportTarget::Ustx,
+                        profile,
+                    );
+                    assert!(result.ok);
+                    for part in &model(&result).voice_parts {
+                        assert_eq!(part.notes[1].lyric, "rgar[fr/r fr/g fr/ah fr/r]");
+                        assert_eq!(part.notes[2].lyric, "des[fr/d fr/ee]");
+                    }
+                }
+                assert_eq!(format!("{midi:?}"), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn short_echoes_cannot_claim_the_head_of_a_longer_audited_word() {
+    let mut notes = direct_notes(&["tu", "crois", "a", "mou", "ou", "ours"]);
+    direct_apply(&mut notes);
+    assert_eq!(phones(&notes[5]), Some("fr/ou fr/r"));
+}
+
+#[test]
+fn crois_a_requires_the_written_present_tense_context() {
+    use verse_lib::engine::midi::Syllabic;
+    let mut unknown = direct_notes(&["crois", "a"]);
+    edit_source(&mut unknown[0]).syllabic = Some(Syllabic::Begin);
+    edit_source(&mut unknown[1]).syllabic = Some(Syllabic::End);
+    let before = unknown.clone();
+    direct_apply(&mut unknown);
+    assert_eq!(unknown, before, "croisa could be a different written word");
+    for boundary in ["none", "row", "verse", "gap", "punctuation", "manual"] {
+        let mut notes = direct_notes(&["tu", "crois", "a"]);
+        edit_source(&mut notes[1]).syllabic = Some(Syllabic::Begin);
+        edit_source(&mut notes[2]).syllabic = Some(Syllabic::End);
+        match boundary {
+            "row" => edit_source(&mut notes[0]).lane = "other".into(),
+            "verse" => edit_source(&mut notes[0]).verse = 2,
+            "gap" => notes[0].duration_ticks -= 1,
+            "punctuation" => {
+                edit_source(&mut notes[0]).state =
+                    verse_lib::engine::midi::LyricState::Text("tu,".into())
+            }
+            "manual" => {
+                edit_source(&mut notes[0]).state =
+                    verse_lib::engine::midi::LyricState::Text("tu[fr/t fr/uh]".into())
+            }
+            _ => {}
+        }
+        let before = notes.clone();
+        direct_apply(&mut notes);
+        if boundary == "none" {
+            assert_eq!(phones(&notes[1]), Some("fr/k fr/r fr/w fr/ah"));
+            assert_eq!(phones(&notes[2]), Some("fr/ah"));
+        } else {
+            assert_eq!(&notes[1..], &before[1..], "{boundary}");
+        }
+    }
+}
+
+#[test]
+fn audited_elisions_and_question_hyphens_are_profile_consistent() {
+    for word in ["j'aboie", "qu'est‐ce", "qu'est‑ce", "qu’est—ce"] {
+        let expected = if word.starts_with("j'") {
+            "fr/j fr/ah fr/b fr/w fr/ah"
+        } else {
+            "fr/k fr/ae fr/s"
+        };
+        for native in [false, true] {
+            let midi = sab(&[word], native, false);
+            for profile in [FR, PronunciationProfile::Automatic] {
+                let result =
+                    convert_midi_with_profile(&midi, "english", None, ExportTarget::Ustx, profile);
+                assert!(result.ok);
+                for part in &model(&result).voice_parts {
+                    assert!(
+                        part.notes[0].lyric.ends_with(&format!("[{expected}]")),
+                        "{word}: {:?}",
+                        part.notes
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn automatic_keeps_an_unmarked_audited_word_in_one_language() {
+    for native in [false, true] {
+        let midi = sab(&["une", "gre", "nad'"], native, false);
+        let result = convert_midi_with_profile(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            PronunciationProfile::Automatic,
+        );
+        assert!(result.ok);
+        for part in &model(&result).voice_parts {
+            assert_eq!(part.notes[1].lyric, "gre[fr/g fr/r fr/ee]");
+            assert_eq!(part.notes[2].lyric, "nad[fr/n fr/ah fr/d]");
+        }
+    }
+}
+
+#[test]
 fn contextual_sung_layout_matrix_in_both_score_formats() {
     // Synthetic isolated words: expected phones come from the FR-004 contract,
     // including contexts that previously received a wrong dictionary reading.
     let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["vil", "lebla", "far", "de"],
+            &["v ih", "l b l ah", "f ah r", "d ee"],
+        ),
+        (&["na", "ni", "mal"], &["n ah", "n ih", "m ah l"]),
+        (&["tu", "crois", "a"], &["t uh", "k r w ah", "ah"]),
+        (&["re", "garde"], &["r ee", "g ah r d"]),
+        (&["rgar", "des"], &["r g ah r", "d ee"]),
+        (&["que", "tu"], &["k ee", "t uh"]),
+        (&["mon", "tre", "rai"], &["m on", "t r ee", "r eh"]),
+        (&["fris", "sonne"], &["f r ih", "s oo n"]),
+        (&["u", "ne"], &["uh", "n ee"]),
+        (&["ra", "ge"], &["r ah", "j ee"]),
+        (&["som", "meille"], &["s oo", "m ae y"]),
+        (&["j'a", "boie"], &["j ah", "b w ah"]),
+        (&["là", "a"], &["l ah", "ah"]),
+        (&["sais", "tu"], &["s ae", "t uh"]),
+        (&["gre", "nad"], &["g r ee", "n ah d"]),
+        (&["regardes"], &["r ee g ah r d"]),
+        (&["mords"], &["m oo r"]),
+        (&["soupçonnes"], &["s ou p s oo n"]),
+        (&["qu'est-ce"], &["k ae s"]),
+        (&["qu'est"], &["k ae"]),
+        (&["aboie"], &["ah b w ah"]),
         (&["j'i", "rai"], &["j ih", "r ae"]),
         (&["rai", "son"], &["r ae", "z on"]),
         (&["s'a", "chève"], &["s ah", "sh ae v"]),

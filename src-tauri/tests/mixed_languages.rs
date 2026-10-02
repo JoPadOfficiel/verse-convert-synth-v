@@ -579,6 +579,472 @@ fn four_language_routing_preserves_source_notes_across_all_adapters() {
 }
 
 #[test]
+fn supported_hints_are_part_and_profile_order_independent() {
+    use std::collections::BTreeMap;
+
+    let cases = [
+        (
+            &["bonjour"][..],
+            "bonjour[fr/b fr/on fr/j fr/ou fr/r]",
+            PronunciationLanguage::French,
+            PronunciationProfile::FrenchMillefeuille,
+            target::french::PHONEMIZER,
+            target::diffsinger::FRENCH_NAME,
+            target::french::APPLIED,
+        ),
+        (
+            &["beautiful"][..],
+            "beautiful[en/b en/y en/uw en/t en/ah en/f en/ah en/l]",
+            PronunciationLanguage::English,
+            PronunciationProfile::EnglishArpabet,
+            target::english::PHONEMIZER,
+            target::diffsinger::ENGLISH_NAME,
+            target::english::APPLIED,
+        ),
+        (
+            &["hola"][..],
+            "hola[o l a]",
+            PronunciationLanguage::Spanish,
+            PronunciationProfile::SpanishDiffSinger,
+            target::diffsinger::SPANISH_PHONEMIZER,
+            target::diffsinger::SPANISH_NAME,
+            target::diffsinger::APPLIED,
+        ),
+        (
+            &["acho", "obrigado"][..],
+            "acho[a S u]",
+            PronunciationLanguage::Portuguese,
+            PronunciationProfile::PortugueseDiffSinger,
+            target::diffsinger::PORTUGUESE_PHONEMIZER,
+            target::diffsinger::PORTUGUESE_NAME,
+            target::diffsinger::APPLIED,
+        ),
+    ];
+    let mut conversions = 0;
+    let mut references_by_profile = BTreeMap::new();
+    for (words, hint, language, profile, phonemizer, name, applied) in cases {
+        for native in [false, true] {
+            let mut parity_reference = None;
+            for reverse_parts in [false, true] {
+                let source = three_part_score(words, native, reverse_parts);
+                let original = format!("{source:?}");
+                assert_eq!(source.tracks.len(), 3);
+                let originals: BTreeMap<_, _> = source
+                    .tracks
+                    .iter()
+                    .flat_map(|track| {
+                        track.events.iter().filter_map(move |event| {
+                            let midi::Kind::NoteOn(note) = &event.kind else {
+                                return None;
+                            };
+                            let off = track
+                                .events
+                                .iter()
+                                .find(|end| {
+                                    matches!(&end.kind, midi::Kind::NoteOff(off)
+                                    if off.source_id.as_deref() == Some(note.source.id.as_str()))
+                                })
+                                .expect("synthetic source note has an exact note-off");
+                            Some(((track.id.clone(), event.order), (event, note, off)))
+                        })
+                    })
+                    .collect();
+                assert_eq!(originals.len(), 3 * words.len());
+                let mut profiles = [profile, AUTO];
+                if reverse_parts {
+                    profiles.reverse();
+                }
+                for selected in profiles {
+                    let context = format!("{language:?}/{native}/{reverse_parts}/{selected:?}");
+                    let outcome = convert_midi_with_profile(
+                        &source,
+                        "english",
+                        None,
+                        ExportTarget::Ustx,
+                        selected,
+                    );
+                    conversions += 1;
+                    assert!(outcome.ok, "{context}: {:?}", outcome.msg);
+                    let project = outcome.svp.as_ref().unwrap();
+                    let output = ustx::serialize(project).unwrap();
+                    assert_eq!(project.tracks.len(), 3, "{context}");
+                    assert_eq!(output.tracks.len(), 3, "{context}");
+                    assert_eq!(output.voice_parts.len(), 3, "{context}");
+                    let expected_parts = if reverse_parts { [3, 2, 1] } else { [1, 2, 3] };
+                    let mut observed = BTreeMap::new();
+                    let mut parity_observed = BTreeMap::new();
+                    for (index, track) in project.tracks.iter().enumerate() {
+                        let part_id = if native {
+                            format!("musescore-part-P{}", expected_parts[index])
+                        } else {
+                            format!("P{}", expected_parts[index])
+                        };
+                        assert_eq!(track.notes.len(), words.len(), "{context}/{part_id}");
+                        let exported = output
+                            .voice_parts
+                            .iter()
+                            .find(|part| part.track_no == index as i32)
+                            .expect("each projected Part has an exported track association");
+                        assert_eq!(exported.notes.len(), words.len(), "{context}/{part_id}");
+                        assert_eq!(
+                            output.tracks[index].phonemizer, phonemizer,
+                            "{context}/{part_id}"
+                        );
+                        let report = outcome
+                            .tracks
+                            .iter()
+                            .find(|report| report.source_id == track.source_track_id)
+                            .expect("each source Part has its own report");
+                        for (word_index, (note, rendered)) in
+                            track.notes.iter().zip(&exported.notes).enumerate()
+                        {
+                            let evidence = note.source_evidence.as_ref().unwrap();
+                            let origin = evidence.origin.as_ref().unwrap();
+                            let (on, original_note, off) = originals
+                                .get(&(origin.track_id.clone(), origin.note_on_order))
+                                .expect("projected identity belongs to an original source attack");
+                            assert_eq!(origin.track_id, track.source_track_id, "{context}");
+                            assert_eq!(
+                                origin.source.part_id.as_deref(),
+                                Some(part_id.as_str()),
+                                "{context}"
+                            );
+                            assert_eq!(origin.source, original_note.source, "{context}");
+                            assert_eq!(origin.note_off_order, off.order, "{context}");
+                            assert_eq!(
+                                evidence.note_on_event_id,
+                                format!("event:{}:{}", origin.track_id, on.order),
+                                "{context}"
+                            );
+                            assert_eq!(
+                                evidence.note_off_event_id,
+                                format!("event:{}:{}", origin.track_id, off.order),
+                                "{context}"
+                            );
+                            assert!(
+                                !origin.lyric_conflict && origin.continuation.is_none(),
+                                "{context}"
+                            );
+                            let lyric = source_lyric(note).unwrap();
+                            assert_eq!(original_note.lyrics.len(), 1, "{context}");
+                            assert_eq!(lyric, &original_note.lyrics[0], "{context}");
+                            assert_eq!(lyric.raw, words[word_index], "{context}");
+                            assert_eq!(
+                                (note.onset_ticks, note.duration_ticks, Some(note.pitch)),
+                                (on.tick, off.tick - on.tick, original_note.key),
+                                "source geometry changed: {context}"
+                            );
+                            assert_eq!(
+                                (rendered.position, rendered.duration, rendered.tone),
+                                (word_index as i32 * 480, 480, note.pitch),
+                                "export geometry changed: {context}"
+                            );
+                            assert_eq!(
+                                note.pronunciation_language,
+                                if selected == AUTO {
+                                    Some(language)
+                                } else {
+                                    None
+                                },
+                                "{context}/{part_id}"
+                            );
+                            assert_eq!(
+                                rendered.phonemizer.as_deref(),
+                                if selected == AUTO { Some(name) } else { None },
+                                "{context}/{part_id}"
+                            );
+                            if word_index == 0 {
+                                assert_eq!(rendered.lyric, hint, "{context}/{part_id}");
+                                assert!(report.warnings.iter().any(|diagnostic|
+                                    diagnostic.code == applied
+                                        && diagnostic.source_id.as_deref() == Some(evidence.note_id.as_str())),
+                                    "exact hint must be reported for this Part's word: {context}/{part_id}");
+                            }
+                            // `obrigado` establishes Portuguese passage ownership;
+                            // its pinned reading need not yield an exact hint.
+                            let mut canonical_note = note.clone();
+                            // The adapter assigns default tempo metadata to the
+                            // first Part, shifting its source event ordinals.
+                            // Those are checked above against this input; compare
+                            // stable notation ownership across reordered inputs.
+                            canonical_note.source_evidence = None;
+                            let identity = (
+                                origin.track_id.clone(),
+                                origin.source.id.clone(),
+                                origin.source.occurrence,
+                                lyric.lane.clone(),
+                                lyric.verse,
+                            );
+                            assert!(
+                                parity_observed
+                                    .insert(
+                                        identity.clone(),
+                                        (
+                                            note.onset_ticks,
+                                            note.duration_ticks,
+                                            note.pitch,
+                                            note.lyric.clone(),
+                                            (rendered.position, rendered.duration, rendered.tone),
+                                            rendered.lyric.clone(),
+                                        )
+                                    )
+                                    .is_none(),
+                                "duplicate source identity: {context}"
+                            );
+                            assert!(
+                                observed
+                                    .insert(
+                                        identity,
+                                        (
+                                            canonical_note,
+                                            origin.source.clone(),
+                                            rendered.clone(),
+                                            output.tracks[index].clone()
+                                        )
+                                    )
+                                    .is_none(),
+                                "duplicate source identity: {context}"
+                            );
+                        }
+                    }
+                    assert_eq!(observed.len(), originals.len(), "{context}");
+                    // Full routing metadata is stable within each profile;
+                    // Automatic-only ownership/overrides remain observable.
+                    let profile_key = (language, native, format!("{selected:?}"));
+                    if let Some(reference) = references_by_profile.get(&profile_key) {
+                        assert_eq!(
+                            &observed, reference,
+                            "Part/profile order changed metadata within a profile: {context}"
+                        );
+                    } else {
+                        references_by_profile.insert(profile_key, observed);
+                    }
+                    // Explicit/Automatic parity covers geometry and lyric hints;
+                    // each profile's routing contract is asserted above.
+                    if let Some(reference) = &parity_reference {
+                        assert_eq!(
+                            &parity_observed, reference,
+                            "Part/profile order changed source geometry or lyric hints: {context}"
+                        );
+                    } else {
+                        parity_reference = Some(parity_observed);
+                    }
+                    assert_eq!(
+                        format!("{source:?}"),
+                        original,
+                        "source IR changed: {context}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(conversions, 32);
+}
+
+fn three_part_score(words: &[&str], native: bool, reverse_parts: bool) -> Midi {
+    part_score(&[words, words, words], native, reverse_parts)
+}
+
+#[test]
+fn automatic_distinct_language_parts_keep_ownership_when_reordered() {
+    use std::collections::BTreeMap;
+
+    let cases = [
+        (
+            &["bonjour"][..],
+            "bonjour[fr/b fr/on fr/j fr/ou fr/r]",
+            PronunciationLanguage::French,
+            target::french::PHONEMIZER,
+            target::diffsinger::FRENCH_NAME,
+        ),
+        (
+            &["beautiful"][..],
+            "beautiful[en/b en/y en/uw en/t en/ah en/f en/ah en/l]",
+            PronunciationLanguage::English,
+            target::english::PHONEMIZER,
+            target::diffsinger::ENGLISH_NAME,
+        ),
+        (
+            &["hola"][..],
+            "hola[o l a]",
+            PronunciationLanguage::Spanish,
+            target::diffsinger::SPANISH_PHONEMIZER,
+            target::diffsinger::SPANISH_NAME,
+        ),
+        (
+            &["acho", "obrigado"][..],
+            "acho[a S u]",
+            PronunciationLanguage::Portuguese,
+            target::diffsinger::PORTUGUESE_PHONEMIZER,
+            target::diffsinger::PORTUGUESE_NAME,
+        ),
+    ];
+    let words = cases.map(|(words, ..)| words);
+    for native in [false, true] {
+        let mut reference = None;
+        for reversed in [false, true] {
+            let source = part_score(&words, native, reversed);
+            let snapshot = format!("{source:?}");
+            let outcome = convert(&source, ExportTarget::Ustx);
+            let project = outcome.svp.as_ref().unwrap();
+            let output = ustx::serialize(project).unwrap();
+            assert_eq!(source.tracks.len(), 4);
+            assert_eq!(project.tracks.len(), 4);
+            assert_eq!(output.tracks.len(), 4);
+            assert_eq!(output.voice_parts.len(), 4);
+            let order = if reversed { [3, 2, 1, 0] } else { [0, 1, 2, 3] };
+            let mut observed = BTreeMap::new();
+            for (index, track) in project.tracks.iter().enumerate() {
+                let case = order[index];
+                let (words, hint, language, phonemizer, name) = cases[case];
+                let part_id = if native {
+                    format!("musescore-part-P{}", case + 1)
+                } else {
+                    format!("P{}", case + 1)
+                };
+                let context = format!("native={native}/reversed={reversed}/{part_id}");
+                let original_track = source
+                    .tracks
+                    .iter()
+                    .find(|original| original.id == track.source_track_id)
+                    .expect("each lane retains its source track identity");
+                let exported = output
+                    .voice_parts
+                    .iter()
+                    .find(|part| part.track_no == index as i32)
+                    .unwrap();
+                assert_eq!(track.notes.len(), words.len(), "{context}");
+                assert_eq!(exported.notes.len(), words.len(), "{context}");
+                assert_eq!(output.tracks[index].phonemizer, phonemizer, "{context}");
+                for (word_index, (note, rendered)) in
+                    track.notes.iter().zip(&exported.notes).enumerate()
+                {
+                    let evidence = note.source_evidence.as_ref().unwrap();
+                    let origin = evidence.origin.as_ref().unwrap();
+                    let on = original_track
+                        .events
+                        .iter()
+                        .find(|event| event.order == origin.note_on_order)
+                        .unwrap();
+                    let midi::Kind::NoteOn(original_note) = &on.kind else {
+                        panic!("source identity must resolve to a note-on: {context}");
+                    };
+                    let off = original_track
+                        .events
+                        .iter()
+                        .find(|event| {
+                            matches!(&event.kind, midi::Kind::NoteOff(off)
+                            if off.source_id.as_deref() == Some(original_note.source.id.as_str()))
+                        })
+                        .unwrap();
+                    assert_eq!(origin.track_id, original_track.id, "{context}");
+                    assert_eq!(
+                        origin.source.part_id.as_deref(),
+                        Some(part_id.as_str()),
+                        "{context}"
+                    );
+                    assert_eq!(origin.source, original_note.source, "{context}");
+                    assert_eq!(origin.note_off_order, off.order, "{context}");
+                    let lyric = source_lyric(note).unwrap();
+                    assert_eq!(original_note.lyrics.len(), 1, "{context}");
+                    assert_eq!(lyric, &original_note.lyrics[0], "{context}");
+                    assert_eq!(lyric.raw, words[word_index], "{context}");
+                    assert_eq!(
+                        (note.onset_ticks, note.duration_ticks, Some(note.pitch)),
+                        (on.tick, off.tick - on.tick, original_note.key),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        (rendered.position, rendered.duration, rendered.tone),
+                        (word_index as i32 * 480, 480, note.pitch),
+                        "{context}"
+                    );
+                    assert_eq!(note.pronunciation_language, Some(language), "{context}");
+                    assert_eq!(rendered.phonemizer.as_deref(), Some(name), "{context}");
+                    if word_index == 0 {
+                        assert_eq!(rendered.lyric, hint, "{context}");
+                    }
+                    // Event ordinals can change with first-Part tempo metadata;
+                    // source notation IDs and lyric rows remain stable.
+                    let mut canonical = note.clone();
+                    canonical.source_evidence = None;
+                    assert!(
+                        observed
+                            .insert(
+                                (
+                                    part_id.clone(),
+                                    origin.track_id.clone(),
+                                    origin.source.id.clone(),
+                                    origin.source.occurrence,
+                                    lyric.lane.clone(),
+                                    lyric.verse
+                                ),
+                                (
+                                    canonical,
+                                    origin.source.clone(),
+                                    rendered.clone(),
+                                    output.tracks[index].clone()
+                                )
+                            )
+                            .is_none(),
+                        "duplicate identity: {context}"
+                    );
+                }
+            }
+            assert_eq!(observed.len(), 5, "every source attack is represented once");
+            if let Some(reference) = &reference {
+                assert_eq!(
+                    &observed, reference,
+                    "Part order changed ownership: native={native}"
+                );
+            } else {
+                reference = Some(observed);
+            }
+            assert_eq!(format!("{source:?}"), snapshot, "source IR is immutable");
+        }
+    }
+}
+
+fn part_score(words: &[&[&str]], native: bool, reverse_parts: bool) -> Midi {
+    let mut declarations = String::new();
+    let mut bodies = String::new();
+    let beats = words.iter().map(|words| words.len()).max().unwrap();
+    let mut parts: Vec<_> = words.iter().enumerate().collect();
+    if reverse_parts {
+        parts.reverse();
+    }
+    for (index, words) in parts {
+        let id = index + 1;
+        let name = ["Soprano", "Alto", "Bass", "Tenor"][index];
+        let octave = 5 - index;
+        let pitch = 72 - index * 12;
+        let notes: String = words.iter().map(|word| {
+            if native {
+                format!("<Chord><durationType>quarter</durationType><Lyrics><syllabic>single</syllabic><text>{word}</text></Lyrics><Note><pitch>{pitch}</pitch><tpc>14</tpc></Note></Chord>")
+            } else {
+                format!("<note><pitch><step>C</step><octave>{octave}</octave></pitch><duration>1</duration><type>quarter</type><voice>1</voice><staff>1</staff><lyric><syllabic>single</syllabic><text>{word}</text></lyric></note>")
+            }
+        }).collect();
+        if native {
+            declarations.push_str(&format!(
+                "<Part id=\"P{id}\"><Staff id=\"{id}\"/><trackName>{name}</trackName></Part>"
+            ));
+            bodies.push_str(&format!("<Staff id=\"{id}\"><Measure><voice><TimeSig><sigN>{beats}</sigN><sigD>4</sigD></TimeSig>{notes}</voice></Measure></Staff>"));
+        } else {
+            declarations.push_str(&format!(
+                "<score-part id=\"P{id}\"><part-name>{name}</part-name></score-part>"
+            ));
+            bodies.push_str(&format!("<part id=\"P{id}\"><measure number=\"1\"><attributes><divisions>1</divisions><time><beats>{beats}</beats><beat-type>4</beat-type></time></attributes>{notes}</measure></part>"));
+        }
+    }
+    if native {
+        musescore::parse(format!("<museScore version=\"4.0\"><Score><Division>480</Division>{declarations}{bodies}</Score></museScore>").as_bytes()).unwrap()
+    } else {
+        musicxml::parse(format!("<score-partwise version=\"4.0\"><part-list>{declarations}</part-list>{bodies}</score-partwise>").as_bytes()).unwrap()
+    }
+}
+
+#[test]
 fn external_spanish_portuguese_split_words_preserve_lyrics_holds_and_manual_hints() {
     for (syllables, word, language, profile, phonemizer) in [
         (

@@ -23,6 +23,15 @@ const COMMUNITY: &str = include_str!("french-community.tsv");
 static CURATED_INDEX: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
 static COMMUNITY_INDEX: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
 
+// Audited homophonous inflections missing from the pinned dictionary. These
+// literal aliases do not establish a general rule for written final s/t.
+const LEXICAL_ALIASES: &[(&str, &str)] = &[
+    ("regardes", "regarde"),
+    ("mords", "mord"),
+    ("soupçonnes", "soupçonne"),
+    ("aboie", "abois"),
+];
+
 fn normalize(text: &str) -> String {
     shared::normalize(text)
 }
@@ -41,12 +50,20 @@ fn ambiguous(key: &str) -> bool {
 }
 
 fn lexical(key: &str) -> Option<String> {
+    if let Some((_, reading)) = LEXICAL_ALIASES.iter().find(|(alias, _)| *alias == key) {
+        return lexical(reading);
+    }
+    if question_compound(key) {
+        return Some("fr/k fr/ae fr/s".into());
+    }
     let special = match key {
         "d'un" => Some("fr/d fr/in"),
         "ouh" => Some("fr/ou"),
         "tau" => Some("fr/t fr/oh"),
         "rê" => Some("fr/r fr/ae"),
         "laisses" => return lexical("laisse"),
+        "qu'est" => Some("fr/k fr/ae"),
+        "montrerai" => Some("fr/m fr/on fr/t fr/r fr/ee fr/r fr/eh"),
         _ => None,
     };
     if let Some(hint) = special {
@@ -85,10 +102,7 @@ fn lexical(key: &str) -> Option<String> {
                 && !ambiguous(remainder)
                 && (remainder.chars().count() > 1 || matches!(remainder, "a" | "y"))
             {
-                let hint = CURATED_INDEX
-                    .get_or_init(|| shared::index(LEXICON))
-                    .get(remainder)
-                    .or_else(|| dictionary.get(remainder));
+                let hint = lexical(remainder);
                 if let Some(hint) = hint {
                     return Some(format!("{phone} {hint}"));
                 }
@@ -96,6 +110,10 @@ fn lexical(key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn question_compound(key: &str) -> bool {
+    key.split(SYLLABLE_HYPHENS).collect::<Vec<_>>().as_slice() == ["qu'est", "ce"]
 }
 
 fn audited_compound_lexical(key: &str) -> Option<String> {
@@ -110,7 +128,7 @@ fn audited_compound_lexical(key: &str) -> Option<String> {
         .map(|hints| hints.join(" "))
 }
 
-fn automatic_lexical(key: &str) -> Option<String> {
+fn audited_lexical(key: &str) -> Option<String> {
     lexical(key).or_else(|| audited_compound_lexical(key))
 }
 
@@ -136,7 +154,12 @@ pub(crate) fn contains_lexeme(key: &str) -> bool {
     if key.is_empty() {
         return false;
     }
-    if matches!(key.as_str(), "d'un" | "ouh" | "tau" | "rê" | "laisses") {
+    if matches!(
+        key.as_str(),
+        "d'un" | "ouh" | "tau" | "rê" | "laisses" | "qu'est" | "qu'est-ce" | "montrerai"
+    ) || question_compound(&key)
+        || LEXICAL_ALIASES.iter().any(|(alias, _)| *alias == key)
+    {
         return true;
     }
     CURATED_INDEX
@@ -147,10 +170,8 @@ pub(crate) fn contains_lexeme(key: &str) -> bool {
             .contains_key(key.as_str())
 }
 
-/// Automatic routing may use the same narrowly audited compound evidence that
-/// the Automatic French pronunciation pass accepts. Keep this separate from
-/// `contains_lexeme` so explicit French profile semantics and generic dictionary
-/// membership remain unchanged.
+/// Automatic routing may use the same narrowly audited compound readings.
+/// Ordinary membership remains a literal dictionary/alias lookup.
 pub(crate) fn contains_automatic_lexeme(key: &str) -> bool {
     contains_lexeme(key) || audited_compound_lexical(&normalize(key)).is_some()
 }
@@ -177,9 +198,108 @@ struct Layout {
     orphan_end_slots: &'static [usize],
 }
 
-// Longest layouts first. Each slot is an attack, including repeated vowels;
+// Each slot is an attack, including repeated vowels;
 // only an actual source extension (or a bracketed empty slot) becomes a hold.
 const LAYOUTS: &[Layout] = &[
+    Layout {
+        word: "ville blafarde",
+        syllables: &["vil", "lebla", "far", "de"],
+        hints: &[
+            "fr/v fr/ih",
+            "fr/l fr/b fr/l fr/ah",
+            "fr/f fr/ah fr/r",
+            "fr/d fr/ee",
+        ],
+        orphan_end_slots: &[],
+    },
+    // The first n is explicitly written on the attack (a source-spelled
+    // liaison); it is not inferred from a preceding word.
+    Layout {
+        word: "animal",
+        syllables: &["na", "ni", "mal"],
+        hints: &["fr/n fr/ah", "fr/n fr/ih", "fr/m fr/ah fr/l"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "",
+        syllables: &["crois", "a"],
+        hints: &["fr/k fr/r fr/w fr/ah", "fr/ah"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "regarde",
+        syllables: &["re", "garde"],
+        hints: &["fr/r fr/ee", "fr/g fr/ah fr/r fr/d"],
+        orphan_end_slots: &[],
+    },
+    // Source-sung contractions and final schwas need separate attacks, not an
+    // independent dictionary reading of the ending (e.g. determiner des).
+    Layout {
+        word: "regardes",
+        syllables: &["rgar", "des"],
+        hints: &["fr/r fr/g fr/ah fr/r", "fr/d fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "",
+        syllables: &["que", "tu"],
+        hints: &["fr/k fr/ee", "fr/t fr/uh"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "montrerai",
+        syllables: &["mon", "tre", "rai"],
+        hints: &["fr/m fr/on", "fr/t fr/r fr/ee", "fr/r fr/eh"],
+        orphan_end_slots: &[1],
+    },
+    Layout {
+        word: "frissonne",
+        syllables: &["fris", "sonne"],
+        hints: &["fr/f fr/r fr/ih", "fr/s fr/oo fr/n"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "une",
+        syllables: &["u", "ne"],
+        hints: &["fr/uh", "fr/n fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "rage",
+        syllables: &["ra", "ge"],
+        hints: &["fr/r fr/ah", "fr/j fr/ee"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "sommeille",
+        syllables: &["som", "meille"],
+        hints: &["fr/s fr/oo", "fr/m fr/ae fr/y"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "j'aboie",
+        syllables: &["j'a", "boie"],
+        hints: &["fr/j fr/ah", "fr/b fr/w fr/ah"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "là",
+        syllables: &["là", "a"],
+        hints: &["fr/l fr/ah", "fr/ah"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "",
+        syllables: &["sais", "tu"],
+        hints: &["fr/s fr/ae", "fr/t fr/uh"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "grenade",
+        syllables: &["gre", "nad"],
+        hints: &["fr/g fr/r fr/ee", "fr/n fr/ah fr/d"],
+        orphan_end_slots: &[],
+    },
     Layout {
         word: "murmures",
         syllables: &["mur", "mu", "u", "ures"],
@@ -653,11 +773,55 @@ fn same_lane_or_hold(left: &ProjectedLyric, right: &ProjectedLyric) -> bool {
 }
 
 fn ends_word(lyric: &ProjectedLyric) -> bool {
-    source(lyric).is_some_and(|s| !matches!(s.syllabic, Some(Syllabic::Begin | Syllabic::Middle)))
-        && !text(lyric).is_some_and(|s| s.trim_end().ends_with('-'))
+    source(lyric).is_some_and(|s| match s.syllabic {
+        Some(Syllabic::Begin | Syllabic::Middle) => false,
+        Some(Syllabic::End | Syllabic::Single) => true,
+        None => !text(lyric).is_some_and(|s| s.trim_end().ends_with(SYLLABLE_HYPHENS)),
+    })
 }
 
-fn layout_members(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Option<Vec<usize>> {
+fn previous_attack(notes: &[ProjectedNote], head: usize) -> Option<usize> {
+    let mut index = head;
+    while index > 0 {
+        index -= 1;
+        match &notes[index].lyric {
+            ProjectedLyric::Extension => {}
+            ProjectedLyric::Source(lyric) if lyric.state == LyricState::Continuation => {}
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
+fn layout_members_raw(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Option<Vec<usize>> {
+    let head_source = source(&notes[head].lyric)?;
+    // A predecessor's binding also protects an unmarked tail. An explicit
+    // Begin/Single on the head instead establishes a new source word.
+    if !matches!(
+        head_source.syllabic,
+        Some(Syllabic::Begin | Syllabic::Single)
+    ) && previous_attack(notes, head).is_some_and(|previous| {
+        same_lane(&notes[previous].lyric, &notes[head].lyric)
+            && !ends_word(&notes[previous].lyric)
+            && text(&notes[previous].lyric).is_some_and(|text| !ends_phrase(text))
+    }) {
+        return None;
+    }
+    // The bare fragments could also spell the past-tense word croisa. Only
+    // the written, touching tu context qualifies this audited sung echo.
+    if layout.syllables == ["crois", "a"]
+        && !previous_attack(notes, head).is_some_and(|previous| {
+            source(&notes[previous].lyric)
+                .and_then(|source| candidate(&ProjectedLyric::Source(Box::new(source.clone()))))
+                .as_deref()
+                == Some("tu")
+                && same_lane(&notes[previous].lyric, &notes[head].lyric)
+                && next_attack(notes, previous) == Some(head)
+                && text(&notes[previous].lyric).is_some_and(|text| !ends_phrase(text))
+        })
+    {
+        return None;
+    }
     let mut members = Vec::new();
     let mut index = head;
     let mut crossed_gap = false;
@@ -727,6 +891,51 @@ fn layout_members(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Opti
         return None;
     }
     Some(members)
+}
+
+fn layout_members(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Option<Vec<usize>> {
+    let members = layout_members_raw(notes, head, layout)?;
+    let tail = *members.last()?;
+    // A short echo cannot consume the first syllable of a longer, complete
+    // audited word. This also protects scores with omitted syllabic metadata.
+    for &interior in members.iter().skip(1) {
+        if LAYOUTS.iter().any(|other| {
+            !other.word.is_empty()
+                && layout_members_raw(notes, interior, other).is_some_and(|other_members| {
+                    other_members.last().is_some_and(|&last| last > tail)
+                })
+        }) {
+            return None;
+        }
+    }
+    Some(members)
+}
+
+/// Read-only canonical identities for exact audited layouts. The router can
+/// classify an entire source-owned word rather than independent fragments.
+pub(crate) fn audited_layout_words(notes: &[ProjectedNote]) -> Vec<(Vec<usize>, &'static str)> {
+    let mut claimed = vec![false; notes.len()];
+    let mut result = Vec::new();
+    for head in 0..notes.len() {
+        for layout in LAYOUTS {
+            if layout.word.is_empty() || layout.word.contains(' ') || !contains_lexeme(layout.word)
+            {
+                continue;
+            }
+            let Some(members) = layout_members(notes, head, layout) else {
+                continue;
+            };
+            if members.iter().any(|&member| claimed[member]) {
+                continue;
+            }
+            for &member in &members {
+                claimed[member] = true;
+            }
+            result.push((members, layout.word));
+            break;
+        }
+    }
+    result
 }
 
 /// Exact independent readings for a caller that has proved source provenance.
@@ -883,13 +1092,13 @@ fn apply_inner(
             else {
                 continue;
             };
-            parts.concat()
+            if parts.as_slice() == ["suis", "moi"] {
+                "suis-moi".into()
+            } else {
+                parts.concat()
+            }
         };
-        let hint = if automatic_recovery {
-            automatic_lexical(&key)
-        } else {
-            lexical(&key)
-        };
+        let hint = audited_lexical(&key);
         if let Some(hint) = hint {
             if shared::vowel_count(&hint) == members.len() {
                 shared::pronounce_word(notes, &members, &key, &hint);
@@ -906,11 +1115,7 @@ fn apply_inner(
             // grammatical or sung-schwa rule.
             if (!fragments[index] || key == "rê") && standalone_allowed(&notes[index].lyric, &key)
             {
-                let hint = if automatic_recovery {
-                    automatic_lexical(&key)
-                } else {
-                    lexical(&key)
-                };
+                let hint = audited_lexical(&key);
                 if let Some(hint) = hint {
                     pronounce(&mut notes[index], &hint);
                     changed[index] = true;

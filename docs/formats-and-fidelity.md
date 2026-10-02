@@ -229,6 +229,29 @@ OpenUtau still processes those retained lyrics through its own phonemizer.
 Liaison uses recognized word boundaries: `mes`/`a`/`mours` adds z on `a`,
 while the `tes` syllable in `tem`/`pê`/`tes` cannot act as a determiner.
 
+Coverage is word- and layout-dependent, not dependent on a vocal Part's order.
+Audited literal inflections include `regardes`, `mords`, `soupçonnes` and
+`aboie`; no general final-consonant removal is applied. The contracted sung
+`rgar`/`des` keeps the first attack's reduced spelling and gives the stated
+second attack its schwa without a final s. Bounded `que`/`tu`,
+`mon`/`tre`/`rai`, `fris`/`sonne`, `u`/`ne`, `ra`/`ge`, `som`/`meille`,
+`j'a`/`boie`, written vowel echoes, source-spelled liaison and packed
+`vil`/`lebla`/`far`/`de` layouts preserve their source notes and raw lyric
+records. Explicit French and Automatic share the audited `suis-moi` reading;
+unreviewed compounds remain unsupported. Unknown or
+incompatible fragments still raise `FRENCH_PRONUNCIATION_UNSUPPORTED`.
+Layouts cannot start inside a bound unknown word or consume the head of a
+longer audited layout. Explicit syllabic metadata takes precedence over typed
+hyphens when deciding whether the preceding word ends. The ambiguous
+`crois`/`a` echo additionally requires
+the written, touching `tu` context in the same lyric row and verse. Automatic
+classifies exact audited complete layouts as words, including unmarked
+`gre`/`nad`, rather than classifying their fragments independently. Audited
+question compounds accept the existing supported Unicode hyphen set, and
+explicit elisions can reuse the same literal inflection aliases.
+An explicit hint on a complete word head followed by native `+` markers is
+also a fully pronounced allocation; a bracket is not required on every note.
+
 The source score and lyric objects (raw text, fragments, metadata, ownership
 and bytes) remain unchanged. Supported target spelling and phonemes live in a
 separate projection variant. Same-lane blank/text duplicates select the

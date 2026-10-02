@@ -970,13 +970,22 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
         .collect();
     let mut groups = lexical::automatic_words(notes);
     groups.sort_by_key(|members| members.first().copied().unwrap_or(usize::MAX));
+    let audited_layouts = french::audited_layout_words(notes);
 
     let mut raw_units: Vec<(Vec<usize>, String)> = Vec::new();
     for members in groups {
         if members.is_empty() || members.iter().any(|&index| ownership[index].is_some()) {
             continue;
         }
-        let key = lexical::preferred_joined_key(notes, &members, known_lexeme);
+        let mut key = lexical::preferred_joined_key(notes, &members, known_lexeme);
+        if !known_lexeme(&key) {
+            if let Some((_, word)) = audited_layouts
+                .iter()
+                .find(|(layout, _)| *layout == members)
+            {
+                key = (*word).into();
+            }
+        }
         if key.is_empty() {
             continue;
         }
@@ -985,6 +994,17 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
             ownership[member] = Some(unit_index);
         }
         raw_units.push((members, key));
+    }
+
+    for (members, word) in audited_layouts {
+        if members.iter().any(|&member| ownership[member].is_some()) {
+            continue;
+        }
+        let unit_index = raw_units.len();
+        for &member in &members {
+            ownership[member] = Some(unit_index);
+        }
+        raw_units.push((members, word.into()));
     }
 
     // Real scores sometimes mark every syllable of a word as Middle (the
