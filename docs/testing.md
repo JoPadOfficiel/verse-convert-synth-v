@@ -91,6 +91,27 @@ listening remain separate evidence.
 
 ## Required quality gates
 
+Fermata rhythm regressions cover the legacy/modern defaults, explicit holds,
+score-global ownership, repeated occurrences, exact segment boundaries and
+both target tempo maps. Renderer preparation tests verify that the full-score
+reference and all isolated Part inputs use the same qualified legacy defaults.
+The private real-renderer gate compares the vocal tempo map with independently
+exported MuseScore MIDI and retains a rendered WAV:
+
+```sh
+VERSE_MUSESCORE_GATE=/path/to/MuseScore \
+VERSE_FERMATA_SOURCE=/path/to/private-legacy-score.mscz \
+VERSE_FERMATA_OUTPUT_DIR=/path/to/new-receipt-directory \
+  cargo test --manifest-path src-tauri/Cargo.toml --locked \
+  supplied_legacy_fermata_render_preserves_the_vocal_tempo_map -- --ignored
+```
+
+`private_rhythm_corpus` additionally requires `VERSE_RHYTHM_CORPUS_DIR` and a
+new `VERSE_RHYTHM_REPORT_DIR`. Request it with `--test private_rhythm_corpus --
+--ignored`; all supported source files outside existing bundles are included.
+Its source/serializer assertions are structural evidence; independent renderer
+MIDI and audio remain separate checks.
+
 Pronunciation feedback adds `src-tauri/tests/pronunciation_feedback.rs` and
 `pronunciation::commands::tests`. These exercise explicit listening approval,
 SQLite restart/migration/backup, JSON pending import/deduplication/revocation,
@@ -305,12 +326,12 @@ The private KAR expectations are exact:
 | Dirty Dancing — She's Like the Wind | 218 |
 | Elvis Presley — Heartbreak Hotel | 276 |
 | Elvis Presley — Hound Dog | 244 |
-| Cabaret | 162 |
+| Cabaret | 178 (170 distinct source lyrics) |
 | Queen — Crazy Little Thing Called Love | 0 |
 
 The Queen result is intentionally empty because the source does not prove a
-safe melody binding. Cabaret additionally locks eight unresolved chord pitches.
-Neither case may be “repaired” by inventing lyrics or a fallback C4.
+safe melody binding. Cabaret preserves source-proven harmony copies across two
+singing voices. Neither case may be “repaired” by inventing lyrics or a fallback C4.
 
 The private score fixtures lock:
 

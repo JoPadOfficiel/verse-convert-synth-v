@@ -51,7 +51,7 @@ pub struct ScoreStems {
     container: Container,
     master: Vec<u8>,
     parts: Vec<ScorePart>,
-    template_mapped: bool,
+    render_prepared: bool,
 }
 
 impl ScoreStems {
@@ -86,7 +86,7 @@ impl ScoreStems {
             container,
             master,
             parts,
-            template_mapped: false,
+            render_prepared: false,
         })
     }
 
@@ -102,14 +102,15 @@ impl ScoreStems {
         }
     }
 
-    /// Qualify the MuseScore 4 legacy piano/drumset template conflict. This
-    /// changes only the template ID in a private render copy, never the source
-    /// snapshot or its musical/instrument evidence. MuseScore 3 stays unchanged.
+    /// Preserve qualified legacy playback defaults and drum templates in a
+    /// private MuseScore 4 render copy. The preserved source is never changed.
     pub fn prepare_for_renderer(&mut self, major: u32) -> Result<Vec<String>, String> {
         if major != 4 {
             return Ok(Vec::new());
         }
-        let (master, warnings) = crate::score_stems::prepare_drum_templates(&self.master)?;
+        let (master, mut warnings) = prepare_drum_templates(&self.master)?;
+        let (master, timing_warnings) = preserve_legacy_fermata_defaults(&master)?;
+        warnings.extend(timing_warnings);
         if warnings.is_empty() {
             return Ok(warnings);
         }
@@ -121,17 +122,17 @@ impl ScoreStems {
                 master_path,
             } => {
                 *archive = replace_entry(archive, master_path, &master)
-                    .map_err(|error| format!("MUSESCORE_DRUM_TEMPLATE_UNPROVEN: {error}"))?;
+                    .map_err(|error| format!("MUSESCORE_RENDER_PREPARATION_FAILED: {error}"))?;
             }
         }
         self.master = master;
         self.parts = parts;
-        self.template_mapped = true;
+        self.render_prepared = true;
         Ok(warnings)
     }
 
-    pub fn has_template_mapping(&self) -> bool {
-        self.template_mapped
+    pub fn has_render_preparation(&self) -> bool {
+        self.render_prepared
     }
 
     /// The coherent full-score render input, before Part silencing.
@@ -239,6 +240,244 @@ fn too_large() -> String {
 /// A narrowly qualified compatibility exception, not instrument inference.
 /// Pinned MuseScore 4 resolves `piano` before consulting percussion evidence;
 /// its `drumset` template selects the Standard kit without replacing the map.
+/// MuseScore 3.6.2 Fermata::propertyDefault(TIME_STRETCH) is 1.0; MuseScore
+/// 4.7.5 uses subtype-dependent defaults, including 2.0 for a normal fermata.
+/// Make only the omitted legacy default explicit before the newer renderer
+/// imports it, so it cannot introduce a hold absent from the source playback.
+fn preserve_legacy_fermata_defaults(master: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+    let offset = usize::from(master.starts_with(&[0xef, 0xbb, 0xbf])) * 3;
+    let xml = std::str::from_utf8(&master[offset..]).map_err(|e| e.to_string())?;
+    let document = roxmltree::Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 5_000_000,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if document
+        .root_element()
+        .attribute("version")
+        .and_then(|v| v.split('.').next())
+        != Some("3")
+    {
+        return Ok((master.to_vec(), Vec::new()));
+    }
+    let score = document
+        .root_element()
+        .children()
+        .find(|n| n.has_tag_name("Score"))
+        .ok_or("SCORE_STEM_UNSILENCEABLE: MuseScore Score element not found")?;
+    let active_explicit = score
+        .descendants()
+        .filter(|n| n.has_tag_name("Fermata"))
+        .any(|mark| {
+            !mark
+                .children()
+                .any(|n| n.has_tag_name("play") && n.text().is_some_and(|v| v.trim() == "0"))
+                && mark
+                    .children()
+                    .find(|n| n.has_tag_name("timeStretch"))
+                    .and_then(|n| n.text())
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .is_some_and(|v| v.is_finite() && v > 0.0 && v != 1.0)
+        });
+    if active_explicit {
+        let plan = musescore::written_playback_plan(xml)?;
+        if plan.has_implicit_gaps {
+            return preserve_legacy_playback_map(master, &document, score, offset);
+        }
+    }
+    let mut edits = Vec::new();
+    for node in score.descendants().filter(|n| n.has_tag_name("Fermata")) {
+        if node.children().any(|n| n.has_tag_name("timeStretch")) {
+            continue;
+        }
+        let range = node.range();
+        if xml[range.clone()].ends_with("/>") {
+            edits.push((
+                range.end - 2 + offset,
+                range.end + offset,
+                b"><timeStretch>1</timeStretch></Fermata>".to_vec(),
+            ));
+        } else {
+            let at = closing_tag_offset(xml, node)? + offset;
+            edits.push((at, at, b"<timeStretch>1</timeStretch>".to_vec()));
+        }
+    }
+    if edits.is_empty() {
+        return Ok((master.to_vec(), Vec::new()));
+    }
+    let count = edits.len();
+    let mut prepared = master.to_vec();
+    for (start, end, replacement) in edits.into_iter().rev() {
+        prepared.splice(start..end, replacement);
+    }
+    if prepared.len() as u64 > MAX_MASTER_BYTES {
+        return Err(too_large());
+    }
+    Ok((prepared, vec![format!("[MUSESCORE_LEGACY_FERMATA_DEFAULT_PRESERVED] Preserved the source MuseScore 3 time stretch of 1 for {count} fermata marks in the private reference/stem render inputs; source notes and tempo are unchanged.")]))
+}
+
+/// Native 4 may subdivide implicit gaps absent from native 3 and shorten
+/// an explicit fermata. Lower the original written playback map into tempo
+/// annotations, with native fermata playback neutralized in this render copy.
+/// Existing note/voice containers, navigation and source snapshots stay intact.
+fn preserve_legacy_playback_map(
+    master: &[u8],
+    document: &roxmltree::Document,
+    score: roxmltree::Node,
+    offset: usize,
+) -> Result<(Vec<u8>, Vec<String>), String> {
+    let xml = document.input_text();
+    let plan = musescore::written_playback_plan(xml)?;
+    let staff = score
+        .children()
+        .find(|n| n.has_tag_name("Staff") && n.attribute("id") == Some(plan.staff_id.as_str()))
+        .ok_or("MUSESCORE_PLAYBACK_MAP_UNPROVEN: source tempo staff is missing")?;
+    if staff
+        .descendants()
+        .filter(|n| n.has_tag_name("TimeSig"))
+        .any(|sig| {
+            let value = |name| {
+                sig.children()
+                    .find(|n| n.has_tag_name(name))
+                    .and_then(|n| n.text())
+                    .map(|v| v.trim().parse::<i64>())
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(1)
+            };
+            value("stretchN") != value("stretchD")
+        })
+    {
+        return Err("MUSESCORE_PLAYBACK_MAP_UNPROVEN: local meter stretch cannot lower the source tempo annotations".into());
+    }
+    let measures: Vec<_> = staff
+        .children()
+        .filter(|n| n.has_tag_name("Measure"))
+        .collect();
+    if measures.len() != plan.measures.len() || measures.len() != plan.first_voice_ends.len() {
+        return Err("MUSESCORE_PLAYBACK_MAP_UNPROVEN: source measure/cursor plan disagrees".into());
+    }
+    let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    for body in score.children().filter(|n| n.has_tag_name("Staff")) {
+        for node in body.descendants().filter(|n| n.has_tag_name("Tempo")) {
+            let range = node.range();
+            edits.push((range.start + offset, range.end + offset, Vec::new()));
+        }
+        for mark in body.descendants().filter(|n| n.has_tag_name("Fermata")) {
+            if let Some(stretch) = mark.children().find(|n| n.has_tag_name("timeStretch")) {
+                let range = stretch.range();
+                edits.push((
+                    range.start + offset,
+                    range.end + offset,
+                    b"<timeStretch>1</timeStretch>".to_vec(),
+                ));
+            } else if xml[mark.range()].ends_with("/>") {
+                let range = mark.range();
+                edits.push((
+                    range.end - 2 + offset,
+                    range.end + offset,
+                    b"><timeStretch>1</timeStretch></Fermata>".to_vec(),
+                ));
+            } else {
+                let at = closing_tag_offset(xml, mark)? + offset;
+                edits.push((at, at, b"<timeStretch>1</timeStretch>".to_vec()));
+            }
+        }
+    }
+    let whole = 4i64 * i64::from(plan.ticks_per_beat);
+    let location =
+        |delta: i64| format!("<location><fractions>{delta}/{whole}</fractions></location>");
+    for ((measure, &(start, end)), &cursor_end) in measures
+        .iter()
+        .zip(&plan.measures)
+        .zip(&plan.first_voice_ends)
+    {
+        let points: Vec<_> = plan
+            .tempos
+            .iter()
+            .copied()
+            .filter(|(tick, _)| *tick >= start && *tick < end)
+            .collect();
+        if points.is_empty() {
+            continue;
+        }
+        let voice = measure.children().find(|n| n.has_tag_name("voice")).ok_or(
+            "MUSESCORE_PLAYBACK_MAP_UNPROVEN: native source has no existing annotation voice",
+        )?;
+        let mut cursor = i64::from(cursor_end);
+        let mut annotations = String::new();
+        for (tick, micros) in points {
+            if cursor != i64::from(tick) {
+                annotations.push_str(&location(i64::from(tick) - cursor));
+            }
+            annotations.push_str(&format!("<Tempo><tempo>{}</tempo><followText>0</followText><text>Source playback</text></Tempo>", 1_000_000.0 / f64::from(micros)));
+            cursor = i64::from(tick);
+        }
+        if cursor != i64::from(cursor_end) {
+            annotations.push_str(&location(i64::from(cursor_end) - cursor));
+        }
+        let at = closing_tag_offset(xml, voice)? + offset;
+        edits.push((at, at, annotations.into_bytes()));
+    }
+    edits.sort_by_key(|edit| (edit.0, edit.1));
+    for pair in edits.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(
+                "MUSESCORE_PLAYBACK_MAP_UNPROVEN: overlapping source annotation edits".into(),
+            );
+        }
+    }
+    let mut prepared = master.to_vec();
+    for (start, end, bytes) in edits.into_iter().rev() {
+        prepared.splice(start..end, bytes);
+    }
+    if prepared.len() as u64 > MAX_MASTER_BYTES {
+        return Err(too_large());
+    }
+    let original_music = musescore::parse(master)?;
+    let prepared_music = musescore::parse(&prepared)?;
+    let geometry = |midi: &crate::engine::midi::Midi| {
+        midi.tracks
+            .iter()
+            .flat_map(|track| {
+                track.events.iter().filter_map(move |event| {
+                    use crate::engine::midi::Kind;
+                    match &event.kind {
+                        Kind::NoteOn(note) => {
+                            Some((track.id.clone(), event.tick, true, note.channel, note.key))
+                        }
+                        Kind::NoteOff(note) => {
+                            Some((track.id.clone(), event.tick, false, note.channel, note.key))
+                        }
+                        _ => None,
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let tempos = |midi: &crate::engine::midi::Midi| {
+        midi.tracks
+            .iter()
+            .flat_map(|t| &t.events)
+            .filter_map(|e| match e.kind {
+                crate::engine::midi::Kind::Tempo(us) => Some((e.tick, us)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    if original_music.ticks_per_beat != prepared_music.ticks_per_beat
+        || geometry(&original_music) != geometry(&prepared_music)
+        || tempos(&original_music) != tempos(&prepared_music)
+    {
+        return Err("MUSESCORE_PLAYBACK_MAP_UNPROVEN: renderer annotations change the source note or playback timeline".into());
+    }
+    Ok((prepared, vec!["[MUSESCORE_SOURCE_PLAYBACK_MAP_PRESERVED] The private reference/stem inputs use the exact native source tempo plan, including explicit fermata durations; source notes, voices and preserved bytes are unchanged.".into()]))
+}
+
 fn prepare_drum_templates(master: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
     let offset = usize::from(master.starts_with(&[0xef, 0xbb, 0xbf])) * 3;
     let xml = std::str::from_utf8(&master[offset..]).map_err(|e| e.to_string())?;
@@ -647,6 +886,8 @@ fn closing_tag_offset(xml: &str, node: roxmltree::Node) -> Result<usize, String>
         .rfind("</")
         .filter(|at| {
             element[at + 2..]
+                .split_once(':')
+                .map_or(&element[at + 2..], |(_, local)| local)
                 .strip_prefix(name)
                 .is_some_and(|rest| rest.trim_start() == ">")
         })
@@ -663,6 +904,323 @@ mod tests {
     use super::*;
 
     const DRUM_CONFLICT: &str = include_str!("../tests/support/score-audio-conflict.mscx");
+
+    #[test]
+    fn legacy_fermata_defaults_are_explicit_in_every_render_copy_only() {
+        for bom in [false, true] {
+            for zip in [false, true] {
+                let xml = score("3.02", PARTS, &staves().replace("<Fermata/>", "")).replacen(
+                    "<Chord>",
+                    "<Fermata><subtype>fermataAbove</subtype></Fermata><Chord>",
+                    1,
+                );
+                let master = [
+                    if bom { &[0xef, 0xbb, 0xbf][..] } else { &[] },
+                    xml.as_bytes(),
+                ]
+                .concat();
+                let original = if zip {
+                    zipped(&[
+                        ("score.mscx", &master),
+                        ("retained.txt", b"original companion"),
+                    ])
+                } else {
+                    master.clone()
+                };
+                let mut stems = ScoreStems::read(&original).unwrap();
+                assert!(stems.prepare_for_renderer(3).unwrap().is_empty());
+                assert_eq!(stems.render_container(), original);
+                let warnings = stems.prepare_for_renderer(4).unwrap();
+                assert_eq!(warnings.len(), 1);
+                assert!(warnings[0].contains("MUSESCORE_LEGACY_FERMATA_DEFAULT_PRESERVED"));
+                assert!(stems.has_render_preparation());
+                let prepared = if zip {
+                    read_entry(stems.render_container(), "score.mscx").unwrap()
+                } else {
+                    stems.render_container().to_vec()
+                };
+                assert_eq!(
+                    String::from_utf8(prepared[offset_for_bom(bom)..].to_vec())
+                        .unwrap()
+                        .replace("<timeStretch>1</timeStretch>", ""),
+                    xml
+                );
+                for part in 0..stems.parts().len() {
+                    let copy = stems.silenced(part).unwrap();
+                    let copy = if zip {
+                        read_entry(&copy, "score.mscx").unwrap()
+                    } else {
+                        copy
+                    };
+                    assert!(String::from_utf8_lossy(&copy).contains("<timeStretch>1</timeStretch>"));
+                }
+                if zip {
+                    assert_eq!(
+                        read_entry(stems.render_container(), "retained.txt").unwrap(),
+                        b"original companion"
+                    );
+                }
+                let once = stems.render_container().to_vec();
+                assert!(stems.prepare_for_renderer(4).unwrap().is_empty());
+                assert_eq!(stems.render_container(), once);
+                assert_eq!(
+                    original,
+                    if zip {
+                        zipped(&[
+                            ("score.mscx", &master),
+                            ("retained.txt", b"original companion"),
+                        ])
+                    } else {
+                        master
+                    }
+                );
+            }
+        }
+    }
+
+    fn offset_for_bom(bom: bool) -> usize {
+        usize::from(bom) * 3
+    }
+
+    #[test]
+    fn authored_fermata_stretch_and_modern_defaults_are_not_replaced() {
+        for version in ["4.0"] {
+            for property in [
+                "<timeStretch>1.5</timeStretch>",
+                "<timeStretch>1</timeStretch>",
+                "<timeStretch>0</timeStretch>",
+            ] {
+                let xml = score(version, PARTS, &staves().replace("<Fermata/>", "")).replacen(
+                    "<Chord>",
+                    &format!("<Fermata><subtype>fermataAbove</subtype>{property}</Fermata><Chord>"),
+                    1,
+                );
+                let mut stems = ScoreStems::read(xml.as_bytes()).unwrap();
+                assert!(stems.prepare_for_renderer(4).unwrap().is_empty());
+                assert_eq!(stems.render_container(), xml.as_bytes());
+            }
+        }
+        let xml = score("4.0", PARTS, &staves().replace("<Fermata/>", "")).replacen(
+            "<Chord>",
+            "<Fermata><subtype>fermataAbove</subtype></Fermata><Chord>",
+            1,
+        );
+        let mut stems = ScoreStems::read(xml.as_bytes()).unwrap();
+        assert!(stems.prepare_for_renderer(4).unwrap().is_empty());
+        assert_eq!(stems.render_container(), xml.as_bytes());
+    }
+
+    #[test]
+    fn explicit_legacy_hold_lowers_exact_source_clock_without_new_notes_or_voices() {
+        let xml = "<museScore version=\"3.02\"><Score><Division>480</Division><Part><Staff id=\"1\"/><Instrument><instrumentId>voice.soprano</instrumentId></Instrument></Part><Part><Staff id=\"2\"/><Instrument><instrumentId>keyboard.piano</instrumentId></Instrument></Part><Staff id=\"1\"><Measure><voice><Tempo><tempo>2</tempo></Tempo><Fermata><subtype>fermataAbove</subtype><timeStretch>1.5</timeStretch></Fermata><Chord><durationType>whole</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>72</pitch></Note></Chord></voice></Measure></Staff><Staff id=\"2\"><Measure><voice><Chord><durationType>quarter</durationType><dots>1</dots><Note><pitch>60</pitch></Note></Chord><Rest><durationType>eighth</durationType></Rest><Rest><durationType>half</durationType></Rest></voice><voice><location><fractions>3/8</fractions></location><Chord><durationType>half</durationType><Note><pitch>48</pitch></Note></Chord></voice></Measure></Staff></Score></museScore>";
+        let mut stems = ScoreStems::read(xml.as_bytes()).unwrap();
+        let warnings = stems.prepare_for_renderer(4).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("MUSESCORE_SOURCE_PLAYBACK_MAP_PRESERVED"));
+        let prepared = std::str::from_utf8(stems.render_container()).unwrap();
+        let before = roxmltree::Document::parse(xml).unwrap();
+        let after = roxmltree::Document::parse(prepared).unwrap();
+        for name in ["Chord", "Rest", "Lyrics", "Note"] {
+            let content = |doc: &roxmltree::Document| {
+                doc.descendants()
+                    .filter(|n| n.has_tag_name(name))
+                    .map(|n| doc.input_text()[n.range()].to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                content(&before),
+                content(&after),
+                "source {name} XML changed"
+            );
+        }
+        assert_eq!(
+            before
+                .descendants()
+                .filter(|n| n.has_tag_name("voice"))
+                .count(),
+            after
+                .descendants()
+                .filter(|n| n.has_tag_name("voice"))
+                .count()
+        );
+        let tempos = |bytes: &[u8]| {
+            let parsed = musescore::parse(bytes).unwrap();
+            parsed
+                .tracks
+                .iter()
+                .flat_map(|t| &t.events)
+                .filter_map(|e| match e.kind {
+                    crate::engine::midi::Kind::Tempo(us) => Some((e.tick, us)),
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            tempos(xml.as_bytes()),
+            BTreeMap::from([(0, 750_000), (719, 500_000)])
+        );
+        assert_eq!(tempos(stems.render_container()), tempos(xml.as_bytes()));
+        assert!(prepared.contains("<timeStretch>1</timeStretch>"));
+        let once = stems.render_container().to_vec();
+        assert!(stems.prepare_for_renderer(4).unwrap().is_empty());
+        assert_eq!(stems.render_container(), once);
+    }
+
+    #[test]
+    fn legacy_default_preparation_handles_self_closing_marks_and_utf8() {
+        let xml = score("3.02", PARTS, &staves().replace("<Fermata/>", "")).replacen(
+            "<Chord>",
+            "<StaffText><text>Été</text></StaffText><Fermata/><Chord>",
+            1,
+        );
+        let (prepared, warnings) = preserve_legacy_fermata_defaults(xml.as_bytes()).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            String::from_utf8(prepared).unwrap(),
+            xml.replace(
+                "<Fermata/>",
+                "<Fermata><timeStretch>1</timeStretch></Fermata>"
+            )
+        );
+    }
+
+    #[test]
+    fn qualified_annotation_edits_accept_namespace_prefixes_and_identity_ratios() {
+        let xml = "<museScore version=\"3.02\"><Score><Division>480</Division><Part><Staff id=\"1\"/><Instrument><instrumentId>voice.soprano</instrumentId></Instrument></Part><Staff id=\"1\"><Measure><m:voice xmlns:m=\"urn:test\"><TimeSig><sigN>4</sigN><sigD>4</sigD><stretchN>2</stretchN><stretchD>2</stretchD></TimeSig><Tempo><tempo>2</tempo></Tempo><Fermata><subtype>fermataAbove</subtype><timeStretch>1.5</timeStretch></Fermata><Chord><durationType>whole</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>72</pitch></Note></Chord></m:voice><voice><location><fractions>3/8</fractions></location><Chord><durationType>half</durationType><Note><pitch>60</pitch></Note></Chord></voice></Measure></Staff></Score></museScore>";
+        let mut source = ScoreStems::read(xml.as_bytes()).unwrap();
+        assert_eq!(source.prepare_for_renderer(4).unwrap().len(), 1);
+        assert!(source.has_render_preparation());
+        let prepared = std::str::from_utf8(source.render_container()).unwrap();
+        assert!(prepared.contains("</m:voice>"));
+        assert!(prepared.contains("<stretchN>2</stretchN><stretchD>2</stretchD>"));
+        assert!(prepared.contains("<timeStretch>1</timeStretch>"));
+    }
+
+    #[test]
+    fn dense_legacy_holds_keep_native_relative_playback_across_tempo_repeats() {
+        let xml = "<museScore version=\"3.02\"><Score><Division>480</Division><Part><Staff id=\"1\"/><Instrument><instrumentId>voice.soprano</instrumentId></Instrument></Part><Staff id=\"1\"><Measure len=\"1/4\"><voice><Tempo><tempo>2</tempo></Tempo><Chord><durationType>quarter</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>60</pitch></Note></Chord></voice></Measure><Measure len=\"1/4\"><startRepeat/><voice><Fermata><subtype>fermataAbove</subtype><timeStretch>2</timeStretch></Fermata><Chord><durationType>quarter</durationType><Lyrics><text>two</text></Lyrics><Note><pitch>62</pitch></Note></Chord></voice></Measure><Measure len=\"1/4\"><voice><Tempo><tempo>4</tempo></Tempo><Chord><durationType>quarter</durationType><Lyrics><text>three</text></Lyrics><Note><pitch>64</pitch></Note></Chord></voice><endRepeat>2</endRepeat></Measure></Staff></Score></museScore>";
+        let mut source = ScoreStems::read(xml.as_bytes()).unwrap();
+        assert!(source.prepare_for_renderer(4).unwrap().is_empty());
+        assert_eq!(source.render_container(), xml.as_bytes());
+        assert!(!source.has_render_preparation());
+    }
+
+    #[test]
+    #[ignore = "requires a private legacy score and a real MuseScore 4 renderer"]
+    fn supplied_legacy_fermata_render_preserves_the_vocal_tempo_map() {
+        use crate::engine::{
+            convert::convert_midi,
+            midi::{self, Kind},
+        };
+        use crate::renderer::{AudioRenderer, MuseScoreRenderer, RenderLimits};
+        use std::{fs, path::PathBuf, process::Command, time::Duration};
+        let executable = std::env::var("VERSE_MUSESCORE_GATE").expect("real renderer required");
+        let source =
+            PathBuf::from(std::env::var("VERSE_FERMATA_SOURCE").expect("private source required"));
+        let root = PathBuf::from(
+            std::env::var("VERSE_FERMATA_OUTPUT_DIR").expect("new output directory required"),
+        );
+        fs::create_dir(&root).expect("output directory must not exist");
+        let original = fs::read(&source).unwrap();
+        let native = musescore::parse(&original).unwrap();
+        let projection = convert_midi(&native, "english").svp.unwrap();
+        let renderer = MuseScoreRenderer::probe(std::path::Path::new(&executable)).unwrap();
+        assert_eq!(renderer.capabilities().identity.major, 4);
+        let mut stems = ScoreStems::read(&original).unwrap();
+        let warnings = stems.prepare_for_renderer(4).unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("MUSESCORE_LEGACY_FERMATA_DEFAULT_PRESERVED")
+                || w.contains("MUSESCORE_SOURCE_PLAYBACK_MAP_PRESERVED")));
+        let prepared = root.join(format!("prepared.{}", stems.extension()));
+        fs::write(&prepared, stems.render_container()).unwrap();
+        let expected: Vec<_> = projection
+            .tempos
+            .iter()
+            .map(|t| (t.tick, (60_000_000.0 / t.bpm).round() as u32))
+            .collect();
+        let mut midi_inputs = vec![prepared.clone()];
+        for part in 0..stems.parts().len() {
+            let input = root.join(format!("stem-{part}.{}", stems.extension()));
+            fs::write(&input, stems.silenced(part).unwrap()).unwrap();
+            midi_inputs.push(input);
+        }
+        // Native converter test mode and one Basic-profile job avoid the
+        // macOS MIDI-only shutdown crash while using the same score reader and
+        // playback tempo exporter. This is oracle tooling, not WAV rendering.
+        let mut successful = None;
+        for attempt in 0..3 {
+            if cfg!(target_os = "macos") {
+                std::thread::sleep(Duration::from_secs(10));
+            }
+            let references: Vec<_> = midi_inputs
+                .iter()
+                .enumerate()
+                .map(|(index, _)| root.join(format!("independent-renderer-{index}-{attempt}.mid")))
+                .collect();
+            let jobs: Vec<_> = midi_inputs
+                .iter()
+                .zip(&references)
+                .map(|(input, output)| serde_json::json!({"in": input, "out": output}))
+                .collect();
+            let job = root.join(format!("midi-job-{attempt}.json"));
+            fs::write(&job, serde_json::to_vec(&jobs).unwrap()).unwrap();
+            let home = root.join(format!("midi-home-{attempt}"));
+            fs::create_dir(&home).unwrap();
+            let output = Command::new(&executable)
+                .args(["-F", "-t", "--sound-profile", "MuseScore Basic", "-j"])
+                .arg(&job)
+                .env_clear()
+                .env("HOME", &home)
+                .env("TMPDIR", std::env::temp_dir())
+                .output()
+                .unwrap();
+            if output.status.success() {
+                successful = Some(references);
+                break;
+            }
+            fs::write(
+                root.join(format!("midi-error-{attempt}.log")),
+                &output.stderr,
+            )
+            .unwrap();
+        }
+        let references = successful.expect("independent MIDI job failed after three isolated attempts; retained logs identify the renderer failure");
+        for (index, reference) in references.iter().enumerate() {
+            let independent = midi::parse(&fs::read(reference).unwrap()).unwrap();
+            let mut independent_tempos = BTreeMap::new();
+            for track in &independent.tracks {
+                for event in &track.events {
+                    if let Kind::Tempo(us) = event.kind {
+                        independent_tempos.insert(event.tick, us);
+                    }
+                }
+            }
+            assert_eq!(independent.ticks_per_beat, projection.ticks_per_beat);
+            assert_eq!(
+                independent_tempos.into_iter().collect::<Vec<_>>(),
+                expected,
+                "reference/stem {index} must not add a pause missing from the vocal timeline"
+            );
+        }
+        let rendered = renderer
+            .render(
+                &prepared,
+                &root.join("reference.wav"),
+                &RenderLimits {
+                    timeout: Duration::from_secs(300),
+                    max_output_bytes: 2 * 1024 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+        assert_eq!(fs::read(&source).unwrap(), original);
+        let receipt = serde_json::json!({"source": source, "sourceBytesPreserved": true, "temposMatch": true, "independentlyCheckedMidiInputs": midi_inputs.len(), "vocalNoteCount": projection.tracks.iter().map(|t| t.notes.len()).sum::<usize>(), "renderer": renderer.capabilities().identity, "warnings": warnings, "wav": rendered.wav});
+        fs::write(
+            root.join("verification.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn drum_template_mapping_changes_only_one_template_in_bounded_render_copies() {
@@ -843,7 +1401,7 @@ mod tests {
                 unchanged.prepare_for_renderer(4).unwrap().is_empty(),
                 "{secondary}"
             );
-            assert!(!unchanged.has_template_mapping());
+            assert!(!unchanged.has_render_preparation());
             assert_eq!(unchanged.render_container(), source.as_bytes());
             let midi = musescore::parse(source.as_bytes()).unwrap();
             assert!(midi

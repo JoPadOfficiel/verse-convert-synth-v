@@ -3748,14 +3748,14 @@ fn export_bundle_with_hook_and_progress(
         (StemSources::Score(scores), Vec::new())
     };
     // Prepare one native master for both the reference and all stems. Ordinary
-    // inputs keep their existing reference path and bytes. Converted inputs
-    // need the same master only when the compatibility mapping applies.
+    // inputs keep their existing reference path and bytes. Every compatibility
+    // preparation must feed the reference as well as the isolated stems.
     let mut reference_path = source_path.clone();
     if let Some(scores) = stem_sources.scores_mut() {
         let warnings = scores
             .prepare_for_renderer(request.renderer.capabilities().identity.major)
             .map_err(BundleError::Integrity)?;
-        if scores.has_template_mapping() {
+        if scores.has_render_preparation() {
             reference_path = render_work
                 .path()
                 .join(format!("prepared.{}", scores.extension()));
@@ -6935,12 +6935,22 @@ pub(crate) mod tests {
                     bytes.to_vec()
                 }
             };
+            let reference = renderer.reference_inputs.lock().unwrap();
+            assert_eq!(reference.len(), 1);
+            let reference = master(&reference[0]);
+            assert_eq!(
+                String::from_utf8(reference).unwrap(),
+                FERMATA_SCORE.replace("</Fermata>", "<timeStretch>1</timeStretch></Fermata>")
+            );
             for (index, (file, bytes)) in inputs.iter().enumerate() {
                 assert!(file.ends_with(&name[name.len() - 5..]), "{file}");
                 let text = master(bytes);
-                assert_eq!(silence_removed(&text), FERMATA_SCORE);
+                assert_eq!(
+                    silence_removed(&text).replace("<timeStretch>1</timeStretch>", ""),
+                    FERMATA_SCORE
+                );
                 let text = String::from_utf8(text).unwrap();
-                assert!(text.contains("<Fermata><subtype>fermataAbove</subtype></Fermata>"));
+                assert!(text.contains("<Fermata><subtype>fermataAbove</subtype><timeStretch>1</timeStretch></Fermata>"));
                 assert!(text.contains("<Breath><subtype>breathMark</subtype></Breath>"));
                 let silenced = text.matches("<play>0</play>").count();
                 // Each Part has two notes, so each stem silences the other two.

@@ -1911,7 +1911,358 @@ fn instrument_integer<'a>(
     Ok(result)
 }
 
+// Qualified against MuseScore v3.6.2 libmscore/fermata.cpp (default 1)
+// and v4.7.5 src/engraving/dom/fermata.cpp (subtype defaults).
+fn fermata_stretch(
+    node: roxmltree::Node,
+    native_major: Option<u32>,
+) -> Result<Option<f64>, String> {
+    let property = |name| -> Result<Option<&str>, String> {
+        let mut nodes = node.children().filter(|child| child.has_tag_name(name));
+        let value = nodes.next();
+        if nodes.next().is_some() {
+            return Err(format!("SOURCE_PLAYBACK_INVALID: duplicate fermata {name}"));
+        }
+        value
+            .map(|value| {
+                if value.children().any(|child| child.is_element()) {
+                    return Err(format!(
+                        "SOURCE_PLAYBACK_INVALID: structured fermata {name}"
+                    ));
+                }
+                value
+                    .text()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| format!("SOURCE_PLAYBACK_INVALID: empty fermata {name}"))
+            })
+            .transpose()
+    };
+    let play = match property("play")? {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(value) => return Err(format!("SOURCE_PLAYBACK_INVALID: fermata play {value:?}")),
+    };
+    let explicit = property("timeStretch")?
+        .map(|text| {
+            text.parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or_else(|| format!("SOURCE_PLAYBACK_INVALID: fermata timeStretch {text:?}"))
+        })
+        .transpose()?;
+    let subtype = property("subtype")?;
+    if !play {
+        return Ok(None);
+    }
+    if !matches!(native_major, Some(3 | 4)) {
+        return Err("SOURCE_PLAYBACK_UNSUPPORTED: fermata native version is unqualified".into());
+    }
+    if let Some(stretch) = explicit {
+        return Ok(Some(stretch));
+    }
+    if native_major == Some(3) {
+        // The native 3 default is independent of the symbol (including noSym).
+        return Ok(Some(1.0));
+    }
+    let default = match subtype {
+        // Native 4's constructor leaves m_timeStretch at -1. A subtype
+        // invokes setSymIdAndTimeStretch; propertyDefault alone is not proof.
+        None => return Err(
+            "SOURCE_PLAYBACK_UNSUPPORTED: native 4 fermata has no subtype or explicit timeStretch"
+                .into(),
+        ),
+        Some("fermataAbove" | "fermataBelow") => 2.0,
+        Some("fermataVeryShortAbove" | "fermataVeryShortBelow") => 1.25,
+        Some(
+            "fermataShortAbove"
+            | "fermataShortBelow"
+            | "fermataShortHenzeAbove"
+            | "fermataShortHenzeBelow",
+        ) => 1.5,
+        Some(
+            "fermataLongAbove"
+            | "fermataLongBelow"
+            | "fermataLongHenzeAbove"
+            | "fermataLongHenzeBelow",
+        ) => 3.0,
+        Some("fermataVeryLongAbove" | "fermataVeryLongBelow") => 4.0,
+        Some(value) => {
+            return Err(format!(
+                "SOURCE_PLAYBACK_UNSUPPORTED: unqualified fermata subtype {value:?}"
+            ))
+        }
+    };
+    Ok(Some(default))
+}
+
+fn apply_fermata_tempos(
+    events: &mut Vec<Event>,
+    mut tempos: BTreeMap<u32, f64>,
+    segments: &BTreeSet<u32>,
+    fermatas: &BTreeMap<u32, f64>,
+    implicit_gaps: &[(u32, u32)],
+    division: u16,
+) -> Result<(), String> {
+    if fermatas.values().all(|stretch| *stretch == 1.0) {
+        return Ok(());
+    }
+    // Fraction::eps() is one native tick, i.e. 1/480 quarter, regardless
+    // of the file Division or Verse's exact tuplet rescaling.
+    let division = u32::from(division);
+    if division % 480 != 0 {
+        return Err(
+            "SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: fermata native tick is off the source grid"
+                .into(),
+        );
+    }
+    let epsilon = division / 480;
+    for (&start, &stretch) in fermatas {
+        if stretch == 1.0 {
+            continue;
+        }
+        let next = segments
+            .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+            .next()
+            .copied()
+            .ok_or(
+                "SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: fermata has no following score segment",
+            )?;
+        let gap = implicit_gaps.partition_point(|(_, end)| *end <= start);
+        if implicit_gaps
+            .get(gap)
+            .is_some_and(|(gap_start, _)| *gap_start < next)
+        {
+            return Err("SOURCE_PLAYBACK_UNSUPPORTED: native 4 implicit gap decomposition intersects fermata playback".into());
+        }
+        if u64::from(start) * 480 % u64::from(division) != 0
+            || u64::from(next) * 480 % u64::from(division) != 0
+            || next - start <= epsilon
+        {
+            return Err("SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: fermata segment is not exact on the native grid".into());
+        }
+        let restore = next - epsilon;
+        let original = tempos
+            .range(..=start)
+            .next_back()
+            .map(|(_, tempo)| *tempo)
+            .unwrap_or(2.0);
+        let micros = (1_000_000.0 / (original / stretch)).round();
+        if !micros.is_finite() || !(1.0..=f64::from(u32::MAX)).contains(&micros) {
+            return Err("SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: stretched fermata tempo exceeds the supported range".into());
+        }
+        push_event(events, start, Kind::Tempo(micros as u32));
+        tempos.insert(start, original / stretch);
+        // MuseScore v3.6.2 score.cpp:480-501 and v4.7.5 score.cpp:538-590:
+        // preserve an existing authored tempo exactly at the restore tick.
+        if let std::collections::btree_map::Entry::Vacant(slot) = tempos.entry(restore) {
+            slot.insert(original);
+            push_event(
+                events,
+                restore,
+                Kind::Tempo((1_000_000.0 / original).round() as u32),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Source-native timing in written measure order, for private renderer preparation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WrittenPlaybackPlan {
+    pub(crate) staff_id: String,
+    pub(crate) ticks_per_beat: u16,
+    pub(crate) measures: Vec<(u32, u32)>,
+    pub(crate) tempos: Vec<(u32, u32)>,
+    pub(crate) first_voice_ends: Vec<u32>,
+    /// An implicit source gap intersects an active fermata's source segment.
+    pub(crate) has_implicit_gaps: bool,
+}
+
+struct WrittenMeasureBounds {
+    staff_id: String,
+    measures: Vec<(u32, u32)>,
+    first_voice_ends: Vec<u32>,
+    has_implicit_gaps: bool,
+}
+
+pub(crate) fn written_playback_plan(xml: &str) -> Result<WrittenPlaybackPlan, String> {
+    crate::engine::musicxml::check_nesting(xml)?;
+    let doc = roxmltree::Document::parse_with_options(
+        xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 5_000_000,
+        },
+    )
+    .map_err(|error| format!("invalid XML: {error}"))?;
+    let score = doc
+        .descendants()
+        .find(|node| node.has_tag_name("Score"))
+        .ok_or("MuseScore: Score element not found")?;
+    let mut ranges: Vec<_> = score
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node
+                    .ancestors()
+                    .find(|ancestor| ancestor.has_tag_name("Score"))
+                    == Some(score)
+                && (node.has_tag_name("startRepeat")
+                    || node.has_tag_name("endRepeat")
+                    || node.has_tag_name("Jump")
+                    || node.has_tag_name("Marker")
+                    || (node.has_tag_name("Spanner") && node.attribute("type") == Some("Volta")))
+        })
+        .map(|node| node.range())
+        .collect();
+    ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+    let mut disjoint = Vec::new();
+    let mut previous_end = 0;
+    for range in ranges {
+        if range.start < previous_end {
+            if range.end > previous_end {
+                return Err("SOURCE_PLAYBACK_INVALID: overlapping navigation XML ranges".into());
+            }
+            continue; // An enclosing navigation element already owns this removal.
+        }
+        previous_end = range.end;
+        disjoint.push(range);
+    }
+    let mut written_xml = xml.to_owned();
+    for range in disjoint.into_iter().rev() {
+        written_xml.replace_range(range, "");
+    }
+    let (midi, bounds) = parse_mscx_with_bounds(&written_xml, true)?;
+    let tempos = midi
+        .tracks
+        .iter()
+        .flat_map(|track| &track.events)
+        .filter_map(|event| match event.kind {
+            Kind::Tempo(micros) => Some((event.tick, micros)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    Ok(WrittenPlaybackPlan {
+        staff_id: bounds.staff_id,
+        ticks_per_beat: midi.ticks_per_beat,
+        measures: bounds.measures,
+        tempos,
+        first_voice_ends: bounds.first_voice_ends,
+        has_implicit_gaps: bounds.has_implicit_gaps,
+    })
+}
+
 pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
+    parse_mscx_with_bounds(xml, false).map(|(midi, _)| midi)
+}
+
+// Native 4.7.5 read460/measureread.cpp reads the staff-local group count;
+// dom/measurerepeat.cpp::referringMeasure resolves each member exactly n bars back.
+// Qualify only complete, pure groups. A strictly earlier reference cannot cycle.
+fn native_four_repeat_reference(
+    measures: &[roxmltree::Node],
+    mi: usize,
+    length: i64,
+    division: i64,
+) -> Option<usize> {
+    let count = |measure: roxmltree::Node| -> Option<usize> {
+        let mut fields = measure
+            .children()
+            .filter(|n| n.has_tag_name("measureRepeatCount"));
+        let field = fields.next();
+        if fields.next().is_some() {
+            return None;
+        }
+        if field.is_some_and(|n| n.children().any(|c| c.is_element())) {
+            return None;
+        }
+        let value = field
+            .map(|n| n.text()?.trim().parse::<usize>().ok())
+            .unwrap_or(Some(0))?;
+        let glyph = measure
+            .descendants()
+            .any(|n| n.has_tag_name("MeasureRepeat") || n.has_tag_name("RepeatMeasure"));
+        Some(if value == 0 && glyph { 1 } else { value }) // Native readVoice fallback.
+    };
+    let member = count(*measures.get(mi)?)?;
+    if !(1..=4).contains(&member) {
+        return None;
+    }
+    let first = mi.checked_sub(member - 1)?;
+    let mut size = None;
+    let mut members = 0;
+    for index in first..first.checked_add(4)? {
+        let Some(&measure) = measures.get(index) else {
+            break;
+        };
+        if count(measure)? != index - first + 1 {
+            break;
+        }
+        let voices = measure_voice_containers(measure).ok()?;
+        if voices.len() != 1 {
+            return None;
+        }
+        let mut elements = voices[0].children().filter(|n| n.is_element());
+        let element = elements.next()?;
+        if elements.next().is_some()
+            || child_text(element, "durationType") != Some("measure")
+            || element
+                .children()
+                .filter(|n| n.has_tag_name("durationType"))
+                .count()
+                != 1
+        {
+            return None;
+        }
+        // A MeasureRepeat overrides its stored Rest duration; a placeholder Rest
+        // does not. Require exact, uniform group lengths rather than retiming it.
+        for text in measure
+            .attribute("len")
+            .into_iter()
+            .chain(child_text(element, "duration").filter(|_| element.has_tag_name("Rest")))
+        {
+            let (n, d) = frac(text)?;
+            if n.checked_mul(4)?.checked_mul(division)? != length.checked_mul(d)? {
+                return None;
+            }
+        }
+        match element.tag_name().name() {
+            "MeasureRepeat" | "RepeatMeasure" => {
+                if size.is_some() {
+                    return None;
+                }
+                let mut fields = element.children().filter(|n| n.has_tag_name("subtype"));
+                let field = fields.next();
+                if fields.next().is_some() {
+                    return None;
+                }
+                if field.is_some_and(|n| n.children().any(|c| c.is_element())) {
+                    return None;
+                }
+                let n = field
+                    .map(|n| n.text()?.trim().parse::<usize>().ok())
+                    .unwrap_or(Some(1))?;
+                size = Some(if n == 0 { 1 } else { n }); // Same native fallback.
+            }
+            "Rest" => {}
+            _ => return None,
+        }
+        members += 1;
+    }
+    let size = size?;
+    if !matches!(size, 1 | 2 | 4) || members != size || member > size {
+        return None;
+    }
+    mi.checked_sub(size)
+}
+
+fn parse_mscx_with_bounds(
+    xml: &str,
+    capture_bounds: bool,
+) -> Result<(Midi, WrittenMeasureBounds), String> {
     crate::engine::musicxml::check_nesting(xml)?;
     let opts = roxmltree::ParsingOptions {
         allow_dtd: false,
@@ -2260,15 +2611,23 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     }
 
     let mut score_expression = super::score_intensity::source::ScoreInput::default();
-    let modern_expression = doc
+    let native_major = doc
         .root_element()
         .attribute("version")
         .and_then(|v| v.split('.').next())
-        .and_then(|v| v.parse::<u32>().ok())
-        .is_some_and(|v| v >= 4);
+        .and_then(|v| v.parse::<u32>().ok());
+    let modern_expression = native_major.is_some_and(|v| v >= 4);
     let mut tracks = Vec::new();
     let mut global_events = Vec::new();
     let mut local_meter_fallbacks = Vec::new();
+    let mut playback_tempos = BTreeMap::new();
+    let mut written_tempos = BTreeMap::new();
+    let mut written_measure_starts = Vec::new();
+    let mut playback_jumps = Vec::new();
+    let mut playback_segments = BTreeSet::new();
+    let mut playback_fermatas: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut playback_implicit_gaps = BTreeSet::new();
+    let mut unqualified_playback_segments: BTreeMap<(u32, u32), BTreeSet<&str>> = BTreeMap::new();
 
     let score_staves: Vec<_> = score
         .children()
@@ -2289,12 +2648,32 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         .collect();
     let score_order = score_playback_order(&staff_measures)?;
     let mut unresolved_tie_diagnostics = 0usize;
+    let mut written_measure_bounds = Vec::new();
+    let mut first_voice_ends = Vec::new();
+    let mut canonical_staff_id = String::new();
 
     for (staff_index, &staff) in score_staves.iter().enumerate() {
         let staff_id = staff
             .attribute("id")
             .map(str::to_string)
             .unwrap_or_else(|| format!("anonymous-{}", tracks.len() + 1));
+        if capture_bounds && staff_index == 0 {
+            canonical_staff_id = staff
+                .attribute("id")
+                .ok_or(
+                    "SOURCE_PLAYBACK_UNSUPPORTED: renderer plan canonical staff has no source ID",
+                )?
+                .to_string();
+            for signature in staff
+                .descendants()
+                .filter(|node| node.has_tag_name("TimeSig"))
+            {
+                let stretch = musescore_time_signature(signature)?.stretch;
+                if stretch.0 != stretch.1 {
+                    return Err("SOURCE_PLAYBACK_UNSUPPORTED: renderer plan cannot lower first-staff local time-signature stretch".into());
+                }
+            }
+        }
         let info = staff_info.get(&staff_id).cloned().unwrap_or_default();
         // A part with several staves gives each of them the part's name, which
         // wrote two different lanes into a project under one identical label.
@@ -2350,6 +2729,9 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             .chain(score_order.iter().copied())
             .collect();
         let mut written_bounds = Vec::with_capacity(written_count);
+        // Dense coverage/length from the written first pass, per staff.
+        // Chained repeats inherit this proof, never IR events or copied attacks.
+        let mut written_dense_lengths: Vec<Option<i64>> = Vec::new();
         let mut written_memberships = Vec::with_capacity(written_count);
         let mut expression_tempo = super::score_intensity::Fraction::integer(120);
         for (visit, &(mi, pass, repeat_pass)) in traversal.iter().enumerate() {
@@ -2377,6 +2759,12 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             // location points at the next NOTATED measure, which is no longer
             // the next PLAYED one, so open chains cannot be proven any more.
             if previous_measure.is_some_and(|previous| mi != previous + 1) {
+                if !recording
+                    && staff_index == 0
+                    && previous_measure.is_some_and(|previous| mi <= previous)
+                {
+                    playback_jumps.push((checked_score_tick(measure_start)?, mi));
+                }
                 abandon_tie_starts(
                     &mut outgoing_ties,
                     &mut voice_events,
@@ -2390,7 +2778,13 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             }
             previous_measure = Some(mi);
             let measure = measures[mi];
+            if !recording {
+                playback_segments.insert(checked_score_tick(measure_start)?);
+            }
             if recording {
+                if staff_index == 0 {
+                    written_measure_starts.push(checked_score_tick(measure_start)?);
+                }
                 written_memberships.push(score_expression.begin_written_measure(
                     &info.part_id,
                     Some(&staff_id),
@@ -2399,9 +2793,25 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                 )?);
             }
             let mut this_len = measure_len;
+            let mut first_voice_end = measure_start;
+            // Keep marks owned by this written measure until its final length
+            // is known. Native readVoice attaches trailing marks at endTick
+            // to EndBarLine, which never applies a fermata tempo stretch.
+            let mut measure_fermatas = Vec::new();
+            let mut measure_unqualified_segments = BTreeSet::new();
+            let native_four_repeat = native_major == Some(4)
+                && (measure
+                    .descendants()
+                    .any(|n| n.has_tag_name("MeasureRepeat") || n.has_tag_name("RepeatMeasure"))
+                    || child_text(measure, "measureRepeatCount").is_some_and(|n| n.trim() != "0"));
+            if native_four_repeat {
+                measure_unqualified_segments.insert("MeasureRepeat");
+            }
+            let mut measure_voice_intervals = Vec::new();
             for (voice_index, voice) in measure_voice_containers(measure)?.into_iter().enumerate() {
                 let mut pos = measure_start;
                 let mut tuplet: Option<(i64, i64)> = None; // (normal, actual)
+                let mut rhythmic_intervals = Vec::new();
                 for (element_index, el) in voice.children().filter(|n| n.is_element()).enumerate() {
                     if recording {
                         let owner = super::score_intensity::ScoreVoice {
@@ -2413,6 +2823,31 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                         score_expression.ms_element(el,
                             &format!("expression:mscx:staff:{staff_id}:measure:{mi}:voice:{voice_index}:element:{element_index}"),
                             &owner, super::score_intensity::source::time(pos,tpb)?, mi, modern_expression, expression_tempo, time_stretch)?;
+                    }
+                    {
+                        // Native readVoice creates segments at the XML cursor
+                        // for these elements, even without a rhythmic attack.
+                        // next1() in native 4 observes those active segments.
+                        match el.tag_name().name() {
+                            "Clef" | "KeySig" | "BarLine" | "TimeSig" | "Tempo" | "Dynamic"
+                            | "Harmony" | "FretDiagram" | "TremoloBar" | "Symbol" | "StaffText"
+                            | "Sticking" | "SystemText" | "Expression" | "RehearsalMark"
+                            | "InstrumentChange" | "StaffState" | "FiguredBass" => {
+                                if !recording {
+                                    playback_segments.insert(checked_score_tick(pos)?);
+                                }
+                                if el.has_tag_name("TimeSig") && pos != measure_start {
+                                    // Native courtesy signatures do not change
+                                    // playback meter; that lowering is unqualified.
+                                    measure_unqualified_segments.insert("interior TimeSig");
+                                }
+                            }
+                            // Repeat groups are qualified below from the written pass.
+                            "Breath" | "RepeatMeasure" | "MeasureRepeat" | "Ambitus" | "Image" => {
+                                measure_unqualified_segments.insert(el.tag_name().name());
+                            }
+                            _ => {}
+                        }
                     }
                     match el.tag_name().name() {
                         "TimeSig" => {
@@ -2487,6 +2922,18 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                 checked_score_tick(pos)?,
                                 Kind::Tempo(micros),
                             );
+                            if recording {
+                                written_tempos
+                                    .insert(checked_score_tick(pos)?, quarters_per_second.unwrap());
+                            } else {
+                                playback_tempos
+                                    .insert(checked_score_tick(pos)?, quarters_per_second.unwrap());
+                            }
+                        }
+                        "Fermata" => {
+                            if !recording {
+                                measure_fermatas.push((pos, el));
+                            }
                         }
                         "Tuplet" => {
                             let normal_text = child_text(el, "normalNotes").ok_or_else(|| {
@@ -2620,6 +3067,16 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                                 return Err(format!(
                                     "MuseScore {} has a non-positive duration",
                                     if is_rest { "Rest" } else { "Chord" }
+                                ));
+                            }
+                            if !grace {
+                                if !recording {
+                                    playback_segments.insert(checked_score_tick(pos)?);
+                                }
+                                rhythmic_intervals.push((
+                                    pos,
+                                    pos.checked_add(dur)
+                                        .ok_or("MuseScore rhythmic interval overflow")?,
                                 ));
                             }
                             if !is_rest {
@@ -3080,6 +3537,12 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                         _ => {}
                     }
                 }
+                if capture_bounds && recording && staff_index == 0 && voice_index == 0 {
+                    first_voice_end = pos;
+                }
+                if !rhythmic_intervals.is_empty() {
+                    measure_voice_intervals.push(rhythmic_intervals);
+                }
             }
             // irregular measure (anacrusis): len="a/b" attribute
             if let Some(value) = measure.attribute("len") {
@@ -3100,7 +3563,116 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
                     return Err("MuseScore measure len is non-positive".into());
                 }
             }
+            if recording && native_major == Some(4) {
+                let proof = if native_four_repeat {
+                    native_four_repeat_reference(measures, mi, this_len, div)
+                        .and_then(|source| written_dense_lengths.get(source).copied().flatten())
+                        .filter(|length| *length == this_len)
+                } else {
+                    let dense = !measure_voice_intervals.is_empty()
+                        && measure_unqualified_segments.is_empty()
+                        && measure_voice_intervals.iter().all(|intervals| {
+                            let mut intervals = intervals.clone();
+                            intervals.sort_unstable();
+                            let mut covered = measure_start;
+                            for (start, end) in intervals {
+                                if start != covered || end <= start {
+                                    return false;
+                                }
+                                covered = end;
+                            }
+                            covered.checked_sub(measure_start) == Some(this_len)
+                        });
+                    dense.then_some(this_len)
+                };
+                written_dense_lengths.push(proof);
+            }
+            if !recording {
+                if native_four_repeat && written_dense_lengths[mi].is_some() {
+                    measure_unqualified_segments.remove("MeasureRepeat");
+                    measure_unqualified_segments.remove("RepeatMeasure");
+                    // Native score.cpp::setUpTempoMap uses notated next1(), not
+                    // playbackmodel.cpp::processMeasureRepeat's copied attacks.
+                    // The glyph start/end are already clock boundaries; do not
+                    // insert the referenced bar's attacks or synthesize IR notes.
+                }
+                let end = measure_start.checked_add(this_len).ok_or(
+                    "SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: fermata measure end overflow",
+                )?;
+                for mut intervals in measure_voice_intervals {
+                    intervals.sort_unstable(); // checkMeasure visits score segments in tick order.
+                    let mut covered_end = measure_start;
+                    let mut gaps = Vec::new();
+                    let mut overlap = false;
+                    for (start, finish) in intervals {
+                        if start < covered_end {
+                            overlap = true; // Native checkMeasure stops at an overlap.
+                            break;
+                        }
+                        if start > covered_end {
+                            gaps.push((covered_end, start));
+                        }
+                        covered_end = finish;
+                    }
+                    if overlap {
+                        measure_unqualified_segments.insert("overlapping voice rhythm");
+                        continue;
+                    }
+                    if covered_end < end {
+                        gaps.push((covered_end, end));
+                    }
+                    for (gap_start, gap_end) in gaps {
+                        if matches!(native_major, Some(3 | 4)) {
+                            // Native 3 check.cpp fillGap inserts one exact-length
+                            // gap Rest at this start. Only its clock boundary is
+                            // needed: never add a Rest or note to the source IR.
+                            let gap_start = checked_score_tick(gap_start)?;
+                            playback_segments.insert(gap_start);
+                            if native_major == Some(4) || capture_bounds {
+                                // Native 4 subdivides gap rests without dots.
+                                // The plan also needs native 3 gaps to qualify
+                                // where renderer preparation can change a hold.
+                                playback_implicit_gaps
+                                    .insert((gap_start, checked_score_tick(gap_end)?));
+                            }
+                        }
+                    }
+                }
+                if !measure_unqualified_segments.is_empty() {
+                    unqualified_playback_segments
+                        .entry((checked_score_tick(measure_start)?, checked_score_tick(end)?))
+                        .or_default()
+                        .extend(measure_unqualified_segments);
+                }
+                for (start, fermata) in measure_fermatas {
+                    if start == end {
+                        continue; // EndBarLine ownership, never the following measure.
+                    }
+                    if start < measure_start || start > end {
+                        return Err("SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: fermata is outside its written measure".into());
+                    }
+                    if let Some(stretch) = fermata_stretch(fermata, native_major)? {
+                        let start = checked_score_tick(start)?;
+                        playback_segments.insert(start);
+                        playback_fermatas
+                            .entry(start)
+                            .and_modify(|longest| *longest = longest.max(stretch))
+                            .or_insert(stretch);
+                    }
+                }
+            }
             if recording {
+                if capture_bounds && staff_index == 0 {
+                    first_voice_ends.push(checked_score_tick(first_voice_end).map_err(|_| "SOURCE_PLAYBACK_UNSUPPORTED: renderer plan first-voice end cursor is outside the supported range")?);
+                    written_measure_bounds.push((
+                        checked_score_tick(measure_start)?,
+                        checked_score_tick(
+                            measure_start
+                                .checked_add(this_len)
+                                .ok_or("MuseScore written measure end overflow")?,
+                        )?,
+                    ));
+                }
                 written_bounds.push((
                     super::score_intensity::source::time(measure_start, tpb)?,
                     super::score_intensity::source::time(
@@ -3124,6 +3696,9 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             measure_start = measure_start
                 .checked_add(this_len)
                 .ok_or_else(|| "MuseScore measure timeline overflow".to_string())?;
+            if !recording {
+                playback_segments.insert(checked_score_tick(measure_start)?);
+            }
         }
 
         abandon_tie_starts(
@@ -3216,6 +3791,90 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
             });
         }
     }
+
+    // A backward return restores its written tempo context. Forward skips keep
+    // the performed context; an unplayed ending cannot introduce a tempo.
+    // Wait for every staff's authored tempos before applying score-global holds.
+    for (played_tick, measure_index) in playback_jumps {
+        let written_tick = written_measure_starts
+            .get(measure_index)
+            .ok_or("SOURCE_PLAYBACK_UNSUPPORTED: repeat target has no written measure start")?;
+        let source_tempo = written_tempos
+            .range(..=*written_tick)
+            .next_back()
+            .map(|(_, tempo)| *tempo)
+            .unwrap_or(2.0);
+        let played_tempo = playback_tempos
+            .range(..=played_tick)
+            .next_back()
+            .map(|(_, tempo)| *tempo)
+            .unwrap_or(2.0);
+        let source_micros = (1_000_000.0 / source_tempo).round() as u32;
+        if (1_000_000.0 / played_tempo).round() as u32 != source_micros {
+            push_event(&mut global_events, played_tick, Kind::Tempo(source_micros));
+        }
+        // Preserve source quarters/sec precision even when both values quantize
+        // to the same microtempo; this anchor need not emit a redundant event.
+        playback_tempos.insert(played_tick, source_tempo);
+    }
+
+    // Every measure endpoint already bounds a hold. Unqualified expansion or
+    // segment ownership in a disjoint played measure cannot change that hold.
+    // Within an owning measure, RepeatMeasure may introduce copied rhythmic
+    // segments: refuse until those source-backed positions are qualified.
+    let mut intersecting_segments = BTreeSet::new();
+    for ((start, end), segments) in unqualified_playback_segments {
+        if playback_fermatas
+            .range(start..end)
+            .any(|(_, stretch)| *stretch != 1.0)
+        {
+            intersecting_segments.extend(segments);
+        }
+    }
+    if !intersecting_segments.is_empty() {
+        return Err(format!(
+            "SOURCE_PLAYBACK_UNSUPPORTED: unqualified native segments with fermata playback: {}",
+            intersecting_segments
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut merged_implicit_gaps: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in playback_implicit_gaps {
+        if let Some(previous) = merged_implicit_gaps.last_mut().filter(|gap| start <= gap.1) {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged_implicit_gaps.push((start, end));
+        }
+    }
+    let has_implicit_gaps = capture_bounds
+        && playback_fermatas.iter().any(|(&start, &stretch)| {
+            if stretch == 1.0 {
+                return false;
+            }
+            let next = playback_segments
+                .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+                .next();
+            let gap = merged_implicit_gaps.partition_point(|(_, end)| *end <= start);
+            next.is_some_and(|next| {
+                merged_implicit_gaps
+                    .get(gap)
+                    .is_some_and(|(gap_start, _)| gap_start < next)
+            })
+        });
+    apply_fermata_tempos(
+        &mut global_events,
+        playback_tempos,
+        &playback_segments,
+        &playback_fermatas,
+        if native_major == Some(4) {
+            &merged_implicit_gaps
+        } else {
+            &[]
+        },
+        tpb,
+    )?;
 
     for event in local_meter_fallbacks {
         let Kind::TimeSig { num, den, .. } = event.kind else {
@@ -3338,16 +3997,24 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
         }
     }
     let topology = SourceTopology::from_declared_parts(declared_parts, &tracks);
-    Ok(Midi {
-        ticks_per_beat: tpb,
-        time_base: TimeBase::PulsesPerQuarter(tpb),
-        format: 1,
-        source_format: SourceFormat::MuseScore,
-        topology,
-        score_intensity: (!score_expression.is_empty()).then_some(score_expression),
-        staff_links,
-        tracks,
-    })
+    Ok((
+        Midi {
+            ticks_per_beat: tpb,
+            time_base: TimeBase::PulsesPerQuarter(tpb),
+            format: 1,
+            source_format: SourceFormat::MuseScore,
+            topology,
+            score_intensity: (!score_expression.is_empty()).then_some(score_expression),
+            staff_links,
+            tracks,
+        },
+        WrittenMeasureBounds {
+            staff_id: canonical_staff_id,
+            measures: written_measure_bounds,
+            first_voice_ends,
+            has_implicit_gaps,
+        },
+    ))
 }
 
 fn percussion_staff_type(staff: roxmltree::Node) -> bool {
@@ -3553,6 +4220,168 @@ fn sort_and_reindex(events: &mut [Event]) {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+
+    fn written_plan_fixture(first: &str, second: &str, division: u16) -> String {
+        format!(
+            r#"<museScore version="3.02"><Score><Division>{division}</Division>
+          <Part><Staff id="1"/></Part><Part><Staff id="2"/></Part>
+          <Staff id="1">{first}</Staff><Staff id="2">{second}</Staff>
+        </Score></museScore>"#
+        )
+    }
+
+    #[test]
+    fn written_playback_plan_preserves_native_three_dotted_quarter_hold() {
+        let first = r#"<Measure><voice><Tempo><tempo>2</tempo></Tempo>
+          <Chord><durationType>whole</durationType><Note><pitch>60</pitch></Note></Chord>
+        </voice></Measure>"#;
+        let second = r#"<Measure><voice><Fermata><timeStretch>1.5</timeStretch></Fermata>
+          <Rest><durationType>quarter</durationType><dots>1</dots></Rest>
+          <Rest><durationType>half</durationType></Rest>
+        </voice></Measure>"#;
+        for (division, next, end) in [(480, 719, 1920), (960, 1438, 3840)] {
+            let xml = written_plan_fixture(first, second, division);
+            let original = xml.clone();
+            let plan = written_playback_plan(&xml).unwrap();
+            assert_eq!(xml, original);
+            assert_eq!(plan.staff_id, "1");
+            assert_eq!(plan.ticks_per_beat, division);
+            assert_eq!(plan.measures, [(0, end)]);
+            assert_eq!(plan.first_voice_ends, [end]);
+            assert_eq!(plan.tempos, [(0, 750_000), (next, 500_000)]);
+        }
+    }
+
+    #[test]
+    fn written_playback_plan_has_45_written_bounds_and_exact_voice_cursors_without_unrolling() {
+        let quarter =
+            "<Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>";
+        let mut first = String::new();
+        let mut second = String::new();
+        for index in 0..44 {
+            let navigation = if index == 0 { "<startRepeat/>" } else { "" };
+            let tempo = if index == 0 {
+                "<Tempo><tempo>2</tempo></Tempo>"
+            } else {
+                ""
+            };
+            first.push_str(&format!(
+                "<Measure len=\"1/4\">{navigation}<voice>{tempo}{quarter}</voice></Measure>"
+            ));
+            second.push_str("<Measure len=\"1/4\"><voice><Rest><durationType>quarter</durationType></Rest></voice></Measure>");
+        }
+        first.push_str(&format!("<Measure><voice>{quarter}<location><fractions>-1/8</fractions></location></voice><endRepeat>2</endRepeat></Measure>"));
+        second.push_str("<Measure><voice><Fermata><timeStretch>1.5</timeStretch></Fermata><Rest><durationType>quarter</durationType><dots>1</dots></Rest><Rest><durationType>half</durationType></Rest></voice></Measure>");
+        let xml = written_plan_fixture(&first, &second, 480);
+        let original = parse_mscx(&xml).unwrap();
+        let geometry = |midi: &Midi| {
+            midi.tracks
+                .iter()
+                .flat_map(|track| &track.events)
+                .filter_map(|event| match &event.kind {
+                    Kind::NoteOn(note) => Some((event.tick, note.source.id.clone(), note.key)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = geometry(&original);
+        assert_eq!(before.len(), 90);
+        let plan = written_playback_plan(&xml).unwrap();
+        assert_eq!(plan.measures.len(), 45);
+        assert_eq!(plan.measures[44], (21_120, 23_040));
+        assert_eq!(plan.first_voice_ends.len(), 45);
+        assert_eq!(plan.first_voice_ends[43], 21_120);
+        assert_eq!(plan.first_voice_ends[44], 21_360);
+        assert_eq!(
+            plan.tempos,
+            [(0, 500_000), (21_120, 750_000), (21_599, 500_000)]
+        );
+        assert_eq!(before, geometry(&parse_mscx(&xml).unwrap()));
+    }
+
+    #[test]
+    fn written_playback_plan_removes_nested_navigation_and_refuses_local_first_staff_stretch() {
+        let first = r#"<Measure><startRepeat/><voice><Tempo><tempo>2</tempo></Tempo>
+          <Chord><durationType>whole</durationType><Note><pitch>60</pitch></Note></Chord>
+          <Marker><label>start</label></Marker>
+          <Jump><jumpTo>unqualified</jumpTo><Marker><label>nested</label></Marker></Jump>
+          <Spanner type="Volta"><Volta><endings>1</endings></Volta></Spanner>
+        </voice><endRepeat>2</endRepeat></Measure>"#;
+        let second =
+            "<Measure><voice><Rest><durationType>whole</durationType></Rest></voice></Measure>";
+        let xml = written_plan_fixture(first, second, 480);
+        let plan = written_playback_plan(&xml).unwrap();
+        assert_eq!(plan.measures, [(0, 1920)]);
+        assert_eq!(plan.first_voice_ends, [1920]);
+        assert_eq!(plan.tempos, [(0, 500_000)]);
+        let stretched = xml.replacen("<voice>", "<voice><TimeSig><sigN>4</sigN><sigD>4</sigD><stretchN>2</stretchN><stretchD>1</stretchD></TimeSig>", 1);
+        assert!(written_playback_plan(&stretched)
+            .unwrap_err()
+            .starts_with("SOURCE_PLAYBACK_UNSUPPORTED:"));
+    }
+
+    #[test]
+    fn written_playback_plan_cursor_qualification_does_not_change_public_parser() {
+        let first = "<Measure><voice><Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord><location><fractions>-1/2</fractions></location></voice></Measure>";
+        let second =
+            "<Measure><voice><Rest><durationType>whole</durationType></Rest></voice></Measure>";
+        let xml = written_plan_fixture(first, second, 480);
+        assert!(parse_mscx(&xml).is_ok());
+        assert!(written_playback_plan(&xml)
+            .unwrap_err()
+            .starts_with("SOURCE_PLAYBACK_UNSUPPORTED:"));
+    }
+
+    #[test]
+    fn written_playback_plan_and_private_overlay_agree_with_repeat_playback() {
+        let note =
+            "<Chord><durationType>quarter</durationType><Note><pitch>60</pitch></Note></Chord>";
+        let opening = format!(
+            "<Measure len=\"1/4\"><voice><Tempo><tempo>2</tempo></Tempo>{note}</voice></Measure>"
+        );
+        let closing = format!("<Measure len=\"1/4\"><voice><Tempo><tempo>4</tempo></Tempo>{note}</voice><endRepeat>2</endRepeat></Measure>");
+        let hold = format!("<Measure len=\"1/4\"><startRepeat/><voice><Fermata><timeStretch>2</timeStretch></Fermata>{note}</voice></Measure>");
+        let rests = "<Measure len=\"1/4\"><voice><Rest><durationType>quarter</durationType></Rest></voice></Measure>".repeat(3);
+        let xml = written_plan_fixture(&format!("{opening}{hold}{closing}"), &rests, 480);
+        let plan = written_playback_plan(&xml).unwrap();
+        assert_eq!(plan.measures, [(0, 480), (480, 960), (960, 1440)]);
+        assert_eq!(
+            plan.tempos,
+            [
+                (0, 500_000),
+                (480, 1_000_000),
+                (959, 500_000),
+                (960, 250_000)
+            ]
+        );
+
+        // The renderer can append this written plan inside the existing voice,
+        // preserving navigation and returning to the source's ending cursor.
+        let overlay = format!("<Measure len=\"1/4\"><startRepeat/><voice><Fermata><play>0</play><timeStretch>2</timeStretch></Fermata>{note}<location><fractions>-1/4</fractions></location><Tempo><tempo>1</tempo></Tempo><location><fractions>479/1920</fractions></location><Tempo><tempo>2</tempo></Tempo><location><fractions>1/1920</fractions></location></voice></Measure>");
+        let prepared = written_plan_fixture(&format!("{opening}{overlay}{closing}"), &rests, 480);
+        let read_tempos = |midi: &Midi| {
+            midi.tracks
+                .iter()
+                .flat_map(|track| &track.events)
+                .filter_map(|event| match event.kind {
+                    Kind::Tempo(micros) => Some((event.tick, micros)),
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let source = parse_mscx(&xml).unwrap();
+        let expected = BTreeMap::from([
+            (0, 500_000),
+            (480, 1_000_000),
+            (959, 500_000),
+            (960, 250_000),
+            (1440, 1_000_000),
+            (1919, 500_000),
+            (1920, 250_000),
+        ]);
+        assert_eq!(read_tempos(&source), expected);
+        assert_eq!(read_tempos(&parse_mscx(&prepared).unwrap()), expected);
+    }
 
     fn mscx(lyric_text_xml: &str) -> String {
         format!(
