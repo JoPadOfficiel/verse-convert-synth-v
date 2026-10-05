@@ -115,6 +115,12 @@ stabilizes a monolingual row; disagreement leaves the local decision intact so
 genuine language switches remain possible. A low-confidence word with independent
 lexical/model evidence for its current language is also left intact, including
 proper names and real single-word switches.
+At the edge of a row, two agreeing words with exclusive lexical membership can
+provide one-sided context within the same eight-complete-word bound. Neutral
+vocalises do not consume this fallback's radius or supply proper-name phrase
+evidence. Independent word evidence, manual hints, conflicting text and source
+ownership barriers still protect real language switches. Incomplete fragments
+retain their original markers and diagnostics even when their language is settled.
 This routing does not copy lyrics or notes between tracks.
 
 Lingua is a statistical language detector, not a generative LLM. Its scores are
@@ -1197,3 +1203,28 @@ Each item represented in the current rich source model receives one of:
 The original source preserves constructs that are not individually represented
 by the current model. See [Bundle format](bundle-format.md) for the complete
 ledger contract.
+
+## Editing one OpenUtau pronunciation safely
+
+Select the leading note of the complete word and choose its per-note phonemizer,
+for example `DiffSinger French Millefeuille Phonemizer`. The track phonemizer is
+fallback metadata. Reset stale manual phoneme aliases by right-clicking precisely
+on each alias label; timing handles reset timing instead. Then let OpenUtau
+regenerate the word or enter a complete, inventory-supported inline hint:
+`ciel[fr/s fr/y fr/ae fr/l]`, `yeux[fr/y fr/ee]`, or
+`blancs[fr/b fr/l fr/en]`. Keep source syllable `+` and held `+~` notes.
+The `en` in French `fr/en` names a French vowel. Replacing every `en/` prefix
+with `fr/` does not convert the underlying English phoneme alphabet.
+
+Both duration and acoustic inventories must support a hint. A generated alias
+edit changes one phone after phonemization; it does not choose the word's language
+or rebuild the complete pronunciation. Dictionary/inventory and native processing
+checks do not establish audible singing quality.
+
+OpenUtau application version and USTX schema version are separate. Verse writes
+USTX 0.6. A consumer supporting USTX 0.9 rejects a project containing the newer
+0.10 `MaskedCurve` expression type, even when its application label is 0.1.569.
+Recover such an edited project into a new copy only after auditing every newer
+field and reference. Empty masked curves and unused descriptors can be removed
+with a receipt; active curves, selected expressions, unknown fields and references
+must be refused. Keep the original edited project, manual work and verified audio.

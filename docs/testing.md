@@ -71,6 +71,24 @@ DiffSinger banks and listening across the language boundaries. Portuguese
 Brazil/Portugal acoustic differences are singer-dependent and are not claimed by
 the structural gate.
 
+The separate White Christmas regression requires its exact private master and
+must be explicitly activated. It checks the four French shared-word heads,
+three unresolved fragment owners, source-proven holds and all 713 projected
+notes without changing the source file:
+
+```sh
+VERSE_WHITE_CHRISTMAS_SOURCE="/path/to/OPEN White Christmas-SATB Pno TAB Do.mscz" \
+  cargo test --manifest-path src-tauri/Cargo.toml --locked \
+  --test mixed_languages white_christmas_french_refrain_preserves_fragment_ownership \
+  -- --ignored
+```
+
+Public synthetic tests cover row-edge ownership, genuine English `noel`,
+capitalized neutral vocalises, conflicting reliable neighbors and source/manual
+barriers. The native compatibility suite also exercises French whole-word hints
+and absent aliases with synthetic timing graphs; real-bank pronunciation and
+listening remain separate evidence.
+
 ## Required quality gates
 
 Run the following commands from the repository root:

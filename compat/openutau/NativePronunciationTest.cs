@@ -99,7 +99,30 @@ namespace OpenUtau.App {
                 $"Please check {Path.Combine(bank.Root, "phonemes.txt")}", error.Message);
         }
 
+        [Theory]
+        [InlineData("ciel", "fr/s fr/y fr/ae fr/l")]
+        [InlineData("yeux", "fr/y fr/ee")]
+        [InlineData("blancs", "fr/b fr/l fr/en")]
+        [InlineData("noel", "fr/n fr/oo fr/ae fr/l")]
+        public void FrenchWholeWordHintSurvivesNativeLifecycle(string word, string hint) {
+            using var bank = new SyntheticSinger("fr", word, true);
+            var result = RunNative(CreateConsumer("fr"), bank, word + "[" + hint + "]");
+            Assert.Equal(hint.Split(' '), result.phonemes.Select(p => p.phoneme));
+            Assert.Equal(hint.Split(' ').Select(bank.Token),
+                result.phonemes.Select(p => bank.Singer.PhonemeTokenize(p.phoneme)));
+        }
+
+        [Theory]
+        [InlineData("fr/i")]
+        [InlineData("fr/el")]
+        public void InvalidFrenchAliasIsRefused(string alias) {
+            using var bank = new SyntheticSinger("fr", "ciel", true);
+            var error = Assert.Throws<Exception>(() => RunNative(CreateConsumer("fr"), bank, "ciel[fr/s " + alias + "]"));
+            Assert.Contains("Unrecognized phoneme", error.Message);
+        }
+
         private static Phonemizer CreateConsumer(string language) => language switch {
+            "fr" => new DiffSingerFrenchMillfeuillePhonemizer(),
             "es" => new DiffSingerSpanishPhonemizer(),
             "pt" => new DiffSingerPortuguesePhonemizer(),
             _ => throw new ArgumentException("Unexpected fixture language", nameof(language)),
@@ -148,7 +171,8 @@ namespace OpenUtau.App {
                 string missingDuration = null, string missingAcoustic = null) {
                 Root = Path.Combine(Path.GetTempPath(), "verse-synthetic-singer-" + Guid.NewGuid());
                 prefix = prefixed ? language + "/" : "";
-                inventory = "SP AP a e i o u b B d D g G s k l m t S".Split(' ').Select(Alias).ToArray();
+                var symbols = (language == "fr" ? "SP AP s y ae l ee b en n oo" : "SP AP a e i o u b B d D g G s k l m t S").Split(' ');
+                inventory = symbols.Select(Alias).ToArray();
                 Directory.CreateDirectory(Root);
                 try {
                     var durationRoot = Path.Combine(Root, "dsdur");
@@ -160,11 +184,10 @@ namespace OpenUtau.App {
                         "phonemes: phonemes.txt\nlinguistic: linguistic.onnx\ndur: duration.onnx\n");
                     File.WriteAllLines(Path.Combine(durationRoot, "phonemes.txt"),
                         inventory.Where(p => missingDuration == null || p != Alias(missingDuration)));
-                    var symbols = "SP AP a e i o u b B d D g G s k l m t S".Split(' ');
                     var dictionary = "symbols:\n" + string.Concat(symbols.Select(symbol =>
-                        $"  - {{symbol: '{Alias(symbol)}', type: {((symbol is "SP" or "AP" or "a" or "e" or "i" or "o" or "u") ? "vowel" : "consonant")}}}\n"));
+                        $"  - {{symbol: '{Alias(symbol)}', type: {((symbol is "SP" or "AP" or "a" or "e" or "i" or "o" or "u" or "ae" or "ee" or "en" or "oo") ? "vowel" : "consonant")}}}\n"));
                     dictionary += $"entries:\n  - grapheme: '{word}'\n    phonemes: [SP]\n";
-                    File.WriteAllText(Path.Combine(durationRoot, "dsdict-" + language + ".yaml"), dictionary);
+                    File.WriteAllText(Path.Combine(durationRoot, "dsdict-" + language + (language == "fr" ? "-millefeuille" : "") + ".yaml"), dictionary);
                     File.WriteAllBytes(Path.Combine(durationRoot, "linguistic.onnx"), Convert.FromBase64String(LinguisticModel));
                     File.WriteAllBytes(Path.Combine(durationRoot, "duration.onnx"), Convert.FromBase64String(DurationModel));
                     Singer = new DiffSingerSinger(new Voicebank {
