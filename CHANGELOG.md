@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.9.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.1...v0.9.2) (2026-10-05)
+
+
+### Bug Fixes
+
+* keep audio export outside pronunciation timer ([73adaee](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/73adaeea60b6203d005a353e9d8c188d3d9cb6d2))
+* keep audio export outside pronunciation timer ([8893696](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/889369661d56b7c45a40094c9a21ededbf64f760))
+
 ## [0.9.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.0...v0.9.1) (2026-10-05)
 
 
