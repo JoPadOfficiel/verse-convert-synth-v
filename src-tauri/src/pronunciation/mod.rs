@@ -54,6 +54,14 @@ pub(crate) fn check_work() -> Result<(), Error> {
     }
     Ok(())
 }
+/// Publication still honors cancellation after pronunciation has completed.
+/// Its computation deadline does not bound separately timed audio rendering.
+pub(crate) fn check_cancellation() -> Result<(), Error> {
+    if let Some(snapshot) = current_snapshot() {
+        snapshot.work.check_cancellation()?;
+    }
+    Ok(())
+}
 pub fn observe_projection(
     outcome: &crate::engine::convert::ConvertOutcome,
     target: crate::engine::target::ExportTarget,
@@ -215,15 +223,21 @@ impl Work {
         }
     }
     pub fn check(&self) -> Result<(), Error> {
+        self.check_cancellation()?;
+        if Instant::now() >= self.deadline {
+            Err(Error::new(
+                "PRONUNCIATION_DEADLINE",
+                "Pronunciation resource deadline exceeded",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn check_cancellation(&self) -> Result<(), Error> {
         if self.cancelled.load(Ordering::Relaxed) {
             Err(Error::new(
                 "PRONUNCIATION_CANCELLED",
                 "Pronunciation operation was cancelled",
-            ))
-        } else if Instant::now() >= self.deadline {
-            Err(Error::new(
-                "PRONUNCIATION_DEADLINE",
-                "Pronunciation resource deadline exceeded",
             ))
         } else {
             Ok(())

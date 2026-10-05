@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import App from "../src/App";
 import { ThemeProvider } from "../src/components/theme-provider";
 import type { FileResult, PronunciationProfile } from "../src/lib/tauri";
+import packageMetadata from "../package.json";
 import "../src/index.css";
 
 const profiles: PronunciationProfile[] = ["automatic", "frenchMillefeuille", "englishArpabet", "spanishDiffSinger", "portugueseDiffSinger", "default"];
@@ -15,6 +16,9 @@ type Progress = { index: number; restart: boolean; tests: TestResult[]; original
 let progress: Progress | null = JSON.parse(sessionStorage.getItem(runKey) ?? "null");
 let mode: "accept" | "reject" | "pending" = "accept";
 let finishPending: (() => void) | undefined;
+const nativeVersion = "7.8.9-native-test";
+let versionMode: "accept" | "reject" | "pending" = "accept";
+const pendingVersions: { resolve: (version: string) => void; reject: (error: Error) => void }[] = [];
 const calls: { command: string; payload: Record<string, unknown> }[] = [];
 const root = createRoot(document.getElementById("root")!);
 const results = document.getElementById("test-results")!;
@@ -52,6 +56,10 @@ Object.assign(window, {
     async invoke(command: string, payload: Record<string, unknown>) {
       calls.push({ command, payload });
       switch (command) {
+        case "plugin:app|version":
+          if (versionMode === "reject") throw new Error("Injected native version rejection");
+          if (versionMode === "pending") return new Promise<string>((resolve, reject) => { pendingVersions.push({ resolve, reject }); });
+          return nativeVersion;
         case "pronunciation_memory": return {
           baseline: "verse-lingua-lexical-context-v1", references: [{ id: "other-reference", exportSha256: "other-export-hash", sourceLabel: "Other score.mscz", exportLabel: "Other score.ustx", createdAtUnixSeconds: 1791190000 }, { id: "export-reference", exportSha256: "source-export-hash", sourceLabel: "Choir original.mscz", exportLabel: "Choir reviewed export.ustx", createdAtUnixSeconds: 1791190000 }],
           history: [{ status: "pending", correction: {
@@ -121,11 +129,68 @@ function last(command: string) {
 function stored(profile: PronunciationProfile) {
   check(localStorage.getItem(key) === profile, `Stored choice must be ${profile}`);
 }
+function versionFooter(message: string) {
+  const footer = document.querySelector<HTMLElement>('footer[aria-label="Application version"]');
+  check(footer?.textContent?.trim() === message, `Settings version must display ${message}`);
+  check(footer.parentElement?.lastElementChild === footer, "Version footer must be the last Settings element");
+  const previous = footer.previousElementSibling;
+  check(previous && previous.textContent?.includes("A complete .versebundle"), "Version must follow the bundle explanation");
+  const bounds = footer.getBoundingClientRect();
+  check(bounds.width > 0 && bounds.height > 0 && bounds.top >= previous.getBoundingClientRect().bottom,
+    "Version footer must render below the final Settings content");
+  return footer;
+}
 async function synced(profile: PronunciationProfile) {
+  if (profile === "automatic") versionMode = "pending";
   await click("Settings");
   const select = document.querySelector<HTMLSelectElement>("#pronunciation-profile")!;
   check(select?.value === profile && header().value === profile, "Header and Settings must agree");
+  if (profile === "automatic") {
+    versionFooter("Loading version…");
+    check(!select.disabled, "Loading the version must leave Settings enabled");
+    check(pendingVersions.length > 0, "Settings must request the native app version");
+    versionMode = "accept";
+    await act(async () => { for (const request of pendingVersions.splice(0)) request.resolve(nativeVersion); });
+  }
+  check(nativeVersion !== packageMetadata.version, "Native version fixture must differ from the web package version");
+  versionFooter(`Verse version ${nativeVersion}`);
+  check(calls.some((call) => call.command === "plugin:app|version"), "Version must come from the native app getter");
   await click("Back");
+  if (profile === "automatic") {
+    versionMode = "reject";
+    await click("Settings");
+    versionFooter("Version unavailable");
+    const availableSelect = document.querySelector<HTMLSelectElement>("#pronunciation-profile")!;
+    const renderer = document.querySelector<HTMLInputElement>("#renderer-path")!;
+    check(!availableSelect.disabled && availableSelect.value === profile && !renderer.disabled,
+      "Version rejection must preserve editable settings and the selected profile");
+    check(!document.querySelector('[role="alert"]'), "Version rejection must stay in the footer");
+    const theme = document.documentElement.classList.contains("light") ? "Dark" : "Light";
+    await click(theme);
+    check(document.documentElement.classList.contains(theme.toLowerCase()), "Appearance must remain usable after version rejection");
+    await click("Back");
+
+    versionMode = "pending";
+    await click("Settings");
+    const oldFooter = versionFooter("Loading version…");
+    const staleRequests = pendingVersions.splice(0);
+    check(staleRequests.length > 0, "Unmount regression needs an unresolved native version request");
+    await click("Back");
+    check(!oldFooter.isConnected, "Closing Settings must unmount the version footer");
+    versionMode = "accept";
+    await click("Settings");
+    await act(async () => {
+      for (let index = 0; index < staleRequests.length; index += 1) {
+        if (index % 2 === 0) staleRequests[index].resolve("stale-native-version");
+        else staleRequests[index].reject(new Error("Late native version rejection"));
+      }
+    });
+    versionFooter(`Verse version ${nativeVersion}`);
+    check(oldFooter.textContent?.trim() === "Loading version…", "Late native results must not update the unmounted footer");
+    check(document.querySelector<HTMLSelectElement>("#pronunciation-profile")?.value === profile,
+      "Late native results must preserve reopened Settings");
+    await click("Back");
+  }
 }
 
 function cleanupRun(original: string | null | undefined) {
@@ -137,6 +202,8 @@ function cleanupRun(original: string | null | undefined) {
   progress = null;
   mode = "accept";
   finishPending = undefined;
+  versionMode = "accept";
+  pendingVersions.length = 0;
   calls.length = 0;
   runButton.disabled = false;
 }
