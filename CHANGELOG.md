@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.9.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.0...v0.9.1) (2026-10-05)
+
+
+### Bug Fixes
+
+* preserve source rhythm across rendering ([4b89381](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/4b893817dc03cc2c652c3b1c2c4b687b22e59415))
+* preserve V3/V4 timing and nasal readings ([1e46a77](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/1e46a77151c4312afa09a19449ffcc97a608fb60))
+
 ## [0.9.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.6...v0.9.0) (2026-10-05)
 
 
