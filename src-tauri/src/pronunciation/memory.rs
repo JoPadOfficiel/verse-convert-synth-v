@@ -1,5 +1,5 @@
 use super::{
-    assets::valid_hash,
+    files::valid_hash,
     hash,
     source_map::{Reading, Reference, Word},
     Error, Language, POLICY,
@@ -646,7 +646,7 @@ impl Memory {
             .join("references")
             .join(format!("{}.ustx", reference.export_sha256));
         if path.exists() {
-            if hash(&super::assets::read_bounded(&path, 32 * 1024 * 1024)?)
+            if hash(&super::files::read_bounded(&path, 32 * 1024 * 1024)?)
                 != reference.export_sha256
             {
                 return Err(Error::new(
@@ -680,7 +680,7 @@ impl Memory {
             .root
             .join("references")
             .join(format!("{}.ustx", reference.export_sha256));
-        if hash(&super::assets::read_bounded(&path, 32 * 1024 * 1024)?) != reference.export_sha256 {
+        if hash(&super::files::read_bounded(&path, 32 * 1024 * 1024)?) != reference.export_sha256 {
             return Err(Error::new(
                 "PRONUNCIATION_REFERENCE_INVALID",
                 "Original export is missing or changed",

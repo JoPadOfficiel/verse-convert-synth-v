@@ -9,11 +9,9 @@ use verse_lib::{
         target::{self, ExportTarget, PronunciationProfile},
     },
     pronunciation::{
-        assets::{external_paths, Calibration},
         exchange::Package,
         feedback::compare,
         hash,
-        laya::{decode, Evidence},
         memory::{Correction, Memory, Scope},
         source_map::{parse_ustx, Reference},
         Snapshot, Work, POLICY,
@@ -439,119 +437,56 @@ fn unrelated_music_and_ambiguous_tracks_never_enter_memory() {
         .proposals
         .is_empty());
 }
-fn calibration(threshold: f64) -> Calibration {
-    Calibration {
-        model_sha256: hash(b"graph"),
-        external_data_sha256: hash(b"weights"),
-        tokenizer_sha256: hash(b"tokenizer"),
-        policy: POLICY.into(),
-        bucket: "choice:3-5".into(),
-        temperature: 1.0,
-        threshold,
-        fitted: true,
-        calibration_families_sha256: hash(b"calibration families"),
-    }
-}
 #[test]
-fn confidence_contract_thresholds_finite_fields_gate_and_fallback() {
-    let calibration = calibration(0.25);
-    let evidence = decode(&[0.; 4], &calibration).unwrap();
-    assert!(evidence.accepted(0.25));
-    assert!(!evidence.accepted(0.2501));
-    assert!(!evidence.accepted(0.));
-    for invalid in [f32::NAN, f32::INFINITY] {
-        assert!(decode(&[invalid, 0., 0., 0.], &calibration).is_err());
-    }
-    let mut e = evidence;
-    e.gate = "unevaluated".into();
-    assert!(!e.accepted(0.25));
-    let json = r#"{"probabilities":[true,0,0,0],"answer_confidence":1,"gate":"passed"}"#;
-    assert!(serde_json::from_str::<Evidence>(json).is_err());
-    assert!(calibration
-        .validate(
-            &hash(b"wrong graph"),
-            &hash(b"weights"),
-            &hash(b"tokenizer")
-        )
-        .is_err());
+fn correction_free_snapshot_preserves_baseline_without_model_resources() {
     let bytes = source();
     let midi = musicxml::parse(&bytes).unwrap();
-    let s = Snapshot::baseline(hash(&bytes), vec![]).unwrap();
-    let b = convert_midi_with_snapshot(
-        &midi,
-        "english",
-        None,
-        ExportTarget::Ustx,
-        PronunciationProfile::Automatic,
-        None,
-    );
-    let h = convert_midi_with_snapshot(
-        &midi,
-        "english",
-        None,
-        ExportTarget::Ustx,
-        PronunciationProfile::Automatic,
-        Some(&s),
-    );
-    assert_eq!(b.svp, h.svp);
-}
-fn field(number: u8, body: &[u8]) -> Vec<u8> {
-    assert!(body.len() < 128);
-    let mut data = vec![number << 3 | 2, body.len() as u8];
-    data.extend(body);
-    data
-}
-fn graph(path: &str) -> Vec<u8> {
-    let mut entry = field(1, b"location");
-    entry.extend(field(2, path.as_bytes()));
-    let mut tensor = field(13, &entry);
-    tensor.extend([14 << 3, 1]);
-    let graph = field(5, &tensor);
-    field(7, &graph)
-}
-#[test]
-fn external_onnx_paths_are_checked_without_initializing_runtime() {
-    assert_eq!(external_paths(&graph("model.onnx.data")).unwrap().len(), 1);
-    for path in [
-        "../escape.data",
-        "/tmp/external",
-        "unexpected.data",
-        "model.onnx.data/../escape",
-    ] {
+    let snapshot = Snapshot::baseline(hash(&bytes), vec![]).unwrap();
+    for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+        let convert = |snapshot| {
+            convert_midi_with_snapshot(
+                &midi,
+                "english",
+                None,
+                target,
+                PronunciationProfile::Automatic,
+                snapshot,
+            )
+        };
+        let baseline = convert(None);
+        let frozen = convert(Some(&snapshot));
+        assert_eq!(baseline.svp, frozen.svp);
+        assert_eq!(baseline.pronunciation_words, frozen.pronunciation_words);
+        assert_eq!(baseline.source_warnings, frozen.source_warnings);
         assert_eq!(
-            external_paths(&graph(path)).unwrap_err().code,
-            "LAYA_GRAPH_EXTERNAL_DATA"
+            baseline
+                .tracks
+                .iter()
+                .map(|track| &track.warnings)
+                .collect::<Vec<_>>(),
+            frozen
+                .tracks
+                .iter()
+                .map(|track| &track.warnings)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            target::serialize_to(target, baseline.svp.as_ref().unwrap()).unwrap(),
+            target::serialize_to(target, frozen.svp.as_ref().unwrap()).unwrap()
         );
     }
-    assert!(external_paths(&[0xff]).is_err());
 }
+
 #[test]
 fn work_deadline_and_cancellation_are_per_operation() {
     let work = Work::new(std::time::Duration::from_secs(30));
     work.cancelled.store(true, Ordering::Relaxed);
-    assert_eq!(work.check().unwrap_err().code, "LAYA_CANCELLED");
+    assert_eq!(work.check().unwrap_err().code, "PRONUNCIATION_CANCELLED");
     let expired = Work {
         deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
         cancelled: Default::default(),
     };
-    assert_eq!(expired.check().unwrap_err().code, "LAYA_DEADLINE");
-}
-
-#[test]
-fn calibration_is_bound_to_external_weights_not_only_shared_graph() {
-    let c = calibration(0.8);
-    c.validate(&hash(b"graph"), &hash(b"weights"), &hash(b"tokenizer"))
-        .unwrap();
-    assert_eq!(
-        c.validate(
-            &hash(b"graph"),
-            &hash(b"another checkpoint weights"),
-            &hash(b"tokenizer")
-        )
-        .unwrap_err()
-        .code,
-        "LAYA_CALIBRATION_UNQUALIFIED"
-    );
+    assert_eq!(expired.check().unwrap_err().code, "PRONUNCIATION_DEADLINE");
 }
 
 #[test]
@@ -921,47 +856,6 @@ fn old_reading_authority_is_preserved_as_incompatible_after_upgrade() {
 }
 
 #[test]
-#[allow(clippy::approx_constant)] // Exact Python decimal rounding fixtures, not approximations of pi.
-fn python_four_decimal_rounding_ties_and_gate_boundaries() {
-    use verse_lib::pronunciation::laya::round_answer_confidence as rounded;
-    // Python 3.13 round() receipts, including exact binary half-even ties and
-    // the multiplication-created tie at 0.52345.
-    for (value, expected, below, above) in [
-        (0.52345, 0.5234, 0.5234, 0.5235),
-        (0.03125, 0.0312, 0.0312, 0.0313),
-        (0.15625, 0.1562, 0.1562, 0.1563),
-        (0.71875, 0.7188, 0.7187, 0.7188),
-        (0.50005, 0.5, 0.5, 0.5001),
-        (0.99995, 1.0, 0.9999, 1.0),
-    ] {
-        assert_eq!(rounded(value), expected);
-        assert_eq!(rounded(f64::from_bits(value.to_bits() - 1)), below);
-        assert_eq!(rounded(f64::from_bits(value.to_bits() + 1)), above);
-        if value >= 0.25 {
-            let remaining = (1.0 - value) / 3.0;
-            let evidence = Evidence {
-                probabilities: [value, remaining, remaining, remaining],
-                answer_confidence: expected,
-                gate: "passed".into(),
-            };
-            assert!(evidence.accepted(f64::from_bits(expected.to_bits() - 1)));
-            assert!(evidence.accepted(expected));
-            assert!(!evidence.accepted(f64::from_bits(expected.to_bits() + 1)));
-        }
-    }
-    let c = calibration(0.25);
-    let decoded = decode(&[0.0; 4], &c).unwrap();
-    assert_eq!(decoded.answer_confidence, rounded(decoded.probabilities[0]));
-    assert!(decoded.accepted(c.threshold));
-    assert!(!decoded.accepted(f64::from_bits(c.threshold.to_bits() + 1)));
-    // Pinned NumPy float32 softmax at the reference's decimal boundary.
-    let decoded = decode(&[1.192_481_f32, 0.0, 0.0, 0.0], &calibration(0.5235)).unwrap();
-    assert_eq!(decoded.answer_confidence, 0.5235);
-    assert!(decoded.accepted(0.5235));
-    assert!(!decoded.accepted(f64::from_bits(0.5235f64.to_bits() + 1)));
-}
-
-#[test]
 fn ten_thousand_record_snapshot_is_indexed_shared_and_conflict_preserving() {
     use verse_lib::pronunciation::memory::CorrectionSet;
     let base = correction();
@@ -1016,172 +910,6 @@ fn ten_thousand_record_snapshot_is_indexed_shared_and_conflict_preserving() {
 }
 
 #[test]
-fn local_asset_gate_checks_receipt_bytes_weights_and_every_mandatory_file() {
-    use verse_lib::pronunciation::assets::{self, Asset, Manifest, Qualification};
-    let temp = Temp::new();
-    std::fs::create_dir(temp.0.join("tokenizer")).unwrap();
-    let mut files = Vec::new();
-    let mut put = |name: &str, bytes: Vec<u8>| {
-        std::fs::write(temp.0.join(name), &bytes).unwrap();
-        let asset = Asset {
-            path: name.into(),
-            bytes: bytes.len() as u64,
-            sha256: hash(&bytes),
-        };
-        files.push(asset.clone());
-        asset
-    };
-    let graph = put("model.onnx", graph("model.onnx.data"));
-    let weights = put(
-        "model.onnx.data",
-        b"contract-fixture-not-trained-weights".to_vec(),
-    );
-    let tokenizer = put("tokenizer/tokenizer.json", b"{}".to_vec());
-    put("tokenizer/tokenizer_config.json", b"{}".to_vec());
-    put("rl_agent_config.json", b"{}".to_vec());
-    let runtime = put(
-        "native.dylib",
-        b"contract-fixture-never-initialized".to_vec(),
-    );
-    let mut c = calibration(0.8);
-    c.model_sha256 = graph.sha256.clone();
-    c.external_data_sha256 = weights.sha256.clone();
-    c.tokenizer_sha256 = tokenizer.sha256.clone();
-    let calibration = put("calibration.json", serde_json::to_vec(&c).unwrap());
-    let identities = serde_json::json!({"schema_version":1,"policy":POLICY,"target":"test-cpu","graph_sha256":graph.sha256,"external_data_sha256":weights.sha256,"tokenizer_sha256":tokenizer.sha256,"calibration_sha256":calibration.sha256,"runtime_sha256":runtime.sha256});
-    let mut evidence = Vec::new();
-    for (name, observation) in [
-        (
-            "rights.json",
-            serde_json::json!({"kind":"rights","checkpoint_license_sha256":hash(b"license"),"tokenizer_permission_sha256":hash(b"permission"),"review_sha256":hash(b"review")}),
-        ),
-        (
-            "parity.json",
-            serde_json::json!({"kind":"offline_parity","token_cases":6,"shape_cases":4,"max_logit_error":0.0001,"max_action_logit_error":0.0001,"network_attempts":0,"missing_corrupt_cases":7,"immutable_assets":true}),
-        ),
-        (
-            "resources.json",
-            serde_json::json!({"kind":"resources","peak_rss_bytes":1000,"package_bytes":1000,"cold_seconds":1.0,"warm_p95_seconds":0.1,"hardware":"contract-only fixture","threads":2}),
-        ),
-    ] {
-        let mut data = identities.clone();
-        data["observation"] = observation;
-        let bytes = serde_json::to_vec(&data).unwrap();
-        evidence.push(put(name, bytes));
-    }
-    let qualification = Qualification {
-        schema_version: 1,
-        policy: POLICY.into(),
-        target: "test-cpu".into(),
-        graph_sha256: graph.sha256,
-        external_data_sha256: weights.sha256,
-        tokenizer_sha256: tokenizer.sha256,
-        calibration_sha256: calibration.sha256,
-        runtime_sha256: runtime.sha256,
-        evidence,
-        rights_evidence: "rights.json".into(),
-        offline_parity_evidence: "parity.json".into(),
-        independent_evaluation_evidence: None,
-        resource_evidence: "resources.json".into(),
-    };
-    let receipt = put(
-        "qualification.json",
-        serde_json::to_vec(&qualification).unwrap(),
-    );
-    let manifest = Manifest {
-        schema_version: 1,
-        policy: POLICY.into(),
-        target: "test-cpu".into(),
-        runtime_path: "native.dylib".into(),
-        files,
-        calibration: c,
-        redistribution_qualified: true,
-        telemetry_free_build: true,
-        native_parity_qualified: true,
-        independent_benefit_qualified: true,
-        qualification_receipt_sha256: Some(receipt.sha256),
-        fusion_weight: 1.0,
-        max_tokens: 1024,
-        max_rows: 2,
-        threads: 2,
-        deadline_ms: 30000,
-    };
-    std::fs::write(
-        temp.0.join("manifest.json"),
-        serde_json::to_vec(&manifest).unwrap(),
-    )
-    .unwrap();
-    // Contract-only data can exercise preflight; it is never a native session
-    // or real model qualification result. Missing independent benefit refuses
-    // production even with every unchecked boolean set true.
-    assets::validate(&temp.0, "test-cpu", false).unwrap();
-    assert_eq!(
-        assets::validate(&temp.0, "test-cpu", true)
-            .unwrap_err()
-            .code,
-        "LAYA_QUALIFICATION_MISSING"
-    );
-    for mandatory in [
-        "model.onnx",
-        "model.onnx.data",
-        "tokenizer/tokenizer.json",
-        "tokenizer/tokenizer_config.json",
-        "rl_agent_config.json",
-        "calibration.json",
-        "native.dylib",
-        "qualification.json",
-    ] {
-        let path = temp.0.join(mandatory);
-        let before = std::fs::read(&path).unwrap();
-        std::fs::write(&path, b"corrupt").unwrap();
-        assert!(
-            assets::validate(&temp.0, "test-cpu", false).is_err(),
-            "{mandatory}"
-        );
-        std::fs::remove_file(&path).unwrap();
-        assert!(
-            assets::validate(&temp.0, "test-cpu", false).is_err(),
-            "{mandatory}"
-        );
-        std::fs::write(path, before).unwrap();
-    }
-    let mut changed = manifest.clone();
-    changed.qualification_receipt_sha256 = Some(hash(b"unchecked hash"));
-    std::fs::write(
-        temp.0.join("manifest.json"),
-        serde_json::to_vec(&changed).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        assets::validate(&temp.0, "test-cpu", false)
-            .unwrap_err()
-            .code,
-        "LAYA_QUALIFICATION_INVALID"
-    );
-    let mut changed = manifest.clone();
-    let replacement = b"different-checkpoint-same-graph";
-    std::fs::write(temp.0.join("model.onnx.data"), replacement).unwrap();
-    let sidecar = changed
-        .files
-        .iter_mut()
-        .find(|a| a.path == "model.onnx.data")
-        .unwrap();
-    sidecar.bytes = replacement.len() as u64;
-    sidecar.sha256 = hash(replacement);
-    std::fs::write(
-        temp.0.join("manifest.json"),
-        serde_json::to_vec(&changed).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        assets::validate(&temp.0, "test-cpu", false)
-            .unwrap_err()
-            .code,
-        "LAYA_CALIBRATION_UNQUALIFIED"
-    );
-}
-
-#[test]
 fn changed_phonemizer_does_not_relabel_stale_hint_alphabet() {
     use verse_lib::pronunciation::{
         source_map::{reading, NativeNote},
@@ -1215,42 +943,6 @@ fn changed_phonemizer_does_not_relabel_stale_hint_alphabet() {
     let correction = &review.proposals[0];
     assert!(correction.after.phones.is_none());
     assert!(correction.after.alphabet.is_none());
-}
-
-#[cfg(feature = "laya-native")]
-#[test]
-#[ignore = "Requires exact local tokenizer and pinned Python parity fixtures"]
-fn native_tokenization_matches_pinned_python_build_sequence() {
-    let root = PathBuf::from(
-        std::env::var("VERSE_LAYA_PARITY_ASSETS")
-            .expect("exact local parity asset directory required"),
-    );
-    let mut tokenizer =
-        tokenizers::Tokenizer::from_file(root.join("tokenizer/tokenizer.json")).unwrap();
-    tokenizer.with_truncation(None).unwrap();
-    tokenizer.with_padding(None);
-    let fixtures: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("verse-parity-fixtures.json")).unwrap())
-            .unwrap();
-    assert_eq!(fixtures["policy"], POLICY);
-    for case in fixtures["cases"].as_array().unwrap() {
-        let encoded = verse_lib::pronunciation::laya::native::encode(
-            &tokenizer,
-            case["state"].as_str().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            serde_json::to_value(encoded.input_ids).unwrap(),
-            case["input_ids"]
-        );
-        assert_eq!(
-            serde_json::to_value(encoded.marker_pos).unwrap(),
-            case["marker_pos"]
-        );
-    }
-    assert!(
-        verse_lib::pronunciation::laya::native::encode(&tokenizer, &"word ".repeat(1024)).is_err()
-    );
 }
 
 #[test]

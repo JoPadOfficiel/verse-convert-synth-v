@@ -1,8 +1,8 @@
-//! IPC adapters. Model and database work runs on blocking workers, never webview.
+//! IPC adapters. Pronunciation and database work runs on blocking workers, never webview.
 use super::{
-    assets::read_bounded,
     exchange::Package,
     feedback::{compare, Review},
+    files::read_bounded,
     hash,
     memory::{HistoryRecord, Memory, Scope},
     source_map::Reference,
@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -31,9 +31,7 @@ struct Plan {
 }
 pub struct AppState {
     pub root: PathBuf,
-    resources: PathBuf,
     plans: Mutex<HashMap<String, Plan>>,
-    model: OnceLock<Result<Arc<super::laya::Laya>, Error>>,
     active: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     next_operation: AtomicU64,
     #[cfg(test)]
@@ -52,26 +50,15 @@ impl Drop for Operation {
     }
 }
 impl AppState {
-    pub fn new(root: PathBuf, resources: &Path) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            resources: resources.into(),
             plans: Mutex::new(HashMap::new()),
-            model: OnceLock::new(),
             active: Mutex::new(HashMap::new()),
             next_operation: AtomicU64::new(0),
             #[cfg(test)]
             test_renderer: None,
         }
-    }
-    fn model(&self) -> Result<Arc<super::laya::Laya>, Error> {
-        self.model
-            .get_or_init(|| {
-                let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-                super::laya::Laya::load(&self.resources.join("pronunciation/laya"), &target)
-                    .map(Arc::new)
-            })
-            .clone()
     }
     fn operation(self: &Arc<Self>) -> Result<Operation, Error> {
         let id = self.next_operation.fetch_add(1, Ordering::Relaxed);
@@ -115,16 +102,10 @@ impl AppState {
     ) -> Result<Arc<Snapshot>, Error> {
         snapshot.expected_projection_sha256 = Some(digest);
         snapshot.sealed = true;
-        let evidence = snapshot
-            .evidence
-            .lock()
-            .map_err(|_| Error::new("LAYA_EVIDENCE_STATE", "Evidence cache unavailable"))?;
         snapshot.id = hash(&serde_json::to_vec(&(
             &snapshot.id,
             &snapshot.expected_projection_sha256,
-            &*evidence,
         ))?);
-        drop(evidence);
         let mut plans = self
             .plans
             .lock()
@@ -174,21 +155,13 @@ impl AppState {
     ) -> Result<Arc<Snapshot>, Error> {
         let data = read_bounded(Path::new(path), crate::MAX_INPUT_BYTES)?;
         let mut snapshot = Snapshot::with_corrections(hash(&data), corrections)?;
-        match self.model() {
-            Ok(model) => snapshot.model = Some(model),
-            Err(e) => snapshot.unavailable_reason = e.code,
-        }
         snapshot.memory_root = Some(self.root.clone());
         snapshot.source_label = Path::new(path)
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_owned);
         snapshot.work = work;
-        snapshot.id = hash(&serde_json::to_vec(&(
-            &signature,
-            &snapshot.id,
-            snapshot.model.as_ref().map(|m| &m.identity),
-        ))?);
+        snapshot.id = hash(&serde_json::to_vec(&(&signature, &snapshot.id))?);
         Ok(Arc::new(snapshot))
     }
 
@@ -349,12 +322,6 @@ fn convert_batch(
                     export_target.unwrap_or_default(),
                     pronunciation_profile.unwrap_or_default(),
                 );
-                if pronunciation_profile.unwrap_or_default() == PronunciationProfile::Automatic {
-                    if let Some(snapshot) = super::current_snapshot().filter(|s| s.model.is_none())
-                    {
-                        result.warnings.push(snapshot.diagnostic());
-                    }
-                }
                 if !write && result.ok {
                     let (_, _, digest) = super::observed_projection().ok_or_else(|| {
                         Error::new(
@@ -493,7 +460,6 @@ pub struct MemoryView {
     pub history: Vec<HistoryRecord>,
     pub references: Vec<super::memory::ReferenceInfo>,
     pub baseline: String,
-    pub laya_reason: String,
 }
 #[allow(clippy::too_many_arguments)]
 fn export_bundle_service(
@@ -552,7 +518,6 @@ pub async fn pronunciation_memory(
             history: memory.history()?,
             references: memory.references()?,
             baseline: super::BASELINE.into(),
-            laya_reason: state.model().err().map(|e| e.code).unwrap_or_default(),
         })
     })
     .await
@@ -693,14 +658,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let path = root.join("source.xml");
         std::fs::write(&path,b"<score-partwise><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\"><attributes><divisions>480</divisions></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><lyric><text>hello</text></lyric></note></measure></part></score-partwise>").unwrap();
-        let state = Arc::new(AppState::new(
-            root.join("memory"),
-            &root.join("absent-assets"),
-        ));
-        assert!(
-            state.model.get().is_none(),
-            "setup must not load/hash the model"
-        );
+        let state = Arc::new(AppState::new(root.join("memory")));
         let path = path.to_string_lossy().to_string();
         let signature = AppState::signature(
             &path,
@@ -761,6 +719,58 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_or_expired_direct_exports_create_no_output() {
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            for cancelled in [true, false] {
+                let (root, state, path, signature) = state();
+                let approved = analysed(&state, &path);
+                let operation = state.operation().unwrap();
+                let mut snapshot = state
+                    .export_plan(
+                        Some(&approved.id),
+                        &path,
+                        &signature,
+                        operation.work.clone(),
+                    )
+                    .unwrap();
+                if cancelled {
+                    state.cancel_running().unwrap();
+                } else {
+                    Arc::make_mut(&mut snapshot).work.deadline = std::time::Instant::now();
+                }
+                let output = root.join(format!("cancelled.{}", target.extension()));
+                let error = with_snapshot(snapshot, || {
+                    crate::export_svp(
+                        path,
+                        output.to_string_lossy().into_owned(),
+                        None,
+                        None,
+                        Some(target),
+                        Some(PronunciationProfile::Automatic),
+                    )
+                })
+                .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if cancelled {
+                        "PRONUNCIATION_CANCELLED"
+                    } else {
+                        "PRONUNCIATION_DEADLINE"
+                    }
+                );
+                assert!(!output.exists());
+                assert!(Memory::open(&state.root)
+                    .unwrap()
+                    .references()
+                    .unwrap()
+                    .is_empty());
+                drop(operation);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn delayed_export_has_fresh_work_and_source_memory_changes_are_refused() {
         let (root, state, path, signature) = state();
         let operation = state.operation().unwrap();
@@ -802,6 +812,17 @@ mod tests {
                 Some(&export),
             );
             super::super::observe_projection(&result, ExportTarget::Ustx).unwrap();
+            let output = root.join("delayed.ustx");
+            crate::export_svp(
+                path.clone(),
+                output.to_string_lossy().into_owned(),
+                None,
+                None,
+                Some(ExportTarget::Ustx),
+                Some(PronunciationProfile::Automatic),
+            )
+            .unwrap();
+            assert!(output.is_file());
         });
         std::fs::write(&path, b"changed source").unwrap();
         assert_eq!(
@@ -887,7 +908,10 @@ mod tests {
         let app = tauri::test::mock_app();
         app.manage(state.clone());
         pronunciation_cancel(app.state()).unwrap();
-        assert_eq!(export.work.check().unwrap_err().code, "LAYA_CANCELLED");
+        assert_eq!(
+            export.work.check().unwrap_err().code,
+            "PRONUNCIATION_CANCELLED"
+        );
         assert!(!snapshot.work.cancelled.load(Ordering::Relaxed));
         drop(export_operation);
         assert!(state.active.lock().unwrap().is_empty());

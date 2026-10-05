@@ -366,7 +366,7 @@ export type ImportedCorrection = {
   };
 };
 export type CorrectionsReview = { reference_id: string; corrected_sha256: string; proposals: ImportedCorrection[]; diagnostics: { code: string; message: string }[] };
-export type PronunciationMemory = { history: { correction: ImportedCorrection; status: string }[]; references: { id: string; exportSha256: string; sourceLabel: string | null; exportLabel: string | null; createdAtUnixSeconds: number | null }[]; baseline: string; layaReason: string };
+export type PronunciationMemory = { history: { correction: ImportedCorrection; status: string }[]; references: { id: string; exportSha256: string; sourceLabel: string | null; exportLabel: string | null; createdAtUnixSeconds: number | null }[]; baseline: string };
 export const getPronunciationMemory = () => invoke<PronunciationMemory>("pronunciation_memory");
 export const comparePronunciation = (referenceId: string, correctedPath: string) => invoke<CorrectionsReview>("pronunciation_compare", { referenceId, correctedPath });
 export const confirmPronunciation = (referenceId: string, correctedPath: string, selections: { correction_id: string; scope: "occurrence_only" | "compatible_context"; listened: boolean }[]) => invoke<void>("pronunciation_confirm", { referenceId, correctedPath, selections });

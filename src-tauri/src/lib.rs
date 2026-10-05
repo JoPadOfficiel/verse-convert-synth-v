@@ -458,10 +458,10 @@ fn process_one(
         // classifies exactly that condition as CONVERSION_FAILED, so this
         // boundary matches it. Every pre-existing arm keeps the WRITE_FAILED code
         // it had in 0.4.9.
-        let write_result = (|| -> Result<String, (&'static str, String)> {
+        let write_result = (|| -> Result<String, (String, String)> {
             let projected = r.svp.as_ref().ok_or_else(|| {
                 (
-                    "WRITE_FAILED",
+                    "WRITE_FAILED".into(),
                     format!(
                         "no {} output was produced",
                         target.extension().to_ascii_uppercase()
@@ -470,20 +470,23 @@ fn process_one(
             })?;
             let out_path = vocal_out_path(path, out_dir, target);
             validate_new_output_target(Path::new(path), Path::new(&out_path))
-                .map_err(|message| ("WRITE_FAILED", message))?;
+                .map_err(|message| ("WRITE_FAILED".into(), message))?;
             // The neutral projection becomes one target's file only here, at the
             // boundary that writes it.
             let bytes =
                 engine::target::serialize_to(target, projected).map_err(|error| match error {
-                    SerializeError::Unrepresentable(message) => ("CONVERSION_FAILED", message),
+                    SerializeError::Unrepresentable(message) => {
+                        ("CONVERSION_FAILED".into(), message)
+                    }
                     SerializeError::Encode(message) => (
-                        "WRITE_FAILED",
+                        "WRITE_FAILED".into(),
                         format!(
                             "cannot serialize {} ({message})",
                             target.extension().to_ascii_uppercase()
                         ),
                     ),
                 })?;
+            pronunciation::check_work().map_err(|e| (e.code, e.message))?;
             if target == ExportTarget::Ustx {
                 pronunciation::retain_reference(
                     &bytes,
@@ -492,11 +495,12 @@ fn process_one(
                         .and_then(|name| name.to_str())
                         .map(str::to_owned),
                 )
-                .map_err(|e| ("PRONUNCIATION_REFERENCE_WRITE", e.to_string()))?;
+                .map_err(|e| ("PRONUNCIATION_REFERENCE_WRITE".into(), e.to_string()))?;
             }
+            pronunciation::check_work().map_err(|e| (e.code, e.message))?;
             bundle::write_bytes_no_replace(Path::new(&out_path), &bytes).map_err(|error| {
                 (
-                    "WRITE_FAILED",
+                    "WRITE_FAILED".into(),
                     format!(
                         "cannot write {} ({error})",
                         target.extension().to_ascii_uppercase()
@@ -622,6 +626,7 @@ fn export_svp(
             }
             SerializeError::Encode(message) => CommandErrorDto::new("SERIALIZE_FAILED", message),
         })?;
+    pronunciation::check_work().map_err(CommandErrorDto::from)?;
     if export_target == ExportTarget::Ustx {
         pronunciation::retain_reference(
             &bytes,
@@ -632,6 +637,7 @@ fn export_svp(
         )
         .map_err(CommandErrorDto::from)?;
     }
+    pronunciation::check_work().map_err(CommandErrorDto::from)?;
     bundle::write_bytes_no_replace(target_path, &bytes).map_err(|error| {
         CommandErrorDto::new("WRITE_FAILED", format!("cannot write file ({error})"))
     })?;
@@ -948,8 +954,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = app.path().app_data_dir()?.join("pronunciation");
-            let resources = app.path().resource_dir()?;
-            app.manage(Arc::new(AppState::new(root, &resources)));
+            app.manage(Arc::new(AppState::new(root)));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

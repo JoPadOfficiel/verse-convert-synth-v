@@ -51,7 +51,7 @@ files, build manifests, launch processes, or commit output.
 | Input adapters | `engine/midi.rs`, `musicxml.rs`, `musescore.rs` | Format-specific parsing into the shared model |
 | Projection seam | `engine/projection.rs` | Target-neutral projection in source-exact IR ticks |
 | Word reassembly | `engine/syllable.rs` | One word per run of syllables, target-neutral |
-| Pronunciation evidence and feedback | `pronunciation/`, `engine/language.rs` | Optional bounded local Laya evidence, frozen analysis snapshots, source-linked human review, SQLite correction/reference history and JSON exchange |
+| Pronunciation evidence and feedback | `pronunciation/`, `engine/language.rs` | Deterministic baseline routing, frozen analysis snapshots, source-linked human review, SQLite correction/reference history and JSON exchange |
 | Target dispatch | `engine/target/mod.rs` | `ExportTarget`, the analysis gate `validate_for`, and the single write boundary `serialize_to` |
 | Target adapter | `engine/target/svp.rs` | Raw Synthesizer V project v113 serialization; blicks |
 | Target adapter | `engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 serialization; 480 ticks per quarter, and its own deterministic YAML emitter |
@@ -278,8 +278,8 @@ records are preserved without application. Scores, audio and musical tuning are
 not correction-memory content. User sources, direct projects and `.versebundle`
 directories retain their existing no-replace publication contract.
 
-Analysis freezes pronunciation model/policy/memory identities, caches accepted
-or rejected word evidence and records the serialized projection hash. Exports
+Analysis freezes pronunciation baseline/policy/memory identities and records
+the serialized projection hash. Exports
 reparse the source under that snapshot, verify source/settings/memory identity
 and refuse a different reproduced plan. Operation deadlines and registered
 cancellation tokens are fresh for export and independent of analysis age.
@@ -287,10 +287,10 @@ The bounded session cache refuses saturation without silently clearing prior
 analyses. This is a pronunciation snapshot contract, not a complete durable job
 or backend source/destination handle architecture.
 
-The shipped resources currently contain no model or native runtime. Laya's
-native packaging, fitted calibration, redistribution, full logit parity and
-independent benefit remain unqualified. Missing/rejected evidence uses the named
-offline deterministic baseline; development preparation Python is not shipped.
+Automatic pronunciation uses bundled Lingua/lexical/context routing and confirmed
+compatible corrections. No candidate adapter, model loader, optional activation
+mode or missing-model diagnostic remains. Cancellation and deadline refusals use
+generic pronunciation codes; SQLite schema and correction identities are unchanged.
 
 Bundle publication follows:
 
@@ -323,8 +323,8 @@ Rust DTOs use `#[serde(rename_all = "camelCase")]` and are mirrored in
 
 The current contract still uses selected path strings and reparses at export
 time. Pronunciation adapters now carry a backend snapshot ID and verify an
-immutable projection hash; bundle progress uses typed Channels. Model/database
-work runs on blocking workers, with registered model-operation cancellation.
+immutable projection hash; bundle progress uses typed Channels. Pronunciation/database
+work runs on blocking workers, with registered operation cancellation.
 Legacy conversion/write helpers are private; the baseline batch dispatcher is
 test-only. No legacy conversion/export RPC is registered. Missing, unknown or
 stale export snapshots are refused with `PRONUNCIATION_SNAPSHOT_STALE`.

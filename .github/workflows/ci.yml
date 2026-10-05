@@ -88,11 +88,5 @@ jobs:
       - name: Run all Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
-      - name: Verify optional offline native adapter compiles
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked --features laya-native -- -D warnings
-
-      - name: Verify native adapter failure and feedback contracts
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --features laya-native --test pronunciation_feedback
-
-      - name: Validate development Python tools
-        run: python3 -m py_compile scripts/prepare-laya-assets.py scripts/evaluate-pronunciation.py scripts/import-pronunciation-corrections.py
+      - name: Validate corrections import tool
+        run: python3 -m py_compile scripts/import-pronunciation-corrections.py

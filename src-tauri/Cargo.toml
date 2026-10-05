@@ -35,13 +35,6 @@ unicode-normalization = "0.1.25"
 lingua = { version = "1.8.0", default-features = false, features = ["english", "french", "spanish", "portuguese"] }
 rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 serde_yaml = "0.9"
-tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"], optional = true }
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24"], optional = true }
-
-[features]
-default = []
-laya-native = ["dep:ort", "dep:tokenizers"]
-
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
