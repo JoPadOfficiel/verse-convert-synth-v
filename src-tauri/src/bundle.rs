@@ -3630,13 +3630,21 @@ fn export_bundle_with_hook_and_progress(
     progress: &(dyn Fn(BundleProgressEvent) + Sync),
 ) -> Result<BundleResult, BundleError> {
     validate_destination(&request.destination)?;
-    let check_work = || {
-        crate::pronunciation::check_work().map_err(|error| BundleError::Io {
-            phase: "check pronunciation operation",
+    // The admitted input already contains its validated vocal projection.
+    // Reject expired pronunciation work here, before creating any staging.
+    crate::pronunciation::check_work().map_err(|error| BundleError::Io {
+        phase: "check pronunciation operation",
+        source: io::Error::other(error),
+    })?;
+    // Audio uses the aggregate render limits below, not the completed
+    // pronunciation computation's deadline. Cancellation remains live through
+    // all renderer phases and the final no-replace publication boundary.
+    let check_cancelled = || {
+        crate::pronunciation::check_cancellation().map_err(|error| BundleError::Io {
+            phase: "check export cancellation",
             source: io::Error::other(error),
         })
     };
-    check_work()?;
     let layout = BundleLayout::new(
         &request.destination,
         &request.input.original_name,
@@ -3716,6 +3724,7 @@ fn export_bundle_with_hook_and_progress(
         ));
     }
     hook.checkpoint(FaultPoint::AfterSource)?;
+    check_cancelled()?;
 
     let render_started = Instant::now();
     let midi_source = is_midi_source(&request.input.source_format);
@@ -3768,6 +3777,7 @@ fn export_bundle_with_hook_and_progress(
         }
     }
 
+    check_cancelled()?;
     progress(BundleProgressEvent {
         phase: BundleProgressPhase::RenderingReference,
         completed: 2,
@@ -3782,7 +3792,9 @@ fn export_bundle_with_hook_and_progress(
         &reference_path,
         &render_output,
         &remaining_render_limits(render_started, &request.render_limits)?,
-    )?;
+    );
+    check_cancelled()?;
+    let rendered = rendered?;
     let audio_path = safe_join(&root, &layout.audio_relative_path)?;
     copy_new_file(
         &render_output,
@@ -3806,6 +3818,7 @@ fn export_bundle_with_hook_and_progress(
         .zip(&stem_relative_paths)
         .enumerate()
     {
+        check_cancelled()?;
         progress(BundleProgressEvent {
             phase: BundleProgressPhase::RenderingStem,
             completed: stem_index + 3,
@@ -3835,7 +3848,9 @@ fn export_bundle_with_hook_and_progress(
             &part_input,
             &part_output,
             &remaining_render_limits(render_started, &request.render_limits)?,
-        )?;
+        );
+        check_cancelled()?;
+        let rendered_part = rendered_part?;
         if rendered_part.renderer != rendered.renderer {
             return Err(BundleError::Integrity(
                 "renderer identity changed during stem export".into(),
@@ -3886,7 +3901,7 @@ fn export_bundle_with_hook_and_progress(
     }
     render_work.cleanup()?;
     hook.checkpoint(FaultPoint::AfterAudio)?;
-    check_work()?;
+    check_cancelled()?;
 
     progress(BundleProgressEvent {
         phase: BundleProgressPhase::Finalizing,
@@ -3950,7 +3965,7 @@ fn export_bundle_with_hook_and_progress(
     )?;
     let project_path = safe_join(&root, &layout.project_relative_path)?;
     let project_bytes = request.input.project.to_bytes()?;
-    check_work()?;
+    check_cancelled()?;
     if layout.target == crate::engine::target::ExportTarget::Ustx {
         crate::pronunciation::retain_reference(
             &project_bytes,
@@ -4041,7 +4056,7 @@ fn export_bundle_with_hook_and_progress(
 
     sync_directory(&root, "sync staging directory")?;
     sync_directory(parent, "sync destination parent before commit")?;
-    check_work()?;
+    check_cancelled()?;
     match rename_no_replace(&root, &request.destination) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -4058,6 +4073,10 @@ fn export_bundle_with_hook_and_progress(
         return Err(error);
     }
     if let Err(error) = verify_bundle(&request.destination, &layout) {
+        remove_owned_destination(&request.destination);
+        return Err(error);
+    }
+    if let Err(error) = check_cancelled() {
         remove_owned_destination(&request.destination);
         return Err(error);
     }
@@ -7943,7 +7962,12 @@ pub(crate) mod tests {
             }
         }
         for target in [ExportTarget::Svp, ExportTarget::Ustx] {
-            for at in [FaultPoint::AfterProject, FaultPoint::BeforeCommit] {
+            for at in [
+                FaultPoint::AfterSource,
+                FaultPoint::AfterProject,
+                FaultPoint::BeforeCommit,
+                FaultPoint::AfterRename,
+            ] {
                 let root = temp_dir("pronunciation-stop-before-commit");
                 let request = request_for(&root, FakeMode::Success, target);
                 let destination = request.destination.clone();
@@ -7969,6 +7993,195 @@ pub(crate) mod tests {
                 );
                 fs::remove_dir_all(root).unwrap();
             }
+        }
+    }
+
+    struct DeadlineDuringAudio {
+        inner: FakeRenderer,
+        cancel: bool,
+    }
+    struct AdmissionCheckpoints(std::sync::atomic::AtomicUsize);
+    impl BundleHook for AdmissionCheckpoints {
+        fn checkpoint(&self, _: FaultPoint) -> Result<(), BundleError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    impl AudioRenderer for DeadlineDuringAudio {
+        fn capabilities(&self) -> &RendererCapabilities {
+            self.inner.capabilities()
+        }
+        fn convert_to_mscz(
+            &self,
+            input: &Path,
+            output: &Path,
+            limits: &RenderLimits,
+        ) -> Result<Vec<u8>, RenderError> {
+            self.inner.convert_to_mscz(input, output, limits)
+        }
+        fn render(
+            &self,
+            input: &Path,
+            output: &Path,
+            limits: &RenderLimits,
+        ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+            let work = crate::pronunciation::current_snapshot()
+                .unwrap()
+                .work
+                .clone();
+            // Cross the real monotonic computation deadline during renderer work.
+            // The independent renderer timeout remains much longer.
+            std::thread::sleep(
+                work.deadline.saturating_duration_since(Instant::now())
+                    + std::time::Duration::from_millis(2),
+            );
+            if self.cancel {
+                work.cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.render(input, output, limits)
+        }
+        fn render_part(
+            &self,
+            input: &Path,
+            output: &Path,
+            limits: &RenderLimits,
+        ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+            self.inner.render_part(input, output, limits)
+        }
+    }
+
+    #[test]
+    fn completed_pronunciation_deadline_does_not_expire_successful_audio_publication() {
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let root = temp_dir("completed-pronunciation-audio-budget");
+            let mut request = request_for(&root, FakeMode::Success, target);
+            let source = request.input.source_bytes.clone();
+            let destination = request.destination.clone();
+            request.renderer = Arc::new(DeadlineDuringAudio {
+                inner: FakeRenderer::new(FakeMode::Success),
+                cancel: false,
+            });
+            let mut snapshot = crate::pronunciation::Snapshot::baseline(
+                crate::pronunciation::hash(&source),
+                vec![],
+            )
+            .unwrap();
+            snapshot.work = crate::pronunciation::Work::new(std::time::Duration::from_secs(2));
+            let work = snapshot.work.clone();
+            let result =
+                crate::pronunciation::with_snapshot(Arc::new(snapshot), || export_bundle(request))
+                    .unwrap();
+            assert_eq!(
+                work.check().unwrap_err().code,
+                "PRONUNCIATION_DEADLINE",
+                "the computation deadline was not extended or disabled"
+            );
+            assert_eq!(fs::read(result.source_path).unwrap(), source);
+            let layout = BundleLayout::new(&destination, "source.mid", target).unwrap();
+            verify_bundle(&destination, &layout).unwrap();
+            assert!(!destination.join(".verse-staging").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn expired_pronunciation_is_refused_before_audio_and_cancel_during_audio_rolls_back() {
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            for before_audio in [true, false] {
+                let root = temp_dir("pronunciation-audio-admission-cancellation");
+                let mut request = request_for(&root, FakeMode::Success, target);
+                let destination = request.destination.clone();
+                let mut snapshot = crate::pronunciation::Snapshot::baseline(
+                    crate::pronunciation::hash(&request.input.source_bytes),
+                    vec![],
+                )
+                .unwrap();
+                snapshot.work = crate::pronunciation::Work::new(std::time::Duration::from_secs(2));
+                if before_audio {
+                    snapshot.work.deadline = Instant::now();
+                }
+                let renderer = Arc::new(DeadlineDuringAudio {
+                    inner: FakeRenderer::new(FakeMode::Success),
+                    cancel: !before_audio,
+                });
+                request.renderer = renderer.clone();
+                let hook = AdmissionCheckpoints(std::sync::atomic::AtomicUsize::new(0));
+                let error = crate::pronunciation::with_snapshot(Arc::new(snapshot), || {
+                    export_bundle_with_hook(request, &hook)
+                })
+                .unwrap_err();
+                if before_audio {
+                    assert_eq!(hook.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+                    assert!(renderer.inner.converted_inputs.lock().unwrap().is_empty());
+                    assert!(renderer.inner.reference_inputs.lock().unwrap().is_empty());
+                    assert!(renderer.inner.stem_inputs.lock().unwrap().is_empty());
+                }
+                assert_eq!(
+                    error.code(),
+                    if before_audio {
+                        "PRONUNCIATION_DEADLINE"
+                    } else {
+                        "PRONUNCIATION_CANCELLED"
+                    }
+                );
+                assert!(!destination.exists());
+                assert_eq!(
+                    fs::read_dir(&root).unwrap().count(),
+                    0,
+                    "no published or partial output remains"
+                );
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn renderer_timeout_does_not_mask_simultaneous_export_cancellation() {
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            let root = temp_dir("cancelled-renderer-timeout");
+            let mut request = request_for(&root, FakeMode::Success, target);
+            let snapshot = crate::pronunciation::Snapshot::baseline(
+                crate::pronunciation::hash(&request.input.source_bytes),
+                vec![],
+            )
+            .unwrap();
+            struct CancelThenTimeout(FakeRenderer);
+            impl AudioRenderer for CancelThenTimeout {
+                fn capabilities(&self) -> &RendererCapabilities {
+                    self.0.capabilities()
+                }
+                fn convert_to_mscz(
+                    &self,
+                    input: &Path,
+                    output: &Path,
+                    limits: &RenderLimits,
+                ) -> Result<Vec<u8>, RenderError> {
+                    self.0.convert_to_mscz(input, output, limits)
+                }
+                fn render(
+                    &self,
+                    _: &Path,
+                    _: &Path,
+                    limits: &RenderLimits,
+                ) -> Result<crate::renderer::RenderedAudio, RenderError> {
+                    crate::pronunciation::current_snapshot()
+                        .unwrap()
+                        .work
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    Err(RenderError::Timeout {
+                        milliseconds: limits.timeout.as_millis() as u64,
+                    })
+                }
+            }
+            request.renderer = Arc::new(CancelThenTimeout(FakeRenderer::new(FakeMode::Success)));
+            let error =
+                crate::pronunciation::with_snapshot(Arc::new(snapshot), || export_bundle(request))
+                    .unwrap_err();
+            assert_eq!(error.code(), "PRONUNCIATION_CANCELLED");
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            fs::remove_dir_all(root).unwrap();
         }
     }
 

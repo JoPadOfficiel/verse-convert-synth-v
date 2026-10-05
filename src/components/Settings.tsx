@@ -1,4 +1,5 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   ChevronLeftIcon,
   DesktopIcon,
@@ -43,6 +44,21 @@ export function Settings({
   onClose: () => void;
 }) {
   const { theme, setTheme } = useTheme();
+  const [versionMessage, setVersionMessage] = useState("Loading version…");
+
+  useEffect(() => {
+    let mounted = true;
+    getVersion().then(
+      (version) => {
+        if (mounted) setVersionMessage(`Verse version ${version}`);
+      },
+      () => {
+        if (mounted) setVersionMessage("Version unavailable");
+      },
+    );
+    return () => { mounted = false; };
+  }, []);
+
   const themes: { value: Theme; label: string; icon: ReactNode }[] = [
     { value: "system", label: "System", icon: <DesktopIcon /> },
     { value: "light", label: "Light", icon: <SunIcon /> },
@@ -243,6 +259,10 @@ export function Settings({
         database in Synthesizer V to every vocal track. Vocal-reference stems
         start muted; accompaniment stems start active.
       </div>
+
+      <footer aria-label="Application version" aria-live="polite" className="border-t pt-3 text-xs text-muted-foreground">
+        {versionMessage}
+      </footer>
     </div>
   );
 }

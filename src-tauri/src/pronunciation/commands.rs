@@ -690,6 +690,121 @@ mod tests {
             .clone()
     }
     #[test]
+    #[ignore = "requires VERSE_COMPLETE_SOURCE, VERSE_MUSESCORE_GATE and a new VERSE_COMPLETE_OUTPUT_DIR"]
+    fn supplied_complete_export_uses_frozen_app_snapshot_through_native_audio() {
+        let path = std::env::var("VERSE_COMPLETE_SOURCE").expect("required real score");
+        let renderer = std::env::var("VERSE_MUSESCORE_GATE").expect("required native renderer");
+        let root = PathBuf::from(
+            std::env::var_os("VERSE_COMPLETE_OUTPUT_DIR").expect("required new receipt directory"),
+        );
+        std::fs::create_dir(&root).expect("receipt directory must not exist");
+        let source_bytes = std::fs::read(&path).unwrap();
+        let before_hash = super::super::hash(&source_bytes);
+        assert_eq!(
+            before_hash, "c688a0d62fd63c0157f2bc84266328da24355ee7b49d7291e930086f743f4b48",
+            "pin the reported legacy score"
+        );
+        let state = Arc::new(AppState::new(root.join("memory")));
+        for target in [ExportTarget::Ustx, ExportTarget::Svp] {
+            let analysis = convert_batch(
+                state.clone(),
+                vec![path.clone()],
+                false,
+                None,
+                None,
+                None,
+                Some(target),
+                Some(PronunciationProfile::Automatic),
+                None,
+            )
+            .unwrap()
+            .remove(0);
+            assert!(analysis.ok, "{:?}", analysis.msg);
+            assert_eq!(analysis.n_parts, 6);
+            let expected = super::super::observed_projection().unwrap().0;
+            assert_eq!(expected.tracks.len(), 4);
+            let expected_bytes = crate::engine::target::serialize_to(target, &expected).unwrap();
+            let snapshot_id = analysis.pronunciation_snapshot_id.unwrap();
+            let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let sink = events.clone();
+            let channel = tauri::ipc::Channel::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                    sink.lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&json).unwrap());
+                }
+                Ok(())
+            });
+            let destination = root.join(format!("Real-{}.versebundle", target.extension()));
+            let started = std::time::Instant::now();
+            let result = export_bundle_service(
+                state.clone(),
+                path.clone(),
+                destination.to_string_lossy().into_owned(),
+                None,
+                None,
+                Some(renderer.clone()),
+                Some(target),
+                Some(PronunciationProfile::Automatic),
+                Some(snapshot_id),
+                channel,
+                None,
+            )
+            .unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            assert_eq!(result.stem_count, 6);
+            assert_eq!(std::fs::read(&result.source_path).unwrap(), source_bytes);
+            assert_eq!(
+                super::super::hash(&std::fs::read(&path).unwrap()),
+                before_hash
+            );
+            let saved = std::fs::read(&result.project_path).unwrap();
+            match target {
+                ExportTarget::Ustx => {
+                    let saved: serde_yaml::Value = serde_yaml::from_slice(&saved).unwrap();
+                    let direct: serde_yaml::Value =
+                        serde_yaml::from_slice(&expected_bytes).unwrap();
+                    assert_eq!(saved["voice_parts"], direct["voice_parts"]);
+                    assert_eq!(saved["tempos"], direct["tempos"]);
+                    assert_eq!(saved["wave_parts"].as_sequence().unwrap().len(), 7);
+                }
+                ExportTarget::Svp => {
+                    let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                    let direct: serde_json::Value =
+                        serde_json::from_slice(&expected_bytes).unwrap();
+                    assert_eq!(
+                        &saved["tracks"].as_array().unwrap()[..expected.tracks.len()],
+                        direct["tracks"].as_array().unwrap()
+                    );
+                    assert_eq!(saved["time"], direct["time"]);
+                    assert_eq!(saved["tracks"].as_array().unwrap().len(), 11);
+                }
+            }
+            if target == ExportTarget::Ustx {
+                let memory = Memory::open(&state.root).unwrap();
+                let references = memory.references().unwrap();
+                assert_eq!(references.len(), 1);
+                let reference = memory.reference(&references[0].id).unwrap();
+                assert_eq!(reference.export_sha256, super::super::hash(&saved));
+                assert!(!reference.words.is_empty());
+            }
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&result.manifest_path).unwrap()).unwrap();
+            assert_eq!(manifest["audio"]["coverage"]["complete"], true);
+            let events = events.lock().unwrap();
+            assert_eq!(events.last().unwrap()["phase"], "finished");
+            assert_eq!(events.last().unwrap()["completed"], 10);
+            let receipt = serde_json::json!({"target":target.extension(),"sourceSha256":before_hash,"elapsedSeconds":elapsed,"pronunciationDeadlineSeconds":30,"completedAfterPronunciationDeadline":elapsed>30.0,"aggregateRendererLimitSeconds":crate::renderer::DEFAULT_RENDER_TIMEOUT.as_secs(),"sourceParts":6,"vocalTracks":4,"projectedLyrics":analysis.placed,"stems":6,"completeSnapshotBoundExport":true,"vocalContentAndTempoPreserved":true,"sourceUnchanged":true,"events":*events,"bundle":destination});
+            std::fs::write(
+                root.join(format!("verification-{}.json", target.extension())),
+                serde_json::to_vec_pretty(&receipt).unwrap(),
+            )
+            .unwrap();
+            eprintln!("{receipt}");
+        }
+    }
+
+    #[test]
     fn exports_refuse_missing_unknown_or_wrong_signature_snapshot_ids() {
         let (root, state, path, signature) = state();
         let operation = state.operation().unwrap();
@@ -1023,6 +1138,89 @@ mod tests {
             2
         );
         drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_bound_complete_export_retains_real_words_after_the_computation_deadline() {
+        use crate::renderer::{
+            AudioRenderer, RenderError, RenderLimits, RenderedAudio, RendererCapabilities,
+        };
+        struct WaitForExpiry(Arc<dyn AudioRenderer>);
+        impl AudioRenderer for WaitForExpiry {
+            fn capabilities(&self) -> &RendererCapabilities {
+                self.0.capabilities()
+            }
+            fn convert_to_mscz(
+                &self,
+                input: &Path,
+                output: &Path,
+                limits: &RenderLimits,
+            ) -> Result<Vec<u8>, RenderError> {
+                self.0.convert_to_mscz(input, output, limits)
+            }
+            fn render(
+                &self,
+                input: &Path,
+                output: &Path,
+                limits: &RenderLimits,
+            ) -> Result<RenderedAudio, RenderError> {
+                let work = super::super::current_snapshot().unwrap().work.clone();
+                std::thread::sleep(
+                    work.deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        + Duration::from_millis(2),
+                );
+                assert_eq!(work.check().unwrap_err().code, "PRONUNCIATION_DEADLINE");
+                self.0.render(input, output, limits)
+            }
+            fn render_part(
+                &self,
+                input: &Path,
+                output: &Path,
+                limits: &RenderLimits,
+            ) -> Result<RenderedAudio, RenderError> {
+                self.0.render_part(input, output, limits)
+            }
+        }
+        let (root, state, path, _) = state();
+        let approved = analysed(&state, &path);
+        let expected = super::super::observed_projection().unwrap().0;
+        assert!(!expected.tracks[0].notes.is_empty());
+        let direct = crate::engine::target::serialize_to(ExportTarget::Ustx, &expected).unwrap();
+        let result = export_bundle_service(
+            state.clone(),
+            path.clone(),
+            root.join("long-audio.versebundle")
+                .to_string_lossy()
+                .into_owned(),
+            None,
+            None,
+            None,
+            Some(ExportTarget::Ustx),
+            Some(PronunciationProfile::Automatic),
+            Some(approved.id.clone()),
+            tauri::ipc::Channel::new(|_| Ok(())),
+            Some(Arc::new(WaitForExpiry(
+                crate::bundle::tests::successful_renderer(),
+            ))),
+        )
+        .unwrap();
+        let saved = std::fs::read(&result.project_path).unwrap();
+        let native: serde_yaml::Value = serde_yaml::from_slice(&saved).unwrap();
+        let direct: serde_yaml::Value = serde_yaml::from_slice(&direct).unwrap();
+        assert_eq!(native["voice_parts"], direct["voice_parts"]);
+        let memory = Memory::open(&state.root).unwrap();
+        let refs = memory.references().unwrap();
+        assert_eq!(refs.len(), 1);
+        let reference = memory.reference(&refs[0].id).unwrap();
+        assert!(!reference.words.is_empty());
+        assert_eq!(reference.export_sha256, super::super::hash(&saved));
+        assert_eq!(
+            reference.source_sha256,
+            super::super::hash(&std::fs::read(&path).unwrap())
+        );
+        assert_eq!(reference.snapshot_id, approved.id);
         std::fs::remove_dir_all(root).unwrap();
     }
 
