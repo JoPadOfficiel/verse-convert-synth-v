@@ -326,12 +326,12 @@ The private KAR expectations are exact:
 | Dirty Dancing — She's Like the Wind | 218 |
 | Elvis Presley — Heartbreak Hotel | 276 |
 | Elvis Presley — Hound Dog | 244 |
-| Cabaret | 162 |
+| Cabaret | 178 (170 distinct source lyrics) |
 | Queen — Crazy Little Thing Called Love | 0 |
 
 The Queen result is intentionally empty because the source does not prove a
-safe melody binding. Cabaret additionally locks eight unresolved chord pitches.
-Neither case may be “repaired” by inventing lyrics or a fallback C4.
+safe melody binding. Cabaret preserves source-proven harmony copies across two
+singing voices. Neither case may be “repaired” by inventing lyrics or a fallback C4.
 
 The private score fixtures lock:
 

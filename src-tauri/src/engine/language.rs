@@ -1072,6 +1072,11 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
     let mut groups = lexical::automatic_words(notes);
     groups.sort_by_key(|members| members.first().copied().unwrap_or(usize::MAX));
     let audited_layouts = french::audited_layout_words(notes);
+    let nasal_readings: Vec<_> = audited_layouts
+        .iter()
+        .filter(|(_, word)| *word == "blanc")
+        .map(|(members, _)| members.clone())
+        .collect();
 
     let mut raw_units: Vec<(Vec<usize>, String)> = Vec::new();
     for members in groups {
@@ -1079,11 +1084,13 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
             continue;
         }
         let mut key = lexical::preferred_joined_key(notes, &members, known_lexeme);
-        if !known_lexeme(&key) {
-            if let Some((_, word)) = audited_layouts
-                .iter()
-                .find(|(layout, _)| *layout == members)
-            {
+        if let Some((_, word)) = audited_layouts
+            .iter()
+            .find(|(layout, _)| *layout == members)
+        {
+            // blan/an overlaps to the English lexeme blan. The qualified sung
+            // nasal reading owns this unit before generic overlap recovery.
+            if !known_lexeme(&key) || *word == "blanc" {
                 key = (*word).into();
             }
         }
@@ -1543,6 +1550,14 @@ fn build_units(notes: &[ProjectedNote], note_ids: &[String]) -> Vec<Unit> {
         });
     }
     extend_language_scores(&mut units, notes);
+    for unit in &mut units {
+        if nasal_readings.contains(&unit.members) {
+            // Source-qualified nasal layouts have explicit French ownership.
+            // Snapshot/manual corrections retain their later precedence.
+            unit.set_scores([0.0, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY]);
+            unit.local_uncertain = false;
+        }
+    }
     units
 }
 

@@ -8,7 +8,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use super::lexical as shared;
 use crate::engine::convert::{Diagnostic, DiagnosticSeverity};
 use crate::engine::midi::{Lyric, LyricState, Syllabic};
-use crate::engine::projection::{ProjectedLyric, ProjectedNote};
+use crate::engine::projection::{ProjectedLyric, ProjectedNote, PronunciationLanguage};
 use crate::engine::syllable::{preserve_bracketed_melismas, touches, SYLLABLE_HYPHENS};
 
 // The misspelling is the actual installed OpenUtau type name.
@@ -143,6 +143,15 @@ fn automatic_word_key(notes: &[ProjectedNote], members: &[usize]) -> String {
     {
         return "suis-moi".into();
     }
+    // candidate strips only a score-proven verse prefix. Prefer that complete
+    // source-qualified spelling before the shared raw-fragment joiner.
+    if let Some(key) = parts
+        .as_ref()
+        .map(|parts| parts.concat())
+        .filter(|key| contains_lexeme(key))
+    {
+        return key;
+    }
     shared::preferred_joined_key(notes, members, contains_lexeme)
 }
 
@@ -201,6 +210,20 @@ struct Layout {
 // Each slot is an attack, including repeated vowels;
 // only an actual source extension (or a bracketed empty slot) becomes a hold.
 const LAYOUTS: &[Layout] = &[
+    // The source writes two attacks of one nasal vowel, not a final n or a
+    // continuation. These literal repairs require bilateral score evidence.
+    Layout {
+        word: "blanc",
+        syllables: &["blanc", "an"],
+        hints: &["fr/b fr/l fr/en", "fr/en"],
+        orphan_end_slots: &[],
+    },
+    Layout {
+        word: "blanc",
+        syllables: &["blan", "an"],
+        hints: &["fr/b fr/l fr/en", "fr/en"],
+        orphan_end_slots: &[],
+    },
     Layout {
         word: "ville blafarde",
         syllables: &["vil", "lebla", "far", "de"],
@@ -737,6 +760,10 @@ fn candidate(lyric: &ProjectedLyric) -> Option<String> {
     Some(key)
 }
 
+fn source_candidate(lyric: &ProjectedLyric) -> Option<String> {
+    candidate(&ProjectedLyric::Source(Box::new(source(lyric)?.clone())))
+}
+
 fn same_lane(left: &ProjectedLyric, right: &ProjectedLyric) -> bool {
     match (source(left), source(right)) {
         (Some(left), Some(right)) => left.lane == right.lane && left.verse == right.verse,
@@ -793,8 +820,157 @@ fn previous_attack(notes: &[ProjectedNote], head: usize) -> Option<usize> {
     None
 }
 
+fn same_reading_domain(left: &ProjectedNote, right: &ProjectedNote) -> bool {
+    let domain = |note: &ProjectedNote| {
+        note.source_evidence
+            .as_ref()
+            .and_then(|e| e.origin.as_ref())
+            .map(|o| {
+                (
+                    o.track_id.clone(),
+                    o.source.part_id.clone(),
+                    o.source.staff_id.clone(),
+                    o.source.voice.clone(),
+                    o.source.occurrence,
+                    o.source.continuity.as_ref().map(|c| c.playback_segment),
+                )
+            })
+    };
+    // Real provenance never borrows from another Part, voice or repeat pass.
+    // Two absent origins are reserved for hand-built analysis fixtures.
+    same_lane(&left.lyric, &right.lyric)
+        && domain(left) == domain(right)
+        && [left, right].iter().all(|n| {
+            n.source_evidence
+                .as_ref()
+                .and_then(|e| e.origin.as_ref())
+                .is_none_or(|o| !o.lyric_conflict)
+        })
+}
+
+/// Adjacent complete words supply context, never the fragments being repaired.
+/// A written English hint or independent English word blocks this local repair.
+fn nasal_context(notes: &[ProjectedNote], head: usize, tail: usize) -> (bool, bool) {
+    let mut french = false;
+    let mut conflict = false;
+    let words = shared::automatic_words(notes);
+    let fragments = shared::fragments(notes);
+    for index in head
+        .checked_sub(1)
+        .into_iter()
+        .chain((tail + 1 < notes.len()).then_some(tail + 1))
+    {
+        let neighbor = &notes[index];
+        let edge = if index < head { head } else { tail };
+        if !same_reading_domain(&notes[edge], neighbor)
+            || !touches(&notes[index.min(edge)], &notes[index.max(edge)])
+            || source(&notes[index.max(edge)].lyric).is_some_and(|s| s.line_break.is_some())
+        {
+            continue;
+        }
+        let Some(raw) = text(&neighbor.lyric) else {
+            continue;
+        };
+        if manual(raw)
+            || neighbor
+                .pronunciation_language
+                .is_some_and(|l| l != PronunciationLanguage::French)
+        {
+            conflict = true;
+            continue;
+        }
+        let key = if let Some(members) = words.iter().find(|members| {
+            if index < head {
+                members.last() == Some(&index)
+            } else {
+                members.first() == Some(&index)
+            }
+        }) {
+            if !members
+                .iter()
+                .all(|&member| same_reading_domain(&notes[edge], &notes[member]))
+            {
+                continue;
+            }
+            automatic_word_key(notes, members)
+        } else {
+            if source(&neighbor.lyric)
+                .is_none_or(|s| !matches!(s.syllabic, None | Some(Syllabic::Single)))
+                || fragments[index]
+            {
+                continue;
+            }
+            let Some(key) = source_candidate(&neighbor.lyric) else {
+                continue;
+            };
+            key
+        };
+        if text(&notes[index.min(edge)].lyric).is_some_and(ends_phrase) {
+            continue;
+        }
+        let fr = contains_lexeme(&key);
+        let en = super::english::contains_lexeme(&key);
+        // The audited Christmas wording also writes NO/EL without the accent.
+        // This is local context for blan with attestation/French ownership,
+        // never a lexical alias or a language override for a standalone name.
+        french |= fr && (!en || key == "noel") && lexical(&key).is_some();
+        conflict |= en && !fr;
+    }
+    (french, conflict)
+}
+
+fn contextual_blan(notes: &[ProjectedNote], head: usize) -> bool {
+    let note = &notes[head];
+    if candidate(&note.lyric).as_deref() != Some("blan")
+        || shared::fragments(notes)[head]
+        || source(&note.lyric).is_none_or(|s| !matches!(s.syllabic, None | Some(Syllabic::Single)))
+        || note
+            .pronunciation_language
+            .is_some_and(|l| l != PronunciationLanguage::French)
+    {
+        return false;
+    }
+    let (french, conflict) = nasal_context(notes, head, head);
+    // Automatic has already resolved the French owner before splitting the
+    // domain into language runs. Its local French context must still agree;
+    // the attesting word may live outside this run and cannot be copied here.
+    let already_french = note.pronunciation_language == Some(PronunciationLanguage::French);
+    french
+        && !conflict
+        && (already_french
+            || notes.iter().enumerate().any(|(index, other)| {
+                same_reading_domain(note, other)
+                    && other
+                        .pronunciation_language
+                        .is_none_or(|l| l == PronunciationLanguage::French)
+                    && source_candidate(&other.lyric).as_deref() == Some("blanc")
+                    && (source(&other.lyric)
+                        .is_some_and(|s| matches!(s.syllabic, None | Some(Syllabic::Single)))
+                        && !shared::fragments(notes)[index]
+                        || layout_members(notes, index, &LAYOUTS[0]).is_some())
+            }))
+}
+
 fn layout_members_raw(notes: &[ProjectedNote], head: usize, layout: &Layout) -> Option<Vec<usize>> {
     let head_source = source(&notes[head].lyric)?;
+    if layout.word == "blanc" {
+        let tail = head + 1;
+        let next = notes.get(tail)?;
+        if candidate(&notes[head].lyric).as_deref() != layout.syllables.first().copied()
+            || head_source.syllabic != Some(Syllabic::Begin)
+            || source(&next.lyric)?.syllabic != Some(Syllabic::End)
+            || !touches(&notes[head], next)
+            || !same_reading_domain(&notes[head], next)
+            || [head, tail].iter().any(|&i| {
+                notes[i]
+                    .pronunciation_language
+                    .is_some_and(|l| l != PronunciationLanguage::French)
+            })
+            || nasal_context(notes, head, tail).1
+        {
+            return None;
+        }
+    }
     // A predecessor's binding also protects an unmarked tail. An explicit
     // Begin/Single on the head instead establishes a new source word.
     if !matches!(
@@ -917,6 +1093,13 @@ pub(crate) fn audited_layout_words(notes: &[ProjectedNote]) -> Vec<(Vec<usize>, 
     let mut claimed = vec![false; notes.len()];
     let mut result = Vec::new();
     for head in 0..notes.len() {
+        // This is a pronunciation identity only: the displayed token remains
+        // blan and the original lyric object is never rewritten to blanc.
+        if contextual_blan(notes, head) {
+            claimed[head] = true;
+            result.push((vec![head], "blanc"));
+            continue;
+        }
         for layout in LAYOUTS {
             if layout.word.is_empty() || layout.word.contains(' ') || !contains_lexeme(layout.word)
             {
@@ -1024,6 +1207,9 @@ fn apply_inner(
     let mut diagnostics = Vec::new();
     let mut changed = vec![false; notes.len()];
     let fragments = shared::fragments(notes);
+    let contextual_blans: Vec<_> = (0..notes.len())
+        .filter(|&head| contextual_blan(notes, head))
+        .collect();
     // Word boundaries are independent of the surface syllable under a note.
     // In particular, the `tes` tail of tempêtes is never a determiner.
     let mut words: Vec<(usize, usize, String)> = Vec::new();
@@ -1111,6 +1297,16 @@ fn apply_inner(
     }
     for index in 0..notes.len() {
         if let Some(key) = candidate(&notes[index].lyric) {
+            if contextual_blans.contains(&index) {
+                let display = text(&notes[index].lyric).unwrap().to_owned();
+                pronounce(&mut notes[index], "fr/b fr/l fr/en");
+                if let ProjectedLyric::Pronounced { text, .. } = &mut notes[index].lyric {
+                    *text = display;
+                }
+                changed[index] = true;
+                words.push((index, index, "blanc".into()));
+                continue;
+            }
             // A variant is looked up literally, never selected from a guessed
             // grammatical or sung-schwa rule.
             if (!fragments[index] || key == "rê") && standalone_allowed(&notes[index].lyric, &key)

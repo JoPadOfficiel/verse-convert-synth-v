@@ -2159,6 +2159,106 @@ pub fn parse_mscx(xml: &str) -> Result<Midi, String> {
     parse_mscx_with_bounds(xml, false).map(|(midi, _)| midi)
 }
 
+// Native 4.7.5 read460/measureread.cpp reads the staff-local group count;
+// dom/measurerepeat.cpp::referringMeasure resolves each member exactly n bars back.
+// Qualify only complete, pure groups. A strictly earlier reference cannot cycle.
+fn native_four_repeat_reference(
+    measures: &[roxmltree::Node],
+    mi: usize,
+    length: i64,
+    division: i64,
+) -> Option<usize> {
+    let count = |measure: roxmltree::Node| -> Option<usize> {
+        let mut fields = measure
+            .children()
+            .filter(|n| n.has_tag_name("measureRepeatCount"));
+        let field = fields.next();
+        if fields.next().is_some() {
+            return None;
+        }
+        if field.is_some_and(|n| n.children().any(|c| c.is_element())) {
+            return None;
+        }
+        let value = field
+            .map(|n| n.text()?.trim().parse::<usize>().ok())
+            .unwrap_or(Some(0))?;
+        let glyph = measure
+            .descendants()
+            .any(|n| n.has_tag_name("MeasureRepeat") || n.has_tag_name("RepeatMeasure"));
+        Some(if value == 0 && glyph { 1 } else { value }) // Native readVoice fallback.
+    };
+    let member = count(*measures.get(mi)?)?;
+    if !(1..=4).contains(&member) {
+        return None;
+    }
+    let first = mi.checked_sub(member - 1)?;
+    let mut size = None;
+    let mut members = 0;
+    for index in first..first.checked_add(4)? {
+        let Some(&measure) = measures.get(index) else {
+            break;
+        };
+        if count(measure)? != index - first + 1 {
+            break;
+        }
+        let voices = measure_voice_containers(measure).ok()?;
+        if voices.len() != 1 {
+            return None;
+        }
+        let mut elements = voices[0].children().filter(|n| n.is_element());
+        let element = elements.next()?;
+        if elements.next().is_some()
+            || child_text(element, "durationType") != Some("measure")
+            || element
+                .children()
+                .filter(|n| n.has_tag_name("durationType"))
+                .count()
+                != 1
+        {
+            return None;
+        }
+        // A MeasureRepeat overrides its stored Rest duration; a placeholder Rest
+        // does not. Require exact, uniform group lengths rather than retiming it.
+        for text in measure
+            .attribute("len")
+            .into_iter()
+            .chain(child_text(element, "duration").filter(|_| element.has_tag_name("Rest")))
+        {
+            let (n, d) = frac(text)?;
+            if n.checked_mul(4)?.checked_mul(division)? != length.checked_mul(d)? {
+                return None;
+            }
+        }
+        match element.tag_name().name() {
+            "MeasureRepeat" | "RepeatMeasure" => {
+                if size.is_some() {
+                    return None;
+                }
+                let mut fields = element.children().filter(|n| n.has_tag_name("subtype"));
+                let field = fields.next();
+                if fields.next().is_some() {
+                    return None;
+                }
+                if field.is_some_and(|n| n.children().any(|c| c.is_element())) {
+                    return None;
+                }
+                let n = field
+                    .map(|n| n.text()?.trim().parse::<usize>().ok())
+                    .unwrap_or(Some(1))?;
+                size = Some(if n == 0 { 1 } else { n }); // Same native fallback.
+            }
+            "Rest" => {}
+            _ => return None,
+        }
+        members += 1;
+    }
+    let size = size?;
+    if !matches!(size, 1 | 2 | 4) || members != size || member > size {
+        return None;
+    }
+    mi.checked_sub(size)
+}
+
 fn parse_mscx_with_bounds(
     xml: &str,
     capture_bounds: bool,
@@ -2629,6 +2729,9 @@ fn parse_mscx_with_bounds(
             .chain(score_order.iter().copied())
             .collect();
         let mut written_bounds = Vec::with_capacity(written_count);
+        // Dense coverage/length from the written first pass, per staff.
+        // Chained repeats inherit this proof, never IR events or copied attacks.
+        let mut written_dense_lengths: Vec<Option<i64>> = Vec::new();
         let mut written_memberships = Vec::with_capacity(written_count);
         let mut expression_tempo = super::score_intensity::Fraction::integer(120);
         for (visit, &(mi, pass, repeat_pass)) in traversal.iter().enumerate() {
@@ -2696,6 +2799,14 @@ fn parse_mscx_with_bounds(
             // to EndBarLine, which never applies a fermata tempo stretch.
             let mut measure_fermatas = Vec::new();
             let mut measure_unqualified_segments = BTreeSet::new();
+            let native_four_repeat = native_major == Some(4)
+                && (measure
+                    .descendants()
+                    .any(|n| n.has_tag_name("MeasureRepeat") || n.has_tag_name("RepeatMeasure"))
+                    || child_text(measure, "measureRepeatCount").is_some_and(|n| n.trim() != "0"));
+            if native_four_repeat {
+                measure_unqualified_segments.insert("MeasureRepeat");
+            }
             let mut measure_voice_intervals = Vec::new();
             for (voice_index, voice) in measure_voice_containers(measure)?.into_iter().enumerate() {
                 let mut pos = measure_start;
@@ -2713,7 +2824,7 @@ fn parse_mscx_with_bounds(
                             &format!("expression:mscx:staff:{staff_id}:measure:{mi}:voice:{voice_index}:element:{element_index}"),
                             &owner, super::score_intensity::source::time(pos,tpb)?, mi, modern_expression, expression_tempo, time_stretch)?;
                     }
-                    if !recording {
+                    {
                         // Native readVoice creates segments at the XML cursor
                         // for these elements, even without a rhythmic attack.
                         // next1() in native 4 observes those active segments.
@@ -2722,15 +2833,16 @@ fn parse_mscx_with_bounds(
                             | "Harmony" | "FretDiagram" | "TremoloBar" | "Symbol" | "StaffText"
                             | "Sticking" | "SystemText" | "Expression" | "RehearsalMark"
                             | "InstrumentChange" | "StaffState" | "FiguredBass" => {
-                                playback_segments.insert(checked_score_tick(pos)?);
+                                if !recording {
+                                    playback_segments.insert(checked_score_tick(pos)?);
+                                }
                                 if el.has_tag_name("TimeSig") && pos != measure_start {
                                     // Native courtesy signatures do not change
                                     // playback meter; that lowering is unqualified.
                                     measure_unqualified_segments.insert("interior TimeSig");
                                 }
                             }
-                            // Breath pauses and repeated-measure expansion need
-                            // separate playback proof, beyond segment positions.
+                            // Repeat groups are qualified below from the written pass.
                             "Breath" | "RepeatMeasure" | "MeasureRepeat" | "Ambitus" | "Image" => {
                                 measure_unqualified_segments.insert(el.tag_name().name());
                             }
@@ -2957,8 +3069,10 @@ fn parse_mscx_with_bounds(
                                     if is_rest { "Rest" } else { "Chord" }
                                 ));
                             }
-                            if !recording && !grace {
-                                playback_segments.insert(checked_score_tick(pos)?);
+                            if !grace {
+                                if !recording {
+                                    playback_segments.insert(checked_score_tick(pos)?);
+                                }
                                 rhythmic_intervals.push((
                                     pos,
                                     pos.checked_add(dur)
@@ -3426,7 +3540,7 @@ fn parse_mscx_with_bounds(
                 if capture_bounds && recording && staff_index == 0 && voice_index == 0 {
                     first_voice_end = pos;
                 }
-                if !recording && !rhythmic_intervals.is_empty() {
+                if !rhythmic_intervals.is_empty() {
                     measure_voice_intervals.push(rhythmic_intervals);
                 }
             }
@@ -3449,7 +3563,39 @@ fn parse_mscx_with_bounds(
                     return Err("MuseScore measure len is non-positive".into());
                 }
             }
+            if recording && native_major == Some(4) {
+                let proof = if native_four_repeat {
+                    native_four_repeat_reference(measures, mi, this_len, div)
+                        .and_then(|source| written_dense_lengths.get(source).copied().flatten())
+                        .filter(|length| *length == this_len)
+                } else {
+                    let dense = !measure_voice_intervals.is_empty()
+                        && measure_unqualified_segments.is_empty()
+                        && measure_voice_intervals.iter().all(|intervals| {
+                            let mut intervals = intervals.clone();
+                            intervals.sort_unstable();
+                            let mut covered = measure_start;
+                            for (start, end) in intervals {
+                                if start != covered || end <= start {
+                                    return false;
+                                }
+                                covered = end;
+                            }
+                            covered.checked_sub(measure_start) == Some(this_len)
+                        });
+                    dense.then_some(this_len)
+                };
+                written_dense_lengths.push(proof);
+            }
             if !recording {
+                if native_four_repeat && written_dense_lengths[mi].is_some() {
+                    measure_unqualified_segments.remove("MeasureRepeat");
+                    measure_unqualified_segments.remove("RepeatMeasure");
+                    // Native score.cpp::setUpTempoMap uses notated next1(), not
+                    // playbackmodel.cpp::processMeasureRepeat's copied attacks.
+                    // The glyph start/end are already clock boundaries; do not
+                    // insert the referenced bar's attacks or synthesize IR notes.
+                }
                 let end = measure_start.checked_add(this_len).ok_or(
                     "SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: fermata measure end overflow",
                 )?;
