@@ -17,13 +17,58 @@ async function load(path, dependencies = {}) {
 }
 
 const calls = [];
+let invokeResult = [];
 const api = await load("../src/lib/tauri.ts", {
   "@tauri-apps/api/core": {
     Channel: class {},
-    invoke: async (command, payload) => { calls.push({ command, payload }); return []; },
+    invoke: async (command, payload) => { calls.push({ command, payload }); return invokeResult; },
   },
   "@tauri-apps/plugin-dialog": { save: async () => "/tmp/song.ustx" },
   "@/lib/file-utils": await load("../src/lib/file-utils.ts"),
+});
+
+const rustAdapter = await readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+const registrations = [...rustAdapter.matchAll(/tauri::generate_handler!\[([\s\S]*?)\]/g)];
+assert.equal(registrations.length, 1, "Audit the actual application IPC registration");
+const registeredCommands = registrations[0][1].split(",").map((name) => name.trim()).filter(Boolean);
+
+test("registered conversion and export RPCs expose only frozen-snapshot adapters", () => {
+  assert.deepEqual(registeredCommands.toSorted(), [
+    "renderer_status",
+    "pronunciation_convert_files", "pronunciation_export_svp", "pronunciation_export_bundle",
+    "pronunciation_memory", "pronunciation_compare", "pronunciation_confirm",
+    "pronunciation_set_status", "pronunciation_exchange", "pronunciation_cancel",
+    "pronunciation_release_snapshots",
+  ].toSorted());
+  for (const legacy of ["convert_files", "export_svp", "export_bundle"]) {
+    assert.ok(!registeredCommands.includes(legacy), `${legacy} must not bypass snapshot enforcement`);
+  }
+});
+
+test("frontend direct, batch and bundle exports use registered RPCs with the analysed snapshot", async () => {
+  const file = { path: "/tmp/frozen-snapshot.mscz", ok: true, pronunciationSnapshotId: "analysis:sealed" };
+  calls.length = 0;
+  try {
+    invokeResult = [file];
+    await api.convertFiles([file.path], false);
+    invokeResult = [];
+    await api.exportVocalsWithDialog(file, "english");
+    await api.exportBundle(file, "/tmp/frozen-snapshot.versebundle", "english");
+    await api.convertFiles([file.path], true);
+    assert.deepEqual(calls.map(({ command }) => command), [
+      "pronunciation_convert_files", "pronunciation_export_svp",
+      "pronunciation_export_bundle", "pronunciation_convert_files",
+    ]);
+    for (const { command } of calls) assert.ok(registeredCommands.includes(command), `${command} is registered`);
+    assert.equal(calls[0].payload.write, false);
+    assert.equal(calls[3].payload.write, true);
+    assert.equal(calls[0].payload.snapshotIds, null);
+    assert.equal(calls[1].payload.snapshotId, file.pronunciationSnapshotId);
+    assert.equal(calls[2].payload.snapshotId, file.pronunciationSnapshotId);
+    assert.deepEqual(calls[3].payload.snapshotIds, { [file.path]: file.pronunciationSnapshotId });
+  } finally {
+    invokeResult = [];
+  }
 });
 
 test("analysis, direct and bundle adapters carry one explicit pronunciation selection", async () => {
@@ -32,7 +77,7 @@ test("analysis, direct and bundle adapters carry one explicit pronunciation sele
     await api.convertFiles(["/tmp/song.mscz"], false, "english", undefined, undefined, "ustx", profile);
     await api.exportVocalsWithDialog({ path: "/tmp/song.mscz" }, "english", undefined, "ustx", profile);
     await api.exportBundle({ path: "/tmp/song.mscz" }, "/tmp/song.versebundle", "english", undefined, undefined, undefined, "ustx", profile);
-    assert.deepEqual(calls.map(({ command }) => command), ["convert_files", "export_svp", "export_bundle"]);
+    assert.deepEqual(calls.map(({ command }) => command), ["pronunciation_convert_files", "pronunciation_export_svp", "pronunciation_export_bundle"]);
     for (const { payload } of calls) {
       assert.equal(payload.pronunciationProfile, profile);
       assert.equal(payload.exportTarget, "ustx");
@@ -190,4 +235,20 @@ test("pronunciation preference survives restart, rejects stale values and tolera
     if (original) Object.defineProperty(globalThis, "localStorage", original);
     else delete globalThis.localStorage;
   }
+});
+
+
+test("memory reanalysis callback replaces FileResults and their snapshots", async () => {
+  let source;
+  function find(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "reanalyseLoaded") source = node.getText(appSource);
+    ts.forEachChild(node, find);
+  }
+  find(appSource);assert.ok(source);
+  const result=[{path:"song.mscz",ok:true,pronunciationSnapshotId:"new-analysis"}];
+  let items=[{path:"song.mscz",ok:true,pronunciationSnapshotId:"retired-analysis"}];let ended=false;
+  const callback=new Function("items","beginBusy","endBusy","setGlobalError","convertFiles","language","overrides","exportTarget","pronunciationProfile","setItems","setExportErrors","setExportProgress","setSelected","commandErrorMessage",
+    ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2020}}).outputText+"\nreturn reanalyseLoaded;")(
+      items,()=>true,()=>{ended=true;},()=>{},async(paths,write)=>{assert.deepEqual(paths,["song.mscz"]);assert.equal(write,false);return result;},"english",{},"ustx","automatic",(value)=>{items=value;},()=>{},()=>{},()=>{},(e)=>e.message);
+  await callback();assert.equal(items,result);assert.equal(items[0].pronunciationSnapshotId,"new-analysis");assert.ok(ended);
 });

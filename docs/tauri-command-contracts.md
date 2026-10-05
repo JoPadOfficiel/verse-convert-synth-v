@@ -2,8 +2,10 @@
 
 ## Boundary
 
-`src/lib/tauri.ts` is the frontend adapter. `src-tauri/src/lib.rs` is the Rust
-command adapter and current orchestration seam. The webview exchanges compact
+`src/lib/tauri.ts` is the frontend adapter. Snapshot-aware Rust command adapters
+live in `src-tauri/src/pronunciation/commands.rs` and are registered in
+`src-tauri/src/lib.rs`, which retains private orchestration helpers. The webview
+exchanges compact
 JSON-compatible DTOs; source bytes, parsed musical IR, and audio never cross
 IPC.
 
@@ -102,7 +104,16 @@ numbered variant by vowel count.
 
 ## Commands
 
-### `convert_files`
+Only `pronunciation_convert_files`, `pronunciation_export_svp` and
+`pronunciation_export_bundle` expose conversion/project export over IPC. The
+legacy `convert_files`, `export_svp` and `export_bundle` RPC names are not
+registered. Private baseline helpers do not provide an alternative IPC path.
+`pronunciation_release_snapshots` retires explicit analysis IDs when the UI
+clears or reanalyses loaded sources. Identical complete previews reuse quota;
+draft or failed analyses are never published as exportable plans. Batch results
+retain each successful file and each per-file error, including stale snapshots.
+
+### `pronunciation_convert_files`
 
 ```text
 request:
@@ -113,25 +124,29 @@ request:
   overrides?: Record<sourcePath, Record<trackIdString, boolean>>
   exportTarget?: "svp" | "ustx"
   pronunciationProfile?: "default" | "frenchMillefeuille" | "englishArpabet" | "spanishDiffSinger" | "portugueseDiffSinger" | "automatic"
+  snapshotIds?: Record<sourcePath, string> // required for every path when write=true
 
 response:
   FileResult[]
 ```
 
 The current UI always passes `write=false`; direct output is handled by the
-dedicated export commands. Analysis is synchronous in Rust.
+dedicated export commands. Analysis runs on a blocking worker and returns a
+`pronunciationSnapshotId` per successful file. Batch writes require the matching
+analysis ID for every path; they do not create a replacement analysis plan.
 
 Analysis is target-dependent: the exactness gate runs the selected target's own
 arithmetic, so `ok`, `msg`, and the diagnostics can differ between targets for
 the same source. Changing the export target in the UI therefore re-analyses every
 file rather than updating state locally.
 
-### `export_svp`
+### `pronunciation_export_svp`
 
 ```text
 request:
   path: string
   target: string
+  snapshotId: string // matching successful analysis
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<trackIdString, boolean>
   exportTarget?: "svp" | "ustx"
@@ -155,12 +170,13 @@ stem is unchanged from 0.4.9; only the extension follows the target.
 `vocal_out_path` in Rust and `defaultVocalPath` in `src/lib/file-utils.ts` must
 stay in agreement.
 
-### `export_bundle`
+### `pronunciation_export_bundle`
 
 ```text
 request:
   path: string
   target: string
+  snapshotId: string // matching successful analysis
   language?: "english" | "french"     // vestigial; see above
   overrides?: Record<trackIdString, boolean>
   rendererPath?: string
@@ -174,7 +190,7 @@ response:
 
 `exportTarget` selects the project format written into `project/`. Both variants
 reference the same stems, by the same relative paths, with the same hashes. As
-with `export_svp`, `target` is the destination path, not a format.
+with `pronunciation_export_svp`, `target` is the destination path, not a format.
 
 The manifest schema is unchanged at version 2, with every key's name intact.
 `svpGroupId` holds the Synthesizer V group UUID for a `.svp` and must be the
@@ -204,6 +220,7 @@ Important fields:
 |---|---|
 | `path`, `name` | Display/source identity for the current process |
 | `ok` | Analysis/projection succeeded |
+| `pronunciationSnapshotId` | Frozen analysis ID for registered direct/batch/bundle exports; null when unavailable |
 | `error` | Structured error when `ok=false` |
 | `msg` | Historical compatibility summary |
 | `nParts` | Source topology Part count |
@@ -291,13 +308,18 @@ Frontend logic may branch on stable codes, never on English message text.
 ## Current authority model
 
 The current commands accept user-selected path strings and re-read/reparse the
-source during export. The renderer accepts a selected executable path, but
+source during export. All registered project exports require the frozen
+analysis snapshot and verify source content, requested options, correction
+memory and the analysed projection. Missing, unknown or stale IDs are refused
+with `PRONUNCIATION_SNAPSHOT_STALE`; no silent reanalysis or baseline export is
+available through a legacy RPC name. The renderer accepts a selected executable
+path, but
 never arbitrary arguments.
 
-The BMAD target architecture proposes backend-issued source/destination
-handles, immutable conversion plans, semantic hashes, cancellable jobs, and
-typed progress Channels. Those types and commands do **not** exist yet and
-must not be treated as public API.
+Pronunciation snapshots, projection hashes, model-operation cancellation and
+typed bundle progress Channels are implemented. General backend-issued
+source/destination handles and recoverable durable jobs remain target
+architecture and must not be treated as public API.
 
 ## Frontend workflow behavior
 

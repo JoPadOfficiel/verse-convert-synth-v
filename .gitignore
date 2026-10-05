@@ -24,3 +24,7 @@ _bmad-output/
 .agent/
 .agents/
 .claude/
+
+# Generated Python preparation caches
+__pycache__/
+*.pyc

@@ -992,8 +992,9 @@ pub fn to_yaml(project: &UstxProject) -> String {
                         "        vibrato: {}\n",
                         flow_vibrato(&note.vibrato)
                     ));
-                    // A phonemizer result is not source evidence, and an
-                    // override is a user edit Verse has never been told about.
+                    // Native alias overrides stay scoped OpenUtau edits.
+                    // Confirmed, authority-bound dictionary readings reach this
+                    // projection as explicit hints, never generated overrides.
                     out.push_str("        phoneme_expressions: []\n");
                     out.push_str("        phoneme_overrides: []\n");
                 }

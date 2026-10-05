@@ -362,6 +362,14 @@ fn romance_context_vote(key: &str) -> f64 {
 }
 
 impl Unit {
+    fn set_scores(&mut self, scores: [f64; 4]) {
+        [
+            self.french_score,
+            self.english_score,
+            self.spanish_score,
+            self.portuguese_score,
+        ] = scores;
+    }
     fn scores(&self) -> [f64; 4] {
         if self.inherit_passage {
             // A token with no independent language evidence must not pull its
@@ -376,6 +384,90 @@ impl Unit {
             ]
         }
     }
+}
+
+fn known_independent_language(key: &str) -> bool {
+    let membership = lexical_membership(key);
+    let scores = multilingual_scores(key);
+    let mut sorted = scores;
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    membership.iter().filter(|&&v| v).count() == 1
+        || (sorted[0] >= 0.75 && sorted[0] - sorted[1] >= 0.5)
+}
+
+fn unit_word(
+    notes: &[ProjectedNote],
+    units: &[Unit],
+    index: usize,
+) -> Option<crate::pronunciation::source_map::Word> {
+    let unit = &units[index];
+    let head = unit.members[0];
+    let mut left = index;
+    for _ in 0..2 {
+        if left == 0
+            || units[left - 1].boundary_after
+            || !same_language_context_row(&notes[head], &notes[units[left - 1].members[0]])
+        {
+            break;
+        }
+        left -= 1;
+    }
+    let mut right = index;
+    for _ in 0..2 {
+        if right + 1 >= units.len()
+            || units[right].boundary_after
+            || !same_language_context_row(&notes[head], &notes[units[right + 1].members[0]])
+        {
+            break;
+        }
+        right += 1;
+    }
+    let context = units[left..=right].iter().map(|u| u.key.clone()).collect();
+    let mut members = unit.members.clone();
+    let mut next = members.last().copied()? + 1;
+    while next < notes.len()
+        && notes[next].lyric.continues_previous_note()
+        && touches(&notes[next - 1], &notes[next])
+        && same_continuation_domain(&notes[head], &notes[next])
+    {
+        members.push(next);
+        next += 1;
+    }
+    crate::pronunciation::source_map::word(notes, &members, unit.key.clone(), context, index - left)
+}
+
+/// Production word units, never a surrogate XML joiner. Context is clipped to
+/// source ownership, source rows, phrase boundaries and manual/conflict barriers.
+pub fn complete_words(track: &ProjectedTrack) -> Vec<crate::pronunciation::source_map::Word> {
+    let mut words = Vec::new();
+    let mut start = 0;
+    while start < track.notes.len() {
+        if context_barrier(&track.notes[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < track.notes.len()
+            && !context_barrier(&track.notes[end])
+            && same_continuation_domain(&track.notes[start], &track.notes[end])
+        {
+            end += 1;
+        }
+        let notes = &track.notes[start..end];
+        let ids: Vec<_> = notes
+            .iter()
+            .map(|n| {
+                n.source_evidence
+                    .as_ref()
+                    .map(|e| e.note_id.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let units = build_units(notes, &ids);
+        words.extend((0..units.len()).filter_map(|i| unit_word(notes, &units, i)));
+        start = end;
+    }
+    words
 }
 
 /// Preserve the qualified FR/EN conditional scorer and compare that language
@@ -813,9 +905,16 @@ fn has_independent_language_evidence(
 /// Share only a language decision from the same original source domain and
 /// lyric row; no text, note or word membership moves between tracks.
 pub fn route_tracks(tracks: &mut [&mut ProjectedTrack]) -> Vec<Vec<Diagnostic>> {
+    route_tracks_with_snapshot(tracks, None)
+}
+
+pub fn route_tracks_with_snapshot(
+    tracks: &mut [&mut ProjectedTrack],
+    snapshot: Option<&crate::pronunciation::Snapshot>,
+) -> Vec<Vec<Diagnostic>> {
     let routed: Vec<_> = tracks
         .iter_mut()
-        .map(|track| route_track_with_inheritance(track))
+        .map(|track| route_track_with_snapshot(track, snapshot))
         .collect();
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct Domain {
@@ -1527,9 +1626,17 @@ fn decode(units: &[Unit]) -> Vec<PronunciationLanguage> {
 /// geometry is changed here. Continuations inherit their proven predecessor's
 /// language and untexted notes remain neutral.
 pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
+    route_with_snapshot(notes, note_ids, None)
+}
+
+fn route_with_snapshot(
+    notes: &[ProjectedNote],
+    note_ids: &[String],
+    snapshot: Option<&crate::pronunciation::Snapshot>,
+) -> Route {
     assert_eq!(notes.len(), note_ids.len());
     if !notes.iter().any(context_barrier) {
-        return route_span(notes, note_ids);
+        return route_span_with_snapshot(notes, note_ids, snapshot);
     }
     // Isolate barriers before scoring and decoding, not only while choosing a
     // final donor. Otherwise a neutral word retains a decision already borrowed
@@ -1549,7 +1656,7 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
                 .find(|&index| context_barrier(&notes[index]))
                 .unwrap_or(notes.len())
         };
-        let routed = route_span(&notes[start..end], &note_ids[start..end]);
+        let routed = route_span_with_snapshot(&notes[start..end], &note_ids[start..end], snapshot);
         result.languages[start..end].copy_from_slice(&routed.languages);
         result.inherit_passage[start..end].copy_from_slice(&routed.inherit_passage);
         result
@@ -1585,12 +1692,93 @@ pub fn route(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
     result
 }
 
-fn route_span(notes: &[ProjectedNote], note_ids: &[String]) -> Route {
-    let units = build_units(notes, note_ids);
+fn route_span_with_snapshot(
+    notes: &[ProjectedNote],
+    note_ids: &[String],
+    snapshot: Option<&crate::pronunciation::Snapshot>,
+) -> Route {
+    let mut units = build_units(notes, note_ids);
+    let mut evidence_diagnostics = Vec::new();
+    if let Some(snapshot) = snapshot {
+        for index in 0..units.len() {
+            let Some(word) = unit_word(notes, &units, index) else {
+                continue;
+            };
+            // Human memory is consulted before any prediction. The frozen copy
+            // is reapplied after all baseline row/sibling policies as well.
+            match snapshot
+                .corrections
+                .find(&word, &snapshot.source_sha256, None)
+            {
+                Ok(Some(c)) => {
+                    let mut scores = [-1000.0; 4];
+                    scores
+                        [crate::pronunciation::memory::language_index(c.after.language.unwrap())] =
+                        1000.0;
+                    units[index].set_scores(scores);
+                    units[index].local_uncertain = false;
+                    units[index].inherit_passage = false;
+                    continue;
+                }
+                Err(_) => continue,
+                Ok(None) => {}
+            }
+            let unit = &units[index];
+            let mut scores = unit.scores();
+            let mut sorted = scores;
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            if unit.inherit_passage
+                || (!unit.local_uncertain && sorted[0] - sorted[1] >= 1.0)
+                || automatic_anchor(&unit.key).is_some()
+                || known_independent_language(&unit.key)
+            {
+                continue;
+            }
+            let Some(model) = &snapshot.model else {
+                continue;
+            };
+            let context = word
+                .context
+                .iter()
+                .enumerate()
+                .map(|(i, key)| {
+                    if i == word.context_target {
+                        format!("<target>{key}</target>")
+                    } else {
+                        key.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            match snapshot.language_evidence(&word, context) {
+                Ok(value) if value.accepted(model.calibration.threshold) => {
+                    let probabilities = value.probabilities;
+                    let maximum = probabilities.iter().copied().fold(0.0, f64::max);
+                    for (score, p) in scores.iter_mut().zip(probabilities) {
+                        *score += model.fusion_weight * (p.max(1e-12) / maximum).ln();
+                    }
+                    units[index].set_scores(scores);
+                    evidence_diagnostics.push(Diagnostic{code:"LAYA_EVIDENCE_APPLIED".into(),severity:DiagnosticSeverity::Info,message:"Calibrated contextual language evidence applied to a weak complete word".into(),source_id:Some(word.id)});
+                }
+                Ok(_) => evidence_diagnostics.push(Diagnostic {
+                    code: "LAYA_ABSTAINED".into(),
+                    severity: DiagnosticSeverity::Info,
+                    message: "Laya gate rejected evidence; deterministic baseline retained".into(),
+                    source_id: Some(word.id),
+                }),
+                Err(e) => evidence_diagnostics.push(Diagnostic {
+                    code: e.code,
+                    severity: DiagnosticSeverity::Info,
+                    message: format!("{}; deterministic baseline retained", e.message),
+                    source_id: Some(word.id),
+                }),
+            }
+        }
+    }
     let decisions = decode(&units);
     let mut languages = vec![None; notes.len()];
     let mut inherit_passage = vec![false; notes.len()];
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = evidence_diagnostics;
     let mut counts = [0usize; 4];
     let mut words: Vec<RoutedWord> = units
         .iter()
@@ -1960,6 +2148,13 @@ fn record_low_confidence_heads(
 }
 
 fn route_track_with_inheritance(track: &mut ProjectedTrack) -> (Vec<Diagnostic>, Vec<RoutedWord>) {
+    route_track_with_snapshot(track, None)
+}
+
+fn route_track_with_snapshot(
+    track: &mut ProjectedTrack,
+    snapshot: Option<&crate::pronunciation::Snapshot>,
+) -> (Vec<Diagnostic>, Vec<RoutedWord>) {
     let mut diagnostics = Vec::new();
     let mut inherit_passage = vec![false; track.notes.len()];
     let mut changed = HashMap::new();
@@ -2015,7 +2210,7 @@ fn route_track_with_inheritance(track: &mut ProjectedTrack) -> (Vec<Diagnostic>,
         // preserves the exact note chain without letting evidence cross voices
         // or repeat occurrences.
         crate::engine::syllable::preserve_bracketed_melismas(&mut track.notes[start..end]);
-        let routed = route(&track.notes[start..end], &ids);
+        let routed = route_with_snapshot(&track.notes[start..end], &ids, snapshot);
         record_low_confidence_heads(&routed, &ids, start, &mut low_confidence_heads);
         words.extend(routed.words.iter().map(|word| RoutedWord {
             members: word.members.iter().map(|member| member + start).collect(),

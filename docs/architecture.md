@@ -2,7 +2,7 @@
 
 **Status:** Authoritative current architecture and convergence guide  
 **Baseline:** `bea4a47` (two export targets)  
-**Updated:** 2026-07-28
+**Updated:** 2026-10-05 (pronunciation persistence and snapshot boundaries)
 
 ## Design paradigm
 
@@ -51,6 +51,7 @@ files, build manifests, launch processes, or commit output.
 | Input adapters | `engine/midi.rs`, `musicxml.rs`, `musescore.rs` | Format-specific parsing into the shared model |
 | Projection seam | `engine/projection.rs` | Target-neutral projection in source-exact IR ticks |
 | Word reassembly | `engine/syllable.rs` | One word per run of syllables, target-neutral |
+| Pronunciation evidence and feedback | `pronunciation/`, `engine/language.rs` | Optional bounded local Laya evidence, frozen analysis snapshots, source-linked human review, SQLite correction/reference history and JSON exchange |
 | Target dispatch | `engine/target/mod.rs` | `ExportTarget`, the analysis gate `validate_for`, and the single write boundary `serialize_to` |
 | Target adapter | `engine/target/svp.rs` | Raw Synthesizer V project v113 serialization; blicks |
 | Target adapter | `engine/target/ustx.rs` | OpenUtau `.ustx` 0.6 serialization; 480 ticks per quarter, and its own deterministic YAML emitter |
@@ -87,8 +88,9 @@ flowchart LR
 
 ### Analysis
 
-`convert_files(write=false)` reads each source once, rejects non-regular or
-oversized files, detects the correct parser, constructs stable topology,
+`pronunciation_convert_files(write=false)` captures a source-bound analysis
+snapshot, rejects non-regular or oversized files, detects the correct parser,
+constructs stable topology,
 classifies tracks, projects eligible vocal notes, asks the selected target
 whether it can represent the result, and returns a `FileResult`. No MuseScore
 process is required.
@@ -139,7 +141,8 @@ about the source and surfaces as `SERIALIZE_FAILED`.
 
 ### Vocals-only export
 
-`export_svp` reparses the selected source, applies the explicit track overrides,
+`pronunciation_export_svp` verifies the frozen analysis snapshot, reparses the
+selected source, applies the explicit track overrides,
 and writes only the vocal-note project to a new path in the format named by its
 `export_target` argument. The argument is optional and defaults to Synthesizer V.
 The output extension must match the chosen target. Instrumental audio is
@@ -147,7 +150,8 @@ intentionally absent from both formats; a `.ustx` carries `wave_parts: []`.
 
 ### Complete bundle export
 
-`export_bundle` reparses one immutable source snapshot, projects vocals, builds
+`pronunciation_export_bundle` verifies the frozen analysis snapshot, reparses
+one immutable source snapshot, projects vocals, builds
 one `StemPlan`, builds the complete preservation ledger, probes MuseScore,
 isolates every audible source Part (the whole score, or MuseScore's import of
 the whole MIDI, with every other Part silenced; a byte-identical MIDI track when
@@ -266,8 +270,27 @@ See [MuseScore renderer](musescore-renderer.md).
 
 ## Persistence and transactions
 
-Verse has no database. Durable data consists of user sources, direct `.svp`
-files, and `.versebundle` directories.
+Verse uses embedded SQLite only for local pronunciation corrections, immutable
+export-reference associations and history under stable application user data.
+Original USTX reference bytes are retained separately by content hash. Versioned
+migrations back up existing databases before a transactional upgrade; incompatible
+records are preserved without application. Scores, audio and musical tuning are
+not correction-memory content. User sources, direct projects and `.versebundle`
+directories retain their existing no-replace publication contract.
+
+Analysis freezes pronunciation model/policy/memory identities, caches accepted
+or rejected word evidence and records the serialized projection hash. Exports
+reparse the source under that snapshot, verify source/settings/memory identity
+and refuse a different reproduced plan. Operation deadlines and registered
+cancellation tokens are fresh for export and independent of analysis age.
+The bounded session cache refuses saturation without silently clearing prior
+analyses. This is a pronunciation snapshot contract, not a complete durable job
+or backend source/destination handle architecture.
+
+The shipped resources currently contain no model or native runtime. Laya's
+native packaging, fitted calibration, redistribution, full logit parity and
+independent benefit remain unqualified. Missing/rejected evidence uses the named
+offline deterministic baseline; development preparation Python is not shipped.
 
 Bundle publication follows:
 
@@ -288,18 +311,25 @@ User files and pre-existing destinations are never deleted.
 
 The current commands are:
 
-- `convert_files`
-- `export_svp`
-- `export_bundle`
 - `renderer_status`
+- `pronunciation_convert_files`, `pronunciation_export_svp`,
+  `pronunciation_export_bundle` (the only registered conversion/export adapters)
+- `pronunciation_memory`, `pronunciation_compare`, `pronunciation_confirm`
+- `pronunciation_set_status`, `pronunciation_exchange`, `pronunciation_cancel`
 
 Rust DTOs use `#[serde(rename_all = "camelCase")]` and are mirrored in
 `src/lib/tauri.ts`. Domain errors cross the boundary as a stable uppercase
 `code`, human-readable `message`, and optional `remediation`.
 
 The current contract still uses selected path strings and reparses at export
-time. Backend-issued handles, immutable plan hashes, cancellable jobs, and
-typed progress Channels are **target architecture**, not current behavior.
+time. Pronunciation adapters now carry a backend snapshot ID and verify an
+immutable projection hash; bundle progress uses typed Channels. Model/database
+work runs on blocking workers, with registered model-operation cancellation.
+Legacy conversion/write helpers are private; the baseline batch dispatcher is
+test-only. No legacy conversion/export RPC is registered. Missing, unknown or
+stale export snapshots are refused with `PRONUNCIATION_SNAPSHOT_STALE`.
+General backend-issued
+source/destination handles and recoverable durable jobs remain target architecture.
 See [Tauri command contracts](tauri-command-contracts.md).
 
 ## Architectural decisions
@@ -315,7 +345,7 @@ full mechanism is not yet present.
 | AD-3 | One canonical source model with topology and performance evidence | Partially adopted through `Midi` + `SourceTopology` |
 | AD-4 | Preserve evidence and never invent source facts | Implemented |
 | AD-5 | Source classification, export projection, and playback are orthogonal | Implemented |
-| AD-6 | Previewed immutable plan is the executed plan | Target; current export reparses and reapplies overrides |
+| AD-6 | Previewed immutable plan is the executed plan | Pronunciation snapshot/hash verification implemented; general durable plans remain target |
 | AD-7 | Stable deterministic IDs, ordering, checked arithmetic, and exact timing | Implemented for current contracts |
 | AD-8 | Recoverable typed jobs with bounded concurrency | Target; current UI has one busy guard and exports sequentially |
 | AD-9 | Narrow typed and handle-authorized IPC | Typed DTOs implemented; opaque handles are target |

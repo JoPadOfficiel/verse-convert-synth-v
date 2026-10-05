@@ -200,7 +200,7 @@ fn map_reading(language: PronunciationLanguage, source: &str) -> Result<String, 
     }
 }
 
-fn target_vowel_count(language: PronunciationLanguage, hint: &str) -> usize {
+pub(crate) fn target_vowel_count(language: PronunciationLanguage, hint: &str) -> usize {
     hint.split_whitespace()
         .filter(|phone| match language {
             PronunciationLanguage::Spanish => matches!(*phone, "a" | "e" | "i" | "o" | "u"),
@@ -242,6 +242,13 @@ fn resolve(language: PronunciationLanguage, key: &str) -> Resolution {
         return Resolution::Ambiguous(mapped.into_iter().collect());
     }
     Resolution::Exact(mapped.pop_first().expect("one exact pronunciation"))
+}
+
+pub(crate) fn confirmed_reading(language: PronunciationLanguage, key: &str) -> Option<String> {
+    match resolve(language, key) {
+        Resolution::Exact(hint) => Some(hint),
+        _ => None,
+    }
 }
 
 fn diagnostic(code: &str, severity: DiagnosticSeverity, message: String, id: &str) -> Diagnostic {

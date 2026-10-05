@@ -351,7 +351,7 @@ pub(crate) fn preferred_joined_key(
         .unwrap_or(plain)
 }
 
-pub(super) fn vowel_count(hint: &str) -> usize {
+pub(crate) fn vowel_count(hint: &str) -> usize {
     hint.split_whitespace()
         .filter(|phone| {
             matches!(

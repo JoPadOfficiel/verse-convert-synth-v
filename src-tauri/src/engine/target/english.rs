@@ -118,7 +118,7 @@ fn diagnostic(code: &str, message: String, source_id: &str) -> Diagnostic {
     }
 }
 
-fn reading(key: &str) -> Result<&'static str, (&'static str, String)> {
+pub(crate) fn reading(key: &str) -> Result<&'static str, (&'static str, String)> {
     if ambiguous(key) {
         return Err((AMBIGUOUS, format!("English ARPAbet: {key:?} needs a grammatical or semantic reading; select an explicit dictionary variant or manual hint. Source text and attacks were retained.")));
     }
