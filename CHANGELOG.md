@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.9.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.6...v0.9.0) (2026-10-05)
+
+
+### Features
+
+* add local pronunciation correction memory ([85b44f5](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/85b44f58641203204e8e7be47337f635c61e0908))
+* add local pronunciation correction memory ([4f0e0fd](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/4f0e0fdc36e8751cba49e64296d78662b2b02e6d))
+
 ## [0.8.6](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.5...v0.8.6) (2026-10-05)
 
 
