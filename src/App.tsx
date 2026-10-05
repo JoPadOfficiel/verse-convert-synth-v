@@ -12,12 +12,14 @@ import { Button } from "@/components/ui/button";
 import { Dropzone } from "@/components/Dropzone";
 import { FileList } from "@/components/FileList";
 import { Settings } from "@/components/Settings";
+import { ImportedCorrectionsReview } from "@/components/ImportedCorrectionsReview";
 import {
   chooseBundleTarget,
   batchBundlePaths,
   commandError,
   commandErrorMessage,
   convertFiles,
+  releaseAnalysisSnapshots,
   defaultBundlePath,
   exportBundle,
   exportVocalsWithDialog,
@@ -54,6 +56,7 @@ function storedRendererPath(): string | undefined {
 export default function App() {
   const [items, setItems] = useState<FileResult[]>([]);
   const [showSettings, setShowSettings] = useState(false);
+  const [showCorrections, setShowCorrections] = useState(false);
   const [outDir, setOutDir] = useState<string | undefined>(undefined);
   const [rendererPath, setRendererPathState] = useState<string | undefined>(
     storedRendererPath,
@@ -388,6 +391,21 @@ export default function App() {
     }
   }
 
+  async function reanalyseLoaded() {
+    if (!items.length || !beginBusy()) return;
+    setGlobalError(null);
+    try {
+      const results = await convertFiles(items.map((item) => item.path), false, language, undefined, overrides, exportTarget, pronunciationProfile);
+      setItems(results);
+      setExportErrors({});
+      setExportProgress({});
+      setSelected((previous) => new Set([...previous].filter((path) => results.some((item) => item.path === path && item.ok))));
+    } catch (error) {
+      setGlobalError(commandErrorMessage(error));
+      throw error;
+    } finally { endBusy(); }
+  }
+
   async function exportVocals(item: FileResult) {
     if (!beginBusy()) return;
     setGlobalError(null);
@@ -491,6 +509,7 @@ export default function App() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-1">
+          <Button variant="outline" disabled={busy} onClick={() => setShowCorrections((shown) => !shown)}>Pronunciation corrections</Button>
           <label className="mr-2 flex items-center gap-2 text-xs text-muted-foreground">
             Pronunciation
             <select
@@ -535,7 +554,7 @@ export default function App() {
         </div>
       </header>
 
-      {showSettings ? (
+      {showCorrections ? <ImportedCorrectionsReview onClose={() => setShowCorrections(false)} onReanalyse={reanalyseLoaded} hasLoadedSongs={items.length > 0} /> : showSettings ? (
         <Settings
           outDir={outDir}
           setOutDir={setOutDir}
@@ -588,7 +607,7 @@ export default function App() {
                 variant="ghost"
                 size="sm"
                 disabled={busy}
-                onClick={() => {
+                onClick={() => { void releaseAnalysisSnapshots(items.map((item) => item.path)).catch((error) => setGlobalError(commandErrorMessage(error)));
                   setItems([]);
                   setSelected(new Set());
                   setOverrides({});

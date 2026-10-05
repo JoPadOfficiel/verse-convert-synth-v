@@ -94,6 +94,7 @@ pub struct TrackReport {
 }
 
 pub struct ConvertOutcome {
+    pub pronunciation_words: Vec<crate::pronunciation::source_map::Word>,
     pub ok: bool,
     pub msg: Option<String>,
     /// The target-neutral projection, in source-exact IR ticks. An export
@@ -1802,6 +1803,7 @@ pub fn convert_auto_with(
     use crate::engine::musescore as ms;
     use crate::engine::musicxml as mx;
     let fail = |m: String| ConvertOutcome {
+        pronunciation_words: Vec::new(),
         ok: false,
         msg: Some(m),
         svp: None,
@@ -1854,6 +1856,7 @@ pub fn convert_bytes(data: &[u8], language: &str) -> ConvertOutcome {
         Ok(m) => m,
         Err(e) => {
             return ConvertOutcome {
+                pronunciation_words: Vec::new(),
                 ok: false,
                 msg: Some(format!("unreadable file ({})", e)),
                 svp: None,
@@ -1921,8 +1924,28 @@ pub fn convert_midi_with_profile(
     target: ExportTarget,
     profile: PronunciationProfile,
 ) -> ConvertOutcome {
+    let snapshot = crate::pronunciation::current_snapshot();
+    convert_midi_with_snapshot(
+        midi,
+        language,
+        overrides,
+        target,
+        profile,
+        snapshot.as_deref(),
+    )
+}
+
+pub fn convert_midi_with_snapshot(
+    midi: &Midi,
+    language: &str,
+    overrides: Option<&HashMap<usize, bool>>,
+    target: ExportTarget,
+    profile: PronunciationProfile,
+    snapshot: Option<&crate::pronunciation::Snapshot>,
+) -> ConvertOutcome {
     let profile = profile.for_target(target);
     let fail = |msg: String| ConvertOutcome {
+        pronunciation_words: Vec::new(),
         ok: false,
         msg: Some(msg),
         svp: None,
@@ -2425,12 +2448,28 @@ pub fn convert_midi_with_profile(
     ) {
         return fail(error);
     }
+    let mut pronunciation_words = Vec::new();
     if profile == PronunciationProfile::Automatic {
         let mut tracks: Vec<_> = pending_tracks
             .iter_mut()
             .map(|(_, _, track)| track)
             .collect();
-        let diagnostics = crate::engine::language::route_tracks(&mut tracks);
+        let diagnostics =
+            crate::engine::language::route_tracks_with_snapshot(&mut tracks, snapshot);
+        pronunciation_words = tracks
+            .iter()
+            .flat_map(|track| crate::engine::language::complete_words(track))
+            .collect();
+        if let Some(snapshot) = snapshot {
+            let memory_diagnostics = crate::pronunciation::memory::apply_languages(
+                &mut tracks,
+                snapshot,
+                &pronunciation_words,
+            );
+            if let Some((index, _, _)) = pending_tracks.first() {
+                report[*index].warnings.extend(memory_diagnostics);
+            }
+        }
         for ((index, _, _), diagnostics) in pending_tracks.iter().zip(diagnostics) {
             report[*index].warnings.extend(diagnostics);
         }
@@ -2470,13 +2509,24 @@ pub fn convert_midi_with_profile(
     let mut left_out_by_track = vec![0usize; midi.tracks.len()];
     let mut voices_by_track = vec![0usize; midi.tracks.len()];
     for (index, _, track) in pending_tracks {
-        let track = finish_track(
+        let mut track = finish_track(
             track,
             target,
             profile,
             &contextual_french,
             &mut report[index].warnings,
         );
+        if target == ExportTarget::Ustx && profile == PronunciationProfile::Automatic {
+            if let Some(snapshot) = snapshot {
+                report[index]
+                    .warnings
+                    .extend(crate::pronunciation::reading::apply(
+                        &mut track,
+                        snapshot,
+                        &pronunciation_words,
+                    ));
+            }
+        }
         let (sung_track, left_out) = drop_untexted(track);
         left_out_by_track[index] += left_out;
         if !sung_track.notes.is_empty() {
@@ -2789,6 +2839,7 @@ pub fn convert_midi_with_profile(
     }
     let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
+        pronunciation_words,
         ok: true,
         msg: None,
         svp: Some(projected),

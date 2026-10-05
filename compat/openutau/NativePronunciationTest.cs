@@ -123,6 +123,7 @@ namespace OpenUtau.App {
 
         private static Phonemizer CreateConsumer(string language) => language switch {
             "fr" => new DiffSingerFrenchMillfeuillePhonemizer(),
+            "en" => new DiffSingerEnglishPhonemizer(),
             "es" => new DiffSingerSpanishPhonemizer(),
             "pt" => new DiffSingerPortuguesePhonemizer(),
             _ => throw new ArgumentException("Unexpected fixture language", nameof(language)),
@@ -171,7 +172,7 @@ namespace OpenUtau.App {
                 string missingDuration = null, string missingAcoustic = null) {
                 Root = Path.Combine(Path.GetTempPath(), "verse-synthetic-singer-" + Guid.NewGuid());
                 prefix = prefixed ? language + "/" : "";
-                var symbols = (language == "fr" ? "SP AP s y ae l ee b en n oo" : "SP AP a e i o u b B d D g G s k l m t S").Split(' ');
+                var symbols = (language == "fr" ? "SP AP s y ae l ee b en n oo" : language == "en" ? "SP AP r iy d" : "SP AP a e i o u b B d D g G s k l m t S").Split(' ');
                 inventory = symbols.Select(Alias).ToArray();
                 Directory.CreateDirectory(Root);
                 try {
@@ -185,7 +186,7 @@ namespace OpenUtau.App {
                     File.WriteAllLines(Path.Combine(durationRoot, "phonemes.txt"),
                         inventory.Where(p => missingDuration == null || p != Alias(missingDuration)));
                     var dictionary = "symbols:\n" + string.Concat(symbols.Select(symbol =>
-                        $"  - {{symbol: '{Alias(symbol)}', type: {((symbol is "SP" or "AP" or "a" or "e" or "i" or "o" or "u" or "ae" or "ee" or "en" or "oo") ? "vowel" : "consonant")}}}\n"));
+                        $"  - {{symbol: '{Alias(symbol)}', type: {((symbol is "SP" or "AP" or "a" or "e" or "i" or "o" or "u" or "ae" or "ee" or "en" or "oo" or "iy") ? "vowel" : "consonant")}}}\n"));
                     dictionary += $"entries:\n  - grapheme: '{word}'\n    phonemes: [SP]\n";
                     File.WriteAllText(Path.Combine(durationRoot, "dsdict-" + language + (language == "fr" ? "-millefeuille" : "") + ".yaml"), dictionary);
                     File.WriteAllBytes(Path.Combine(durationRoot, "linguistic.onnx"), Convert.FromBase64String(LinguisticModel));
@@ -259,6 +260,27 @@ namespace OpenUtau.App {
             var factory = Assert.Single(PhonemizerFactory.GetAll(),
                 f => f.name == reread.PhonemizerOverride);
             Assert.IsType<DiffSingerPortuguesePhonemizer>(factory.Create());
+        }
+
+        [Theory]
+        [InlineData("fr", "ciel", "fr/s fr/y fr/ae fr/l", "DiffSinger French Millefeuille Phonemizer")]
+        [InlineData("pt", "acho", "a S u", "DiffSinger Portuguese Phonemizer")]
+        [InlineData("en", "read", "en/r en/iy en/d", "DiffSinger English Phonemizer")]
+        public void ConfirmedReadingRoundTripPreservesNativeSymbolsAndMusicalFields(
+            string language, string word, string hint, string phonemizer) {
+            using var bank = new SyntheticSinger(language, word, language is "fr" or "en");
+            var source = new UNote { lyric = word, position = 960, duration = 480, tone = 64 };
+            var edited = Yaml.DefaultDeserializer.Deserialize<UNote>(Yaml.DefaultSerializer.Serialize(source));
+            edited.lyric = word + "[" + hint + "]";
+            edited.PhonemizerOverride = phonemizer;
+            var restored = Yaml.DefaultDeserializer.Deserialize<UNote>(Yaml.DefaultSerializer.Serialize(edited));
+            Assert.Equal(source.position, restored.position);
+            Assert.Equal(source.duration, restored.duration);
+            Assert.Equal(source.tone, restored.tone);
+            Assert.Equal(edited.PhonemizerOverride, restored.PhonemizerOverride);
+            Assert.Equal(hint.Split(' ').Select(phone => phone.Contains('/') ? phone : bank.Alias(phone)),
+                RunNative(CreateConsumer(language), bank, restored.lyric).phonemes.Select(p => p.phoneme));
+            // This proves native consumption/round-trip, never listening approval.
         }
 
         [Fact]

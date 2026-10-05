@@ -49,7 +49,7 @@ fn ambiguous(key: &str) -> bool {
     )
 }
 
-fn lexical(key: &str) -> Option<String> {
+pub(crate) fn lexical(key: &str) -> Option<String> {
     if let Some((_, reading)) = LEXICAL_ALIASES.iter().find(|(alias, _)| *alias == key) {
         return lexical(reading);
     }

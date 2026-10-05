@@ -1,5 +1,6 @@
 pub mod bundle;
 pub mod engine;
+pub mod pronunciation;
 pub mod renderer;
 pub mod score_stems;
 pub mod stems;
@@ -22,7 +23,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::ipc::Channel;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +71,8 @@ pub enum AudioStatusDto {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pronunciation_snapshot_id: Option<String>,
     pub path: String,
     pub name: String,
     pub ok: bool,
@@ -165,6 +167,12 @@ impl From<bundle::BundleError> for CommandErrorDto {
         let mut dto = Self::new(code, error.to_string());
         dto.remediation = remediation.map(str::to_string);
         dto
+    }
+}
+
+impl From<pronunciation::Error> for CommandErrorDto {
+    fn from(error: pronunciation::Error) -> Self {
+        Self::new(&error.code, error.message)
     }
 }
 
@@ -349,6 +357,7 @@ fn process_one(
         .unwrap_or(path)
         .to_string();
     let err = |name: String, code: &str, msg: String| FileResult {
+        pronunciation_snapshot_id: None,
         path: path.into(),
         name,
         ok: false,
@@ -398,7 +407,13 @@ fn process_one(
         Ok(midi) => midi,
         Err(message) => return err(name, "SOURCE_PARSE_FAILED", message),
     };
+    if let Err(e) = pronunciation::check_source(&data) {
+        return err(name, &e.code, e.message);
+    }
     let r = convert_midi_with_profile(&midi, language, overrides, target, pronunciation_profile);
+    if let Err(e) = pronunciation::observe_projection(&r, target) {
+        return err(name, &e.code, e.message);
+    }
     let tracks: Vec<_> = r
         .tracks
         .iter()
@@ -469,6 +484,16 @@ fn process_one(
                         ),
                     ),
                 })?;
+            if target == ExportTarget::Ustx {
+                pronunciation::retain_reference(
+                    &bytes,
+                    Path::new(&out_path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned),
+                )
+                .map_err(|e| ("PRONUNCIATION_REFERENCE_WRITE", e.to_string()))?;
+            }
             bundle::write_bytes_no_replace(Path::new(&out_path), &bytes).map_err(|error| {
                 (
                     "WRITE_FAILED",
@@ -490,6 +515,7 @@ fn process_one(
         }
     }
     FileResult {
+        pronunciation_snapshot_id: pronunciation::current_snapshot().map(|s| s.id.clone()),
         path: path.into(),
         name,
         ok,
@@ -509,12 +535,11 @@ fn process_one(
     }
 }
 
-/// Writes one vocal-only project.
+/// Private write helper called within the snapshot-aware IPC adapter.
 ///
 /// `target` is the **output path**, which it has been since 0.1.0, so the export
 /// format is `export_target` — an optional parameter that keeps every existing
 /// caller writing `.svp` exactly as before.
-#[tauri::command]
 fn export_svp(
     path: String,
     target: String,
@@ -541,6 +566,7 @@ fn export_svp(
     let data = std::fs::read(&path).map_err(|error| {
         CommandErrorDto::new("SOURCE_READ_FAILED", format!("cannot read file ({error})"))
     })?;
+    pronunciation::check_source(&data).map_err(CommandErrorDto::from)?;
     let ov: HashMap<usize, bool> = overrides
         .unwrap_or_default()
         .into_iter()
@@ -556,6 +582,7 @@ fn export_svp(
         export_target,
         pronunciation_profile.unwrap_or_default(),
     );
+    pronunciation::observe_projection(&r, export_target).map_err(CommandErrorDto::from)?;
     if !r.ok {
         return Err(CommandErrorDto::new(
             "CONVERSION_FAILED",
@@ -595,6 +622,16 @@ fn export_svp(
             }
             SerializeError::Encode(message) => CommandErrorDto::new("SERIALIZE_FAILED", message),
         })?;
+    if export_target == ExportTarget::Ustx {
+        pronunciation::retain_reference(
+            &bytes,
+            target_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+        )
+        .map_err(CommandErrorDto::from)?;
+    }
     bundle::write_bytes_no_replace(target_path, &bytes).map_err(|error| {
         CommandErrorDto::new("WRITE_FAILED", format!("cannot write file ({error})"))
     })?;
@@ -680,6 +717,7 @@ fn export_bundle_blocking(
     }
     let source_bytes = std::fs::read(&source_path)
         .map_err(|error| CommandErrorDto::new("SOURCE_READ_FAILED", error.to_string()))?;
+    pronunciation::check_source(&source_bytes).map_err(CommandErrorDto::from)?;
     let midi = parse_source_snapshot(&source_bytes, &extension)
         .map_err(|message| CommandErrorDto::new("SOURCE_PARSE_FAILED", message))?;
     let parsed_overrides: HashMap<usize, bool> = overrides
@@ -697,6 +735,7 @@ fn export_bundle_blocking(
         export_target,
         pronunciation_profile.unwrap_or_default(),
     );
+    pronunciation::observe_projection(&outcome, export_target).map_err(CommandErrorDto::from)?;
     if !outcome.ok {
         return Err(CommandErrorDto::new(
             "CONVERSION_FAILED",
@@ -799,43 +838,6 @@ fn export_bundle_blocking(
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments)] // Tauri exposes each optional field separately.
-async fn export_bundle(
-    path: String,
-    target: String,
-    language: Option<String>,
-    overrides: Option<HashMap<String, bool>>,
-    renderer_path: Option<String>,
-    export_target: Option<ExportTarget>,
-    pronunciation_profile: Option<PronunciationProfile>,
-    on_progress: Channel<BundleProgressEvent>,
-) -> Result<BundleResult, CommandErrorDto> {
-    tauri::async_runtime::spawn_blocking(move || {
-        export_bundle_blocking(
-            path,
-            target,
-            language,
-            overrides,
-            renderer_path,
-            export_target,
-            pronunciation_profile,
-            &|event| {
-                let _ = on_progress.send(event);
-            },
-            #[cfg(test)]
-            None,
-        )
-    })
-    .await
-    .map_err(|error| {
-        CommandErrorDto::new(
-            "BUNDLE_TASK_FAILED",
-            format!("bundle worker did not complete: {error}"),
-        )
-    })?
-}
-
-#[tauri::command]
 async fn renderer_status(renderer_path: Option<String>) -> RendererStatusDto {
     let configured = renderer_path
         .as_deref()
@@ -892,13 +894,13 @@ async fn renderer_status(renderer_path: Option<String>) -> RendererStatusDto {
     }
 }
 
-/// Analyses (`write = false`) or batch-exports (`write = true`) every path.
+/// Private baseline dispatcher for conversion regression tests.
 ///
 /// `export_target` is optional and defaults to Synthesizer V, so a caller that
 /// names no target gets 0.4.9's analysis verdict and 0.4.9's bytes. It reaches
 /// analysis and not only the writer because the timing a target accepts is part
 /// of the convertibility verdict this returns.
-#[tauri::command]
+#[cfg(test)]
 fn convert_files(
     paths: Vec<String>,
     write: bool,
@@ -940,13 +942,28 @@ fn convert_files(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use pronunciation::commands::*;
+    use tauri::Manager;
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let root = app.path().app_data_dir()?.join("pronunciation");
+            let resources = app.path().resource_dir()?;
+            app.manage(Arc::new(AppState::new(root, &resources)));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            convert_files,
-            export_svp,
-            export_bundle,
-            renderer_status
+            renderer_status,
+            pronunciation_convert_files,
+            pronunciation_export_svp,
+            pronunciation_export_bundle,
+            pronunciation_memory,
+            pronunciation_compare,
+            pronunciation_confirm,
+            pronunciation_set_status,
+            pronunciation_exchange,
+            pronunciation_cancel,
+            pronunciation_release_snapshots
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "policy": "verse-pronunciation-v1",
+  "model": "convaiinnovations/laya-multilingual",
+  "model_revision": "1720e3e3357cfe1e281542e223f8273b0890ca34",
+  "upstream_revision": "8a6e1328cce2460a0e5aa348ad465bb1b5821cd2",
+  "checkpoint_sha256": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204",
+  "tokenizer_sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+  "checkpoint_license_declaration": "Apache-2.0",
+  "tokenizer_provenance": "mmBERT / Gemma 2",
+  "tokenizer_redistribution_qualified": false,
+  "onnx_artifact": {
+    "graph": {
+      "path": "model.onnx",
+      "bytes": 2547941,
+      "sha256": "e4c80c897b9974a8068032adbf3f1e67d8a8f5126d7826f289cdfd85fa804d54"
+    },
+    "external_data": {
+      "path": "model.onnx.data",
+      "bytes": 1287635968,
+      "sha256": "f01238e183ace77661282e4eb2dd9b872c7044cb9678f904cf409e6cc1146d09"
+    },
+    "graph_metadata": {
+      "ir_version": 10,
+      "opsets": {
+        "": 18
+      }
+    },
+    "redistributed": false,
+    "native_logit_parity_qualified": false
+  },
+  "calibration_artifact": null,
+  "telemetry_free_native_build": null,
+  "activation_qualified": false,
+  "development_smoke": {
+    "raw_choices": [
+      "pt",
+      "pt",
+      "pt",
+      "pt"
+    ],
+    "maximum_answer_confidence_ciel": 0.721,
+    "peak_rss_approx_gib": 1.978,
+    "interpretation": "Isolated authored loader probes only. Uncalibrated; no song accuracy or benefit result."
+  },
+  "distribution": "No model or native runtime assets are redistributed while gates remain unqualified.",
+  "prepared_tokenizer_config_sha256": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+}

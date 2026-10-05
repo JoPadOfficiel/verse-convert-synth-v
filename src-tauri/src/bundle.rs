@@ -3934,6 +3934,16 @@ fn export_bundle_with_hook_and_progress(
     )?;
     let project_path = safe_join(&root, &layout.project_relative_path)?;
     let project_bytes = request.input.project.to_bytes()?;
+    if layout.target == crate::engine::target::ExportTarget::Ustx {
+        crate::pronunciation::retain_reference(
+            &project_bytes,
+            project_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+        )
+        .map_err(|error| BundleError::Integrity(error.to_string()))?;
+    }
     write_new(&project_path, &project_bytes, write_project_phase(&layout))?;
     hook.checkpoint(FaultPoint::AfterProject)?;
 

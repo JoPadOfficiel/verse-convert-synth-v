@@ -38,7 +38,7 @@ function fixture(profile: unknown): FileResult {
         projectedTextCount: 1, explicitEmptyCount: 0, continuationCount: 0, unsupportedCount: 0 },
       warnings: [{ code: "TEST_VERDICT", severity: "info", message: `Verdict ${profile}`, sourceId: "note" }] }],
     audioStatus: { state: "notRendered" }, requiresVoiceAssignment: true,
-    bundleReady: true, warnings: [], out: null,
+    bundleReady: true, warnings: [], out: null, pronunciationSnapshotId: "browser-frozen-plan",
   };
 }
 
@@ -52,6 +52,18 @@ Object.assign(window, {
     async invoke(command: string, payload: Record<string, unknown>) {
       calls.push({ command, payload });
       switch (command) {
+        case "pronunciation_memory": return {
+          baseline: "verse-lingua-lexical-context-v1", layaReason: "LAYA_ACTIVATION_UNQUALIFIED", references: [{ id: "other-reference", exportSha256: "other-export-hash", sourceLabel: "Other score.mscz", exportLabel: "Other score.ustx", createdAtUnixSeconds: 1791190000 }, { id: "export-reference", exportSha256: "source-export-hash", sourceLabel: "Choir original.mscz", exportLabel: "Choir reviewed export.ustx", createdAtUnixSeconds: 1791190000 }],
+          history: [{ status: "pending", correction: {
+            id: "imported-correction", fingerprint: "fingerprint", scope: "compatible_context", voice: { singer: "Reviewed singer", inventory_sha256: "duration-and-acoustic-inventory", configuration_sha256: "voice-configuration" },
+            word: { id: "word", key: "ciel", original: ["ciel"], members: ["word"], context: ["le", "ciel", "bleu"], context_target: 1, attacks: 1, manual: false, owner: { track: "track", part: "P1", staff: "1", voice: "2", occurrence: 3, segment: 1, lane: "lyrics", verse: 2 } },
+            before: { language: "en", phonemizer: "DiffSinger English Phonemizer", lexical_reading: "ciel", phones: ["en/s", "en/iy", "en/l"], alphabet: "cmu39" },
+            after: { language: "fr", phonemizer: "DiffSinger French Millefeuille Phonemizer", lexical_reading: "ciel", phones: ["fr/s", "fr/y", "fr/ae", "fr/l"], alphabet: "millefeuille" },
+            provenance: { source_sha256: "source-hash", export_sha256: "export-hash", corrected_sha256: "corrected-hash", confirmed_after_listening: true, symbol_validation: "unknown", policy: "verse-pronunciation-v1", observed_singer: "Observed singer only" },
+          } }],
+        };
+        case "pronunciation_set_status": return null;
+        case "pronunciation_release_snapshots": return null;
         case "plugin:event|listen": return calls.length;
         case "plugin:event|unlisten": return null;
         case "plugin:window|inner_size": return { width: 1000, height: 760 };
@@ -60,8 +72,8 @@ Object.assign(window, {
           version: null, fullScoreMix: false, message: "Browser test: native renderer is mocked." };
         case "plugin:dialog|open": return ["/test/song.mscz"];
         case "plugin:dialog|save": return "/test/export.ustx";
-        case "export_svp": return "/test/export.ustx";
-        case "convert_files":
+        case "pronunciation_export_svp": return "/test/export.ustx";
+        case "pronunciation_convert_files":
           if (mode === "reject") throw new Error("Injected reanalysis rejection");
           if (mode === "pending") await new Promise<void>((resolve) => { finishPending = resolve; });
           return [fixture(payload.pronunciationProfile)];
@@ -143,7 +155,7 @@ async function run() {
       check(header().value === "automatic", "Fresh startup must select Automatic FR+EN+ES+PT");
       check(header().selectedOptions[0].textContent?.includes("ES + PT"), "Automatic must advertise all four languages");
       await click("Drop your files, or click to choose");
-      check(last("convert_files").pronunciationProfile === "automatic", "First import needs no manual language selection");
+      check(last("pronunciation_convert_files").pronunciationProfile === "automatic", "First import needs no manual language selection");
       await click("Clear");
       calls.length = 0;
       await choose("default");
@@ -153,7 +165,7 @@ async function run() {
     if (!progress.restart) {
       await choose(profile);
       stored(profile);
-      check(!calls.some((c) => c.command === "convert_files"), "Empty selection must not analyse files");
+      check(!calls.some((c) => c.command === "pronunciation_convert_files"), "Empty selection must not analyse files");
       await synced(profile);
       record(`${profile}: empty choice and synchronized controls`);
       progress.restart = true;
@@ -165,9 +177,9 @@ async function run() {
     stored(profile);
     record(`${profile}: full page restart restores preference`);
     await click("Drop your files, or click to choose");
-    check(last("convert_files").pronunciationProfile === profile, "Next import must use saved profile");
+    check(last("pronunciation_convert_files").pronunciationProfile === profile, "Next import must use saved profile");
     await click("Vocals only");
-    check(last("export_svp").pronunciationProfile === profile, "Next export must use saved profile");
+    check(last("pronunciation_export_svp").pronunciationProfile === profile, "Next export must use saved profile");
     record(`${profile}: post-restart import and export propagation`);
 
     const next = profiles[(progress.index + 1) % profiles.length];
@@ -178,9 +190,9 @@ async function run() {
     await click("Settings");
     const settings = document.querySelector<HTMLSelectElement>("#pronunciation-profile")!;
     check(settings.disabled && settings.value === profile, "Pending Settings selection must be disabled and unchanged");
-    const count = calls.filter((c) => c.command === "convert_files").length;
+    const count = calls.filter((c) => c.command === "pronunciation_convert_files").length;
     await act(async () => { settings.dispatchEvent(new Event("change", { bubbles: true })); });
-    check(calls.filter((c) => c.command === "convert_files").length === count, "Busy callback cannot start another command");
+    check(calls.filter((c) => c.command === "pronunciation_convert_files").length === count, "Busy callback cannot start another command");
     stored(profile);
     check(finishPending, "Pending native command must exist");
     mode = "accept";
@@ -202,16 +214,16 @@ async function run() {
     mode = "accept";
     await click("Synthesizer V");
     stored(next);
-    check(last("convert_files").exportTarget === "svp", "SVP target must reach reanalysis");
+    check(last("pronunciation_convert_files").exportTarget === "svp", "SVP target must reach reanalysis");
     await click("Settings");
     const svpProfile = document.querySelector<HTMLSelectElement>("#pronunciation-profile")!;
     check(!svpProfile.disabled && svpProfile.value === next, "SVP must expose the target-neutral Automatic/Default choice");
     if (next === "automatic") {
       await choose("default", svpProfile);
-      check(last("convert_files").exportTarget === "svp" && last("convert_files").pronunciationProfile === "default",
+      check(last("pronunciation_convert_files").exportTarget === "svp" && last("pronunciation_convert_files").pronunciationProfile === "default",
         "SVP Default selection must reanalyse as SVP");
       await choose("automatic", svpProfile);
-      check(last("convert_files").exportTarget === "svp" && last("convert_files").pronunciationProfile === "automatic",
+      check(last("pronunciation_convert_files").exportTarget === "svp" && last("pronunciation_convert_files").pronunciationProfile === "automatic",
         "SVP Automatic FR+EN+ES+PT selection must reanalyse as SVP");
       stored("automatic");
     }
@@ -271,6 +283,37 @@ async function run() {
       check(header().value === "englishArpabet", "Storage read failure must not prevent session choices");
       record("Storage read failure preserves startup and current-session usability");
     } finally { Storage.prototype.getItem = getItem; }
+    await click("Drop your files, or click to choose");
+    await click("Pronunciation corrections");
+    const panel = document.querySelector('[aria-label="Pronunciation correction memory"]');
+    check(panel, "Correction review must render after loading native memory");
+    const referenceSelector = panel.querySelector<HTMLSelectElement>('select[aria-label="Original export reference"]');
+    check(referenceSelector, "Named original references must be selectable");
+    const named = [...referenceSelector.options].find((option) => option.textContent?.includes("Choir original.mscz") && option.textContent.includes("Choir reviewed export.ustx"));
+    check(named && named.value === "export-reference", "Source and export names must identify the correct immutable reference");
+    await act(async () => { referenceSelector.value = named.value; referenceSelector.dispatchEvent(new Event("change", { bubbles: true })); });
+    check(referenceSelector.value === "export-reference" && !button("Compare corrected USTX copy").disabled, "Choosing a named reference must enable comparison for that exact ID");
+    record("Human-readable source/export labels select the correct immutable reference");
+    check(panel.textContent!.includes("en/s en/iy en/l") && panel.textContent!.includes("fr/s fr/y fr/ae fr/l"), "Before/after phone readings must be visible");
+    check(panel.textContent!.includes("le [ciel] bleu") && panel.textContent!.includes("occurrence 3"), "Context and original occurrence must be reviewable");
+    record("Imported correction exposes readings, phones, context and ownership");
+    check(panel.textContent!.includes("Reviewed singer") && panel.textContent!.includes("duration-and-acoustic-inventory") && panel.textContent!.includes("voice-configuration"), "Singer constraints must be visible before confirmation");
+    check(panel.textContent!.includes("Observed singer: Observed singer only") && panel.textContent!.includes("This identity does not qualify inventory or reuse"), "Observed singer identity must stay distinct from qualified voice constraints");
+    check(panel.textContent!.includes("Unqualified phones remain excluded"), "Unknown phone validation cannot be promoted to automatic reuse");
+    record("Imported correction exposes voice constraints and unknown symbol qualification");
+    check(button("Activate reviewed correction").disabled, "Pending import requires explicit listening confirmation");
+    check(!calls.some((c) => c.command === "pronunciation_set_status"), "Viewing/importing a record never activates it");
+    record("Pending correction remains inactive without an explicit listening check");
+    const listening = [...panel.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((input) => input.closest("label")?.textContent?.includes("I reviewed this word"));
+    check(listening, "Imported records need their own listening confirmation");
+    await act(async () => { listening.click(); });
+    await click("Activate reviewed correction");
+    check(last("pronunciation_set_status").confirmed === true && last("pronunciation_set_status").id === "imported-correction", "Only checked reviewed record can activate");
+    const previousAnalyses = calls.filter((c) => c.command === "pronunciation_convert_files").length;
+    await click("Reanalyse loaded songs");
+    check(calls.filter((c) => c.command === "pronunciation_convert_files").length === previousAnalyses + 1, "Reviewed memory must be reanalysable with loaded source paths");
+    check(calls.some((c) => c.command === "pronunciation_release_snapshots"), "Reanalysis must release retired snapshots to recover quota");
+    record("Explicit imported-record listening confirmation reaches native activation");
     const result = { passed: true, tests: progress.tests, userAgent: navigator.userAgent,
       boundary: "Real browser, React StrictMode, App, Settings, storage and Tauri adapter; native IPC mocked", reloads: profiles.length };
     const response = await fetch("/__pronunciation-results", { method: "POST", body: JSON.stringify(result) });

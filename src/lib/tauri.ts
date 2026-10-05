@@ -107,6 +107,7 @@ export type PartInfo = {
 };
 
 export type FileResult = {
+  pronunciationSnapshotId?: string;
   path: string;
   name: string;
   ok: boolean;
@@ -255,7 +256,8 @@ export async function exportVocalsWithDialog(
   if (!target) return undefined;
   // `target` is the output path and has been since 0.1.0; `exportTarget` is the
   // format. The backend defaults it to `svp`, so the two stay independent.
-  return await invoke<string>("export_svp", {
+  return await invoke<string>("pronunciation_export_svp", {
+    snapshotId: file.pronunciationSnapshotId ?? analysisSnapshots.get(file.path) ?? null,
     path: file.path,
     target,
     language,
@@ -286,7 +288,8 @@ export async function exportBundle(
 ): Promise<BundleResult> {
   const progress = new Channel<BundleProgressEvent>();
   progress.onmessage = (event) => onProgress?.(event);
-  return await invoke<BundleResult>("export_bundle", {
+  return await invoke<BundleResult>("pronunciation_export_bundle", {
+    snapshotId: file.pronunciationSnapshotId ?? analysisSnapshots.get(file.path) ?? null,
     path: file.path,
     target,
     language,
@@ -314,6 +317,13 @@ export async function getRendererStatus(
  * quarter represent a strict subset of what Synthesizer V blicks do, so a source
  * that analyses cleanly for one target can be refused by the other.
  */
+const analysisSnapshots = new Map<string, string>();
+export async function releaseAnalysisSnapshots(paths: string[]): Promise<void> {
+  const snapshotIds = paths.map((path) => analysisSnapshots.get(path)).filter((id): id is string => Boolean(id));
+  if (snapshotIds.length) await invoke<void>("pronunciation_release_snapshots", { snapshotIds });
+  for (const path of paths) analysisSnapshots.delete(path);
+}
+
 export async function convertFiles(
   paths: string[],
   write: boolean,
@@ -323,7 +333,9 @@ export async function convertFiles(
   exportTarget: ExportTarget = "svp",
   pronunciationProfile: PronunciationProfile = "automatic",
 ): Promise<FileResult[]> {
-  return await invoke<FileResult[]>("convert_files", {
+  if (!write) await releaseAnalysisSnapshots(paths);
+  const results = await invoke<FileResult[]>("pronunciation_convert_files", {
+    snapshotIds: write ? Object.fromEntries(paths.map((path) => [path, analysisSnapshots.get(path) ?? ""])) : null,
     paths,
     write,
     outDir: outDir ?? null,
@@ -332,4 +344,37 @@ export async function convertFiles(
     exportTarget,
     pronunciationProfile,
   });
+  for (const result of results) {
+    if (result.ok && result.pronunciationSnapshotId) analysisSnapshots.set(result.path, result.pronunciationSnapshotId);
+    else analysisSnapshots.delete(result.path);
+  }
+  return results;
 }
+
+export type CorrectionReading = { aliases?: { member: number; index: number; phone: string }[] | null; authority?: string | null; language: "fr" | "en" | "es" | "pt" | null; phonemizer: string; lexical_reading: string | null; phones: string[] | null; alphabet: string | null };
+export type ImportedCorrection = {
+  accepted_variant?: string | null;
+  id: string; fingerprint: string;
+  word: { id: string; key: string; original: string[]; members: string[]; context: string[]; context_target: number; attacks: number; manual: boolean;
+    owner: { track: string; part: string | null; staff: string | null; voice: string | null; occurrence: number; segment: number | null; lane: string; verse: number } };
+  before: CorrectionReading; after: CorrectionReading;
+  scope: "occurrence_only" | "compatible_context";
+  voice: { singer: string; inventory_sha256: string; configuration_sha256: string } | null;
+  provenance: { source_sha256: string; export_sha256: string; corrected_sha256: string; confirmed_after_listening: boolean; symbol_validation: string; policy: string;
+    /** Native identity observed in the corrected copy; does not qualify voice reuse. */
+    observed_singer?: string | null;
+  };
+};
+export type CorrectionsReview = { reference_id: string; corrected_sha256: string; proposals: ImportedCorrection[]; diagnostics: { code: string; message: string }[] };
+export type PronunciationMemory = { history: { correction: ImportedCorrection; status: string }[]; references: { id: string; exportSha256: string; sourceLabel: string | null; exportLabel: string | null; createdAtUnixSeconds: number | null }[]; baseline: string; layaReason: string };
+export const getPronunciationMemory = () => invoke<PronunciationMemory>("pronunciation_memory");
+export const comparePronunciation = (referenceId: string, correctedPath: string) => invoke<CorrectionsReview>("pronunciation_compare", { referenceId, correctedPath });
+export const confirmPronunciation = (referenceId: string, correctedPath: string, selections: { correction_id: string; scope: "occurrence_only" | "compatible_context"; listened: boolean }[]) => invoke<void>("pronunciation_confirm", { referenceId, correctedPath, selections });
+export const setCorrectionStatus = (id: string, status: "active" | "revoked", confirmed = false) => invoke<void>("pronunciation_set_status", { id, status, confirmed });
+export const exchangePronunciation = (path: string, importing: boolean) => invoke<void>("pronunciation_exchange", { path, import: importing });
+export const pickCorrectedProject = async () => { const path = await open({ multiple: false, filters: [{ name: "Corrected OpenUtau project", extensions: ["ustx"] }] }); return typeof path === "string" ? path : undefined; };
+export const pickCorrectionExchange = async (importing: boolean) => {
+  const options = { filters: [{ name: "Pronunciation corrections JSON", extensions: ["json"] }] };
+  const path = importing ? await open({ ...options, multiple: false }) : await save({ ...options, defaultPath: "pronunciation-corrections.json" });
+  return typeof path === "string" ? path : undefined;
+};
