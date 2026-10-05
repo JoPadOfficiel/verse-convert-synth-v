@@ -14,6 +14,195 @@ use verse_lib::engine::{musescore, musicxml};
 const AUTO: PronunciationProfile = PronunciationProfile::Automatic;
 
 #[test]
+#[ignore = "requires the private, hash-pinned White Christmas master"]
+fn white_christmas_french_refrain_preserves_fragment_ownership() {
+    let path = std::env::var("VERSE_WHITE_CHRISTMAS_SOURCE").expect("private master path required");
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        "851e91e0ddfe61d13160c8c20ca360e33cd70925026628be6a00008e37cf0be5"
+    );
+    let midi = musescore::parse(&bytes).unwrap();
+    let outcome = convert(&midi, ExportTarget::Ustx);
+    let project = outcome.svp.as_ref().unwrap();
+    assert_eq!(
+        project
+            .tracks
+            .iter()
+            .map(|t| t.notes.len())
+            .collect::<Vec<_>>(),
+        [151, 237, 206, 119]
+    );
+    let native = ustx::serialize(project).unwrap();
+    let mut failures = Vec::new();
+    for (part, indices) in [
+        (1, vec![208, 210]),
+        (2, vec![178, 180]),
+        (3, vec![78, 99, 101]),
+    ] {
+        for index in indices {
+            let note = &project.tracks[part].notes[index];
+
+            if note.pronunciation_language != Some(PronunciationLanguage::French) {
+                failures.push((part, index));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "wrong French owners: {failures:?}");
+    for (part, index) in [(1, 210), (2, 180), (3, 101)] {
+        let source = source_lyric(&project.tracks[part].notes[index]).unwrap();
+        assert_eq!(source.syllabic, Some(midi::Syllabic::End));
+        assert_eq!(source.raw, "blancs");
+        assert_eq!(native.voice_parts[part].notes[index].lyric, "blancs");
+        assert_eq!(native.voice_parts[part].notes[index + 1].lyric, "+~");
+    }
+    let baseline = convert_midi_with_profile(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        PronunciationProfile::Default,
+    )
+    .svp
+    .unwrap();
+    for (track, before) in project.tracks.iter().zip(&baseline.tracks) {
+        for (note, original) in track.notes.iter().zip(&before.notes) {
+            assert_eq!(
+                (
+                    note.onset_ticks,
+                    note.duration_ticks,
+                    note.pitch,
+                    &note.source_evidence,
+                    &note.performance
+                ),
+                (
+                    original.onset_ticks,
+                    original.duration_ticks,
+                    original.pitch,
+                    &original.source_evidence,
+                    &original.performance
+                )
+            );
+            assert_eq!(
+                source_lyric(note).map(|lyric| (&lyric.raw, &lyric.id, &lyric.lane, lyric.verse)),
+                source_lyric(original).map(|lyric| (
+                    &lyric.raw,
+                    &lyric.id,
+                    &lyric.lane,
+                    lyric.verse
+                ))
+            );
+        }
+    }
+}
+
+#[test]
+fn automatic_row_edge_shared_word_keeps_french_and_orphan_evidence() {
+    for tail in ["EL", "EL,"] {
+        let xml = musicxml_score(&["scintillant", "vieillard", "NO", tail, "blancs"])
+            .replacen(
+                "<syllabic>single</syllabic><text>NO</text>",
+                "<syllabic>begin</syllabic><text>NO</text>",
+                1,
+            )
+            .replacen(
+                &format!("<syllabic>single</syllabic><text>{tail}</text>"),
+                &format!("<syllabic>end</syllabic><text>{tail}</text>"),
+                1,
+            )
+            .replacen(
+                "<syllabic>single</syllabic><text>blancs</text>",
+                "<syllabic>end</syllabic><text>blancs</text>",
+                1,
+            );
+        let midi = musicxml::parse(xml.as_bytes()).unwrap();
+        let outcome = convert(&midi, ExportTarget::Ustx);
+        let project = outcome.svp.as_ref().unwrap();
+        let native = ustx::serialize(project).unwrap();
+        assert_eq!(
+            native.voice_parts[0].notes[2].lyric,
+            "noel[fr/n fr/oo fr/ae fr/l]"
+        );
+        assert_eq!(native.voice_parts[0].notes[3].lyric, "+");
+        assert_eq!(native.voice_parts[0].notes[4].lyric, "blancs");
+        assert_eq!(
+            source_lyric(&project.tracks[0].notes[4]).unwrap().syllabic,
+            Some(midi::Syllabic::End)
+        );
+        assert_eq!(
+            native.voice_parts[0].notes[4].phonemizer.as_deref(),
+            Some(target::diffsinger::FRENCH_NAME)
+        );
+        let svp = convert(&midi, ExportTarget::Svp);
+        let text = String::from_utf8(
+            target::serialize_to(ExportTarget::Svp, svp.svp.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(!text.contains("phonemizer") && !text.contains("fr/"));
+    }
+}
+
+#[test]
+fn automatic_capitalized_split_word_beside_hou_keeps_french_hint() {
+    let xml = musicxml_score(&["scintillant", "vieillard", "NO", "EL", "Hou"])
+        .replacen(
+            "<syllabic>single</syllabic><text>NO</text>",
+            "<syllabic>begin</syllabic><text>NO</text>",
+            1,
+        )
+        .replacen(
+            "<syllabic>single</syllabic><text>EL</text>",
+            "<syllabic>end</syllabic><text>EL</text>",
+            1,
+        );
+    // A performed gap isolates the shared word's local phrase; its authored row
+    // still has two French lexical donors, while Hou is neutral, not a name.
+    let needle="<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type><lyric><syllabic>begin</syllabic><text>NO</text>";
+    let xml = xml.replacen(
+        needle,
+        &format!("<note><rest/><duration>1</duration><type>quarter</type></note>{needle}"),
+        1,
+    );
+    let midi = musicxml::parse(xml.as_bytes()).unwrap();
+    let outcome = convert(&midi, ExportTarget::Ustx);
+    let native = ustx::serialize(outcome.svp.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        native.voice_parts[0].notes[2].lyric,
+        "noel[fr/n fr/oo fr/ae fr/l]"
+    );
+    assert_eq!(
+        native.voice_parts[0].notes[2].phonemizer.as_deref(),
+        Some(target::diffsinger::FRENCH_NAME)
+    );
+}
+
+#[test]
+fn automatic_genuine_english_split_noel_remains_english() {
+    let xml = musicxml_score(&["the", "first", "No", "el"])
+        .replacen(
+            "<syllabic>single</syllabic><text>No</text>",
+            "<syllabic>begin</syllabic><text>No</text>",
+            1,
+        )
+        .replacen(
+            "<syllabic>single</syllabic><text>el</text>",
+            "<syllabic>end</syllabic><text>el</text>",
+            1,
+        );
+    let midi = musicxml::parse(xml.as_bytes()).unwrap();
+    let outcome = convert(&midi, ExportTarget::Ustx);
+    let native = ustx::serialize(outcome.svp.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        native.voice_parts[0].notes[2].lyric,
+        "noel[en/n en/ow en/eh en/l]"
+    );
+    assert_eq!(
+        native.voice_parts[0].notes[2].phonemizer.as_deref(),
+        Some(target::diffsinger::ENGLISH_NAME)
+    );
+}
+
+#[test]
 fn automatic_french_compound_and_silent_endings_use_millefeuille_hints() {
     let midi = musicxml::parse(
         musicxml_score(&["bonjour", "suis", "suis-moi", "chanter", "merci"]).as_bytes(),

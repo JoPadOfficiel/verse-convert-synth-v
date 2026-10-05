@@ -78,3 +78,22 @@ lyric/geometry preservation. Passing only the helper tests does not prove the
 complete editor experience. Invocation receipts, patch/source hashes and local
 artifacts are recorded in the task's ignored implementation-artifact directory;
 private scores, renders and generated application bundles do not belong in Git.
+
+## French word editing and schema recovery
+
+On the full word head, choose `DiffSinger French Millefeuille Phonemizer`, reset
+stale generated alias substitutions (right-click the alias text), and regenerate
+or supply the complete supported hint. Native regressions cover
+`ciel[fr/s fr/y fr/ae fr/l]`, `yeux[fr/y fr/ee]`,
+`blancs[fr/b fr/l fr/en]` and `noel[fr/n fr/oo fr/ae fr/l]`.
+They reject `fr/i` and `fr/el`. Preserve `+` syllables and `+~` holds.
+Changing an alias prefix alone cannot select the word language or translate phones.
+The French tests use synthetic untrained duration graphs and verify native
+SetSinger/SetUp/Process and acoustic token consumption; they make no listening claim.
+
+The pinned 0.1.569 consumer supports USTX 0.9, while later 0.10 projects may
+contain `MaskedCurve`. Deserialization precedes the native version check, so this
+can surface as `Exception during deserialization`. Application labels alone do
+not prove schema support. Preserve edited projects in new recovery copies and
+reject active or unexplained newer-schema values. Verify the exact consumer's
+load/save/reload and resolved WAV references independently of pronunciation.
