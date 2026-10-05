@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.8.6](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.5...v0.8.6) (2026-10-05)
+
+
+### Bug Fixes
+
+* preserve French pronunciation ownership ([12b1404](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/12b140453e1e431ea1554d40a89bedcf5f2e9c73))
+* preserve French pronunciation ownership ([2c133ef](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/2c133efde8e1a36fca2b658b8f75fad19699939d))
+
 ## [0.8.5](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.8.4...v0.8.5) (2026-10-02)
 
 
