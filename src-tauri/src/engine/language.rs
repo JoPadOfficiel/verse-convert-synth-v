@@ -386,15 +386,6 @@ impl Unit {
     }
 }
 
-fn known_independent_language(key: &str) -> bool {
-    let membership = lexical_membership(key);
-    let scores = multilingual_scores(key);
-    let mut sorted = scores;
-    sorted.sort_by(|a, b| b.total_cmp(a));
-    membership.iter().filter(|&&v| v).count() == 1
-        || (sorted[0] >= 0.75 && sorted[0] - sorted[1] >= 0.5)
-}
-
 fn unit_word(
     notes: &[ProjectedNote],
     units: &[Unit],
@@ -1698,13 +1689,12 @@ fn route_span_with_snapshot(
     snapshot: Option<&crate::pronunciation::Snapshot>,
 ) -> Route {
     let mut units = build_units(notes, note_ids);
-    let mut evidence_diagnostics = Vec::new();
     if let Some(snapshot) = snapshot {
         for index in 0..units.len() {
             let Some(word) = unit_word(notes, &units, index) else {
                 continue;
             };
-            // Human memory is consulted before any prediction. The frozen copy
+            // Human memory overrides baseline scoring. The frozen copy
             // is reapplied after all baseline row/sibling policies as well.
             match snapshot
                 .corrections
@@ -1723,62 +1713,12 @@ fn route_span_with_snapshot(
                 Err(_) => continue,
                 Ok(None) => {}
             }
-            let unit = &units[index];
-            let mut scores = unit.scores();
-            let mut sorted = scores;
-            sorted.sort_by(|a, b| b.total_cmp(a));
-            if unit.inherit_passage
-                || (!unit.local_uncertain && sorted[0] - sorted[1] >= 1.0)
-                || automatic_anchor(&unit.key).is_some()
-                || known_independent_language(&unit.key)
-            {
-                continue;
-            }
-            let Some(model) = &snapshot.model else {
-                continue;
-            };
-            let context = word
-                .context
-                .iter()
-                .enumerate()
-                .map(|(i, key)| {
-                    if i == word.context_target {
-                        format!("<target>{key}</target>")
-                    } else {
-                        key.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            match snapshot.language_evidence(&word, context) {
-                Ok(value) if value.accepted(model.calibration.threshold) => {
-                    let probabilities = value.probabilities;
-                    let maximum = probabilities.iter().copied().fold(0.0, f64::max);
-                    for (score, p) in scores.iter_mut().zip(probabilities) {
-                        *score += model.fusion_weight * (p.max(1e-12) / maximum).ln();
-                    }
-                    units[index].set_scores(scores);
-                    evidence_diagnostics.push(Diagnostic{code:"LAYA_EVIDENCE_APPLIED".into(),severity:DiagnosticSeverity::Info,message:"Calibrated contextual language evidence applied to a weak complete word".into(),source_id:Some(word.id)});
-                }
-                Ok(_) => evidence_diagnostics.push(Diagnostic {
-                    code: "LAYA_ABSTAINED".into(),
-                    severity: DiagnosticSeverity::Info,
-                    message: "Laya gate rejected evidence; deterministic baseline retained".into(),
-                    source_id: Some(word.id),
-                }),
-                Err(e) => evidence_diagnostics.push(Diagnostic {
-                    code: e.code,
-                    severity: DiagnosticSeverity::Info,
-                    message: format!("{}; deterministic baseline retained", e.message),
-                    source_id: Some(word.id),
-                }),
-            }
         }
     }
     let decisions = decode(&units);
     let mut languages = vec![None; notes.len()];
     let mut inherit_passage = vec![false; notes.len()];
-    let mut diagnostics = evidence_diagnostics;
+    let mut diagnostics = Vec::new();
     let mut counts = [0usize; 4];
     let mut words: Vec<RoutedWord> = units
         .iter()

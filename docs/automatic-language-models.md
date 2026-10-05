@@ -55,31 +55,27 @@ errors. There are no runtime downloads, remote classification calls or generated
 lyrics. Quality gates require the unchanged private development oracle and
 self-authored boundary regressions; listening with compatible banks remains a
 separate acoustic validation.
-# Laya integration gate (2026-10-05)
+## Rejected experiment (2026-10-05)
 
-Verse now has an optional Rust tokenizer/ONNX CPU adapter and bounded hybrid
-evidence injection before the existing deterministic decoder. Only complete
-source-attested weak words qualify; independent language evidence, manual hints,
-source conflicts and trusted human corrections remain protected. The decoder,
-source ownership and native pronunciation dictionaries retain their authority.
+The local raw Laya candidate failed the paired language-decision test and was
+removed completely. Its adapter, dependencies, resource packaging, availability
+contract and preparation/evaluation tools are no longer part of Verse. Historical
+measurement receipts remain local. Automatic routing retains the deterministic
+Lingua/lexical/context baseline; there is no optional candidate mode.
 
-Laya is **not activated** in the shipped resource set. Canonical assets were
-locally SHA-256 verified and an FP32 fused ONNX graph was prepared. A fixed
-ordered question uses `fr: French pronunciation`, `en: English pronunciation`,
-`es: Spanish pronunciation`, `pt: Portuguese pronunciation` exactly as pinned
-`render_options`/`build_sequence` renders the Python mapping. The token parity
-test compares both token IDs and marker positions, independently of logits.
+The raw protocol compared the unadapted candidate's four-choice FR/EN/ES/PT
+language predictions before hybrid routing against editorial eligible lyric
+records, including unresolved fragments, on two exposed
+development references. It produced 1,054 wrong decisions among 1,189 covered
+records (135 correct), with 83 uncovered records out of 1,272 eligible records.
+These are development language-decision measurements, not population or acoustic
+accuracy. The compact local receipt is retained at
+`_bmad-output/implementation-artifacts/remove-laya-20261005/rejected-candidate-summary.json`.
 
-The runtime requires confined regular files, exact sizes/hashes, adjacent ONNX
-external data, fitted model/tokenizer/policy-bound calibration, a telemetry-free
-CPU build, and hash-checked qualification/evidence files. Production additionally
-requires redistribution, native parity and independent paired benefit. The
-development evaluation entry point can measure a calibrated candidate before
-that benefit gate has passed. No runtime download, Python service or remote
-classifier is introduced.
+## Pronunciation correction memory
 
 Human correction memory is local SQLite under stable application user data.
-Analysis freezes model/policy/memory identities and caches evidence; export uses
+Analysis freezes baseline/policy/memory identities and the projection hash; export uses
 fresh registered cancellation/deadline state and verifies the reproduced plan.
 Changed source, settings or active memory requires reanalysis. JSON imports are
 pending until the user reviews before/after reading, source/context/voice scope
@@ -92,9 +88,5 @@ confirmation, storage and contribution JSON export. This observation is separate
 from `VoiceConstraint`: it supplies no inventory/configuration hashes and cannot
 qualify bank-specific reuse. Older records omit it and retain their fingerprints.
 
-The current local raw Laya comparison is development evidence, not a four-language
-accuracy study. Both exposed song-family oracles, independent ES/PT gold,
-reconstruction/phone gold, fitted calibration, telemetry-free native-package
-parity and blinded acoustic listening must retain separate qualification status.
-99% is an objective; no population, acoustic or universal hardware guarantee is
-supported by these implementation gates.
+Structural, dictionary and native-consumer checks do not establish audible
+singing quality. Listening confirmation remains explicit and singer-dependent.

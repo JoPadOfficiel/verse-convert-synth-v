@@ -53,7 +53,7 @@ Object.assign(window, {
       calls.push({ command, payload });
       switch (command) {
         case "pronunciation_memory": return {
-          baseline: "verse-lingua-lexical-context-v1", layaReason: "LAYA_ACTIVATION_UNQUALIFIED", references: [{ id: "other-reference", exportSha256: "other-export-hash", sourceLabel: "Other score.mscz", exportLabel: "Other score.ustx", createdAtUnixSeconds: 1791190000 }, { id: "export-reference", exportSha256: "source-export-hash", sourceLabel: "Choir original.mscz", exportLabel: "Choir reviewed export.ustx", createdAtUnixSeconds: 1791190000 }],
+          baseline: "verse-lingua-lexical-context-v1", references: [{ id: "other-reference", exportSha256: "other-export-hash", sourceLabel: "Other score.mscz", exportLabel: "Other score.ustx", createdAtUnixSeconds: 1791190000 }, { id: "export-reference", exportSha256: "source-export-hash", sourceLabel: "Choir original.mscz", exportLabel: "Choir reviewed export.ustx", createdAtUnixSeconds: 1791190000 }],
           history: [{ status: "pending", correction: {
             id: "imported-correction", fingerprint: "fingerprint", scope: "compatible_context", voice: { singer: "Reviewed singer", inventory_sha256: "duration-and-acoustic-inventory", configuration_sha256: "voice-configuration" },
             word: { id: "word", key: "ciel", original: ["ciel"], members: ["word"], context: ["le", "ciel", "bleu"], context_target: 1, attacks: 1, manual: false, owner: { track: "track", part: "P1", staff: "1", voice: "2", occurrence: 3, segment: 1, lane: "lyrics", verse: 2 } },
@@ -287,6 +287,8 @@ async function run() {
     await click("Pronunciation corrections");
     const panel = document.querySelector('[aria-label="Pronunciation correction memory"]');
     check(panel, "Correction review must render after loading native memory");
+    check(panel.textContent!.includes("Baseline: verse-lingua-lexical-context-v1."), "Correction memory must show the deterministic baseline without optional resources");
+    check(!/\blaya\b|unavailable|qualified local.*evidence/i.test(panel.textContent!), "Correction memory must not expose rejected model availability");
     const referenceSelector = panel.querySelector<HTMLSelectElement>('select[aria-label="Original export reference"]');
     check(referenceSelector, "Named original references must be selectable");
     const named = [...referenceSelector.options].find((option) => option.textContent?.includes("Choir original.mscz") && option.textContent.includes("Choir reviewed export.ustx"));

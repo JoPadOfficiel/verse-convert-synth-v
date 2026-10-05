@@ -1,5 +1,5 @@
 //! Durable source ownership associated with an immutable original USTX export.
-use super::{assets::read_bounded, hash, Error, Language, POLICY};
+use super::{files::read_bounded, hash, Error, Language, POLICY};
 use crate::engine::{
     projection::{ProjectedNote, ProjectedProject},
     target::{lexical, ustx},

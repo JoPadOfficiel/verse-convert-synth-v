@@ -1,9 +1,8 @@
 //! Local pronunciation evidence and explicitly confirmed correction memory.
-pub mod assets;
 pub mod commands;
 pub mod exchange;
 pub mod feedback;
-pub mod laya;
+pub mod files;
 pub mod memory;
 pub mod reading;
 pub mod source_map;
@@ -19,15 +18,6 @@ use std::{
 };
 pub const POLICY: &str = "verse-pronunciation-v1";
 pub const BASELINE: &str = "verse-lingua-lexical-context-v1";
-pub const PROMPT: &str = "Which language should own the pronunciation of the marked complete source word in this lyric context?";
-// Exact render_options output from the pinned ordered Python crit mapping.
-pub const OPTIONS: [&str; 4] = [
-    "fr: French pronunciation",
-    "en: English pronunciation",
-    "es: Spanish pronunciation",
-    "pt: Portuguese pronunciation",
-];
-
 // Legacy use cases stay callable without application state. Desktop commands
 // bind a frozen snapshot only for their synchronous blocking worker; the guard
 // restores it even on panic. No snapshot crosses an async suspension point.
@@ -48,6 +38,7 @@ pub fn with_snapshot<T>(snapshot: Arc<Snapshot>, action: impl FnOnce() -> T) -> 
     action()
 }
 pub fn check_source(bytes: &[u8]) -> Result<(), Error> {
+    check_work()?;
     if current_snapshot().is_some_and(|s| s.source_sha256 != hash(bytes)) {
         Err(Error::new(
             "PRONUNCIATION_SNAPSHOT_STALE",
@@ -57,6 +48,12 @@ pub fn check_source(bytes: &[u8]) -> Result<(), Error> {
         Ok(())
     }
 }
+pub(crate) fn check_work() -> Result<(), Error> {
+    if let Some(snapshot) = current_snapshot() {
+        snapshot.work.check()?;
+    }
+    Ok(())
+}
 pub fn observe_projection(
     outcome: &crate::engine::convert::ConvertOutcome,
     target: crate::engine::target::ExportTarget,
@@ -64,6 +61,7 @@ pub fn observe_projection(
     let Some(snapshot) = current_snapshot() else {
         return Ok(());
     };
+    snapshot.work.check()?;
     if let Some(project) = &outcome.svp {
         let bytes = crate::engine::target::serialize_to(target, project)
             .map_err(|e| Error::new("PRONUNCIATION_PROJECTION_INVALID", &e.to_string()))?;
@@ -106,7 +104,7 @@ pub fn observe_projection(
             )))
         });
     }
-    Ok(())
+    snapshot.work.check()
 }
 pub fn observed_projection() -> Option<(
     crate::engine::projection::ProjectedProject,
@@ -219,12 +217,12 @@ impl Work {
     pub fn check(&self) -> Result<(), Error> {
         if self.cancelled.load(Ordering::Relaxed) {
             Err(Error::new(
-                "LAYA_CANCELLED",
-                "Pronunciation inference was cancelled",
+                "PRONUNCIATION_CANCELLED",
+                "Pronunciation operation was cancelled",
             ))
         } else if Instant::now() >= self.deadline {
             Err(Error::new(
-                "LAYA_DEADLINE",
+                "PRONUNCIATION_DEADLINE",
                 "Pronunciation resource deadline exceeded",
             ))
         } else {
@@ -238,14 +236,10 @@ pub struct Snapshot {
     pub id: String,
     pub source_sha256: String,
     pub corrections: Arc<memory::CorrectionSet>,
-    pub model: Option<Arc<laya::Laya>>,
-    pub unavailable_reason: String,
     pub work: Work,
     pub expected_projection_sha256: Option<String>,
     pub memory_root: Option<std::path::PathBuf>,
     pub source_label: Option<String>,
-    pub evidence:
-        Arc<std::sync::Mutex<std::collections::BTreeMap<String, Result<laya::Evidence, Error>>>>,
     pub sealed: bool,
 }
 impl Snapshot {
@@ -272,69 +266,12 @@ impl Snapshot {
             id,
             source_sha256,
             corrections,
-            model: None,
-            unavailable_reason: "LAYA_ACTIVATION_UNQUALIFIED".into(),
             work: Work::new(Duration::from_secs(30)),
             expected_projection_sha256: None,
             memory_root: None,
             source_label: None,
-            evidence: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             sealed: false,
         })
-    }
-    pub fn diagnostic(&self) -> crate::engine::convert::Diagnostic {
-        crate::engine::convert::Diagnostic {
-            code: self.unavailable_reason.clone(),
-            severity: crate::engine::convert::DiagnosticSeverity::Info,
-            message: format!(
-                "Laya unavailable; using deterministic {BASELINE}. Snapshot {}",
-                self.id
-            ),
-            source_id: None,
-        }
-    }
-    pub fn language_evidence(
-        &self,
-        word: &source_map::Word,
-        context: String,
-    ) -> Result<laya::Evidence, Error> {
-        self.work.check()?;
-        let key = hash(&serde_json::to_vec(&(word, &context))?);
-        if let Some(value) = self
-            .evidence
-            .lock()
-            .map_err(|_| Error::new("LAYA_EVIDENCE_STATE", "Evidence cache unavailable"))?
-            .get(&key)
-        {
-            return value.clone();
-        }
-        if self.sealed {
-            return Err(Error::new(
-                "PRONUNCIATION_SNAPSHOT_STALE",
-                "No approved evidence for this word; analyse again",
-            ));
-        }
-        let model = self
-            .model
-            .as_ref()
-            .ok_or_else(|| Error::new("LAYA_UNAVAILABLE", "Laya unavailable"))?;
-        let result = model.predict(&[context], &self.work).and_then(|rows| {
-            rows.into_iter()
-                .next()
-                .ok_or_else(|| Error::new("LAYA_OUTPUT_CONTRACT", "Missing inference row"))
-        });
-        let mut cache = self
-            .evidence
-            .lock()
-            .map_err(|_| Error::new("LAYA_EVIDENCE_STATE", "Evidence cache unavailable"))?;
-        if cache.len() >= 10_000 {
-            return Err(Error::new(
-                "LAYA_ROW_LIMIT",
-                "Per-source evidence budget exceeded",
-            ));
-        }
-        cache.insert(key, result.clone());
-        result
     }
 }
 

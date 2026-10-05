@@ -3586,7 +3586,15 @@ impl BundleError {
             ) => "RENDERER_UNSUPPORTED",
             Self::Render(RenderError::Timeout { .. }) => "RENDERER_TIMEOUT",
             Self::Render(_) => "RENDERER_FAILED",
-            Self::Io { .. } => "BUNDLE_IO_FAILED",
+            Self::Io { source, .. } => match source
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<crate::pronunciation::Error>())
+                .map(|error| error.code.as_str())
+            {
+                Some("PRONUNCIATION_CANCELLED") => "PRONUNCIATION_CANCELLED",
+                Some("PRONUNCIATION_DEADLINE") => "PRONUNCIATION_DEADLINE",
+                _ => "BUNDLE_IO_FAILED",
+            },
             Self::Serialize(_) => "BUNDLE_SERIALIZE_FAILED",
             Self::InvalidLedger(_) => "PRESERVATION_INCOMPLETE",
             Self::InvalidStemPlan(_) => "STEM_PLAN_INVALID",
@@ -3622,6 +3630,13 @@ fn export_bundle_with_hook_and_progress(
     progress: &(dyn Fn(BundleProgressEvent) + Sync),
 ) -> Result<BundleResult, BundleError> {
     validate_destination(&request.destination)?;
+    let check_work = || {
+        crate::pronunciation::check_work().map_err(|error| BundleError::Io {
+            phase: "check pronunciation operation",
+            source: io::Error::other(error),
+        })
+    };
+    check_work()?;
     let layout = BundleLayout::new(
         &request.destination,
         &request.input.original_name,
@@ -3871,6 +3886,7 @@ fn export_bundle_with_hook_and_progress(
     }
     render_work.cleanup()?;
     hook.checkpoint(FaultPoint::AfterAudio)?;
+    check_work()?;
 
     progress(BundleProgressEvent {
         phase: BundleProgressPhase::Finalizing,
@@ -3934,6 +3950,7 @@ fn export_bundle_with_hook_and_progress(
     )?;
     let project_path = safe_join(&root, &layout.project_relative_path)?;
     let project_bytes = request.input.project.to_bytes()?;
+    check_work()?;
     if layout.target == crate::engine::target::ExportTarget::Ustx {
         crate::pronunciation::retain_reference(
             &project_bytes,
@@ -4024,6 +4041,7 @@ fn export_bundle_with_hook_and_progress(
 
     sync_directory(&root, "sync staging directory")?;
     sync_directory(parent, "sync destination parent before commit")?;
+    check_work()?;
     match rename_no_replace(&root, &request.destination) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -7897,6 +7915,52 @@ pub(crate) mod tests {
     }
 
     struct FailAt(FaultPoint);
+
+    #[test]
+    fn cancelled_work_after_projection_and_before_bundle_commit_rolls_back() {
+        struct CancelWork {
+            at: FaultPoint,
+            work: crate::pronunciation::Work,
+        }
+        impl BundleHook for CancelWork {
+            fn checkpoint(&self, point: FaultPoint) -> Result<(), BundleError> {
+                if point == self.at {
+                    self.work
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            for at in [FaultPoint::AfterProject, FaultPoint::BeforeCommit] {
+                let root = temp_dir("pronunciation-stop-before-commit");
+                let request = request_for(&root, FakeMode::Success, target);
+                let destination = request.destination.clone();
+                let snapshot = crate::pronunciation::Snapshot::baseline(
+                    crate::pronunciation::hash(&request.input.source_bytes),
+                    vec![],
+                )
+                .unwrap();
+                let hook = CancelWork {
+                    at,
+                    work: snapshot.work.clone(),
+                };
+                let error = crate::pronunciation::with_snapshot(Arc::new(snapshot), || {
+                    export_bundle_with_hook(request, &hook)
+                })
+                .unwrap_err();
+                assert_eq!(error.code(), "PRONUNCIATION_CANCELLED");
+                assert!(!destination.exists());
+                assert_eq!(
+                    fs::read_dir(&root).unwrap().count(),
+                    0,
+                    "staging must roll back"
+                );
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
 
     impl BundleHook for FailAt {
         fn checkpoint(&self, point: FaultPoint) -> Result<(), BundleError> {

@@ -1,5 +1,5 @@
 use super::{
-    assets::read_bounded,
+    files::read_bounded,
     memory::{Correction, Memory},
     Error, POLICY,
 };

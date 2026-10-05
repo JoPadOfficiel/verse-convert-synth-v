@@ -26,9 +26,6 @@
     }
   },
   "bundle": {
-    "resources": {
-      "resources/pronunciation/": "pronunciation/"
-    },
     "active": true,
     "targets": "all",
     "icon": [
