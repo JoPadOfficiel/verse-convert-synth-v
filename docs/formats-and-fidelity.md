@@ -987,6 +987,24 @@ something real files contain — and not a second verse. Reading the second
 element's position among its siblings as a verse number copied every lane of a
 score out a second time, note for note, and doubled its sung syllables.
 
+### Native fermata playback
+
+Native MuseScore 3 omitted fermata stretch means 1; MuseScore 4 uses its
+qualified subtype default (2 for a normal fermata). Explicit positive stretch
+and `play` declarations govern playback. Verse keeps every nominal note tick
+unchanged and projects the qualified hold through a score-global tempo map,
+including each repeated occurrence. Simultaneous marks use the longest
+declared stretch; the next score segment bounds the hold. Malformed or
+unrepresentable playback declarations produce `SOURCE_PLAYBACK_*` diagnostics.
+
+When MuseScore 4 renders a legacy source, Verse makes the omitted legacy value
+explicit only in the private reference/stem inputs. Explicit legacy holds also
+use the source-native written tempo plan, preventing the newer renderer's gap
+decomposition from shortening them. Playback annotations live inside existing
+voices and never add notes or rests. The source bytes and explicit stretch
+values remain intact in preservation; lyrics, pitches, note geometry and the
+played tempo map are checked before rendering the private compatibility copy.
+
 ### Native ties
 
 Native MuseScore tie spanners are merged into one sustained projected note, as

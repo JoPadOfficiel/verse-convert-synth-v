@@ -91,6 +91,27 @@ listening remain separate evidence.
 
 ## Required quality gates
 
+Fermata rhythm regressions cover the legacy/modern defaults, explicit holds,
+score-global ownership, repeated occurrences, exact segment boundaries and
+both target tempo maps. Renderer preparation tests verify that the full-score
+reference and all isolated Part inputs use the same qualified legacy defaults.
+The private real-renderer gate compares the vocal tempo map with independently
+exported MuseScore MIDI and retains a rendered WAV:
+
+```sh
+VERSE_MUSESCORE_GATE=/path/to/MuseScore \
+VERSE_FERMATA_SOURCE=/path/to/private-legacy-score.mscz \
+VERSE_FERMATA_OUTPUT_DIR=/path/to/new-receipt-directory \
+  cargo test --manifest-path src-tauri/Cargo.toml --locked \
+  supplied_legacy_fermata_render_preserves_the_vocal_tempo_map -- --ignored
+```
+
+`private_rhythm_corpus` additionally requires `VERSE_RHYTHM_CORPUS_DIR` and a
+new `VERSE_RHYTHM_REPORT_DIR`. Request it with `--test private_rhythm_corpus --
+--ignored`; all supported source files outside existing bundles are included.
+Its source/serializer assertions are structural evidence; independent renderer
+MIDI and audio remain separate checks.
+
 Pronunciation feedback adds `src-tauri/tests/pronunciation_feedback.rs` and
 `pronunciation::commands::tests`. These exercise explicit listening approval,
 SQLite restart/migration/backup, JSON pending import/deduplication/revocation,

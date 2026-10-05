@@ -134,6 +134,29 @@ note-bearing source tracks; otherwise it is one byte-identical source track
 after the file's global marks. See
 [Formats and fidelity](formats-and-fidelity.md#audio-stems).
 
+### Source playback defaults
+
+MuseScore 3 gives a fermata with no `timeStretch` property a playback multiplier
+of 1. MuseScore 4 defaults a normal fermata to 2. Loading unchanged legacy XML
+in the newer renderer can therefore add a pause absent from the vocal project.
+Verse writes the legacy value of 1 explicitly in a private render copy before
+rendering the reference and every Part stem. The preserved source stays
+byte-identical. The diagnostic is
+`MUSESCORE_LEGACY_FERMATA_DEFAULT_PRESERVED`.
+
+For an explicitly prolonged legacy fermata, the newer renderer may split an
+implicit silence into shorter notation segments and restore normal tempo too
+early. Verse lowers the exact written native 3 playback map into private tempo
+annotations, neutralizes only the private fermata playback, and retains every
+existing note and voice container. Before rendering it checks that the prepared
+input preserves the complete note geometry and played tempo map. Unsupported
+lowering refuses with `MUSESCORE_PLAYBACK_MAP_UNPROVEN`; successful preparation
+reports `MUSESCORE_SOURCE_PLAYBACK_MAP_PRESERVED`.
+
+Native explicit fermata prolongations, and qualified MuseScore 4 subtype
+defaults, use one global playback tempo map in both vocal export targets.
+They never move nominal note positions or alter their written durations.
+
 ### Qualified legacy drum template compatibility
 
 MuseScore 4 can resolve a native `Instrument id="piano"` as piano before
