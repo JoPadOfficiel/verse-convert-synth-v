@@ -1911,8 +1911,9 @@ fn instrument_integer<'a>(
     Ok(result)
 }
 
-// Qualified against MuseScore v3.6.2 libmscore/fermata.cpp (default 1)
-// and v4.7.5 src/engraving/dom/fermata.cpp (subtype defaults).
+// Explicit playback durations are source evidence. Native3/4 software defaults
+// are not a numerically authored hold; keep their symbols in source evidence
+// without changing written tempo. Validate native4 symbol spellings nonetheless.
 fn fermata_stretch(
     node: roxmltree::Node,
     native_major: Option<u32>,
@@ -1962,38 +1963,40 @@ fn fermata_stretch(
         return Ok(Some(stretch));
     }
     if native_major == Some(3) {
-        // The native 3 default is independent of the symbol (including noSym).
-        return Ok(Some(1.0));
+        // Undefined duration contributes no numerical playback instruction.
+        return Ok(None);
     }
-    let default = match subtype {
-        // Native 4's constructor leaves m_timeStretch at -1. A subtype
-        // invokes setSymIdAndTimeStretch; propertyDefault alone is not proof.
+    match subtype {
         None => return Err(
             "SOURCE_PLAYBACK_UNSUPPORTED: native 4 fermata has no subtype or explicit timeStretch"
                 .into(),
         ),
-        Some("fermataAbove" | "fermataBelow") => 2.0,
-        Some("fermataVeryShortAbove" | "fermataVeryShortBelow") => 1.25,
         Some(
-            "fermataShortAbove"
+            "fermataAbove"
+            | "fermataBelow"
+            | "fermataVeryShortAbove"
+            | "fermataVeryShortBelow"
+            | "fermataShortAbove"
             | "fermataShortBelow"
             | "fermataShortHenzeAbove"
-            | "fermataShortHenzeBelow",
-        ) => 1.5,
-        Some(
-            "fermataLongAbove"
+            | "fermataShortHenzeBelow"
+            | "fermataLongAbove"
             | "fermataLongBelow"
             | "fermataLongHenzeAbove"
-            | "fermataLongHenzeBelow",
-        ) => 3.0,
-        Some("fermataVeryLongAbove" | "fermataVeryLongBelow") => 4.0,
+            | "fermataLongHenzeBelow"
+            | "fermataVeryLongAbove"
+            | "fermataVeryLongBelow",
+        ) => {}
         Some(value) => {
             return Err(format!(
                 "SOURCE_PLAYBACK_UNSUPPORTED: unqualified fermata subtype {value:?}"
             ))
         }
-    };
-    Ok(Some(default))
+    }
+    // MuseScore4 normal/short/long defaults are playback choices, not stated
+    // durations. A save from3 to4 must not create a55BPM event from no number,
+    // and a symbol cannot suppress another Part's explicitly stated speedup.
+    Ok(None)
 }
 
 fn apply_fermata_tempos(
@@ -3651,9 +3654,12 @@ fn parse_mscx_with_bounds(
                     if start < measure_start || start > end {
                         return Err("SOURCE_PLAYBACK_TIMING_UNREPRESENTABLE: fermata is outside its written measure".into());
                     }
-                    if let Some(stretch) = fermata_stretch(fermata, native_major)? {
-                        let start = checked_score_tick(start)?;
-                        playback_segments.insert(start);
+                    let stretch = fermata_stretch(fermata, native_major)?;
+                    let start = checked_score_tick(start)?;
+                    // A source marker remains a notated clock boundary even when
+                    // it supplies no numerical playback duration.
+                    playback_segments.insert(start);
+                    if let Some(stretch) = stretch {
                         playback_fermatas
                             .entry(start)
                             .and_modify(|longest| *longest = longest.max(stretch))

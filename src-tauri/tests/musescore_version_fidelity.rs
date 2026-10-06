@@ -515,16 +515,16 @@ fn held(version: &str, properties: &str, other: Option<String>) -> String {
 }
 
 #[test]
-fn omitted_native_three_and_named_native_four_fermata_defaults_differ_only_in_tempo() {
+fn omitted_native_three_four_fermata_duration_keeps_the_same_written_tempo() {
     let legacy = musescore::parse(held("3.02", "", None).as_bytes()).unwrap();
     let modern =
         musescore::parse(held("4.70", "<subtype>fermataAbove</subtype>", None).as_bytes()).unwrap();
     assert_eq!(geometry(&legacy), geometry(&modern));
     assert_eq!(geometry(&legacy), [(0, 480, 60)]);
     assert_eq!(tempos(&legacy), [(0, 500_000)]);
-    assert_eq!(tempos(&modern), [(0, 1_000_000), (479, 500_000)]);
+    assert_eq!(tempos(&modern), [(0, 500_000)]);
     assert_targets(&legacy, &[(0, 480, 60)], &[(0, 120.0)], 0);
-    assert_targets(&modern, &[(0, 480, 60)], &[(0, 60.0), (479, 120.0)], 0);
+    assert_targets(&modern, &[(0, 480, 60)], &[(0, 120.0)], 0);
 }
 
 #[test]
@@ -679,7 +679,7 @@ fn repeat_score(version: &str, backing: &str, bars: usize, hold_bar: usize) -> S
                 ""
             };
             let hold = if bar == hold_bar {
-                "<Fermata><subtype>fermataAbove</subtype></Fermata>"
+                "<Fermata><subtype>fermataAbove</subtype><timeStretch>2</timeStretch></Fermata>"
             } else {
                 ""
             };
@@ -758,9 +758,12 @@ fn native_four_repeat_groups_and_chains_qualify_without_copied_ir_or_clock_attac
             &[(0, 120.0), (start, 60.0), (start + 479, 120.0)],
             0,
         );
-        let legacy =
-            musescore::parse(repeat_score("3.02", &backing, 3 * size, 2 * size).as_bytes())
-                .unwrap();
+        let legacy = musescore::parse(
+            repeat_score("3.02", &backing, 3 * size, 2 * size)
+                .replace("<timeStretch>2</timeStretch>", "")
+                .as_bytes(),
+        )
+        .unwrap();
         assert_eq!(geometry(&legacy), geometry(&disabled));
         assert_eq!(
             tempos(&legacy),

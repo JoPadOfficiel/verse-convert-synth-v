@@ -1,0 +1,19 @@
+--- a/OpenUtau.Core/Util/PathManager.cs
++++ b/OpenUtau.Core/Util/PathManager.cs
+@@ -17,5 +17,16 @@
+     public class PathManager : SingletonBase<PathManager> {
+         public PathManager() {
++            // Test-host isolation only. Never include this patch in a local app build.
++            string testRoot = Environment.GetEnvironmentVariable("VERSE_OPENUTAU_TEST_ROOT");
++            if (!string.IsNullOrEmpty(testRoot)) {
++                RootPath = Path.GetFullPath(testRoot);
++                DataPath = Path.Combine(RootPath, "data");
++                CachePath = Path.Combine(RootPath, "cache");
++                HomePathIsAscii = true;
++                Directory.CreateDirectory(DataPath);
++                Directory.CreateDirectory(CachePath);
++                return;
++            }
+             RootPath = Path.GetDirectoryName(Assembly.GetEntryAssembly().Location);
+             if (OS.IsMacOS()) {
+                 string userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);

@@ -321,7 +321,7 @@ fn native_epsilon_scales_exactly_with_source_division() {
 }
 
 #[test]
-fn native_four_defaults_are_qualified_by_subtype() {
+fn native_four_implicit_symbols_do_not_invent_a_playback_stretch() {
     for (subtype, micros) in [
         (Some("fermataAbove"), 1_000_000),
         (Some("fermataBelow"), 1_000_000),
@@ -344,9 +344,19 @@ fn native_four_defaults_are_qualified_by_subtype() {
             ))],
         );
         let midi = parse_mscx(&xml).unwrap();
-        assert_eq!(tempos(&midi), [(0, micros), (479, 500_000)], "{subtype:?}");
+        assert!(tempos(&midi).is_empty(), "{subtype:?}");
+        both_targets(&midi, &[(0, 120.0)]);
+        let explicit = xml.replace(
+            "</Fermata>",
+            &format!(
+                "<timeStretch>{}</timeStretch></Fermata>",
+                f64::from(micros) / 500_000.0
+            ),
+        );
+        let stated = parse_mscx(&explicit).unwrap();
+        assert_eq!(tempos(&stated), [(0, micros), (479, 500_000)]);
         both_targets(
-            &midi,
+            &stated,
             &[(0, 60_000_000.0 / f64::from(micros)), (479, 120.0)],
         );
     }
@@ -709,6 +719,40 @@ fn simultaneous_one_is_maximum_but_disabled_mark_does_not_suppress_a_speedup() {
             ))],
         );
         assert_eq!(tempos(&parse_mscx(&xml).unwrap()), expected);
+    }
+}
+
+#[test]
+fn an_undefined_symbol_never_suppresses_an_explicit_speedup() {
+    for version in ["3.02", "4.50"] {
+        let xml = score(
+            version,
+            &[
+                measure(&format!(
+                    "{}{}",
+                    fermata("<timeStretch>0.5</timeStretch>"),
+                    chord("quarter", 60)
+                )),
+                measure(&format!(
+                    "{}{}",
+                    fermata("<subtype>fermataAbove</subtype>"),
+                    chord("quarter", 48)
+                )),
+            ],
+        );
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(tempos(&midi), [(0, 250_000), (479, 500_000)]);
+        both_targets(&midi, &[(0, 240.0), (479, 120.0)]);
+    }
+}
+
+#[test]
+fn an_implicit_fermata_retains_its_source_clock_boundary() {
+    for version in ["3.02", "4.50"] {
+        let xml=score(version,&[format!("<Measure><voice>{}{}<location><fractions>-3/4</fractions></location>{}</voice></Measure>",fermata("<timeStretch>2</timeStretch>"),chord("whole",60),fermata("<subtype>fermataAbove</subtype>"))]);
+        let midi = parse_mscx(&xml).unwrap();
+        assert_eq!(tempos(&midi), [(0, 1_000_000), (479, 500_000)]);
+        both_targets(&midi, &[(0, 60.0), (479, 120.0)]);
     }
 }
 

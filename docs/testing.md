@@ -91,10 +91,12 @@ listening remain separate evidence.
 
 ## Required quality gates
 
-Fermata rhythm regressions cover the legacy/modern defaults, explicit holds,
+Fermata rhythm regressions cover omitted-duration symbols, explicit numeric holds,
 score-global ownership, repeated occurrences, exact segment boundaries and
 both target tempo maps. Renderer preparation tests verify that the full-score
-reference and all isolated Part inputs use the same qualified legacy defaults.
+reference and all isolated Part inputs use the same explicit timing policy:
+omitted `timeStretch` is neutral, and positive authored numeric values remain
+authoritative. Symbols alone do not authorize derived slowdowns.
 The private real-renderer gate compares the vocal tempo map with independently
 exported MuseScore MIDI and retains a rendered WAV:
 
@@ -148,9 +150,60 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked
 These are the same core gates used by CI. `npm test` includes the rendered
 pronunciation regression and therefore needs Chrome or Chromium. The separate
 OpenUtau compatibility gate needs .NET SDK 10 and network access to fetch the
-exact pinned OpenUtau revision. Before applying the repository patch, the gate
+two allowlisted immutable OpenUtau revisions. Before applying the repository
+patch, the gate
 also asserts that native `UNote` YAML still exposes the per-note `phonemizer`
 override and that `UPart` resolves that override through `PhonemizerFactory`.
+The default full gate targets `3f213e8993ca792c3e6f8958c92ab27eae78eac5`
+(0.1.569). CI runs the full qualification gate for both that baseline and
+`ec7ba520583173c67aabfc5feab33390b4f720a4` (exact 0.1.571-beta):
+
+```sh
+bash scripts/test-openutau-clean-lyrics.sh --native-only \
+  --revision 3f213e8993ca792c3e6f8958c92ab27eae78eac5
+bash scripts/test-openutau-clean-lyrics.sh --native-only \
+  --revision ec7ba520583173c67aabfc5feab33390b4f720a4
+```
+
+`--native-only` does not run Cargo or synthesize with models. Its explicit
+synthetic input exercises native USTX 0.6 load/save/reload, distinct Part/voice
+ownership, French/English/Spanish/Portuguese per-note overrides and inline hints,
+continuation markers, declared expression descriptors, expression values and
+ordinary curves. The real native lyric command changes a word, saves/reloads it
+and undoes it while preserving both a single explicit tempo and an authored
+three-entry tempo map. TimeAxis values are checked at transition boundaries and
+against an independent piecewise clock expectation. The exact beta additionally
+round-trips supplied RPIT/PITO masked values and absent intervals, and verifies
+that old input without graphs retains native defaults without graph selection or
+invented automation. Nonempty user graph execution and acoustic playback are not
+qualified by this sidecar; no daily alpha revision is selected or tested.
+
+Only the two complete SHA values above are accepted; tags, branches, abbreviated
+hashes and arbitrary revisions fail before checkout. Caption patches are mapped
+per revision and checked before application. The beta uses its native xUnit v3
+4.0 / Microsoft.Testing.Platform invocation, while the baseline retains VSTest.
+A separate **test-host-only** path patch isolates native preferences, caches and
+data; never include that isolation patch in a distributed OpenUtau application.
+The sidecar requires Python 3 to check TRX outcomes and required test coverage;
+successful execution with missing or skipped selected cases fails qualification.
+
+For retained evidence, pass `--results /path/to/new-directory`. It retains TRX and
+`qualification.txt` with the exact consumer tree and test/patch blob hashes;
+existing directories are rejected. Hashes identify the disposable patch/test
+copies and snapshotted fixture inputs actually consumed. CI retains both
+consumer receipts as `openutau-qualification`, including available failure
+receipts. `--source-checkout /path/to/local/git-clone`
+fetches the selected immutable commit locally, ignoring checkout modifications.
+Neither option opens or changes the installed consumer or private projects.
+
+`--fixtures-only` runs the existing pronunciation lifecycle tests without Cargo
+when both `VERSE_OPENUTAU_EXACT_HINT_FIXTURE` (Verse-generated TSV) and
+`VERSE_OPENUTAU_PRONUNCIATION_FIXTURE` (Verse-generated USTX) already exist.
+The default full mode retains their existing Cargo generation and untrained
+timing scaffolds. These are separate from the model-free native sidecar; passing
+the latter does not establish DiffSinger acoustic quality or beta real-bank
+pronunciation.
+
 The CI
 environment uses Node 22, .NET 10, Rust 1.93.0, an immutable npm install, the
 locked Cargo dependency graph, and Ubuntu 22.04 native Tauri dependencies.

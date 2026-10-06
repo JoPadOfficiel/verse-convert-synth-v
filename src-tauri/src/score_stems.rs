@@ -103,12 +103,16 @@ impl ScoreStems {
     }
 
     /// Preserve qualified legacy playback defaults and drum templates in a
-    /// private MuseScore 4 render copy. The preserved source is never changed.
+    /// private MuseScore 3/4 render copy. The preserved source is never changed.
     pub fn prepare_for_renderer(&mut self, major: u32) -> Result<Vec<String>, String> {
-        if major != 4 {
+        if !matches!(major, 3 | 4) {
             return Ok(Vec::new());
         }
-        let (master, mut warnings) = prepare_drum_templates(&self.master)?;
+        let (master, mut warnings) = if major == 4 {
+            prepare_drum_templates(&self.master)?
+        } else {
+            (self.master.clone(), Vec::new())
+        };
         let (master, timing_warnings) = preserve_legacy_fermata_defaults(&master)?;
         warnings.extend(timing_warnings);
         if warnings.is_empty() {
@@ -242,8 +246,9 @@ fn too_large() -> String {
 /// its `drumset` template selects the Standard kit without replacing the map.
 /// MuseScore 3.6.2 Fermata::propertyDefault(TIME_STRETCH) is 1.0; MuseScore
 /// 4.7.5 uses subtype-dependent defaults, including 2.0 for a normal fermata.
-/// Make only the omitted legacy default explicit before the newer renderer
-/// imports it, so it cannot introduce a hold absent from the source playback.
+/// Pin only omitted durations to neutral playback in the private copy.
+/// Numerically authored durations remain source evidence. Version4 software
+/// defaults must not reintroduce timing that the vocal projection did not use.
 fn preserve_legacy_fermata_defaults(master: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
     let offset = usize::from(master.starts_with(&[0xef, 0xbb, 0xbf])) * 3;
     let xml = std::str::from_utf8(&master[offset..]).map_err(|e| e.to_string())?;
@@ -255,12 +260,11 @@ fn preserve_legacy_fermata_defaults(master: &[u8]) -> Result<(Vec<u8>, Vec<Strin
         },
     )
     .map_err(|e| e.to_string())?;
-    if document
+    let native_major = document
         .root_element()
         .attribute("version")
-        .and_then(|v| v.split('.').next())
-        != Some("3")
-    {
+        .and_then(|v| v.split('.').next());
+    if !matches!(native_major, Some("3" | "4")) {
         return Ok((master.to_vec(), Vec::new()));
     }
     let score = document
@@ -270,7 +274,10 @@ fn preserve_legacy_fermata_defaults(master: &[u8]) -> Result<(Vec<u8>, Vec<Strin
         .ok_or("SCORE_STEM_UNSILENCEABLE: MuseScore Score element not found")?;
     let active_explicit = score
         .descendants()
-        .filter(|n| n.has_tag_name("Fermata"))
+        .filter(|n| {
+            n.has_tag_name("Fermata")
+                && n.ancestors().find(|a| a.has_tag_name("Score")) == Some(score)
+        })
         .any(|mark| {
             !mark
                 .children()
@@ -282,41 +289,99 @@ fn preserve_legacy_fermata_defaults(master: &[u8]) -> Result<(Vec<u8>, Vec<Strin
                     .and_then(|v| v.trim().parse::<f64>().ok())
                     .is_some_and(|v| v.is_finite() && v > 0.0 && v != 1.0)
         });
-    if active_explicit {
+    if native_major == Some("3") && active_explicit {
         let plan = musescore::written_playback_plan(xml)?;
         if plan.has_implicit_gaps {
             return preserve_legacy_playback_map(master, &document, score, offset);
         }
     }
     let mut edits = Vec::new();
-    for node in score.descendants().filter(|n| n.has_tag_name("Fermata")) {
+    let mut omitted_marks = 0usize;
+    for node in score.descendants().filter(|n| {
+        n.has_tag_name("Fermata") && n.ancestors().find(|a| a.has_tag_name("Score")) == Some(score)
+    }) {
         if node.children().any(|n| n.has_tag_name("timeStretch")) {
             continue;
         }
+        omitted_marks += 1;
+        let mut plays = node.children().filter(|n| n.has_tag_name("play"));
+        let play = plays.next();
+        if plays.next().is_some() {
+            return Err("MUSESCORE_RENDER_PREPARATION_FAILED: duplicate fermata play".into());
+        }
+        if let Some(play) = play {
+            if play.children().any(|n| n.is_element())
+                || !matches!(play.text().map(str::trim), Some("0" | "1"))
+            {
+                return Err("MUSESCORE_RENDER_PREPARATION_FAILED: invalid fermata play".into());
+            }
+            if play.text().map(str::trim) == Some("1") {
+                let mut text_nodes = play.children().filter(|n| n.is_text());
+                let text = text_nodes
+                    .next()
+                    .ok_or("MUSESCORE_RENDER_PREPARATION_FAILED: missing fermata play text")?;
+                if text_nodes.next().is_some() {
+                    return Err(
+                        "MUSESCORE_RENDER_PREPARATION_FAILED: ambiguous fermata play text".into(),
+                    );
+                }
+                let range = text.range();
+                edits.push((range.start + offset, range.end + offset, b"0".to_vec()));
+            }
+        }
+        let disabled = if play.is_none() { "<play>0</play>" } else { "" };
         let range = node.range();
         if xml[range.clone()].ends_with("/>") {
+            let tag = xml[range.start + 1..range.end - 2]
+                .split_whitespace()
+                .next()
+                .ok_or("MUSESCORE_RENDER_PREPARATION_FAILED: missing fermata tag")?;
             edits.push((
                 range.end - 2 + offset,
                 range.end + offset,
-                b"><timeStretch>1</timeStretch></Fermata>".to_vec(),
+                format!("><timeStretch>1</timeStretch>{disabled}</{tag}>").into_bytes(),
             ));
         } else {
             let at = closing_tag_offset(xml, node)? + offset;
-            edits.push((at, at, b"<timeStretch>1</timeStretch>".to_vec()));
+            edits.push((
+                at,
+                at,
+                format!("<timeStretch>1</timeStretch>{disabled}").into_bytes(),
+            ));
         }
     }
     if edits.is_empty() {
         return Ok((master.to_vec(), Vec::new()));
     }
-    let count = edits.len();
-    let mut prepared = master.to_vec();
-    for (start, end, replacement) in edits.into_iter().rev() {
-        prepared.splice(start..end, replacement);
+    let count = omitted_marks;
+    edits.sort_by_key(|edit| edit.0);
+    let mut size = master.len();
+    let mut covered = 0;
+    for (start, end, replacement) in &edits {
+        if *start < covered || start > end || *end > master.len() {
+            return Err("MUSESCORE_RENDER_PREPARATION_FAILED: overlapping timing edits".into());
+        }
+        size = size
+            .checked_sub(end - start)
+            .and_then(|n| n.checked_add(replacement.len()))
+            .filter(|n| (*n as u64) <= MAX_MASTER_BYTES)
+            .ok_or_else(too_large)?;
+        covered = *end;
     }
-    if prepared.len() as u64 > MAX_MASTER_BYTES {
-        return Err(too_large());
+    let mut prepared = Vec::with_capacity(size);
+    let mut copied = 0;
+    for (start, end, replacement) in edits {
+        prepared.extend_from_slice(&master[copied..start]);
+        prepared.extend_from_slice(&replacement);
+        copied = end;
     }
-    Ok((prepared, vec![format!("[MUSESCORE_LEGACY_FERMATA_DEFAULT_PRESERVED] Preserved the source MuseScore 3 time stretch of 1 for {count} fermata marks in the private reference/stem render inputs; source notes and tempo are unchanged.")]))
+    prepared.extend_from_slice(&master[copied..]);
+    let warning = if native_major == Some("3") {
+        format!("[MUSESCORE_LEGACY_FERMATA_DEFAULT_PRESERVED] Preserved written timing by disabling undefined playback for {count} source MuseScore 3 fermata marks in the private reference/stem render inputs; source notes and tempo are unchanged.")
+    } else {
+        format!("[MUSESCORE_IMPLICIT_FERMATA_TIMING_PRESERVED] {count} fermata symbols without an explicit playback duration remain in source evidence. Their undefined playback is disabled only in private reference/stem inputs, preserving written tempo and note timing; explicit stretches are unchanged.")
+    };
+    Ok((prepared, vec![warning]))
 }
 
 /// Native 4 may subdivide implicit gaps absent from native 3 and shorten
@@ -363,11 +428,17 @@ fn preserve_legacy_playback_map(
     }
     let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
     for body in score.children().filter(|n| n.has_tag_name("Staff")) {
-        for node in body.descendants().filter(|n| n.has_tag_name("Tempo")) {
+        for node in body.descendants().filter(|n| {
+            n.has_tag_name("Tempo")
+                && n.ancestors().find(|a| a.has_tag_name("Score")) == Some(score)
+        }) {
             let range = node.range();
             edits.push((range.start + offset, range.end + offset, Vec::new()));
         }
-        for mark in body.descendants().filter(|n| n.has_tag_name("Fermata")) {
+        for mark in body.descendants().filter(|n| {
+            n.has_tag_name("Fermata")
+                && n.ancestors().find(|a| a.has_tag_name("Score")) == Some(score)
+        }) {
             if let Some(stretch) = mark.children().find(|n| n.has_tag_name("timeStretch")) {
                 let range = stretch.range();
                 edits.push((
@@ -928,7 +999,6 @@ mod tests {
                     master.clone()
                 };
                 let mut stems = ScoreStems::read(&original).unwrap();
-                assert!(stems.prepare_for_renderer(3).unwrap().is_empty());
                 assert_eq!(stems.render_container(), original);
                 let warnings = stems.prepare_for_renderer(4).unwrap();
                 assert_eq!(warnings.len(), 1);
@@ -942,7 +1012,7 @@ mod tests {
                 assert_eq!(
                     String::from_utf8(prepared[offset_for_bom(bom)..].to_vec())
                         .unwrap()
-                        .replace("<timeStretch>1</timeStretch>", ""),
+                        .replace("<timeStretch>1</timeStretch><play>0</play>", ""),
                     xml
                 );
                 for part in 0..stems.parts().len() {
@@ -983,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn authored_fermata_stretch_and_modern_defaults_are_not_replaced() {
+    fn authored_fermata_stretch_is_kept_and_implicit_modern_playback_is_neutral() {
         for version in ["4.0"] {
             for property in [
                 "<timeStretch>1.5</timeStretch>",
@@ -1006,8 +1076,117 @@ mod tests {
             1,
         );
         let mut stems = ScoreStems::read(xml.as_bytes()).unwrap();
-        assert!(stems.prepare_for_renderer(4).unwrap().is_empty());
-        assert_eq!(stems.render_container(), xml.as_bytes());
+        let warnings = stems.prepare_for_renderer(4).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("MUSESCORE_IMPLICIT_FERMATA_TIMING_PRESERVED"));
+        assert!(std::str::from_utf8(stems.render_container())
+            .unwrap()
+            .contains("<timeStretch>1</timeStretch>"));
+        assert_eq!(
+            stems.render_container(),
+            xml.replace(
+                "</Fermata>",
+                "<timeStretch>1</timeStretch><play>0</play></Fermata>"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn undefined_playback_is_disabled_without_suppressing_an_explicit_speedup() {
+        for version in ["3.02", "4.70"] {
+            for implicit in [
+                "<Fermata><subtype>fermataAbove</subtype><play>1</play></Fermata>",
+                "<Fermata><subtype>fermataAbove</subtype><play comment=\">\"> 1 </play></Fermata>",
+                "<m:Fermata xmlns:m=\"urn:test\"/>",
+            ] {
+                // The prefixed empty legacy symbol has no qualified native4 glyph.
+                let implicit = if version == "4.70" && implicit.contains("m:Fermata") {
+                    "<m:Fermata xmlns:m=\"urn:test\"><subtype>fermataAbove</subtype></m:Fermata>"
+                } else {
+                    implicit
+                };
+                let xml = format!("<museScore version=\"{version}\"><Score><Division>480</Division><Part><Staff id=\"1\"/><Instrument><instrumentId>voice.soprano</instrumentId></Instrument></Part><Staff id=\"1\"><Measure len=\"1/4\"><voice><Tempo><tempo>2</tempo></Tempo><Fermata><subtype>fermataAbove</subtype><timeStretch>0.5</timeStretch></Fermata>{implicit}<Chord><durationType>quarter</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>60</pitch></Note></Chord></voice></Measure></Staff></Score></museScore>");
+                let original = musescore::parse(xml.as_bytes()).unwrap();
+                let mut stems = ScoreStems::read(xml.as_bytes()).unwrap();
+                let warnings = stems.prepare_for_renderer(4).unwrap();
+                assert_eq!(warnings.len(), 1);
+                assert!(
+                    warnings[0].contains("1 "),
+                    "one implicit symbol, not edit count"
+                );
+                let prepared = std::str::from_utf8(stems.render_container()).unwrap();
+                assert!(prepared.contains("<timeStretch>0.5</timeStretch>"));
+                let doc = roxmltree::Document::parse(prepared).unwrap();
+                let marks: Vec<_> = doc
+                    .descendants()
+                    .filter(|n| n.tag_name().name() == "Fermata")
+                    .collect();
+                assert_eq!(marks.len(), 2);
+                assert_eq!(
+                    marks[1]
+                        .children()
+                        .find(|n| n.tag_name().name() == "play")
+                        .unwrap()
+                        .text(),
+                    Some("0")
+                );
+                let lowered = musescore::parse(prepared.as_bytes()).unwrap();
+                assert_eq!(original.tracks, lowered.tracks);
+                assert_eq!(
+                    ScoreStems::read(xml.as_bytes()).unwrap().render_container(),
+                    xml.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn master_only_timing_preparation_keeps_embedded_excerpts_byte_exact() {
+        let excerpt="<Score><Staff id=\"99\"><Measure><voice><Fermata><subtype>fermataAbove</subtype><play>invalid</play></Fermata></voice></Measure></Staff></Score>";
+        let xml = score(
+            "4.70",
+            PARTS,
+            &staves().replace(
+                "<Fermata/>",
+                "<Fermata><subtype>fermataAbove</subtype></Fermata>",
+            ),
+        )
+        .replace("</Score>", &format!("{excerpt}</Score>"));
+        let mut stems = ScoreStems::read(xml.as_bytes()).unwrap();
+        stems.prepare_for_renderer(4).unwrap();
+        let prepared = std::str::from_utf8(stems.render_container()).unwrap();
+        assert!(prepared.contains(excerpt));
+        assert!(prepared.contains("<timeStretch>1</timeStretch><play>0</play>"));
+    }
+
+    #[test]
+    fn both_renderer_versions_preserve_another_parts_explicit_speedup() {
+        let xml="<museScore version=\"3.02\"><Score><Division>480</Division><Part><Staff id=\"1\"/><Instrument><instrumentId>voice.soprano</instrumentId></Instrument></Part><Part><Staff id=\"2\"/><Instrument><instrumentId>keyboard.piano</instrumentId></Instrument></Part><Staff id=\"1\"><Measure len=\"1/4\"><voice><Tempo><tempo>2</tempo></Tempo><Fermata><timeStretch>0.5</timeStretch></Fermata><Chord><durationType>quarter</durationType><Lyrics><text>one</text></Lyrics><Note><pitch>60</pitch></Note></Chord></voice></Measure></Staff><Staff id=\"2\"><Measure len=\"1/4\"><voice><Fermata/><Chord><durationType>quarter</durationType><Note><pitch>48</pitch></Note></Chord></voice></Measure></Staff></Score></museScore>";
+        for major in [3, 4] {
+            let mut stems = ScoreStems::read(xml.as_bytes()).unwrap();
+            stems.prepare_for_renderer(major).unwrap();
+            let prepared = std::str::from_utf8(stems.render_container()).unwrap();
+            assert!(prepared.contains("<timeStretch>0.5</timeStretch>"));
+            assert!(prepared.contains("<timeStretch>1</timeStretch><play>0</play>"));
+            let midi = musescore::parse(prepared.as_bytes()).unwrap();
+            let tempos: BTreeMap<_, _> = midi
+                .tracks
+                .iter()
+                .flat_map(|t| &t.events)
+                .filter_map(|e| {
+                    if let crate::engine::midi::Kind::Tempo(v) = e.kind {
+                        Some((e.tick, v))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                tempos.into_iter().collect::<Vec<_>>(),
+                [(0, 250_000), (479, 500_000)]
+            );
+        }
     }
 
     #[test]
@@ -1079,7 +1258,7 @@ mod tests {
             String::from_utf8(prepared).unwrap(),
             xml.replace(
                 "<Fermata/>",
-                "<Fermata><timeStretch>1</timeStretch></Fermata>"
+                "<Fermata><timeStretch>1</timeStretch><play>0</play></Fermata>"
             )
         );
     }
