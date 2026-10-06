@@ -29,6 +29,47 @@ serialized word-level hint and cannot replace the input needed for syllable
 allocation. No voicebank dictionary, source note, or synthesis setting is
 changed by this patch.
 
+The bounded compatibility sidecar also qualifies exact 0.1.571-beta revision
+`ec7ba520583173c67aabfc5feab33390b4f720a4`. Its caption boundary is unchanged apart
+from the four-line source offset: `clean-note-labels-beta.patch` explicitly
+targets that revision. The CLI maps each complete SHA to its own caption patch;
+it never applies the baseline patch speculatively to a tag, branch or alpha.
+`NativeCompatibilityTest.cs` runs on both revisions, and
+`BetaCompatibilityTest.cs` is copied only into the exact beta checkout.
+
+The beta's primary source sets `Ustx.kUstxVersion` to `0.10`, introduces
+`UExpressionType.MaskedCurve`, and stores expression graphs in `UProject` with
+optional per-renderer defaults and track overrides. `UPart.AfterLoad` resolves
+ordinary curves through track/project descriptors and removes undeclared ones.
+Tests preserve declared input expressions, curves and explicit masked values;
+they do not treat unknown expressions as safely preserved, generate graph
+automation, render RPIT data, install banks or models, or change renderers.
+Missing graph libraries/defaults remain absent across native load/save/reload.
+No nonempty user graph evaluation or daily alpha compatibility is claimed.
+
+The gate applies `isolated-test-paths.patch` only to its disposable test host,
+before native preferences/cache initialization. This patch is **not** a consumer
+feature and must never be used in an application build. Native USTX Save still
+runs its normal code, including isolated preference writes. See
+[`docs/testing.md`](../../docs/testing.md) for immutable selection, model-free
+native mode, external Verse fixtures and retained TRX receipts.
+
+Full and fixtures-only receipts require the exact 43-case
+`NativePronunciationTest` inventory, including theory arguments, plus all native
+caption/compatibility cases: 65 total on the baseline and 67 on the beta.
+Missing, duplicated, substituted or skipped cases fail qualification. Recheck
+the validator without rebuilding either consumer using qualified full receipts:
+
+```sh
+python3 compat/openutau/test_receipt_validator.py \
+  --baseline-trx /path/to/baseline-full/native-compatibility.trx \
+  --beta-trx /path/to/beta-full/native-compatibility.trx
+```
+
+This exercises the production validator with `PYTHONOPTIMIZE=1`, including the
+regression where 23 pronunciation results are deleted while all formerly
+required minimum checks still match. It does not change the source receipts.
+
 ## Display behavior
 
 The helper follows the same bracket syntax as the native phonemizer. It retains
@@ -91,8 +132,9 @@ Changing an alias prefix alone cannot select the word language or translate phon
 The French tests use synthetic untrained duration graphs and verify native
 SetSinger/SetUp/Process and acoustic token consumption; they make no listening claim.
 
-The pinned 0.1.569 consumer supports USTX 0.9, while later 0.10 projects may
-contain `MaskedCurve`. Deserialization precedes the native version check, so this
+The pinned 0.1.569 consumer supports USTX 0.9; the exact qualified 0.1.571-beta
+supports 0.10 and `MaskedCurve`. Deserialization precedes the native version
+check, so opening a newer schema with the baseline
 can surface as `Exception during deserialization`. Application labels alone do
 not prove schema support. Preserve edited projects in new recovery copies and
 reject active or unexplained newer-schema values. Verify the exact consumer's

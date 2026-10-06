@@ -6959,7 +6959,10 @@ pub(crate) mod tests {
             let reference = master(&reference[0]);
             assert_eq!(
                 String::from_utf8(reference).unwrap(),
-                FERMATA_SCORE.replace("</Fermata>", "<timeStretch>1</timeStretch></Fermata>")
+                FERMATA_SCORE.replace(
+                    "</Fermata>",
+                    "<timeStretch>1</timeStretch><play>0</play></Fermata>"
+                )
             );
             for (index, (file, bytes)) in inputs.iter().enumerate() {
                 assert!(file.ends_with(&name[name.len() - 5..]), "{file}");
@@ -6969,9 +6972,17 @@ pub(crate) mod tests {
                     FERMATA_SCORE
                 );
                 let text = String::from_utf8(text).unwrap();
-                assert!(text.contains("<Fermata><subtype>fermataAbove</subtype><timeStretch>1</timeStretch></Fermata>"));
+                assert!(text.contains("<Fermata><subtype>fermataAbove</subtype><timeStretch>1</timeStretch><play>0</play></Fermata>"));
                 assert!(text.contains("<Breath><subtype>breathMark</subtype></Breath>"));
-                let silenced = text.matches("<play>0</play>").count();
+                let parsed = roxmltree::Document::parse(&text).unwrap();
+                let silenced = parsed
+                    .descendants()
+                    .filter(|n| {
+                        n.has_tag_name("Note")
+                            && n.children()
+                                .any(|c| c.has_tag_name("play") && c.text() == Some("0"))
+                    })
+                    .count();
                 // Each Part has two notes, so each stem silences the other two.
                 assert_eq!(silenced, 2);
                 if index == 0 {

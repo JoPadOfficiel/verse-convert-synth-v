@@ -762,10 +762,13 @@ below, it changes no other byte. Excerpts and every other container
 entry stay untouched. Tempo marks, fermatas, breaths and every other timing
 mark therefore stay in each stem exactly as in the reference mix, including
 when only some Parts write them. Rendering a Part on its own would lose that
-timing: a fermata written on one Part holds every Part. A MusicXML or MXL
-source is first converted by MuseScore to `.mscz`, which renders identically to
-the MusicXML itself, and is then silenced Part by Part. A native MuseScore
-score with nothing else audible is rendered from its own bytes.
+timing: an explicitly timed fermata on one Part holds every Part. Undefined
+fermata durations follow the written-timing policy below in both reference and
+stems. A MusicXML or MXL source is first converted by MuseScore to `.mscz`,
+then uses the same private written-timing preparation for reference and every
+isolated Part; raw importer-default playback is not claimed as source timing. A native MuseScore
+score with nothing else audible uses the same private timing preparation when
+required; its original bytes remain preserved unchanged.
 
 For MuseScore 4 only, a source-proven Standard drumset carrying a legacy
 `piano` template may use a private render copy with that single template ID
@@ -989,21 +992,40 @@ score out a second time, note for note, and doubled its sung syllables.
 
 ### Native fermata playback
 
-Native MuseScore 3 omitted fermata stretch means 1; MuseScore 4 uses its
-qualified subtype default (2 for a normal fermata). Explicit positive stretch
-and `play` declarations govern playback. Verse keeps every nominal note tick
-unchanged and projects the qualified hold through a score-global tempo map,
-including each repeated occurrence. Simultaneous marks use the longest
-declared stretch; the next score segment bounds the hold. Malformed or
-unrepresentable playback declarations produce `SOURCE_PLAYBACK_*` diagnostics.
+A fermata symbol states a musical hold but does not state its numerical playback
+length. MuseScore3 and4 choose different software defaults (normal native3 uses1,
+normal native4 uses2). Verse does not turn an omitted duration into a new numerical
+tempo change: the symbol remains byte-exact in the source, while the explicit
+written tempo and nominal note ticks stay unchanged. This prevents an ordinary
+3-to4 open/save from introducing55BPM where the score explicitly states110BPM.
+This is a deliberate source-timing policy, not a guess about the editor's history.
+Native4 symbol spelling and unsupported native versions still fail closed.
 
-When MuseScore 4 renders a legacy source, Verse makes the omitted legacy value
-explicit only in the private reference/stem inputs. Explicit legacy holds also
-use the source-native written tempo plan, preventing the newer renderer's gap
-decomposition from shortening them. Playback annotations live inside existing
-voices and never add notes or rests. The source bytes and explicit stretch
-values remain intact in preservation; lyrics, pitches, note geometry and the
-played tempo map are checked before rendering the private compatibility copy.
+Explicit positive `timeStretch` and `play` declarations retain their established
+source meaning. Qualified numeric holds/speedups use the score-global tempo map,
+including repeat occurrences; they never move nominal note ticks. Simultaneous
+marks use the longest stated stretch and the next qualified score segment bounds
+the hold. Malformed or unrepresentable declarations produce `SOURCE_PLAYBACK_*`.
+Do not remove explicit tempo changes or stretches to suppress visual label overlap.
+
+Private native3/4 reference/stem render inputs disable playback only for omitted
+fermata durations (with neutral1 stored for compatibility), including masters imported from MusicXML/MXL, so the renderer cannot
+reintroduce an unrequested default pause. Original archives, including notes, voices, lyrics and authored numeric values,
+remain untouched. Qualified legacy lowering may neutralize numeric properties
+only in a private copy while carrying their exact timing in tempo annotations. The stable
+`MUSESCORE_IMPLICIT_FERMATA_TIMING_PRESERVED` renderer diagnostic explains the
+native4 policy; the existing legacy default diagnostic remains stable for native3.
+Explicit legacy holds over implicit gaps still use the qualified source-native
+written tempo plan and exact annotations inside existing voices, without adding
+notes/rests. Unqualified native4 metrical gap decomposition with an active explicit
+hold remains refused rather than guessed.
+
+An already saved USTX can retain old numerical tempos independently of a later
+lyric edit or Verse update. A migrated4 source without its old3 reference cannot
+prove the provenance of missing numeric properties. Verse's omitted-duration rule
+preserves written timing and symbol evidence, not every interpretation another
+program assigns to an indefinite symbol. An explicit number in the current source
+remains authoritative.
 
 ### Native ties
 
