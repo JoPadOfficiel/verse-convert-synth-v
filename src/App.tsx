@@ -57,6 +57,7 @@ export default function App() {
   const [items, setItems] = useState<FileResult[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [showCorrections, setShowCorrections] = useState(false);
+  const [correctionsBusy, setCorrectionsBusy] = useState(false);
   const [outDir, setOutDir] = useState<string | undefined>(undefined);
   const [rendererPath, setRendererPathState] = useState<string | undefined>(
     storedRendererPath,
@@ -186,7 +187,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (showCorrections) {
+      setDragging(false);
+      return;
+    }
+    let current = true;
     const unlisten = getCurrentWebview().onDragDropEvent((event) => {
+      if (!current) return;
       const type = event.payload.type;
       if (type === "enter" || type === "over") setDragging(true);
       else if (type === "leave") setDragging(false);
@@ -195,10 +202,12 @@ export default function App() {
         void addPaths(event.payload.paths);
       }
     });
+    void unlisten.catch((error) => { if (current) setGlobalError(commandErrorMessage(error)); });
     return () => {
-      void unlisten.then((dispose) => dispose());
+      current = false;
+      void unlisten.then((dispose) => dispose()).catch(() => {});
     };
-  }, [addPaths]);
+  }, [addPaths, showCorrections]);
 
   async function onAdd() {
     try {
@@ -509,12 +518,12 @@ export default function App() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-1">
-          <Button variant="outline" disabled={busy} onClick={() => setShowCorrections((shown) => !shown)}>Pronunciation corrections</Button>
+          <Button variant="outline" disabled={busy || correctionsBusy} onClick={() => setShowCorrections((shown) => !shown)}>Pronunciation corrections</Button>
           <label className="mr-2 flex items-center gap-2 text-xs text-muted-foreground">
             Pronunciation
             <select
               aria-label="Pronunciation"
-              disabled={busy}
+              disabled={busy || correctionsBusy}
               value={pronunciationProfile}
               onChange={(event) => void changeTarget(exportTarget, event.target.value as PronunciationProfile)}
               className="max-w-56 rounded-md border bg-background px-2 py-1 text-foreground disabled:opacity-50"
@@ -554,7 +563,7 @@ export default function App() {
         </div>
       </header>
 
-      {showCorrections ? <ImportedCorrectionsReview onClose={() => setShowCorrections(false)} onReanalyse={reanalyseLoaded} hasLoadedSongs={items.length > 0} /> : showSettings ? (
+      {showCorrections ? <ImportedCorrectionsReview onClose={() => setShowCorrections(false)} onReanalyse={reanalyseLoaded} onBusyChange={setCorrectionsBusy} hasLoadedSongs={items.length > 0} /> : showSettings ? (
         <Settings
           outDir={outDir}
           setOutDir={setOutDir}

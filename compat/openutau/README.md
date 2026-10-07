@@ -54,9 +54,9 @@ runs its normal code, including isolated preference writes. See
 [`docs/testing.md`](../../docs/testing.md) for immutable selection, model-free
 native mode, external Verse fixtures and retained TRX receipts.
 
-Full and fixtures-only receipts require the exact 43-case
+Full and fixtures-only receipts require the exact 46-case
 `NativePronunciationTest` inventory, including theory arguments, plus all native
-caption/compatibility cases: 65 total on the baseline and 67 on the beta.
+caption/compatibility cases: 68 total on the baseline and 70 on the beta.
 Missing, duplicated, substituted or skipped cases fail qualification. Recheck
 the validator without rebuilding either consumer using qualified full receipts:
 
@@ -67,7 +67,7 @@ python3 compat/openutau/test_receipt_validator.py \
 ```
 
 This exercises the production validator with `PYTHONOPTIMIZE=1`, including the
-regression where 23 pronunciation results are deleted while all formerly
+regression where 26 pronunciation results are deleted while all formerly
 required minimum checks still match. It does not change the source receipts.
 
 ## Display behavior

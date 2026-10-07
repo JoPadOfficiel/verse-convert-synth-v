@@ -216,9 +216,14 @@ apostrophes in `rêves',` or `rêves’,` are punctuation; the internal
 apostrophe in `d'un` is retained. `un` receives `[fr/in]`; `d'un` includes
 `[fr/d fr/in]`. The raw word `in` is never substituted.
 Supported touching pairs include `tout au/à`, `est un`, selected plural
-determiners before `ami(s)`, `amours`, `enfant(s)`, `homme(s)`, and `un/mon/ton/son` before
-`ami` or `enfant`. Liaison is placed on the next attack, never across a rest,
-hold, source row, voice or repeat boundary. Existing spelling `tau` and manual
+determiners (including `ces`) before `ami(s)`, `amours`, `enfant(s)`, `homme(s)`
+or `yeux`, and `un/mon/ton/son` before `ami` or `enfant`. Liaison is placed on
+the next attack. A contiguous source-proven hold chain belonging to the preceding
+word can carry its boundary, as in held `tes` followed by `yeux`; every link must
+retain its owner, predecessor and source domain, or retain a complete written
+start/continue/stop lyric-extension chain in that domain. Bare hold markers, rests, source
+rows, voices, conflicting lyrics and repeat boundaries cannot authorize a liaison.
+Existing spelling `tau` and manual
 hints do not receive a second consonant. Ambiguous h and unknown vocabulary or
 layouts retain the original text with a source-linked diagnostic. The profile
 includes 104,943 community dictionary keys, indexed once and imported from a
@@ -1251,8 +1256,11 @@ for example `DiffSinger French Millefeuille Phonemizer`. The track phonemizer is
 fallback metadata. Reset stale manual phoneme aliases by right-clicking precisely
 on each alias label; timing handles reset timing instead. Then let OpenUtau
 regenerate the word or enter a complete, inventory-supported inline hint:
-`ciel[fr/s fr/y fr/ae fr/l]`, `yeux[fr/y fr/ee]`, or
+`ciel[fr/s fr/y fr/ae fr/l]`, standalone `yeux[fr/y fr/ee]`, or
 `blancs[fr/b fr/l fr/en]`. Keep source syllable `+` and held `+~` notes.
+In touching `tes yeux clairs`, the contextual hint is `yeux[fr/z fr/y fr/ee]`:
+the liaison z starts the next word, while the attested y/ee reading remains.
+No final z is added to `yeux` before `clairs`.
 The `en` in French `fr/en` names a French vowel. Replacing every `en/` prefix
 with `fr/` does not convert the underlying English phoneme alphabet.
 

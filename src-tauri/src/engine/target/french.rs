@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::OnceLock};
 
 use super::lexical as shared;
 use crate::engine::convert::{Diagnostic, DiagnosticSeverity};
-use crate::engine::midi::{Lyric, LyricState, Syllabic};
+use crate::engine::midi::{Lyric, LyricExtension, LyricState, Syllabic};
 use crate::engine::projection::{ProjectedLyric, ProjectedNote, PronunciationLanguage};
 use crate::engine::syllable::{preserve_bracketed_melismas, touches, SYLLABLE_HYPHENS};
 
@@ -820,7 +820,7 @@ fn previous_attack(notes: &[ProjectedNote], head: usize) -> Option<usize> {
     None
 }
 
-fn same_reading_domain(left: &ProjectedNote, right: &ProjectedNote) -> bool {
+fn same_source_domain(left: &ProjectedNote, right: &ProjectedNote) -> bool {
     let domain = |note: &ProjectedNote| {
         note.source_evidence
             .as_ref()
@@ -838,14 +838,117 @@ fn same_reading_domain(left: &ProjectedNote, right: &ProjectedNote) -> bool {
     };
     // Real provenance never borrows from another Part, voice or repeat pass.
     // Two absent origins are reserved for hand-built analysis fixtures.
-    same_lane(&left.lyric, &right.lyric)
-        && domain(left) == domain(right)
+    domain(left) == domain(right)
         && [left, right].iter().all(|n| {
             n.source_evidence
                 .as_ref()
                 .and_then(|e| e.origin.as_ref())
                 .is_none_or(|o| !o.lyric_conflict)
         })
+}
+
+fn same_reading_domain(left: &ProjectedNote, right: &ProjectedNote) -> bool {
+    same_lane(&left.lyric, &right.lyric) && same_source_domain(left, right)
+}
+
+/// A proven continuation may retain its original technical chord-member track.
+/// Only complete musical ownership can qualify that planner-authenticated move.
+fn same_moved_continuation_domain(left: &ProjectedNote, right: &ProjectedNote) -> bool {
+    let origins = [left, right].map(|note| {
+        note.source_evidence
+            .as_ref()
+            .and_then(|e| e.origin.as_ref())
+    });
+    let [Some(left), Some(right)] = origins else {
+        return false;
+    };
+    right.continuation.is_some()
+        && !left.lyric_conflict
+        && !right.lyric_conflict
+        && left.source.part_id.is_some()
+        && left.source.staff_id.is_some()
+        && left.source.voice.is_some()
+        && left.source.part_id == right.source.part_id
+        && left.source.staff_id == right.source.staff_id
+        && left.source.voice == right.source.voice
+        && left.source.occurrence == right.source.occurrence
+        && left.source.continuity.as_ref().map(|c| c.playback_segment)
+            == right.source.continuity.as_ref().map(|c| c.playback_segment)
+}
+
+/// Only an explicitly owned, touching hold chain can extend a word's boundary.
+/// Bare extension markers never authorize a liaison through unproven notes.
+fn liaison_contact(notes: &[ProjectedNote], tail: usize, next: usize) -> bool {
+    if tail >= next
+        || !same_reading_domain(&notes[tail], &notes[next])
+        || source(&notes[next].lyric).is_some_and(|s| s.line_break.is_some())
+    {
+        return false;
+    }
+    if next == tail + 1 {
+        return touches(&notes[tail], &notes[next]);
+    }
+    let Some(evidence) = &notes[tail].source_evidence else {
+        return false;
+    };
+    let Some(owner) = source(&notes[tail].lyric).map(|s| s.id.as_str()) else {
+        return false;
+    };
+    let mut predecessor = evidence.note_id.as_str();
+    let mut destination = None;
+    // Older source adapters retain explicit start/continue/stop lyric evidence
+    // instead of ContinuationOwner links. Require the complete written pair;
+    // an unmarked continuation is not enough to infer its word owner.
+    let written_chain = evidence.origin.is_some()
+        && source(&notes[tail].lyric).is_some_and(|s| s.extension == Some(LyricExtension::Start))
+        && (tail + 1..next).all(|index| {
+            same_lane(&notes[tail].lyric, &notes[index].lyric)
+                && source(&notes[index].lyric).is_some_and(|s| {
+                    s.state == LyricState::Continuation
+                        && s.extension
+                            == Some(if index + 1 == next {
+                                LyricExtension::Stop
+                            } else {
+                                LyricExtension::Continue
+                            })
+                })
+                || index + 1 < next && matches!(&notes[index].lyric, ProjectedLyric::Extension)
+        });
+    for index in tail + 1..next {
+        let note = &notes[index];
+        if !matches!(&note.lyric, ProjectedLyric::Extension)
+            && !matches!(&note.lyric, ProjectedLyric::Source(s) if s.state == LyricState::Continuation)
+        {
+            return false;
+        }
+        if !touches(&notes[index - 1], note)
+            || !(same_source_domain(&notes[tail], note)
+                || same_moved_continuation_domain(&notes[tail], note))
+            || source(&note.lyric).is_some_and(|s| s.line_break.is_some())
+        {
+            return false;
+        }
+        let Some(evidence) = &note.source_evidence else {
+            return false;
+        };
+        let Some(origin) = evidence.origin.as_ref() else {
+            return false;
+        };
+        if let Some(link) = &origin.continuation {
+            if link.predecessor_id != predecessor
+                || link.lyric_owner_id != owner
+                || link.destination_track_id.is_empty()
+                || destination.is_some_and(|track| track != link.destination_track_id)
+            {
+                return false;
+            }
+            destination = Some(link.destination_track_id.as_str());
+        } else if !written_chain {
+            return false;
+        }
+        predecessor = evidence.note_id.as_str();
+    }
+    touches(&notes[next - 1], &notes[next])
 }
 
 /// Adjacent complete words supply context, never the fragments being repaired.
@@ -1326,17 +1429,14 @@ fn apply_inner(
             ), &note_ids[index]));
         }
     }
-    // Liaison belongs to the next attack, never a trailing phoneme attached to
-    // the preceding vowel. Do not cross a hold, rest, row or manual hint.
+    // Liaison belongs to the next attack, never a trailing phone attached to the
+    // preceding vowel. Only source-proven same-word holds can bridge attacks.
     words.sort_by_key(|word| word.0);
     for pair in words.windows(2) {
         let (_, tail, left) = &pair[0];
         let (index, _, right) = &pair[1];
         let (tail, index) = (*tail, *index);
-        if tail + 1 != index
-            || !touches(&notes[tail], &notes[index])
-            || !same_lane(&notes[tail].lyric, &notes[index].lyric)
-        {
+        if !liaison_contact(notes, tail, index) {
             continue;
         }
         let Some(left_text) = text(&notes[tail].lyric) else {
@@ -1348,8 +1448,8 @@ fn apply_inner(
         let consonant = match (left.as_str(), right.as_str()) {
             ("tout", "au" | "à") | ("est", "un") => "fr/t",
             (
-                "mes" | "tes" | "ses" | "les" | "des" | "nos" | "vos",
-                "ami" | "amis" | "amours" | "enfant" | "enfants" | "homme" | "hommes",
+                "mes" | "tes" | "ses" | "les" | "des" | "nos" | "vos" | "ces",
+                "ami" | "amis" | "amours" | "enfant" | "enfants" | "homme" | "hommes" | "yeux",
             ) => "fr/z",
             ("un" | "mon" | "ton" | "son", "ami" | "enfant") => "fr/n",
             _ => continue,
@@ -1362,7 +1462,7 @@ fn apply_inner(
         }
         *phonemes = format!("{consonant} {phonemes}");
         diagnostics.push(diagnose(LIAISON, format!(
-            "French Millefeuille: {left} / {right} adds {consonant} on the next touching note in the same source lane."
+            "French Millefeuille: {left} / {right} adds {consonant} on the next touching attack in the same source lane, allowing only source-owned word continuations."
         ), &note_ids[index]));
     }
     for index in 0..notes.len() {
