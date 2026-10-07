@@ -5,6 +5,15 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.9.4](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.3...v0.9.4) (2026-10-07)
+
+
+### Bug Fixes
+
+* add edited USTX browse and drop import ([6fbf986](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/6fbf98676b416478a840c6018a286fd72f453d27))
+* preserve French liaison before yeux ([fef8790](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/fef879054f578d91373034354e182dc51eda17be))
+* simplify pronunciation correction steps ([384a8a7](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/384a8a7fdcf6f4055e197e68ae7172fe7b2d02af))
+
 ## [0.9.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.2...v0.9.3) (2026-10-06)
 
 
