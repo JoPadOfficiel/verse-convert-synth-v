@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.9.3](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.2...v0.9.3) (2026-10-06)
+
+
+### Bug Fixes
+
+* preserve explicit score timing across versions ([e1920f2](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/e1920f296f14bd58a4a7ac81e2ef031b2fd42b18))
+* preserve explicit score timing across versions ([a46364d](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/a46364d8b486b250c363817e656d7c9d710a6a95))
+
 ## [0.9.2](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.1...v0.9.2) (2026-10-05)
 
 
