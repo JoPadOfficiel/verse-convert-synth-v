@@ -203,8 +203,8 @@ try {
   if (!outcome.passed) {
     throw new Error(outcome.error ?? "Pronunciation browser regression failed");
   }
-  if (outcome.tests.length !== 51 || outcome.tests.some((test) => test.passed !== true) || outcome.reloads !== 6) {
-    throw new Error("Incomplete browser receipt: expected 51 passing cases and 6 reloads");
+  if (outcome.tests.length !== 58 || outcome.tests.some((test) => test.passed !== true) || outcome.reloads !== 6) {
+    throw new Error("Incomplete browser receipt: expected 58 passing cases and 6 reloads");
   }
 } catch (error) {
   testError = error;

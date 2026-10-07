@@ -4,7 +4,7 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import App from "../src/App";
 import { ThemeProvider } from "../src/components/theme-provider";
-import type { FileResult, PronunciationProfile } from "../src/lib/tauri";
+import type { FileResult, ImportedCorrection, PronunciationMemory, PronunciationProfile } from "../src/lib/tauri";
 import packageMetadata from "../package.json";
 import "../src/index.css";
 
@@ -16,6 +16,15 @@ type Progress = { index: number; restart: boolean; tests: TestResult[]; original
 let progress: Progress | null = JSON.parse(sessionStorage.getItem(runKey) ?? "null");
 let mode: "accept" | "reject" | "pending" = "accept";
 let finishPending: (() => void) | undefined;
+let correctedDialogPath: string | null = "/test/choir-edited.ustx";
+let comparisonMode: "accept" | "reject" | "pending" = "accept";
+let finishComparison: (() => void) | undefined;
+const callbacks = new Map<number, (event: unknown) => void>();
+const listeners = new Map<number, { event: string; handler: number }>();
+let listenerId = 0;
+let delayListenerCompletion = false;
+const pendingListenerCompletions: (() => void)[] = [];
+let comparisonProposals: ImportedCorrection[] = [];
 const nativeVersion = "7.8.9-native-test";
 let versionMode: "accept" | "reject" | "pending" = "accept";
 const pendingVersions: { resolve: (version: string) => void; reject: (error: Error) => void }[] = [];
@@ -51,8 +60,8 @@ Object.assign(window, {
   __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener() {} },
   __TAURI_INTERNALS__: {
     metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
-    transformCallback: (() => { let id = 0; return () => ++id; })(),
-    unregisterCallback() {},
+    transformCallback: (() => { let id = 0; return (callback: (event: unknown) => void) => { callbacks.set(++id, callback); return id; }; })(),
+    unregisterCallback(id: number) { callbacks.delete(id); },
     async invoke(command: string, payload: Record<string, unknown>) {
       calls.push({ command, payload });
       switch (command) {
@@ -60,7 +69,7 @@ Object.assign(window, {
           if (versionMode === "reject") throw new Error("Injected native version rejection");
           if (versionMode === "pending") return new Promise<string>((resolve, reject) => { pendingVersions.push({ resolve, reject }); });
           return nativeVersion;
-        case "pronunciation_memory": return {
+        case "pronunciation_memory": { const memory: PronunciationMemory = {
           baseline: "verse-lingua-lexical-context-v1", references: [{ id: "other-reference", exportSha256: "other-export-hash", sourceLabel: "Other score.mscz", exportLabel: "Other score.ustx", createdAtUnixSeconds: 1791190000 }, { id: "export-reference", exportSha256: "source-export-hash", sourceLabel: "Choir original.mscz", exportLabel: "Choir reviewed export.ustx", createdAtUnixSeconds: 1791190000 }],
           history: [{ status: "pending", correction: {
             id: "imported-correction", fingerprint: "fingerprint", scope: "compatible_context", voice: { singer: "Reviewed singer", inventory_sha256: "duration-and-acoustic-inventory", configuration_sha256: "voice-configuration" },
@@ -69,16 +78,26 @@ Object.assign(window, {
             after: { language: "fr", phonemizer: "DiffSinger French Millefeuille Phonemizer", lexical_reading: "ciel", phones: ["fr/s", "fr/y", "fr/ae", "fr/l"], alphabet: "millefeuille" },
             provenance: { source_sha256: "source-hash", export_sha256: "export-hash", corrected_sha256: "corrected-hash", confirmed_after_listening: true, symbol_validation: "unknown", policy: "verse-pronunciation-v1", observed_singer: "Observed singer only" },
           } }],
-        };
+        }; comparisonProposals = [{ ...memory.history[0].correction, id: "reviewed-correction", scope: "occurrence_only" }]; return memory; }
         case "pronunciation_set_status": return null;
+        case "pronunciation_confirm": return null;
+        case "pronunciation_compare":
+          if (comparisonMode === "reject") throw new Error("Injected comparison rejection");
+          if (comparisonMode === "pending") await new Promise<void>((resolve) => { finishComparison = resolve; });
+          return { reference_id: payload.referenceId, corrected_sha256: "edited-hash", proposals: comparisonProposals, diagnostics: [] };
         case "pronunciation_release_snapshots": return null;
-        case "plugin:event|listen": return calls.length;
-        case "plugin:event|unlisten": return null;
+        case "plugin:event|listen": {
+          const id = ++listenerId;
+          listeners.set(id, { event: payload.event as string, handler: payload.handler as number });
+          if (delayListenerCompletion && payload.event === "tauri://drag-leave") await new Promise<void>((resolve) => { pendingListenerCompletions.push(resolve); });
+          return id;
+        }
+        case "plugin:event|unlisten": listeners.delete(payload.eventId as number); return null;
         case "plugin:window|inner_size": return { width: 1000, height: 760 };
         case "plugin:window|scale_factor": return 1;
         case "renderer_status": return { state: "missing", configured: false, provider: null,
           version: null, fullScoreMix: false, message: "Browser test: native renderer is mocked." };
-        case "plugin:dialog|open": return ["/test/song.mscz"];
+        case "plugin:dialog|open": return (payload.options as { multiple: boolean }).multiple ? ["/test/song.mscz"] : correctedDialogPath;
         case "plugin:dialog|save": return "/test/export.ustx";
         case "pronunciation_export_svp": return "/test/export.ustx";
         case "pronunciation_convert_files":
@@ -110,6 +129,13 @@ async function click(text: string) {
   const element = button(text);
   check(!element.disabled, `Disabled button: ${text}`);
   await act(async () => { element.click(); });
+}
+async function drop(paths: string[]) {
+  await act(async () => {
+    for (const [id, listener] of [...listeners]) {
+      if (listener.event === "tauri://drag-drop") callbacks.get(listener.handler)?.({ id, event: listener.event, payload: { paths, position: { x: 100, y: 100 } } });
+    }
+  });
 }
 async function choose(profile: PronunciationProfile, select = header()) {
   check(!select.disabled, "Profile control must be enabled before a change");
@@ -360,9 +386,78 @@ async function run() {
     check(referenceSelector, "Named original references must be selectable");
     const named = [...referenceSelector.options].find((option) => option.textContent?.includes("Choir original.mscz") && option.textContent.includes("Choir reviewed export.ustx"));
     check(named && named.value === "export-reference", "Source and export names must identify the correct immutable reference");
+    const browseLabel = "Drop an edited .ustx file here, or click to browse";
+    check(!button(browseLabel).disabled && button("Compare corrected USTX copy").disabled, "An edited project must be loadable before choosing its original reference");
+    const comparisonsBeforeLoad = calls.filter((call) => call.command === "pronunciation_compare").length;
+    await click(browseLabel);
+    check(panel.textContent!.includes("Selected project: /test/choir-edited.ustx"), "Browsing must visibly select the edited USTX file");
+    check(button("Compare corrected USTX copy").disabled && calls.filter((call) => call.command === "pronunciation_compare").length === comparisonsBeforeLoad,
+      "File selection must neither compare without a reference nor write correction memory");
+    check(!calls.some((call) => call.command === "pronunciation_confirm"), "Loading a file must not save corrections");
+    record("Edited USTX browse works before reference selection without comparison or memory writes");
+    correctedDialogPath = null;
+    await click(browseLabel);
+    check(panel.textContent!.includes("/test/choir-edited.ustx"), "Cancelling browse must preserve the selected project");
+    record("Cancelling edited-project browse preserves selection");
     await act(async () => { referenceSelector.value = named.value; referenceSelector.dispatchEvent(new Event("change", { bubbles: true })); });
     check(referenceSelector.value === "export-reference" && !button("Compare corrected USTX copy").disabled, "Choosing a named reference must enable comparison for that exact ID");
     record("Human-readable source/export labels select the correct immutable reference");
+    await click("Compare corrected USTX copy");
+    check(last("pronunciation_compare").referenceId === "export-reference" && last("pronunciation_compare").correctedPath === "/test/choir-edited.ustx",
+      "Comparison must use the selected reference and previously loaded file");
+    const analysesBeforeDrop = calls.filter((call) => call.command === "pronunciation_convert_files").length;
+    await drop(["/test/replaced.USTX"]);
+    check(panel.textContent!.includes("Selected project: /test/replaced.USTX") && !panel.textContent!.includes("pronunciation changes available for review"),
+      "Native drop must replace the file and clear its old comparison");
+    check(calls.filter((call) => call.command === "pronunciation_convert_files").length === analysesBeforeDrop, "Correction-screen drops must never reach source conversion");
+    record("Native USTX drop selects a file and clears stale review without source conversion");
+    for (const paths of [["/test/source.mscz"], ["/test/one.ustx", "/test/two.ustx"], []]) {
+      await drop(paths);
+      check(panel.querySelector('[role="alert"]')?.textContent?.includes("Choose one edited OpenUtau .ustx project"), "Invalid drops must explain the required input");
+      check(panel.textContent!.includes("Selected project: /test/replaced.USTX"), "Invalid drops must preserve the last valid file");
+      check(calls.filter((call) => call.command === "pronunciation_convert_files").length === analysesBeforeDrop, "Invalid correction-screen drops must never trigger score conversion");
+    }
+    record("Invalid and multiple drops explain the error and preserve the selected USTX");
+    comparisonMode = "pending";
+    await click("Compare corrected USTX copy");
+    check(button(browseLabel).disabled && referenceSelector.disabled && finishComparison, "Pending comparison must disable both inputs");
+    check(button("Pronunciation corrections").disabled && header().disabled, "Header must not close or change the profile during correction operations");
+    await drop(["/test/ignored.ustx"]);
+    check(panel.textContent!.includes("Selected project: /test/replaced.USTX"), "Busy comparison must ignore replacement drops");
+    comparisonMode = "accept";
+    await act(async () => { finishComparison!(); });
+    check(!button(browseLabel).disabled, "Comparison completion must restore file loading");
+    await act(async () => { referenceSelector.value = "other-reference"; referenceSelector.dispatchEvent(new Event("change", { bubbles: true })); });
+    check(!panel.textContent!.includes("pronunciation changes available for review"), "Changing the original reference must clear stale comparison");
+    comparisonMode = "reject";
+    await click("Compare corrected USTX copy");
+    check(panel.querySelector('[role="alert"]')?.textContent?.includes("Injected comparison rejection") && !button(browseLabel).disabled,
+      "Failed comparisons must display the error and allow another file");
+    comparisonMode = "accept";
+    record("Busy and failed comparisons preserve inputs and reference changes clear stale review");
+    const selectReviewedCorrection = async () => {
+      const inputs = [...panel.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
+      const proposal = inputs.find((input) => input.closest("label")?.textContent?.includes("ciel"));
+      const listening = inputs.find((input) => input.closest("label")?.textContent?.includes("I listened with the assigned voices"));
+      check(proposal && listening && !proposal.checked && !listening.checked && button("Save confirmed corrections").disabled,
+        "A new comparison must require fresh selection and listening confirmation");
+      await act(async () => { proposal.click(); listening.click(); });
+      check(!button("Save confirmed corrections").disabled, "Explicit selection and listening must enable saving");
+    };
+    await click("Compare corrected USTX copy");
+    await selectReviewedCorrection();
+    await drop(["/test/final-edited.ustx"]);
+    await click("Compare corrected USTX copy");
+    await selectReviewedCorrection();
+    await act(async () => { referenceSelector.value = "export-reference"; referenceSelector.dispatchEvent(new Event("change", { bubbles: true })); });
+    await click("Compare corrected USTX copy");
+    await selectReviewedCorrection();
+    await click("Save confirmed corrections");
+    const confirmation = last("pronunciation_confirm");
+    check(confirmation.referenceId === "export-reference" && confirmation.correctedPath === "/test/final-edited.ustx" &&
+      JSON.stringify(confirmation.selections) === JSON.stringify([{ correction_id: "reviewed-correction", scope: "occurrence_only", listened: true }]),
+      "Confirmation must bind only freshly selected/listened corrections to the current inputs");
+    record("Replacing file or reference resets selection and listening before exact confirmation");
     check(panel.textContent!.includes("en/s en/iy en/l") && panel.textContent!.includes("fr/s fr/y fr/ae fr/l"), "Before/after phone readings must be visible");
     check(panel.textContent!.includes("le [ciel] bleu") && panel.textContent!.includes("occurrence 3"), "Context and original occurrence must be reviewable");
     record("Imported correction exposes readings, phones, context and ownership");
@@ -383,6 +478,22 @@ async function run() {
     check(calls.filter((c) => c.command === "pronunciation_convert_files").length === previousAnalyses + 1, "Reviewed memory must be reanalysable with loaded source paths");
     check(calls.some((c) => c.command === "pronunciation_release_snapshots"), "Reanalysis must release retired snapshots to recover quota");
     record("Explicit imported-record listening confirmation reaches native activation");
+    await click("Close");
+    const analysesAfterClose = calls.filter((call) => call.command === "pronunciation_convert_files").length;
+    await drop(["/test/song.mscz"]);
+    check(calls.filter((call) => call.command === "pronunciation_convert_files").length === analysesAfterClose + 1, "Closing corrections must restore exactly one source-drop handler");
+    await act(async () => { root.render(null); });
+    delayListenerCompletion = true;
+    await mount();
+    check(pendingListenerCompletions.length > 0, "Delayed listener regression must leave native registration unresolved");
+    delayListenerCompletion = false;
+    await click("Pronunciation corrections");
+    const analysesBeforeDelayedDrop = calls.filter((call) => call.command === "pronunciation_convert_files").length;
+    await drop(["/test/source.mscz"]);
+    check(calls.filter((call) => call.command === "pronunciation_convert_files").length === analysesBeforeDelayedDrop,
+      "Retired App callbacks must ignore drops even before their native registration completes");
+    await act(async () => { for (const resolve of pendingListenerCompletions.splice(0)) resolve(); });
+    record("Source drops resume once after close and retired delayed listeners cannot convert");
     const result = { passed: true, tests: progress.tests, userAgent: navigator.userAgent,
       boundary: "Real browser, React StrictMode, App, Settings, storage and Tauri adapter; native IPC mocked", reloads: profiles.length };
     const response = await fetch("/__pronunciation-results", { method: "POST", body: JSON.stringify(result) });

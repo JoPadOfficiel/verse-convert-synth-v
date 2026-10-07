@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { UploadIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import { commandErrorMessage, comparePronunciation, confirmPronunciation, exchangePronunciation, getPronunciationMemory, pickCorrectedProject, pickCorrectionExchange, setCorrectionStatus, type CorrectionsReview, type PronunciationMemory } from "@/lib/tauri";
 
-export function ImportedCorrectionsReview({ onClose, onReanalyse, hasLoadedSongs }: { onClose: () => void; onReanalyse: () => Promise<void>; hasLoadedSongs: boolean }) {
+export function ImportedCorrectionsReview({ onClose, onReanalyse, onBusyChange, hasLoadedSongs }: { onClose: () => void; onReanalyse: () => Promise<void>; onBusyChange: (busy: boolean) => void; hasLoadedSongs: boolean }) {
   const [memory, setMemory] = useState<PronunciationMemory>();
   const [reference, setReference] = useState("");
   const [correctedPath, setCorrectedPath] = useState("");
@@ -11,19 +13,54 @@ export function ImportedCorrectionsReview({ onClose, onReanalyse, hasLoadedSongs
   const [listened, setListened] = useState(false);
   const [importListened, setImportListened] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string>();
   const refresh = async () => setMemory(await getPronunciationMemory());
   useEffect(() => { let current = true; void getPronunciationMemory().then((value) => { if (current) setMemory(value); }).catch((e) => { if (current) setError(commandErrorMessage(e)); }); return () => { current = false; }; }, []);
-  const run = async (action: () => Promise<void>) => { if (busy) return; setBusy(true); setError(undefined); try { await action(); } catch (e) { setError(commandErrorMessage(e)); } finally { setBusy(false); } };
-  const resetReview = () => { setReview(undefined); setSelected({}); setListened(false); };
+  const run = async (action: () => Promise<void>) => { if (busyRef.current) return; busyRef.current = true; setBusy(true); onBusyChange(true); setError(undefined); try { await action(); } catch (e) { setError(commandErrorMessage(e)); } finally { busyRef.current = false; setBusy(false); onBusyChange(false); } };
+  const resetReview = useCallback(() => { setReview(undefined); setSelected({}); setListened(false); }, []);
+  const loadCorrectedPaths = useCallback((paths: string[]) => {
+    if (paths.length !== 1 || !/\.ustx$/i.test(paths[0])) {
+      setError("Choose one edited OpenUtau .ustx project. Scores and corrections JSON use separate import actions.");
+      return;
+    }
+    resetReview();
+    setCorrectedPath(paths[0]);
+    setError(undefined);
+  }, [resetReview]);
+  useEffect(() => {
+    let current = true;
+    const unlisten = getCurrentWebview().onDragDropEvent((event) => {
+      if (!current) return;
+      const type = event.payload.type;
+      if (type === "leave" || type === "drop") setDragging(false);
+      if (busyRef.current) return;
+      if (type === "enter" || type === "over") setDragging(true);
+      else if (type === "drop") loadCorrectedPaths(event.payload.paths);
+    });
+    void unlisten.catch((e) => { if (current) setError(commandErrorMessage(e)); });
+    return () => { current = false; void unlisten.then((dispose) => dispose()).catch(() => {}); };
+  }, [loadCorrectedPaths]);
   return <section aria-label="Pronunciation correction memory" className="min-h-0 overflow-auto rounded-lg border p-4">
     <div className="flex items-center justify-between gap-3"><h2 className="text-lg font-semibold">Pronunciation corrections</h2><Button variant="outline" disabled={busy} onClick={onClose}>Close</Button></div>
     <p className="mt-2 text-sm text-muted-foreground">Assign voices, listen and edit in OpenUtau. Compare a corrected copy here, then confirm only the corrections you heard. Pitch, timing and mix edits are excluded.</p>
     {memory && <p className="mt-2 text-xs text-muted-foreground">Baseline: {memory.baseline}.</p>}
     {error && <p role="alert" className="mt-3 text-sm text-destructive">{error}</p>}
     <Button className="mt-3" variant="outline" disabled={busy || !hasLoadedSongs} onClick={() => void run(onReanalyse)}>Reanalyse loaded songs</Button>
+    <div className="mt-4">
+      <h3 className="font-medium">Edited OpenUtau project</h3>
+      <button type="button" disabled={busy} onClick={() => void run(async () => { const path = await pickCorrectedProject(); if (path) loadCorrectedPaths([path]); })}
+        className={"mt-2 flex w-full flex-col items-center gap-2 rounded-xl border-2 border-dashed bg-card px-4 py-6 text-center transition-colors disabled:cursor-not-allowed disabled:opacity-50 " + (dragging ? "border-ring bg-accent" : "border-input hover:border-ring")}>
+        <UploadIcon className="size-6 text-muted-foreground" aria-hidden="true" />
+        <span className="font-medium">Drop an edited .ustx file here, or click to browse</span>
+        <span className="text-sm text-muted-foreground">Choose the copy saved in OpenUtau after your edits.</span>
+      </button>
+      {correctedPath && <p role="status" className="mt-2 break-all text-sm">Selected project: {correctedPath}</p>}
+    </div>
     <label className="mt-4 block text-sm">Original export reference<select aria-label="Original export reference" className="mt-1 block w-full rounded border bg-background p-2" value={reference} disabled={busy} onChange={(e) => { setReference(e.target.value); resetReview(); }}><option value="">Select an immutable saved export</option>{memory?.references.map((item) => <option key={item.id} value={item.id}>{item.sourceLabel ?? "Unknown source"} · {item.exportLabel ?? "Unknown export"} · {item.createdAtUnixSeconds ? new Date(item.createdAtUnixSeconds * 1000).toLocaleString() : "Creation time unknown"} · {item.exportSha256.slice(0, 12)}</option>)}</select></label>
-    <div className="mt-3 flex flex-wrap gap-2"><Button disabled={busy || !reference} onClick={() => void run(async () => { const path = await pickCorrectedProject(); if (!path) return; resetReview(); setCorrectedPath(path); setReview(await comparePronunciation(reference, path)); })}>Compare corrected USTX copy</Button><Button variant="outline" disabled={busy} onClick={() => void run(async () => { const path = await pickCorrectionExchange(true); if (path) { await exchangePronunciation(path, true); await refresh(); } })}>Import corrections JSON</Button><Button variant="outline" disabled={busy} onClick={() => void run(async () => { const path = await pickCorrectionExchange(false); if (path) await exchangePronunciation(path, false); })}>Export confirmed corrections JSON</Button></div>
+    <p className="mt-2 text-xs text-muted-foreground">{memory?.references.length === 0 ? "Export an OpenUtau project from Verse first to create an original reference, then compare your edited copy here." : "Load your edited file and select the Verse export it came from, then compare. Only corrections you confirm after listening are saved to memory."}</p>
+    <div className="mt-3 flex flex-wrap gap-2"><Button disabled={busy || !reference || !correctedPath} onClick={() => void run(async () => { resetReview(); setReview(await comparePronunciation(reference, correctedPath)); })}>Compare corrected USTX copy</Button><Button variant="outline" disabled={busy} onClick={() => void run(async () => { const path = await pickCorrectionExchange(true); if (path) { await exchangePronunciation(path, true); await refresh(); } })}>Import corrections JSON</Button><Button variant="outline" disabled={busy} onClick={() => void run(async () => { const path = await pickCorrectionExchange(false); if (path) await exchangePronunciation(path, false); })}>Export confirmed corrections JSON</Button></div>
     {review && <div className="mt-4">
       <p className="text-sm">{review.proposals.length} pronunciation changes available for review.</p>
       {review.diagnostics.length > 0 && <details className="mt-2 text-sm"><summary>Refused associations ({review.diagnostics.length})</summary><ul>{review.diagnostics.map((d, i) => <li key={i}>{d.code}: {d.message}</li>)}</ul></details>}
