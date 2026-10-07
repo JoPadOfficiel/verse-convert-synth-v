@@ -342,6 +342,7 @@ fn part_infos(topology: &SourceTopology, reports: &[TrackReport]) -> Vec<PartInf
         .collect()
 }
 
+#[cfg(test)]
 fn process_one(
     path: &str,
     write: bool,
@@ -350,6 +351,29 @@ fn process_one(
     overrides: Option<&HashMap<usize, bool>>,
     target: ExportTarget,
     pronunciation_profile: PronunciationProfile,
+) -> FileResult {
+    process_one_with_predictor(
+        path,
+        write,
+        out_dir,
+        language,
+        overrides,
+        target,
+        pronunciation_profile,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_one_with_predictor(
+    path: &str,
+    write: bool,
+    out_dir: Option<&str>,
+    language: &str,
+    overrides: Option<&HashMap<usize, bool>>,
+    target: ExportTarget,
+    pronunciation_profile: PronunciationProfile,
+    predictor: Option<&dyn engine::lectura::LiaisonPredictor>,
 ) -> FileResult {
     let name = Path::new(path)
         .file_name()
@@ -410,7 +434,14 @@ fn process_one(
     if let Err(e) = pronunciation::check_source(&data) {
         return err(name, &e.code, e.message);
     }
-    let r = convert_midi_with_profile(&midi, language, overrides, target, pronunciation_profile);
+    let r = engine::convert::convert_midi_with_predictor(
+        &midi,
+        language,
+        overrides,
+        target,
+        pronunciation_profile,
+        predictor,
+    );
     if let Err(e) = pronunciation::observe_projection(&r, target) {
         return err(name, &e.code, e.message);
     }

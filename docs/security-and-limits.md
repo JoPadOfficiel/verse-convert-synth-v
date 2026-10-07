@@ -2,9 +2,17 @@
 
 Verse treats imported scores, MIDI files, archive contents, output paths,
 MuseScore executables, renderer output, and generated bundle metadata as
-untrusted. Conversion is offline, but local files can still attempt path
+untrusted. Conversion is local-first, but local files can still attempt path
 traversal, decompression bombs, excessive allocation, process hangs, or
 inconsistent output substitution.
+
+The sole online conversion exception is French USTX liaison analysis through
+Lectura. Only complete French lyric tokens in guarded contiguous phrases are
+sent; no scores, audio, note metadata, source IDs or other-language text leave
+the application. Requests and responses are bounded, redirects and retries are
+disabled, and safe failure diagnostics retain local liaison rules. Provider
+content retention is unknown. Exports reuse the sealed analysis without remote
+calls. See the [French liaison exception](formats-and-fidelity.md#french-liaison-api-exception).
 
 The governing rule is **fail closed**: when Verse cannot prove ownership,
 timing, identity, or integrity, it preserves the source evidence where

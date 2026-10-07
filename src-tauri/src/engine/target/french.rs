@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::OnceLock};
 
 use super::lexical as shared;
 use crate::engine::convert::{Diagnostic, DiagnosticSeverity};
+use crate::engine::lectura::{Failure, Label, LiaisonPredictor, LOOKUP_FAILED, MAX_TOKENS};
 use crate::engine::midi::{Lyric, LyricExtension, LyricState, Syllabic};
 use crate::engine::projection::{ProjectedLyric, ProjectedNote, PronunciationLanguage};
 use crate::engine::syllable::{preserve_bracketed_melismas, touches, SYLLABLE_HYPHENS};
@@ -776,6 +777,11 @@ fn ends_phrase(text: &str) -> bool {
         .ends_with([',', '.', ';', ':', '!', '?', '…'])
 }
 
+fn phrase_break_before(text: &str) -> bool {
+    text.trim_start_matches(|c: char| c.is_whitespace() || "'’\"«“(".contains(c))
+        .starts_with([',', '.', ';', ':', '!', '?', '…'])
+}
+
 /// Next attack inside this source row, allowing only touching genuine holds.
 fn next_attack(notes: &[ProjectedNote], head: usize) -> Option<usize> {
     let mut index = head + 1;
@@ -1262,6 +1268,67 @@ pub(crate) fn contextual_readings(notes: &[ProjectedNote]) -> Vec<Vec<(usize, St
     result
 }
 
+/// Prepare the complete proven chronology before projecting chord members back.
+pub(crate) fn contextual_projection(
+    notes: &[ProjectedNote],
+    predictor: &dyn LiaisonPredictor,
+    authorized: &[Vec<(usize, String)>],
+    automatic: bool,
+) -> (Vec<(usize, String)>, Vec<Diagnostic>) {
+    let mut pronounced = notes.to_vec();
+    // Cross-member lookup may annotate complete standalone heads and only the
+    // multi-attack groups already authorized by the source chronology filter.
+    // Mask other fragments for lookup, not for their existing local rendering.
+    let allowed: std::collections::BTreeSet<_> =
+        authorized.iter().flatten().map(|(i, _)| *i).collect();
+    let forbidden: std::collections::BTreeSet<_> = contextual_readings(notes)
+        .into_iter()
+        .filter(|reading| {
+            !authorized.iter().any(|group| {
+                group
+                    .iter()
+                    .map(|(i, _)| i)
+                    .eq(reading.iter().map(|(i, _)| i))
+            })
+        })
+        .flatten()
+        .map(|(i, _)| i)
+        .collect();
+    let fragments = shared::fragments(notes);
+    for (index, note) in pronounced.iter_mut().enumerate() {
+        let standalone = source(&note.lyric)
+            .is_some_and(|s| matches!(s.syllabic, None | Some(Syllabic::Single)))
+            && !fragments[index];
+        if forbidden.contains(&index) || (!standalone && !allowed.contains(&index)) {
+            note.lyric = ProjectedLyric::Absent;
+        }
+    }
+    let diagnostics = apply_with_predictor(
+        &mut pronounced,
+        &vec![String::new(); notes.len()],
+        automatic,
+        Some(predictor),
+    );
+    let hints = pronounced
+        .iter()
+        .enumerate()
+        .filter_map(|(index, note)| {
+            if let ProjectedLyric::Pronounced { phonemes, .. } = &note.lyric {
+                Some((index, phonemes.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (
+        hints,
+        diagnostics
+            .into_iter()
+            .filter(|d| d.code == LOOKUP_FAILED)
+            .collect(),
+    )
+}
+
 pub(crate) fn apply_contextual_reading(
     note: &mut ProjectedNote,
     hint: &str,
@@ -1304,9 +1371,11 @@ fn apply_inner(
     notes: &mut [ProjectedNote],
     note_ids: &[String],
     automatic_recovery: bool,
+    predictor: Option<&dyn LiaisonPredictor>,
 ) -> Vec<Diagnostic> {
     assert_eq!(notes.len(), note_ids.len());
     preserve_bracketed_melismas(notes);
+    let source_notes = predictor.map(|_| notes.to_vec());
     let mut diagnostics = Vec::new();
     let mut changed = vec![false; notes.len()];
     let fragments = shared::fragments(notes);
@@ -1388,6 +1457,15 @@ fn apply_inner(
             }
         };
         let hint = audited_lexical(&key);
+        // Complete words without a renderable dictionary reading still provide
+        // source-owned phrase context. The provider never supplies their phones.
+        if predictor.is_some()
+            && hint
+                .as_ref()
+                .is_none_or(|h| shared::vowel_count(h) != members.len())
+        {
+            words.push((members[0], *members.last().unwrap(), key.clone()));
+        }
         if let Some(hint) = hint {
             if shared::vowel_count(&hint) == members.len() {
                 shared::pronounce_word(notes, &members, &key, &hint);
@@ -1424,6 +1502,13 @@ fn apply_inner(
                     continue;
                 }
             }
+            if predictor.is_some()
+                && !fragments[index]
+                && source(&notes[index].lyric)
+                    .is_some_and(|s| matches!(s.syllabic, None | Some(Syllabic::Single)))
+            {
+                words.push((index, index, key));
+            }
             diagnostics.push(diagnose(UNSUPPORTED, format!(
                 "French Millefeuille has no unambiguous reading compatible with the source syllable layout for lyric {:?} in this layout; text and attacks were retained.", text(&notes[index].lyric).unwrap_or_default()
             ), &note_ids[index]));
@@ -1432,7 +1517,16 @@ fn apply_inner(
     // Liaison belongs to the next attack, never a trailing phone attached to the
     // preceding vowel. Only source-proven same-word holds can bridge attacks.
     words.sort_by_key(|word| word.0);
-    for pair in words.windows(2) {
+    // A failed phrase keeps the local rules; valid `none` suppresses them.
+    let predicted = predict_phrases(
+        source_notes.as_deref().unwrap_or(notes),
+        &words,
+        predictor,
+        note_ids,
+        &mut diagnostics,
+        automatic_recovery,
+    );
+    for (pair_index, pair) in words.windows(2).enumerate() {
         let (_, tail, left) = &pair[0];
         let (index, _, right) = &pair[1];
         let (tail, index) = (*tail, *index);
@@ -1445,14 +1539,20 @@ fn apply_inner(
         if manual(left_text) || ends_phrase(left_text) {
             continue;
         }
-        let consonant = match (left.as_str(), right.as_str()) {
-            ("tout", "au" | "à") | ("est", "un") => "fr/t",
-            (
-                "mes" | "tes" | "ses" | "les" | "des" | "nos" | "vos" | "ces",
-                "ami" | "amis" | "amours" | "enfant" | "enfants" | "homme" | "hommes" | "yeux",
-            ) => "fr/z",
-            ("un" | "mon" | "ton" | "son", "ami" | "enfant") => "fr/n",
-            _ => continue,
+        let consonant = match predicted.get(&pair_index) {
+            Some(label) => match label.phone() {
+                Some(phone) => phone,
+                None => continue,
+            },
+            None => match (left.as_str(), right.as_str()) {
+                ("tout", "au" | "à") | ("est", "un") => "fr/t",
+                (
+                    "mes" | "tes" | "ses" | "les" | "des" | "nos" | "vos" | "ces",
+                    "ami" | "amis" | "amours" | "enfant" | "enfants" | "homme" | "hommes" | "yeux",
+                ) => "fr/z",
+                ("un" | "mon" | "ton" | "son", "ami" | "enfant") => "fr/n",
+                _ => continue,
+            },
         };
         let ProjectedLyric::Pronounced { phonemes, .. } = &mut notes[index].lyric else {
             continue;
@@ -1491,9 +1591,209 @@ fn apply_inner(
 /// Apply once to one source voice / repeat occurrence before default joining.
 /// Original source objects remain immutable. Running again adds nothing.
 pub fn apply(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
-    apply_inner(notes, note_ids, false)
+    apply_inner(notes, note_ids, false, None)
 }
 
-pub(crate) fn apply_automatic(notes: &mut [ProjectedNote], note_ids: &[String]) -> Vec<Diagnostic> {
-    apply_inner(notes, note_ids, true)
+/// Only callers preparing French USTX spans may supply a predictor.
+pub fn apply_with_predictor(
+    notes: &mut [ProjectedNote],
+    note_ids: &[String],
+    automatic_recovery: bool,
+    predictor: Option<&dyn LiaisonPredictor>,
+) -> Vec<Diagnostic> {
+    apply_inner(notes, note_ids, automatic_recovery, predictor)
+}
+
+fn predict_phrases(
+    notes: &[ProjectedNote],
+    words: &[(usize, usize, String)],
+    predictor: Option<&dyn LiaisonPredictor>,
+    note_ids: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
+    automatic: bool,
+) -> HashMap<usize, Label> {
+    let mut result = HashMap::new();
+    let Some(predictor) = predictor else {
+        return result;
+    };
+    // Dictionary/layout identities may repair pronunciation (blan -> blanc),
+    // but remote tokens must retain the actual source-owned spelling.
+    let fragments = shared::fragments(notes);
+    let tokens: Vec<Option<String>> = words
+        .iter()
+        .map(|(head, tail, word)| {
+            let attacks: Vec<_> = (*head..=*tail)
+                .filter(|&i| source_candidate(&notes[i].lyric).is_some())
+                .collect();
+            if attacks.first() != Some(head)
+                || attacks.last() != Some(tail)
+                || attacks
+                    .windows(2)
+                    .any(|p| !liaison_contact(notes, p[0], p[1]))
+            {
+                return None;
+            }
+            let token = if head == tail {
+                if fragments[*head]
+                    || source(&notes[*head].lyric)
+                        .is_none_or(|s| !matches!(s.syllabic, None | Some(Syllabic::Single)))
+                {
+                    return None;
+                }
+                source_candidate(&notes[*head].lyric)?
+            } else {
+                let layout = LAYOUTS.iter().any(|layout| {
+                    layout.word == word
+                        && layout_members(notes, *head, layout).as_ref() == Some(&attacks)
+                });
+                let complete = shared::words(notes)
+                    .iter()
+                    .any(|members| members == &attacks);
+                if !layout && !complete {
+                    return None;
+                }
+                let head_text = source_candidate(&notes[*head].lyric)?;
+                // A source-spelled complete head can include sung echoes such
+                // as blanc/an. Otherwise only the literal complete spelling is
+                // transferable; lookup repairs (suis/moi -> suis-moi) stay local.
+                if layout && head_text == *word {
+                    head_text
+                } else {
+                    attacks
+                        .iter()
+                        .filter_map(|&i| source_candidate(&notes[i].lyric))
+                        .collect()
+                }
+            };
+            if token.is_empty()
+                || !token
+                    .chars()
+                    .all(|c| c.is_alphabetic() || c == '\'' || SYLLABLE_HYPHENS.contains(&c))
+            {
+                return None;
+            }
+            // A reconstructed fragment concatenation must itself be an attested
+            // complete spelling, even when Automatic owns its source attacks.
+            if head != tail && !contains_automatic_lexeme(&token) {
+                return None;
+            }
+            let owned = attacks
+                .iter()
+                .all(|&i| notes[i].pronunciation_language == Some(PronunciationLanguage::French));
+            if automatic {
+                return owned.then_some(token);
+            }
+            let evidenced = contains_automatic_lexeme(&token)
+                || (head == tail && contextual_blan(notes, *head));
+            evidenced.then_some(token)
+        })
+        .collect();
+    let safe_word = |index: usize| {
+        let (head, tail, _) = &words[index];
+        tokens[index].is_some()
+            && (*head..=*tail).all(|i| {
+                same_source_domain(&notes[*head], &notes[i])
+                    && !text(&notes[i].lyric).is_some_and(manual)
+                    && (i == *head || touches(&notes[i - 1], &notes[i]))
+                    && (i == *head
+                        || source(&notes[i].lyric).is_none_or(|s| s.line_break.is_none()))
+                    && (i == *head || !text(&notes[i].lyric).is_some_and(phrase_break_before))
+                    && (i == *tail || !text(&notes[i].lyric).is_some_and(ends_phrase))
+            })
+    };
+    let connected = |left: &(usize, usize, String), right: &(usize, usize, String)| {
+        liaison_contact(notes, left.1, right.0)
+            && !text(&notes[right.0].lyric).is_some_and(phrase_break_before)
+            && !text(&notes[left.1].lyric).is_some_and(ends_phrase)
+            && (left.0..=left.1).all(|i| !text(&notes[i].lyric).is_some_and(ends_phrase))
+    };
+    let mut start = 0;
+    while start < words.len() {
+        if !safe_word(start) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < words.len() && safe_word(end) && connected(&words[end - 1], &words[end]) {
+            end += 1;
+        }
+        if end - start > MAX_TOKENS {
+            diagnostics.push(Diagnostic {
+                code: LOOKUP_FAILED.into(),
+                severity: DiagnosticSeverity::Warning,
+                message: Failure::Limit.message().into(),
+                source_id: Some(note_ids[words[start].0].clone()),
+            });
+            start = end;
+            continue;
+        }
+        // Explicit French is a rendering choice, not permission to transfer
+        // foreign text. Read-only local routing uses this guarded source phrase
+        // so shared French words retain their context. Automatic ownership is
+        // already authoritative and is never recomputed here.
+        let french = if automatic {
+            vec![true; end - start]
+        } else {
+            let first = words[start].0;
+            let last = words[end - 1].1;
+            let route =
+                crate::engine::language::route(&notes[first..=last], &note_ids[first..=last]);
+            words[start..end]
+                .iter()
+                .map(|(head, tail, _)| {
+                    (*head..=*tail)
+                        .filter(|&i| source_candidate(&notes[i].lyric).is_some())
+                        .all(|i| route.languages[i - first] == Some(PronunciationLanguage::French))
+                })
+                .collect()
+        };
+        let mut lookup_start = start;
+        while lookup_start < end {
+            if !french[lookup_start - start] {
+                lookup_start += 1;
+                continue;
+            }
+            let mut lookup_end = lookup_start + 1;
+            while lookup_end < end && french[lookup_end - start] {
+                lookup_end += 1;
+            }
+            if lookup_end - lookup_start >= 2 {
+                let labels = if crate::pronunciation::check_work().is_err() {
+                    Err(Failure::Unavailable)
+                } else {
+                    let phrase: Vec<_> = tokens[lookup_start..lookup_end]
+                        .iter()
+                        .map(|token| token.clone().unwrap())
+                        .collect();
+                    predictor.predict(&phrase).and_then(|labels| {
+                        if labels.len() == lookup_end - lookup_start {
+                            Ok(labels)
+                        } else {
+                            Err(Failure::InvalidResponse)
+                        }
+                    })
+                };
+                match labels {
+                    Ok(labels) => {
+                        for (offset, label) in labels
+                            .into_iter()
+                            .take(lookup_end - lookup_start - 1)
+                            .enumerate()
+                        {
+                            result.insert(lookup_start + offset, label);
+                        }
+                    }
+                    Err(error) => diagnostics.push(Diagnostic {
+                        code: LOOKUP_FAILED.into(),
+                        severity: DiagnosticSeverity::Warning,
+                        message: error.message().into(),
+                        source_id: Some(note_ids[words[lookup_start].0].clone()),
+                    }),
+                }
+            }
+            lookup_start = lookup_end;
+        }
+        start = end;
+    }
+    result
 }

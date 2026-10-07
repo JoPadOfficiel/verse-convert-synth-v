@@ -34,8 +34,11 @@ pub struct AppState {
     plans: Mutex<HashMap<String, Plan>>,
     active: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     next_operation: AtomicU64,
+    retained_limit: usize,
     #[cfg(test)]
     test_renderer: Option<Arc<dyn crate::renderer::AudioRenderer>>,
+    #[cfg(test)]
+    test_liaison: Option<Arc<dyn crate::engine::lectura::LiaisonPredictor>>,
 }
 struct Operation {
     state: Arc<AppState>,
@@ -56,8 +59,11 @@ impl AppState {
             plans: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
             next_operation: AtomicU64::new(0),
+            retained_limit: super::MAX_RETAINED_BYTES,
             #[cfg(test)]
             test_renderer: None,
+            #[cfg(test)]
+            test_liaison: None,
         }
     }
     fn operation(self: &Arc<Self>) -> Result<Operation, Error> {
@@ -92,6 +98,8 @@ impl AppState {
         for id in ids {
             plans.remove(id);
         }
+        super::OBSERVED_OUTCOME.with(|s| s.replace(None));
+        super::OBSERVED.with(|s| s.replace(None));
         Ok(())
     }
     fn publish_plan(
@@ -101,11 +109,16 @@ impl AppState {
         digest: String,
     ) -> Result<Arc<Snapshot>, Error> {
         snapshot.expected_projection_sha256 = Some(digest);
+        let retained = super::OBSERVED_OUTCOME.with(|s| s.take());
+        let outcome_identity = retained.as_ref().map(|r| &r.identity);
+        snapshot.retained_bytes = retained.as_ref().map_or(0, |r| r.bytes);
         snapshot.sealed = true;
         snapshot.id = hash(&serde_json::to_vec(&(
             &snapshot.id,
             &snapshot.expected_projection_sha256,
+            outcome_identity,
         ))?);
+        snapshot.analysis_outcome = retained.map(|r| r.value);
         let mut plans = self
             .plans
             .lock()
@@ -117,6 +130,17 @@ impl AppState {
             return Err(Error::new(
                 "PRONUNCIATION_SNAPSHOT_LIMIT",
                 "Release unused analyses before publishing another preview",
+            ));
+        }
+        let retained_bytes = plans
+            .values()
+            .try_fold(snapshot.retained_bytes, |bytes, plan| {
+                bytes.checked_add(plan.snapshot.retained_bytes)
+            });
+        if retained_bytes.is_none_or(|bytes| bytes > self.retained_limit) {
+            return Err(Error::new(
+                "PRONUNCIATION_SNAPSHOT_LIMIT",
+                "Retained analysis byte budget exceeded; release unused analyses",
             ));
         }
         let snapshot = Arc::new(snapshot);
@@ -263,6 +287,15 @@ fn file_error(path: &str, error: Error) -> FileResult {
         out: None,
     }
 }
+
+fn liaison_enabled(write: bool, target: ExportTarget, profile: PronunciationProfile) -> bool {
+    !write
+        && target == ExportTarget::Ustx
+        && matches!(
+            profile,
+            PronunciationProfile::FrenchMillefeuille | PronunciationProfile::Automatic
+        )
+}
 #[allow(clippy::too_many_arguments)]
 fn convert_batch(
     state: Arc<AppState>,
@@ -284,6 +317,26 @@ fn convert_batch(
     let operation = state.operation()?;
     let corrections = Memory::open(&state.root)?.trusted_snapshot()?;
     let mut results = Vec::new();
+    let use_liaison = liaison_enabled(
+        write,
+        export_target.unwrap_or_default(),
+        pronunciation_profile.unwrap_or_default(),
+    );
+    #[cfg(not(test))]
+    let lectura = use_liaison.then(crate::engine::lectura::Client::production);
+    #[cfg(not(test))]
+    let predictor = lectura
+        .as_ref()
+        .map(|c| c as &dyn crate::engine::lectura::LiaisonPredictor);
+    #[cfg(test)]
+    let predictor = use_liaison
+        .then_some(state.test_liaison.as_deref())
+        .flatten();
+    let budgeted = predictor
+        .map(|p| crate::engine::lectura::BudgetedPredictor::new(p, Duration::from_secs(8)));
+    let predictor = budgeted
+        .as_ref()
+        .map(|p| p as &dyn crate::engine::lectura::LiaisonPredictor);
     for path in paths {
         let ov = overrides.as_ref().and_then(|m| m.get(&path)).cloned();
         let signature =
@@ -313,7 +366,7 @@ fn convert_batch(
                         .filter_map(|(k, v)| k.parse().ok().map(|k| (k, v)))
                         .collect()
                 });
-                let mut result = crate::process_one(
+                let mut result = crate::process_one_with_predictor(
                     &path,
                     write,
                     out_dir.as_deref(),
@@ -321,6 +374,7 @@ fn convert_batch(
                     parsed.as_ref(),
                     export_target.unwrap_or_default(),
                     pronunciation_profile.unwrap_or_default(),
+                    predictor,
                 );
                 if !write && result.ok {
                     let (_, _, digest) = super::observed_projection().ok_or_else(|| {
@@ -688,6 +742,422 @@ mod tests {
         state.plans.lock().unwrap()[result.pronunciation_snapshot_id.as_ref().unwrap()]
             .snapshot
             .clone()
+    }
+
+    fn french_state() -> (PathBuf, Arc<AppState>, String, String) {
+        let result = state();
+        let xml = std::fs::read_to_string(&result.2).unwrap().replace("<text>hello</text>", "<text>tes</text>")
+            .replace("</measure>", "<note><pitch><step>D</step><octave>4</octave></pitch><duration>480</duration><lyric><text>yeux</text></lyric></note></measure>");
+        std::fs::write(&result.2, xml).unwrap();
+        result
+    }
+
+    #[test]
+    fn identical_native_bytes_keep_distinct_success_and_fallback_diagnostics_in_either_order() {
+        use crate::engine::lectura::{Failure, Label, LiaisonPredictor, LOOKUP_FAILED};
+        struct Switch(AtomicBool);
+        impl LiaisonPredictor for Switch {
+            fn predict(&self, words: &[String]) -> Result<Vec<Label>, Failure> {
+                assert_eq!(words, ["tes", "yeux"]);
+                if self.0.load(Ordering::Relaxed) {
+                    Err(Failure::Http)
+                } else {
+                    Ok(vec![Label::Lz, Label::None])
+                }
+            }
+        }
+        for failure_first in [false, true] {
+            let (root, mut state, path, signature) = french_state();
+            let predictor = Arc::new(Switch(AtomicBool::new(failure_first)));
+            Arc::get_mut(&mut state).unwrap().test_liaison = Some(predictor.clone());
+            let first = analysed(&state, &path);
+            predictor.0.store(!failure_first, Ordering::Relaxed);
+            let second = analysed(&state, &path);
+            assert_eq!(
+                first.expected_projection_sha256,
+                second.expected_projection_sha256
+            );
+            assert_ne!(first.id, second.id);
+            for (approved, failed) in [(&first, failure_first), (&second, !failure_first)] {
+                let exported = state
+                    .export_plan(
+                        Some(&approved.id),
+                        &path,
+                        &signature,
+                        Work::new(Duration::from_secs(30)),
+                    )
+                    .unwrap();
+                let outcome = exported.analysis_outcome.as_ref().unwrap();
+                assert_eq!(
+                    outcome
+                        .tracks
+                        .iter()
+                        .flat_map(|t| &t.warnings)
+                        .any(|d| d.code == LOOKUP_FAILED),
+                    failed
+                );
+            }
+            assert!(super::super::OBSERVED_OUTCOME.with(|s| s.borrow().is_none()));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn cached_engine_inputs_refuse_changed_ppq_and_overrides_and_hash_order_deterministically() {
+        use crate::engine::convert::convert_midi_with_snapshot;
+        let (root, state, path, _) = french_state();
+        let approved = analysed(&state, &path);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut midi = crate::parse_source_snapshot(&bytes, "xml").unwrap();
+        midi.ticks_per_beat = 479;
+        midi.time_base = crate::engine::midi::TimeBase::PulsesPerQuarter(479);
+        let changed = convert_midi_with_snapshot(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            PronunciationProfile::Automatic,
+            Some(&approved),
+        );
+        assert!(!changed.ok);
+        assert!(changed.svp.is_none());
+        assert!(changed
+            .source_warnings
+            .iter()
+            .any(|d| d.code == "PRONUNCIATION_SNAPSHOT_STALE"));
+        let midi = crate::parse_source_snapshot(&bytes, "xml").unwrap();
+        let changed = convert_midi_with_snapshot(
+            &midi,
+            "english",
+            Some(&HashMap::from([(0, false)])),
+            ExportTarget::Ustx,
+            PronunciationProfile::Automatic,
+            Some(&approved),
+        );
+        assert!(!changed.ok);
+        assert!(changed
+            .source_warnings
+            .iter()
+            .any(|d| d.code == "PRONUNCIATION_SNAPSHOT_STALE"));
+        with_snapshot(approved.clone(), || {
+            assert_eq!(
+                super::super::observe_projection(&changed, ExportTarget::Ustx)
+                    .unwrap_err()
+                    .code,
+                "PRONUNCIATION_SNAPSHOT_STALE"
+            )
+        });
+        let mut left = HashMap::new();
+        left.insert(0, true);
+        left.insert(1, false);
+        let mut right = HashMap::new();
+        right.insert(1, false);
+        right.insert(0, true);
+        let draft = Snapshot::baseline(super::super::hash(&bytes), vec![]).unwrap();
+        let a = convert_midi_with_snapshot(
+            &midi,
+            "english",
+            Some(&left),
+            ExportTarget::Ustx,
+            PronunciationProfile::Automatic,
+            Some(&draft),
+        );
+        let b = convert_midi_with_snapshot(
+            &midi,
+            "english",
+            Some(&right),
+            ExportTarget::Ustx,
+            PronunciationProfile::Automatic,
+            Some(&draft),
+        );
+        assert!(a.ok && b.ok);
+        assert_eq!(a.engine_inputs, b.engine_inputs);
+        let mut sealed = draft;
+        sealed.sealed = true;
+        sealed.analysis_outcome = Some(Arc::new(a));
+        assert!(
+            convert_midi_with_snapshot(
+                &midi,
+                "english",
+                Some(&right),
+                ExportTarget::Ustx,
+                PronunciationProfile::Automatic,
+                Some(&sealed)
+            )
+            .ok
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_byte_budget_and_release_drop_the_outcome_and_observer_reference() {
+        let (root, mut state, path, _) = french_state();
+        let approved = analysed(&state, &path);
+        assert!(approved.retained_bytes > 0);
+        Arc::get_mut(&mut state).unwrap().retained_limit = approved.retained_bytes;
+        let weak = Arc::downgrade(approved.analysis_outcome.as_ref().unwrap());
+        let second = root.join("second.xml").to_string_lossy().into_owned();
+        std::fs::copy(&path, &second).unwrap();
+        let denied = convert_batch(
+            state.clone(),
+            vec![second.clone()],
+            false,
+            None,
+            None,
+            None,
+            Some(ExportTarget::Ustx),
+            Some(PronunciationProfile::Automatic),
+            None,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(!denied.ok);
+        assert_eq!(denied.error.unwrap().code, "PRONUNCIATION_SNAPSHOT_LIMIT");
+        assert!(super::super::OBSERVED_OUTCOME.with(|s| s.borrow().is_none()));
+        let id = approved.id.clone();
+        drop(approved);
+        state.release(&[id]).unwrap();
+        assert!(weak.upgrade().is_none());
+        assert!(state.plans.lock().unwrap().is_empty());
+        assert!(super::super::observed_projection().is_none());
+        assert!(analysed(&state, &second).retained_bytes > 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_and_test_activation_share_every_profile_target_and_export_guard() {
+        use crate::engine::lectura::{Failure, Label, LiaisonPredictor};
+        struct Count(AtomicU64);
+        impl LiaisonPredictor for Count {
+            fn predict(&self, words: &[String]) -> Result<Vec<Label>, Failure> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![Label::None; words.len()])
+            }
+        }
+        let (root, mut state, path, _) = french_state();
+        let predictor = Arc::new(Count(AtomicU64::new(0)));
+        Arc::get_mut(&mut state).unwrap().test_liaison = Some(predictor.clone());
+        for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+            for profile in [
+                PronunciationProfile::Automatic,
+                PronunciationProfile::FrenchMillefeuille,
+                PronunciationProfile::Default,
+                PronunciationProfile::EnglishArpabet,
+                PronunciationProfile::SpanishDiffSinger,
+                PronunciationProfile::PortugueseDiffSinger,
+            ] {
+                let before = predictor.0.load(Ordering::Relaxed);
+                let analysis = convert_batch(
+                    state.clone(),
+                    vec![path.clone()],
+                    false,
+                    None,
+                    None,
+                    None,
+                    Some(target),
+                    Some(profile),
+                    None,
+                )
+                .unwrap()
+                .remove(0);
+                assert!(analysis.ok, "{:?}", analysis.msg);
+                let expected = target == ExportTarget::Ustx
+                    && matches!(
+                        profile,
+                        PronunciationProfile::Automatic | PronunciationProfile::FrenchMillefeuille
+                    );
+                assert_eq!(
+                    predictor.0.load(Ordering::Relaxed) - before,
+                    u64::from(expected)
+                );
+                assert_eq!(liaison_enabled(false, target, profile), expected);
+                assert!(!liaison_enabled(true, target, profile));
+                let directory = root.join(format!("{target:?}-{profile:?}"));
+                std::fs::create_dir(&directory).unwrap();
+                let after = predictor.0.load(Ordering::Relaxed);
+                let export = convert_batch(
+                    state.clone(),
+                    vec![path.clone()],
+                    true,
+                    Some(directory.to_string_lossy().into_owned()),
+                    None,
+                    None,
+                    Some(target),
+                    Some(profile),
+                    Some(HashMap::from([(
+                        path.clone(),
+                        analysis.pronunciation_snapshot_id.unwrap(),
+                    )])),
+                )
+                .unwrap()
+                .remove(0);
+                assert!(export.ok, "{:?}", export.msg);
+                assert_eq!(predictor.0.load(Ordering::Relaxed), after);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_service_is_looked_up_once_per_batch_and_all_files_keep_local_fallback() {
+        use crate::engine::lectura::{Failure, Label, LiaisonPredictor, LOOKUP_FAILED};
+        struct Unavailable(AtomicU64);
+        impl LiaisonPredictor for Unavailable {
+            fn predict(&self, _: &[String]) -> Result<Vec<Label>, Failure> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(Failure::Timeout)
+            }
+        }
+        let (root, mut state, path, _) = french_state();
+        let predictor = Arc::new(Unavailable(AtomicU64::new(0)));
+        Arc::get_mut(&mut state).unwrap().test_liaison = Some(predictor.clone());
+        let mut paths = vec![path.clone()];
+        for index in 1..3 {
+            let other = root
+                .join(format!("source-{index}.xml"))
+                .to_string_lossy()
+                .into_owned();
+            std::fs::copy(&path, &other).unwrap();
+            paths.push(other);
+        }
+        let results = convert_batch(
+            state.clone(),
+            paths,
+            false,
+            None,
+            None,
+            None,
+            Some(ExportTarget::Ustx),
+            Some(PronunciationProfile::FrenchMillefeuille),
+            None,
+        )
+        .unwrap();
+        assert_eq!(predictor.0.load(Ordering::Relaxed), 1);
+        for result in results {
+            assert!(result.ok, "{:?}", result.msg);
+            assert!(result
+                .tracks
+                .iter()
+                .flat_map(|t| &t.warnings)
+                .any(|d| d.code == LOOKUP_FAILED));
+            let cached = state.plans.lock().unwrap()
+                [result.pronunciation_snapshot_id.as_ref().unwrap()]
+            .snapshot
+            .analysis_outcome
+            .clone()
+            .unwrap();
+            let bytes = crate::engine::target::serialize_to(
+                ExportTarget::Ustx,
+                cached.svp.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("yeux[fr/z fr/y fr/ee]"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lectura_analysis_is_reused_by_direct_batch_and_bundle_exports() {
+        use crate::engine::lectura::{Failure, Label, LiaisonPredictor};
+        struct Count(AtomicU64);
+        impl LiaisonPredictor for Count {
+            fn predict(&self, words: &[String]) -> Result<Vec<Label>, Failure> {
+                assert_eq!(words, ["tes", "yeux"]);
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![Label::None; words.len()])
+            }
+        }
+        let (root, mut state, path, _) = state();
+        let predictor = Arc::new(Count(AtomicU64::new(0)));
+        Arc::get_mut(&mut state).unwrap().test_liaison = Some(predictor.clone());
+        std::fs::write(&path, b"<score-partwise><part-list><score-part id=\"P1\"><part-name>Voice</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\"><attributes><divisions>480</divisions></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>480</duration><lyric><text>tes</text></lyric></note><note><pitch><step>D</step><octave>4</octave></pitch><duration>480</duration><lyric><text>yeux</text></lyric></note></measure></part></score-partwise>").unwrap();
+        for profile in [
+            PronunciationProfile::Automatic,
+            PronunciationProfile::FrenchMillefeuille,
+        ] {
+            let analysis = convert_batch(
+                state.clone(),
+                vec![path.clone()],
+                false,
+                None,
+                None,
+                None,
+                Some(ExportTarget::Ustx),
+                Some(profile),
+                None,
+            )
+            .unwrap()
+            .remove(0);
+            assert!(analysis.ok, "{:?}", analysis.msg);
+            let id = analysis.pronunciation_snapshot_id.unwrap();
+            let approved = state.plans.lock().unwrap()[&id].snapshot.clone();
+            let expected = crate::engine::target::serialize_to(
+                ExportTarget::Ustx,
+                approved
+                    .analysis_outcome
+                    .as_ref()
+                    .unwrap()
+                    .svp
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(!String::from_utf8_lossy(&expected).contains("fr/z"));
+            let calls = predictor.0.load(Ordering::Relaxed);
+            let direct = root.join(format!("{profile:?}.ustx"));
+            export_vocals(
+                state.clone(),
+                path.clone(),
+                direct.to_string_lossy().into_owned(),
+                None,
+                None,
+                Some(ExportTarget::Ustx),
+                Some(profile),
+                Some(id.clone()),
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(direct).unwrap(), expected);
+            let out = root.join(format!("batch-{profile:?}"));
+            std::fs::create_dir(&out).unwrap();
+            let exported = convert_batch(
+                state.clone(),
+                vec![path.clone()],
+                true,
+                Some(out.to_string_lossy().into_owned()),
+                None,
+                None,
+                Some(ExportTarget::Ustx),
+                Some(profile),
+                Some(HashMap::from([(path.clone(), id.clone())])),
+            )
+            .unwrap()
+            .remove(0);
+            assert!(exported.ok, "{:?}", exported.msg);
+            assert_eq!(std::fs::read(exported.out.unwrap()).unwrap(), expected);
+            let bundle = export_bundle_service(
+                state.clone(),
+                path.clone(),
+                root.join(format!("bundle-{profile:?}.versebundle"))
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+                None,
+                None,
+                Some(ExportTarget::Ustx),
+                Some(profile),
+                Some(id),
+                tauri::ipc::Channel::new(|_| Ok(())),
+                Some(crate::bundle::tests::successful_renderer()),
+            )
+            .unwrap();
+            let native: serde_yaml::Value =
+                serde_yaml::from_slice(&std::fs::read(bundle.project_path).unwrap()).unwrap();
+            let direct: serde_yaml::Value = serde_yaml::from_slice(&expected).unwrap();
+            assert_eq!(native["voice_parts"], direct["voice_parts"]);
+            assert_eq!(predictor.0.load(Ordering::Relaxed), calls);
+        }
+        assert_eq!(predictor.0.load(Ordering::Relaxed), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     #[ignore = "requires VERSE_COMPLETE_SOURCE, VERSE_MUSESCORE_GATE and a new VERSE_COMPLETE_OUTPUT_DIR"]

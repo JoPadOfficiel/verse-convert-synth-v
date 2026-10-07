@@ -1,11 +1,512 @@
 //! Source-owned sung attacks, pronunciation policy, and musical invariants.
+use std::sync::Mutex;
 use verse_lib::engine::convert::{
     convert_midi_with_profile, convert_midi_with_target, ConvertOutcome,
 };
+use verse_lib::engine::lectura::{Failure, Label, LiaisonPredictor, LOOKUP_FAILED};
 use verse_lib::engine::midi::{Kind, Midi};
 use verse_lib::engine::projection::ProjectedLyric;
 use verse_lib::engine::target::{self, french, ustx, ExportTarget, PronunciationProfile};
 use verse_lib::engine::{musescore, musicxml};
+
+struct MockLiaison {
+    calls: Mutex<Vec<Vec<String>>>,
+    response: Result<Label, Failure>,
+}
+impl MockLiaison {
+    fn new(response: Result<Label, Failure>) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            response,
+        }
+    }
+}
+impl LiaisonPredictor for MockLiaison {
+    fn predict(&self, tokens: &[String]) -> Result<Vec<Label>, Failure> {
+        self.calls.lock().unwrap().push(tokens.to_vec());
+        self.response.map(|label| vec![label; tokens.len()])
+    }
+}
+
+fn predict(
+    notes: &mut [verse_lib::engine::projection::ProjectedNote],
+    predictor: &MockLiaison,
+) -> Vec<verse_lib::engine::convert::Diagnostic> {
+    french::apply_with_predictor(
+        notes,
+        &(0..notes.len())
+            .map(|i| format!("note-{i}"))
+            .collect::<Vec<_>>(),
+        false,
+        Some(predictor),
+    )
+}
+
+#[test]
+fn lectura_labels_keep_base_phones_and_none_overrides_local_pairs() {
+    for (label, phone) in [
+        (Label::Lz, "fr/z"),
+        (Label::Lt, "fr/t"),
+        (Label::Ln, "fr/n"),
+        (Label::Lr, "fr/r"),
+        (Label::Lp, "fr/p"),
+    ] {
+        let mut notes = direct_notes(&["tes", "yeux"]);
+        let original = notes.clone();
+        let predictor = MockLiaison::new(Ok(label));
+        predict(&mut notes, &predictor);
+        assert_eq!(
+            phones(&notes[1]),
+            Some(format!("{phone} fr/y fr/ee").as_str())
+        );
+        assert_eq!(*predictor.calls.lock().unwrap(), vec![vec!["tes", "yeux"]]);
+        predict(&mut notes, &predictor);
+        assert_eq!(
+            phones(&notes[1]),
+            Some(format!("{phone} fr/y fr/ee").as_str())
+        );
+        assert_eq!(predictor.calls.lock().unwrap().len(), 1);
+        for (before, after) in original.iter().zip(&notes) {
+            assert_eq!(
+                (before.onset_ticks, before.duration_ticks, before.pitch),
+                (after.onset_ticks, after.duration_ticks, after.pitch)
+            );
+            if let ProjectedLyric::Pronounced { source, .. } = &after.lyric {
+                assert_eq!(ProjectedLyric::Source(source.clone()), before.lyric);
+            }
+        }
+    }
+    for pair in [["tes", "yeux"], ["et", "un"], ["des", "héros"]] {
+        let mut notes = direct_notes(&pair);
+        let predictor = MockLiaison::new(Ok(Label::None));
+        let diagnostics = predict(&mut notes, &predictor);
+        assert!(!diagnostics.iter().any(|d| d.code == french::LIAISON));
+        assert_eq!(predictor.calls.lock().unwrap().len(), 1);
+        if pair[1] == "yeux" {
+            assert_eq!(phones(&notes[1]), Some("fr/y fr/ee"));
+        }
+        if pair[1] == "un" {
+            assert_eq!(phones(&notes[1]), Some("fr/in"));
+        }
+    }
+}
+
+#[test]
+fn lectura_failures_retain_local_liaison_with_safe_stable_warning() {
+    for error in [
+        Failure::Timeout,
+        Failure::Network,
+        Failure::Http,
+        Failure::InvalidResponse,
+        Failure::Limit,
+        Failure::Unavailable,
+    ] {
+        let mut notes = direct_notes(&["tes", "yeux"]);
+        let diagnostics = predict(&mut notes, &MockLiaison::new(Err(error)));
+        assert_eq!(phones(&notes[1]), Some("fr/z fr/y fr/ee"));
+        let warning = diagnostics
+            .iter()
+            .find(|d| d.code == LOOKUP_FAILED)
+            .unwrap();
+        assert_eq!(
+            warning.severity,
+            verse_lib::engine::convert::DiagnosticSeverity::Warning
+        );
+        assert!(!warning.message.contains("tes"));
+        assert!(!warning.message.contains("yeux"));
+    }
+}
+
+#[test]
+fn lectura_requests_complete_phrases_and_preserves_source_spelling() {
+    let mut notes = direct_notes(&["tes", "yeux", "clairs,", "les", "a", "mours"]);
+    use verse_lib::engine::midi::Syllabic;
+    edit_source(&mut notes[4]).syllabic = Some(Syllabic::Begin);
+    edit_source(&mut notes[5]).syllabic = Some(Syllabic::End);
+    let predictor = MockLiaison::new(Ok(Label::None));
+    predict(&mut notes, &predictor);
+    assert_eq!(
+        *predictor.calls.lock().unwrap(),
+        vec![vec!["tes", "yeux", "clairs"], vec!["les", "amours"]]
+    );
+    let mut notes = direct_notes(&["les", "blan", "yeux"]);
+    for note in &mut notes {
+        note.pronunciation_language =
+            Some(verse_lib::engine::projection::PronunciationLanguage::French);
+    }
+    let predictor = MockLiaison::new(Ok(Label::None));
+    french::apply_with_predictor(&mut notes, &vec![String::new(); 3], true, Some(&predictor));
+    let calls = predictor.calls.lock().unwrap();
+    assert!(
+        calls.iter().flatten().any(|token| token == "blan"),
+        "{calls:?}"
+    );
+    assert!(!calls.iter().flatten().any(|token| token == "blanc"));
+}
+
+#[test]
+fn lectura_never_crosses_manual_phrase_or_unproven_hold_boundaries() {
+    use verse_lib::engine::midi::{LineBreak, LyricState};
+    for boundary in [
+        "manual_left",
+        "manual_right",
+        "gap",
+        "line",
+        "row",
+        "verse",
+        "punctuation",
+        "hold",
+    ] {
+        let mut notes = direct_notes(&["tes", "yeux"]);
+        match boundary {
+            "manual_left" => {
+                edit_source(&mut notes[0]).state = LyricState::Text("tes[fr/t fr/ae]".into())
+            }
+            "manual_right" => {
+                edit_source(&mut notes[1]).state = LyricState::Text("yeux[fr/y fr/ee]".into())
+            }
+            "gap" => notes[0].duration_ticks -= 1,
+            "line" => edit_source(&mut notes[1]).line_break = Some(LineBreak::Line),
+            "row" => edit_source(&mut notes[1]).lane = "other".into(),
+            "verse" => edit_source(&mut notes[1]).verse += 1,
+            "punctuation" => edit_source(&mut notes[0]).state = LyricState::Text("tes,".into()),
+            "hold" => {
+                let mut hold = direct_notes(&[""]).remove(0);
+                hold.onset_ticks = 480;
+                hold.lyric = ProjectedLyric::Extension;
+                notes[1].onset_ticks = 960;
+                notes.insert(1, hold);
+            }
+            _ => unreachable!(),
+        }
+        let predictor = MockLiaison::new(Ok(Label::Lz));
+        predict(&mut notes, &predictor);
+        assert!(predictor.calls.lock().unwrap().is_empty(), "{boundary}");
+        assert_ne!(
+            phones(notes.last().unwrap()),
+            Some("fr/z fr/y fr/ee"),
+            "{boundary}"
+        );
+    }
+}
+
+#[test]
+fn lectura_complete_unknown_words_supply_context_without_remote_phones() {
+    let mut notes = direct_notes(&["tes", "yeux", "zyx"]);
+    let original = notes[2].lyric.clone();
+    let predictor = MockLiaison::new(Ok(Label::Lz));
+    // Unknown text is transferable only with authoritative Automatic ownership.
+    for note in &mut notes {
+        note.pronunciation_language =
+            Some(verse_lib::engine::projection::PronunciationLanguage::French);
+    }
+    french::apply_with_predictor(&mut notes, &vec![String::new(); 3], true, Some(&predictor));
+    assert_eq!(
+        *predictor.calls.lock().unwrap(),
+        vec![vec!["tes", "yeux", "zyx"]]
+    );
+    assert_eq!(notes[2].lyric, original);
+    assert_eq!(phones(&notes[1]), Some("fr/z fr/y fr/ee"));
+}
+
+#[test]
+fn lectura_explicit_transfer_requires_complete_french_evidence_without_changing_local_readings() {
+    use verse_lib::engine::midi::Syllabic;
+    for words in [
+        ["beautiful", "always"],
+        ["hola", "amigo"],
+        ["obrigado", "saudade"],
+    ] {
+        let mut notes = direct_notes(&words);
+        let mut local = notes.clone();
+        direct_apply(&mut local);
+        let predictor = MockLiaison::new(Ok(Label::Lr));
+        predict(&mut notes, &predictor);
+        assert!(predictor.calls.lock().unwrap().is_empty(), "{words:?}");
+        assert_eq!(notes, local, "{words:?}");
+    }
+    let mut notes = direct_notes(&["tes", "yeux"]);
+    edit_source(&mut notes[0]).syllabic = Some(Syllabic::Begin);
+    edit_source(&mut notes[1]).syllabic = Some(Syllabic::Single);
+    let mut local = notes.clone();
+    direct_apply(&mut local);
+    let predictor = MockLiaison::new(Ok(Label::None));
+    predict(&mut notes, &predictor);
+    assert!(predictor.calls.lock().unwrap().is_empty());
+    assert_eq!(notes, local);
+    for language in [
+        verse_lib::engine::projection::PronunciationLanguage::English,
+        verse_lib::engine::projection::PronunciationLanguage::Spanish,
+        verse_lib::engine::projection::PronunciationLanguage::Portuguese,
+    ] {
+        let mut notes = direct_notes(&["tes", "yeux"]);
+        for note in &mut notes {
+            note.pronunciation_language = Some(language);
+        }
+        let predictor = MockLiaison::new(Ok(Label::Lr));
+        french::apply_with_predictor(&mut notes, &vec![String::new(); 2], true, Some(&predictor));
+        assert!(predictor.calls.lock().unwrap().is_empty(), "{language:?}");
+    }
+}
+
+#[test]
+fn lectura_explicit_french_shared_words_keep_guarded_phrase_evidence() {
+    for pair in [["grand", "arbre"], ["un", "ami"], ["les", "enfants"]] {
+        let mut notes = direct_notes(&pair);
+        let predictor = MockLiaison::new(Ok(Label::None));
+        predict(&mut notes, &predictor);
+        assert_eq!(
+            *predictor.calls.lock().unwrap(),
+            vec![pair.to_vec()],
+            "{pair:?}"
+        );
+    }
+    let mut notes = direct_notes(&["tes", "yeux", "beautiful", "always", "les", "enfants"]);
+    let predictor = MockLiaison::new(Ok(Label::None));
+    predict(&mut notes, &predictor);
+    assert_eq!(
+        *predictor.calls.lock().unwrap(),
+        vec![vec!["tes", "yeux"], vec!["les", "enfants"]]
+    );
+}
+
+#[test]
+fn lectura_preserves_qualified_echo_spelling_and_refuses_repairs_or_leading_punctuation() {
+    use verse_lib::engine::midi::Syllabic;
+    let mut notes = direct_notes(&["les", "blanc", "an"]);
+    edit_source(&mut notes[1]).syllabic = Some(Syllabic::Begin);
+    edit_source(&mut notes[2]).syllabic = Some(Syllabic::End);
+    let predictor = MockLiaison::new(Ok(Label::None));
+    predict(&mut notes, &predictor);
+    assert_eq!(*predictor.calls.lock().unwrap(), vec![vec!["les", "blanc"]]);
+    let mut notes = direct_notes(&["tes", "suis", "moi", "yeux"]);
+    edit_source(&mut notes[1]).syllabic = Some(Syllabic::Begin);
+    edit_source(&mut notes[2]).syllabic = Some(Syllabic::End);
+    let mut local = notes.clone();
+    direct_apply(&mut local);
+    let predictor = MockLiaison::new(Ok(Label::None));
+    predict(&mut notes, &predictor);
+    assert!(predictor.calls.lock().unwrap().is_empty());
+    assert_eq!(notes, local);
+    let mut notes = direct_notes(&["tes", ",yeux"]);
+    let mut local = notes.clone();
+    direct_apply(&mut local);
+    let predictor = MockLiaison::new(Ok(Label::Lr));
+    predict(&mut notes, &predictor);
+    assert!(predictor.calls.lock().unwrap().is_empty());
+    assert_eq!(notes, local);
+}
+
+#[test]
+fn lectura_internal_word_holds_need_the_same_owned_chain_as_word_boundaries() {
+    use verse_lib::engine::midi::Syllabic;
+    let mut midi = sab_with_extension(&["mes", "a", "", "mours"], true, false, Some(1));
+    for track in &mut midi.tracks {
+        for event in &mut track.events {
+            if let Kind::NoteOn(note) = &mut event.kind {
+                for lyric in &mut note.lyrics {
+                    lyric.syllabic = match lyric.raw.as_str() {
+                        "a" => Some(Syllabic::Begin),
+                        "mours" => Some(Syllabic::End),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+    let base = convert_midi_with_profile(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        PronunciationProfile::Default,
+    );
+    for qualified in [false, true] {
+        let mut notes = base.svp.as_ref().unwrap().tracks[0].notes.clone();
+        // Default joining has rewritten the projection's head state. Restore
+        // the unchanged source lyrics so this exercises French before joining.
+        for (note, raw) in notes.iter_mut().zip(["mes", "a", "", "mours"]) {
+            if raw.is_empty() {
+                continue;
+            }
+            let lyric = midi.tracks[0]
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let Kind::NoteOn(n) = &event.kind {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .flat_map(|n| &n.lyrics)
+                .find(|l| l.raw == raw)
+                .unwrap()
+                .clone();
+            note.lyric = ProjectedLyric::Source(Box::new(lyric));
+        }
+        if !qualified {
+            notes[2].source_evidence = None;
+            notes[2].lyric = ProjectedLyric::Extension;
+        }
+        let mut local = notes.clone();
+        direct_apply(&mut local);
+        let predictor = MockLiaison::new(Ok(Label::None));
+        predict(&mut notes, &predictor);
+        let calls = predictor.calls.lock().unwrap().clone();
+        assert_eq!(!calls.is_empty(), qualified, "calls={calls:?}");
+        if qualified {
+            assert_eq!(
+                *predictor.calls.lock().unwrap(),
+                vec![vec!["mes", "amours"]]
+            );
+        }
+        // Only liaison changes; dictionary syllables and holds remain local.
+        for index in [0, 2, 3] {
+            assert_eq!(notes[index].lyric, local[index].lyric);
+        }
+    }
+}
+
+#[test]
+fn lectura_nonuniform_outgoing_labels_are_applied_to_exact_successor_heads() {
+    struct Sequence;
+    impl LiaisonPredictor for Sequence {
+        fn predict(&self, tokens: &[String]) -> Result<Vec<Label>, Failure> {
+            assert_eq!(tokens, ["tes", "yeux", "les", "enfants", "un", "ami"]);
+            Ok(vec![
+                Label::Lz,
+                Label::None,
+                Label::Lt,
+                Label::Lr,
+                Label::Lp,
+                Label::None,
+            ])
+        }
+    }
+    let mut notes = direct_notes(&["tes", "yeux", "les", "enfants", "un", "ami"]);
+    let mut local = notes.clone();
+    direct_apply(&mut local);
+    french::apply_with_predictor(&mut notes, &vec![String::new(); 6], false, Some(&Sequence));
+    assert_eq!(phones(&notes[0]), Some("fr/t fr/ae"));
+    assert_eq!(phones(&notes[1]), Some("fr/z fr/y fr/ee"));
+    assert_eq!(phones(&notes[2]), Some("fr/l fr/eh"));
+    assert_eq!(phones(&notes[3]), Some("fr/t fr/en fr/f fr/en"));
+    assert_eq!(phones(&notes[4]), Some("fr/r fr/in"));
+    assert_eq!(phones(&notes[5]), Some("fr/p fr/ah fr/m fr/ih"));
+}
+
+#[test]
+fn lectura_oversized_phrase_is_not_split_and_retains_local_fallback() {
+    let mut notes = direct_notes(&["tes", "yeux"]);
+    let plain = direct_notes(&["la"]).remove(0);
+    while notes.len() <= verse_lib::engine::lectura::MAX_TOKENS {
+        let mut note = plain.clone();
+        note.onset_ticks = notes.len() as u32 * 480;
+        notes.push(note);
+    }
+    let predictor = MockLiaison::new(Ok(Label::None));
+    let diagnostics = predict(&mut notes, &predictor);
+    assert!(predictor.calls.lock().unwrap().is_empty());
+    assert_eq!(phones(&notes[1]), Some("fr/z fr/y fr/ee"));
+    assert!(diagnostics.iter().any(|d| d.code == LOOKUP_FAILED));
+}
+
+#[test]
+fn lectura_injection_is_limited_to_french_ustx_and_owned_holds() {
+    use verse_lib::engine::convert::convert_midi_with_predictor;
+    for target in [ExportTarget::Svp, ExportTarget::Ustx] {
+        for profile in [
+            FR,
+            PronunciationProfile::Automatic,
+            PronunciationProfile::Default,
+            PronunciationProfile::EnglishArpabet,
+            PronunciationProfile::SpanishDiffSinger,
+            PronunciationProfile::PortugueseDiffSinger,
+        ] {
+            let midi = sab_with_extension(&["tes", "", "yeux", "clairs"], true, false, Some(0));
+            let predictor = MockLiaison::new(Ok(Label::Lz));
+            let result = convert_midi_with_predictor(
+                &midi,
+                "english",
+                None,
+                target,
+                profile,
+                Some(&predictor),
+            );
+            assert!(result.ok, "{:?}", result.msg);
+            let eligible = target == ExportTarget::Ustx
+                && matches!(profile, FR | PronunciationProfile::Automatic);
+            assert_eq!(
+                !predictor.calls.lock().unwrap().is_empty(),
+                eligible,
+                "{target:?} {profile:?}"
+            );
+            if eligible {
+                for track in &result.svp.unwrap().tracks {
+                    assert_eq!(phones(&track.notes[2]), Some("fr/z fr/y fr/ee"));
+                    assert!(matches!(
+                        track.notes[1].lyric,
+                        ProjectedLyric::Extension | ProjectedLyric::Source(_)
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "explicit live Lectura check; synthetic French tokens only"]
+fn live_lectura_synthetic_phrases_keep_millefeuille_phones() {
+    use std::io::Write;
+    use verse_lib::engine::convert::convert_midi_with_predictor;
+    use verse_lib::engine::lectura::Client;
+    let client = Client::production();
+    let output = std::env::var_os("VERSE_LECTURA_PROBE_OUTPUT_DIR").map(std::path::PathBuf::from);
+    if let Some(output) = &output {
+        std::fs::create_dir(output).unwrap();
+    }
+    for (name, pair, expected) in [
+        ("tes-yeux", ["tes", "yeux"], "yeux[fr/z fr/y fr/ee]"),
+        ("et-un", ["et", "un"], "un[fr/in]"),
+        ("des-heros", ["des", "héros"], "héros[fr/eh fr/r fr/oh]"),
+    ] {
+        let notes: String = pair.iter().map(|word| format!("<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><lyric><text>{word}</text></lyric></note>")).collect();
+        let xml = format!("<score-partwise><part-list><score-part id=\"P1\"><part-name>Synthetic</part-name></score-part></part-list><part id=\"P1\"><measure number=\"1\"><attributes><divisions>1</divisions></attributes>{notes}</measure></part></score-partwise>");
+        let midi = musicxml::parse(xml.as_bytes()).unwrap();
+        let result = convert_midi_with_predictor(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            FR,
+            Some(&client),
+        );
+        assert!(result.ok, "{:?}", result.msg);
+        let failure = result
+            .tracks
+            .iter()
+            .flat_map(|t| &t.warnings)
+            .chain(&result.source_warnings)
+            .find(|d| d.code == LOOKUP_FAILED);
+        assert!(
+            failure.is_none(),
+            "{}",
+            failure.map(|d| d.message.as_str()).unwrap_or_default()
+        );
+        assert_eq!(model(&result).voice_parts[0].notes[1].lyric, expected);
+        let bytes = target::serialize_to(ExportTarget::Ustx, result.svp.as_ref().unwrap()).unwrap();
+        if let Some(output) = &output {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output.join(format!("{name}.ustx")))
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
+        }
+    }
+}
 
 const FR: PronunciationProfile = PronunciationProfile::FrenchMillefeuille;
 
@@ -797,6 +1298,105 @@ fn divided_word() -> Midi {
 }
 
 #[test]
+fn lectura_complete_tes_yeux_across_technical_members_does_not_need_a_layout() {
+    use verse_lib::engine::midi::{LyricState, Syllabic};
+    for label in [Label::Lz, Label::None] {
+        let mut midi = divided_word();
+        for (index, track) in midi.tracks.iter_mut().enumerate() {
+            for event in &mut track.events {
+                if let Kind::NoteOn(note) = &mut event.kind {
+                    for lyric in &mut note.lyrics {
+                        let word = if index == 0 { "yeux" } else { "tes" };
+                        lyric.raw = word.into();
+                        lyric.state = LyricState::Text(word.into());
+                        lyric.syllabic = Some(Syllabic::Single);
+                    }
+                }
+            }
+        }
+        let predictor = MockLiaison::new(Ok(label));
+        let outcome = verse_lib::engine::convert::convert_midi_with_predictor(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            FR,
+            Some(&predictor),
+        );
+        assert!(outcome.ok, "{:?}", outcome.msg);
+        assert_eq!(*predictor.calls.lock().unwrap(), vec![vec!["tes", "yeux"]]);
+        assert_eq!(
+            phones(&outcome.svp.unwrap().tracks[0].notes[0]),
+            Some(if label == Label::Lz {
+                "fr/z fr/y fr/ee"
+            } else {
+                "fr/y fr/ee"
+            })
+        );
+    }
+}
+
+#[test]
+fn lectura_context_keeps_chan_ger_authorization_without_borrowing_a_gap_spanning_word() {
+    use verse_lib::engine::midi::Syllabic;
+    let mut midi = divided_word();
+    let extra = sab(&["a", "mours"], true, false).tracks.remove(0);
+    for (index, word) in ["a", "mours"].iter().enumerate() {
+        let mut track = extra.clone();
+        track.id = format!("gap-member-{index}");
+        track.events.retain(|event| match &event.kind {
+            Kind::NoteOn(n) => n.lyrics.iter().any(|l| l.raw == *word),
+            Kind::NoteOff(_) => event.tick == (index as u32 + 1) * 480,
+            _ => false,
+        });
+        for event in &mut track.events {
+            event.tick += if index == 0 { 1440 } else { 1920 };
+            match &mut event.kind {
+                Kind::NoteOn(note) => {
+                    note.source.id.push_str("-gap");
+                    for lyric in &mut note.lyrics {
+                        lyric.id.push_str("-gap");
+                        lyric.syllabic = Some(if index == 0 {
+                            Syllabic::Begin
+                        } else {
+                            Syllabic::End
+                        });
+                    }
+                }
+                Kind::NoteOff(note) => note.source_id.as_mut().unwrap().push_str("-gap"),
+                _ => {}
+            }
+        }
+        midi.tracks.push(track);
+    }
+    midi.topology = verse_lib::engine::midi::SourceTopology::from_tracks(&midi.tracks);
+    let local = convert(&midi);
+    let predictor = MockLiaison::new(Ok(Label::None));
+    let remote = verse_lib::engine::convert::convert_midi_with_predictor(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        FR,
+        Some(&predictor),
+    );
+    assert!(local.ok && remote.ok, "{:?}", remote.msg);
+    let before = local.svp.unwrap();
+    let after = remote.svp.unwrap();
+    assert_eq!(phones(&after.tracks[1].notes[0]), Some("fr/sh fr/en"));
+    for (original, actual) in before.tracks.iter().zip(&after.tracks) {
+        assert_eq!(original.notes, actual.notes);
+    }
+    assert!(!predictor
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .any(|word| word == "amours"));
+}
+
+#[test]
 fn divided_word_uses_written_provenance_without_changing_ownership_or_geometry() {
     for explicit in [false, true] {
         let mut midi = divided_word();
@@ -1265,6 +1865,29 @@ fn cross_member_liaison_uses_the_whole_source_word_and_its_boundaries() {
             midi.tracks.push(rival);
         }
         midi.tracks.push(preceding);
+        let predictor = MockLiaison::new(Ok(Label::None));
+        let remote = verse_lib::engine::convert::convert_midi_with_predictor(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            FR,
+            Some(&predictor),
+        );
+        assert!(remote.ok, "{:?}", remote.msg);
+        for index in [1, 2] {
+            assert_ne!(
+                phones(&remote.svp.as_ref().unwrap().tracks[index].notes[0]),
+                Some("fr/z fr/ah"),
+                "remote none: {boundary}"
+            );
+        }
+        if ["les", "mes"].contains(&boundary) {
+            assert_eq!(
+                *predictor.calls.lock().unwrap(),
+                vec![vec![boundary, "amours"]]
+            );
+        }
         let result = convert(&midi);
         for index in [1, 2] {
             let phone = phones(&result.svp.as_ref().unwrap().tracks[index].notes[0]);
@@ -1968,6 +2591,19 @@ fn yeux_liaison_refuses_unowned_holds_and_source_boundaries() {
             _ => unreachable!(),
         }
         let original = notes.clone();
+        let predictor = MockLiaison::new(Ok(Label::None));
+        let mut remote = notes.clone();
+        predict(&mut remote, &predictor);
+        assert_eq!(phones(&remote[2]), Some("fr/y fr/ee"), "remote {boundary}");
+        assert!(
+            !predictor
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|words| words.windows(2).any(|pair| pair == ["tes", "yeux"])),
+            "remote {boundary}"
+        );
         let diagnostics = direct_apply(&mut notes);
         assert_eq!(phones(&notes[2]), Some("fr/y fr/ee"), "{boundary}");
         assert!(

@@ -125,8 +125,14 @@ export function Settings({
           {" "}Your choice is remembered even before importing a file; with files
           loaded, it is saved after reanalysis succeeds.
           {pronunciationProfile === "automatic" && (
-            <> Automatic FR+EN+ES+PT uses only bundled local detector data and dictionaries;
-            no network lookup or separate installation is required.</>
+            <> Language detection and pronunciation dictionaries use bundled local data;
+            no separate installation is required.</>
+          )}
+          {exportTarget === "ustx" && (pronunciationProfile === "automatic" || pronunciationProfile === "frenchMillefeuille") && (
+            <> French liaison analysis sends complete French lyric tokens to Lectura and
+            requires internet. No audio, score files or note metadata are sent. Provider
+            lyric retention is unknown. Failed lookups keep local liaison rules with a
+            warning; export reuses the analysis without another lookup.</>
           )}
         </p>
         <a className="text-xs underline" href="/licenses/french-community-dictionary.txt" target="_blank" rel="noreferrer">

@@ -90,3 +90,16 @@ qualify bank-specific reuse. Older records omit it and retain their fingerprints
 
 Structural, dictionary and native-consumer checks do not establish audible
 singing quality. Listening confirmation remains explicit and singer-dependent.
+
+## French liaison online exception
+
+Automatic language ownership remains deterministic and offline. Only desktop
+USTX French spans use Lectura for liaison labels during analysis; French lyric
+tokens are transferred and internet is required. Other languages and SVP never
+use this service. Verse ignores remote IPA/POS/morphology, keeps its bundled
+Millefeuille readings and source/music guards, and uses local liaison fallback
+with `FRENCH_LIAISON_LOOKUP_FAILED` on failure. Provider content retention and
+model revision are unknown. No request payload is persisted. Sealed analyses
+retain the projection in memory so every export reuses exactly that result
+without a new lookup. See [Formats and fidelity](formats-and-fidelity.md#french-liaison-api-exception)
+for request limits and backend-only bearer configuration.
