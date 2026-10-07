@@ -186,7 +186,7 @@ matches OpenUtau's type). Singer assignment stays with the user. Default and
 Synthesizer V output retain their previous behavior; the legacy `language`
 argument does not activate this profile.
 
-The profile runs offline before word joining. Supported lexical layouts such
+The profile prepares bundled dictionary readings before word joining. Supported lexical layouts such
 as `chan`/`ger`, `mê`/`me`, `pres`/`se`, `tem`/`pê`/`tes`, and
 `rê`/`ê`/`ves` receive one explicit `fr/` hint per sung syllable. Repeated vowels
 remain attacks. Sung final schwas are selected only by a validated layout;
@@ -283,6 +283,46 @@ The [redistribution license](../public/licenses/french-community-dictionary.txt)
 is included in the app's public assets and accessible from Settings. Literal
 numbered variants are internal data keys, not a general source-lyric syntax.
 No installed bank is edited or required during conversion.
+
+### French liaison API exception
+
+During desktop USTX analysis with French Millefeuille or Automatic, Verse sends
+complete source-owned French word tokens in contiguous phrases to Lectura's
+`POST https://api.lectura.world/g2p/analyser`. This narrow online exception
+requires internet. No audio, scores, note metadata, source IDs or other-language
+spans are sent. Language detection and all dictionaries remain local. Provider
+lyric-content retention, public rate limits and model revision are unknown.
+
+Verse consumes only aligned liaison labels: `Lz`, `Lt`, `Ln`, `Lr`, `Lp` map to
+`fr/z`, `fr/t`, `fr/n`, `fr/r`, `fr/p` on the next eligible attack. A valid `none`
+suppresses the bounded local pair rule. Lectura IPA, POS and morphology never
+replace Verse's Millefeuille readings. Manual hints, language/source/phrase
+boundaries, rests and unproven holds remain barriers. Source text, musical
+geometry and evidence are unchanged.
+
+One blocking client is reused per analysis batch. Connect timeout is two seconds,
+request timeout four seconds, with no retries or redirects. Phrases are bounded
+by an eight-second aggregate network budget per batch; an unavailable service
+stops subsequent lookups so local fallback can finish within the analysis deadline.
+Individual phrase size is bounded
+at 128 tokens, requests at 16 KiB and responses at 256 KiB; an oversized phrase
+uses local fallback rather than being split into artificial contexts. The
+backend-only optional `VERSE_LECTURA_BEARER_TOKEN` environment variable supplies
+a bearer token; it is never exposed in Settings. Network/HTTP/timeouts, invalid
+JSON, mismatched echoed tokens or array lengths and unknown labels retain local
+liaison rules and emit `FRENCH_LIAISON_LOOKUP_FAILED` without request or response
+text. Lookup payloads are neither logged nor persisted.
+
+The sealed in-memory analysis retains its complete projection and warnings.
+Direct, batch and bundle exports reuse it without remote calls, while source,
+settings, memory, digest, cancellation and deadline checks remain authoritative.
+Retained analysis outcomes have a 256 MiB aggregate fingerprint-size budget in
+addition to the 128-snapshot limit. Their identity includes the actual ordered
+engine inputs and diagnostics, so matching output bytes cannot substitute an
+older warning outcome. Releasing snapshots clears the retained observer references.
+Reanalysis may obtain a different provider result. SVP, Default and English,
+Spanish and Portuguese profiles never call Lectura. Library/test callers use
+an explicit injectable seam; the existing conversion API remains offline.
 
 Serializer and source regressions establish text, allocation inputs and
 musical invariants. They do not establish audible pronunciation. Listening

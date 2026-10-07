@@ -93,7 +93,9 @@ pub struct TrackReport {
     pub warnings: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug)]
 pub struct ConvertOutcome {
+    pub(crate) engine_inputs: Option<String>,
     pub pronunciation_words: Vec<crate::pronunciation::source_map::Word>,
     pub ok: bool,
     pub msg: Option<String>,
@@ -722,8 +724,10 @@ fn french_source_context(
     midi: &Midi,
     notes_by_track: &[Vec<SourceNote>],
     allowed: Option<&BTreeSet<(String, u32, String)>>,
+    predictor: Option<&dyn crate::engine::lectura::LiaisonPredictor>,
+    lookup_warnings: &mut Vec<Diagnostic>,
 ) -> HashMap<(String, u32, String), String> {
-    type Domain = (String, String, String, u32);
+    type Domain = (String, String, String, u32, Option<u32>);
     type Entry<'a> = (usize, &'a SourceNote);
     let mut domains: BTreeMap<Domain, Vec<Entry<'_>>> = BTreeMap::new();
     for (track, notes) in notes_by_track.iter().enumerate() {
@@ -743,6 +747,7 @@ fn french_source_context(
                     staff.clone(),
                     voice.clone(),
                     note.source.occurrence,
+                    note.source.continuity.as_ref().map(|c| c.playback_segment),
                 ))
                 .or_default()
                 .push((track, note));
@@ -806,7 +811,9 @@ fn french_source_context(
                     });
                     ProjectedNote {
                         performance: None,
-                        pronunciation_language: None,
+                        pronunciation_language: allowed
+                            .filter(|_| predictor.is_some())
+                            .map(|_| crate::engine::projection::PronunciationLanguage::French),
                         source_evidence: None,
                         onset_ticks: first.onset,
                         duration_ticks: first.duration,
@@ -840,21 +847,44 @@ fn french_source_context(
                 }
                 latest_end = latest_end.max(end);
             }
-            for reading in crate::engine::target::french::contextual_readings(&notes) {
-                if reading.windows(2).any(|pair| {
-                    pair[0].0 + 1 != pair[1].0
-                        || !crate::engine::syllable::touches(&notes[pair[0].0], &notes[pair[1].0])
-                }) || reading
-                    .iter()
-                    .flat_map(|(index, _)| &groups[*index])
-                    .filter(|e| e.2.is_some())
-                    .map(|e| e.0)
-                    .collect::<BTreeSet<_>>()
-                    .len()
-                    < 2
-                {
-                    continue;
-                }
+            let readings: Vec<_> = crate::engine::target::french::contextual_readings(&notes)
+                .into_iter()
+                .filter(|reading| {
+                    !(reading.windows(2).any(|pair| {
+                        pair[0].0 + 1 != pair[1].0
+                            || !crate::engine::syllable::touches(
+                                &notes[pair[0].0],
+                                &notes[pair[1].0],
+                            )
+                    }) || reading
+                        .iter()
+                        .flat_map(|(index, _)| &groups[*index])
+                        .filter(|e| e.2.is_some())
+                        .map(|e| e.0)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        < 2)
+                })
+                .collect();
+            if readings.is_empty() && predictor.is_none() {
+                continue;
+            }
+            let readings = if let Some(predictor) = predictor {
+                let (hints, warnings) = crate::engine::target::french::contextual_projection(
+                    &notes,
+                    predictor,
+                    &readings,
+                    allowed.is_some(),
+                );
+                lookup_warnings.extend(warnings.into_iter().map(|mut warning| {
+                    warning.source_id = None;
+                    warning
+                }));
+                vec![hints]
+            } else {
+                readings
+            };
+            for reading in readings {
                 for (index, hint) in reading {
                     for &(track, note, lyric, _) in &groups[index] {
                         if let Some(lyric) = lyric {
@@ -1391,6 +1421,7 @@ fn finish_track(
     profile: PronunciationProfile,
     contextual_french: &HashMap<(String, u32, String), String>,
     diagnostics: &mut Vec<Diagnostic>,
+    predictor: Option<&dyn crate::engine::lectura::LiaisonPredictor>,
 ) -> ProjectedTrack {
     let projected_notes = &mut track.notes;
     let mut note_ids = Vec::with_capacity(projected_notes.len());
@@ -1450,7 +1481,9 @@ fn finish_track(
             let ids = &note_ids[start..end];
             match profile {
                 PronunciationProfile::FrenchMillefeuille => {
-                    diagnostics.extend(crate::engine::target::french::apply(notes, ids));
+                    diagnostics.extend(crate::engine::target::french::apply_with_predictor(
+                        notes, ids, false, predictor,
+                    ));
                 }
                 PronunciationProfile::EnglishArpabet => {
                     diagnostics.extend(crate::engine::target::english::apply(notes, ids));
@@ -1488,9 +1521,11 @@ fn finish_track(
                         let language_ids = &ids[language_start..language_end];
                         diagnostics.extend(match language {
                             crate::engine::projection::PronunciationLanguage::French => {
-                                crate::engine::target::french::apply_automatic(
+                                crate::engine::target::french::apply_with_predictor(
                                     language_notes,
                                     language_ids,
+                                    true,
+                                    predictor,
                                 )
                             }
                             crate::engine::projection::PronunciationLanguage::English => {
@@ -1803,6 +1838,7 @@ pub fn convert_auto_with(
     use crate::engine::musescore as ms;
     use crate::engine::musicxml as mx;
     let fail = |m: String| ConvertOutcome {
+        engine_inputs: None,
         pronunciation_words: Vec::new(),
         ok: false,
         msg: Some(m),
@@ -1856,6 +1892,7 @@ pub fn convert_bytes(data: &[u8], language: &str) -> ConvertOutcome {
         Ok(m) => m,
         Err(e) => {
             return ConvertOutcome {
+                engine_inputs: None,
                 pronunciation_words: Vec::new(),
                 ok: false,
                 msg: Some(format!("unreadable file ({})", e)),
@@ -1943,8 +1980,44 @@ pub fn convert_midi_with_snapshot(
     profile: PronunciationProfile,
     snapshot: Option<&crate::pronunciation::Snapshot>,
 ) -> ConvertOutcome {
+    convert_midi_with_snapshot_and_predictor(
+        midi, language, overrides, target, profile, snapshot, None,
+    )
+}
+
+/// Injectable French liaison seam; ordinary library conversion stays offline.
+pub fn convert_midi_with_predictor(
+    midi: &Midi,
+    language: &str,
+    overrides: Option<&HashMap<usize, bool>>,
+    target: ExportTarget,
+    profile: PronunciationProfile,
+    predictor: Option<&dyn crate::engine::lectura::LiaisonPredictor>,
+) -> ConvertOutcome {
+    let snapshot = crate::pronunciation::current_snapshot();
+    convert_midi_with_snapshot_and_predictor(
+        midi,
+        language,
+        overrides,
+        target,
+        profile,
+        snapshot.as_deref(),
+        predictor,
+    )
+}
+
+fn convert_midi_with_snapshot_and_predictor(
+    midi: &Midi,
+    language: &str,
+    overrides: Option<&HashMap<usize, bool>>,
+    target: ExportTarget,
+    profile: PronunciationProfile,
+    snapshot: Option<&crate::pronunciation::Snapshot>,
+    predictor: Option<&dyn crate::engine::lectura::LiaisonPredictor>,
+) -> ConvertOutcome {
     let profile = profile.for_target(target);
     let fail = |msg: String| ConvertOutcome {
+        engine_inputs: None,
         pronunciation_words: Vec::new(),
         ok: false,
         msg: Some(msg),
@@ -1959,6 +2032,49 @@ pub fn convert_midi_with_snapshot(
         bundle_ready: false,
         projection: ProjectionEvidence::default(),
     };
+    let engine_inputs = if snapshot.is_some() {
+        // Midi and its nested source evidence contain only ordered Vec/BTree
+        // collections. Stream them; never build a whole-source debug string.
+        let ordered: BTreeMap<_, _> = overrides
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        match crate::pronunciation::bounded_debug_digest(
+            &(
+                midi,
+                language,
+                ordered,
+                target,
+                profile,
+                snapshot.map(|s| s.corrections.identity()),
+            ),
+            crate::pronunciation::MAX_RETAINED_BYTES,
+        ) {
+            Ok((digest, _)) => Some(digest),
+            Err(error) => return fail(error.to_string()),
+        }
+    } else {
+        None
+    };
+    if let Some(snapshot) = snapshot.filter(|s| s.sealed) {
+        if let Err(error) = snapshot.work.check() {
+            return fail(error.to_string());
+        }
+        if let Some(cached) = &snapshot.analysis_outcome {
+            if cached.engine_inputs != engine_inputs || engine_inputs.is_none() {
+                let mut refused = fail("PRONUNCIATION_SNAPSHOT_STALE: engine inputs differ from analysis; analyse again".into());
+                refused.source_warnings.push(Diagnostic {
+                    code: "PRONUNCIATION_SNAPSHOT_STALE".into(),
+                    severity: DiagnosticSeverity::Warning,
+                    message: "Engine inputs differ from analysis; analyse again".into(),
+                    source_id: None,
+                });
+                return refused;
+            }
+            return (**cached).clone();
+        }
+    }
     let tpb = match midi.time_base {
         TimeBase::PulsesPerQuarter(0) => {
             return fail("MIDI PPQ division must be non-zero".into());
@@ -2497,13 +2613,25 @@ pub fn convert_midi_with_snapshot(
         } else {
             BTreeSet::new()
         };
+    let mut lookup_warnings = Vec::new();
+    let contextual_predictor = (target == ExportTarget::Ustx)
+        .then_some(predictor)
+        .flatten();
     let contextual_french = match profile {
-        PronunciationProfile::FrenchMillefeuille => {
-            french_source_context(midi, &notes_by_track, None)
-        }
-        PronunciationProfile::Automatic => {
-            french_source_context(midi, &notes_by_track, Some(&automatic_french))
-        }
+        PronunciationProfile::FrenchMillefeuille => french_source_context(
+            midi,
+            &notes_by_track,
+            None,
+            contextual_predictor,
+            &mut lookup_warnings,
+        ),
+        PronunciationProfile::Automatic => french_source_context(
+            midi,
+            &notes_by_track,
+            Some(&automatic_french),
+            contextual_predictor,
+            &mut lookup_warnings,
+        ),
         _ => HashMap::new(),
     };
     let mut left_out_by_track = vec![0usize; midi.tracks.len()];
@@ -2515,6 +2643,7 @@ pub fn convert_midi_with_snapshot(
             profile,
             &contextual_french,
             &mut report[index].warnings,
+            predictor,
         );
         if target == ExportTarget::Ustx && profile == PronunciationProfile::Automatic {
             if let Some(snapshot) = snapshot {
@@ -2839,12 +2968,16 @@ pub fn convert_midi_with_snapshot(
     }
     let n_tracks = midi.topology.voice_count();
     ConvertOutcome {
+        engine_inputs,
         pronunciation_words,
         ok: true,
         msg: None,
         svp: Some(projected),
         topology: midi.topology.clone(),
-        source_warnings: staff_link_warnings(midi),
+        source_warnings: staff_link_warnings(midi)
+            .into_iter()
+            .chain(lookup_warnings)
+            .collect(),
         tracks: report,
         n_tracks,
         placed: total_placed,

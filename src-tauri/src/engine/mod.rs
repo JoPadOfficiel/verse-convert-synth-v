@@ -1,5 +1,6 @@
 pub mod convert;
 pub mod language;
+pub mod lectura;
 pub mod midi;
 pub mod midi_split;
 pub mod musescore;

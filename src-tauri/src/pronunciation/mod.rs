@@ -18,11 +18,18 @@ use std::{
 };
 pub const POLICY: &str = "verse-pronunciation-v1";
 pub const BASELINE: &str = "verse-lingua-lexical-context-v1";
+pub(crate) const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) struct RetainedOutcome {
+    pub value: Arc<crate::engine::convert::ConvertOutcome>,
+    pub identity: String,
+    pub bytes: usize,
+}
 // Legacy use cases stay callable without application state. Desktop commands
 // bind a frozen snapshot only for their synchronous blocking worker; the guard
 // restores it even on panic. No snapshot crosses an async suspension point.
 thread_local! { static CURRENT: std::cell::RefCell<Option<Arc<Snapshot>>> = const { std::cell::RefCell::new(None) }; }
 thread_local! { static OBSERVED: std::cell::RefCell<Option<(crate::engine::projection::ProjectedProject, Vec<source_map::Word>, String)>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { static OBSERVED_OUTCOME: std::cell::RefCell<Option<RetainedOutcome>> = const { std::cell::RefCell::new(None) }; }
 pub fn current_snapshot() -> Option<Arc<Snapshot>> {
     CURRENT.with(|s| s.borrow().clone())
 }
@@ -31,10 +38,12 @@ pub fn with_snapshot<T>(snapshot: Arc<Snapshot>, action: impl FnOnce() -> T) -> 
     impl Drop for Guard {
         fn drop(&mut self) {
             CURRENT.with(|s| *s.borrow_mut() = self.0.take());
+            OBSERVED_OUTCOME.with(|s| s.replace(None));
         }
     }
     let _guard = Guard(CURRENT.with(|s| s.replace(Some(snapshot))));
     OBSERVED.with(|s| s.replace(None));
+    OBSERVED_OUTCOME.with(|s| s.replace(None));
     action()
 }
 pub fn check_source(bytes: &[u8]) -> Result<(), Error> {
@@ -70,6 +79,13 @@ pub fn observe_projection(
         return Ok(());
     };
     snapshot.work.check()?;
+    if let Some(diagnostic) = outcome
+        .source_warnings
+        .iter()
+        .find(|d| d.code == "PRONUNCIATION_SNAPSHOT_STALE")
+    {
+        return Err(Error::new(&diagnostic.code, &diagnostic.message));
+    }
     if let Some(project) = &outcome.svp {
         let bytes = crate::engine::target::serialize_to(target, project)
             .map_err(|e| Error::new("PRONUNCIATION_PROJECTION_INVALID", &e.to_string()))?;
@@ -104,6 +120,28 @@ pub fn observe_projection(
             )?;
             reference.check_budget(&bytes)?;
         }
+        let retain = !snapshot.sealed
+            && target == crate::engine::target::ExportTarget::Ustx
+            && matches!(
+                project.pronunciation_profile,
+                crate::engine::target::PronunciationProfile::FrenchMillefeuille
+                    | crate::engine::target::PronunciationProfile::Automatic
+            );
+        // Stream into a bounded digest/counter before cloning. A conservative
+        // eightfold charge covers allocation/node overhead as well as strings.
+        let retained = if retain {
+            let (identity, text_bytes) = bounded_debug_digest(outcome, MAX_RETAINED_BYTES / 8)?;
+            Some(RetainedOutcome {
+                value: Arc::new(outcome.clone()),
+                identity,
+                bytes: text_bytes
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(std::mem::size_of_val(outcome)))
+                    .ok_or_else(retention_limit)?,
+            })
+        } else {
+            None
+        };
         OBSERVED.with(|s| {
             s.replace(Some((
                 project.clone(),
@@ -111,6 +149,7 @@ pub fn observe_projection(
                 digest,
             )))
         });
+        OBSERVED_OUTCOME.with(|s| s.replace(retained));
     }
     snapshot.work.check()
 }
@@ -158,6 +197,45 @@ impl From<rusqlite::Error> for Error {
 }
 pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn retention_limit() -> Error {
+    Error::new(
+        "PRONUNCIATION_SNAPSHOT_LIMIT",
+        "Retained analysis byte budget exceeded; release unused analyses",
+    )
+}
+
+/// Constant-space, bounded fingerprint. Callers pass ordered IR collections;
+/// unordered override maps must be converted to BTreeMap before this seam.
+pub(crate) fn bounded_debug_digest(
+    value: &impl std::fmt::Debug,
+    limit: usize,
+) -> Result<(String, usize), Error> {
+    use std::fmt::Write;
+    struct Sink {
+        digest: Sha256,
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::fmt::Write for Sink {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.bytes = self
+                .bytes
+                .checked_add(text.len())
+                .filter(|n| *n <= self.limit)
+                .ok_or(std::fmt::Error)?;
+            self.digest.update(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut sink = Sink {
+        digest: Sha256::new(),
+        bytes: 0,
+        limit,
+    };
+    write!(&mut sink, "{value:?}").map_err(|_| retention_limit())?;
+    Ok((format!("{:x}", sink.digest.finalize()), sink.bytes))
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,6 +333,9 @@ pub struct Snapshot {
     pub memory_root: Option<std::path::PathBuf>,
     pub source_label: Option<String>,
     pub sealed: bool,
+    /// In-memory analysis result only, never a persisted remote request payload.
+    pub analysis_outcome: Option<Arc<crate::engine::convert::ConvertOutcome>>,
+    pub(crate) retained_bytes: usize,
 }
 impl Snapshot {
     pub fn baseline(
@@ -285,6 +366,8 @@ impl Snapshot {
             memory_root: None,
             source_label: None,
             sealed: false,
+            analysis_outcome: None,
+            retained_bytes: 0,
         })
     }
 }

@@ -51,3 +51,27 @@ Verse is an offline Tauri desktop application that converts source-owned MIDI/KA
 - Base USTX facts may come from the qualified 0.1.568 source, but per-note `phonemizer` behavior is a 0.1.569+ fact. Verify format behavior against the exact pinned OpenUtau source rather than documentation alone.
 
 <!-- /bmad:context -->
+## Human-approved French liaison API exception (2026-10-07)
+
+The human explicitly selected Lectura's public API for French liaison and accepted
+internet use for this narrow feature. This overrides the offline policy only for
+USTX FrenchMillefeuille and Automatic French liaison analysis. Send only complete
+source-owned French word tokens in safe contiguous phrases; use only liaison
+labels and retain Verse's Millefeuille phones and source/music guards. Never send
+audio, scores, note metadata, source IDs or other languages. No model weights,
+runtime model downloads or remote language classification are authorized.
+Disclose lyric transfer in English UI/docs, do not claim provider content retention
+is known, use bounded requests with local fallback and stable safe diagnostics,
+and reuse the sealed analysis projection during export without remote calls.
+All other conversion paths remain offline and local-first.
+
+Lectura implementation uses one bounded blocking client per French USTX analysis
+batch (2 s connect / 4 s request, no retries or redirects). The optional backend
+`VERSE_LECTURA_BEARER_TOKEN` never enters the frontend. Stable
+`FRENCH_LIAISON_LOOKUP_FAILED` warnings contain no lyric or response payload.
+Sealed snapshots retain the in-memory analysis outcome for direct, batch and
+bundle exports; exports must never instantiate or invoke the liaison client.
+The batch network budget is eight seconds and service unavailability stops
+subsequent lookups. Retained outcomes have a 256 MiB aggregate fingerprint-size
+budget, with ordered engine-input and diagnostic identities; release clears
+observer references.

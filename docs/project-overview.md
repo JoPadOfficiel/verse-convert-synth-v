@@ -23,8 +23,13 @@ Verse offers two outputs:
    source Part, a muted full-score reference, a manifest, and a complete
    preservation ledger. Both project variants reference the same stems.
 
-The application is local-first and offline at runtime. It has no account,
-server, database, telemetry, or cloud dependency.
+The application is local-first. French liaison analysis for USTX French
+Millefeuille and Automatic French spans sends complete French lyric tokens to
+Lectura and requires internet; failures retain local liaison rules. All other
+conversion paths and language detection remain offline. No audio, score files,
+note metadata or source IDs are sent, and provider lyric retention is unknown.
+Exports reuse the sealed analysis without another lookup. See the
+[French liaison exception](formats-and-fidelity.md#french-liaison-api-exception).
 
 ## Repository classification
 

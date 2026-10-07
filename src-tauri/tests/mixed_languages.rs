@@ -1469,6 +1469,48 @@ fn french_liaison_cannot_cross_into_an_english_word() {
 }
 
 #[test]
+fn lectura_receives_only_contiguous_automatic_french_spans() {
+    use verse_lib::engine::lectura::{Failure, Label, LiaisonPredictor};
+    struct Capture(std::sync::Mutex<Vec<Vec<String>>>);
+    impl LiaisonPredictor for Capture {
+        fn predict(&self, words: &[String]) -> Result<Vec<Label>, Failure> {
+            self.0.lock().unwrap().push(words.to_vec());
+            Ok(vec![Label::Lz; words.len()])
+        }
+    }
+    let predictor = Capture(Default::default());
+    let midi = musicxml::parse(
+        musicxml_score(&["tes", "yeux", "always", "beautiful", "bonjour", "merci"]).as_bytes(),
+    )
+    .unwrap();
+    let result = verse_lib::engine::convert::convert_midi_with_predictor(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        AUTO,
+        Some(&predictor),
+    );
+    assert!(result.ok, "{:?}", result.msg);
+    assert_eq!(
+        *predictor.0.lock().unwrap(),
+        vec![vec!["tes", "yeux"], vec!["bonjour", "merci"]]
+    );
+    let notes = &result.svp.unwrap().tracks[0].notes;
+    for index in [2, 3] {
+        assert_eq!(
+            notes[index].pronunciation_language,
+            Some(PronunciationLanguage::English)
+        );
+        if let verse_lib::engine::projection::ProjectedLyric::Pronounced { phonemes, .. } =
+            &notes[index].lyric
+        {
+            assert!(!phonemes.contains("fr/"));
+        }
+    }
+}
+
+#[test]
 fn automatic_svp_keeps_default_split_word_serialization() {
     let midi = musicxml::parse(musicxml_split_word().as_bytes()).unwrap();
     let default = convert_midi_with_profile(

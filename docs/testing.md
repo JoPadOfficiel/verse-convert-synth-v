@@ -571,3 +571,34 @@ exactly. A regression exists when one of these occurs:
 When adding support for a previously ineligible construct, add a focused unit
 test, a fidelity assertion, and—where legally possible—a corpus case. Do not
 broaden an allowlist merely to make a corpus total green.
+
+## Lectura liaison verification
+
+`engine::lectura::tests` uses a loopback HTTP server, never the public provider,
+to verify token-only JSON, optional bearer authentication, aligned token/label
+arrays, all five phone labels, authoritative `none`, malformed JSON, unknown
+labels, HTTP/network/timeout failures, redirect refusal and response/request
+bounds. `french_phonetics` injects deterministic predictors for source-owned
+phrase grouping, manual hints, punctuation, line breaks, provenance barriers,
+owned/unproven holds, split words, phone preservation and target/profile isolation.
+Command tests exercise sealed analysis through direct, batch and bundle exports
+with a counting predictor and the existing stale-snapshot checks. Ordinary test
+and library conversion stays offline; public-service probes use synthetic words
+only and remain separate from the required deterministic gates.
+
+Manual acoustic qualification still requires opening generated USTX in the
+pinned OpenUtau version with a compatible French bank and listening to `tes yeux`,
+`et un` and `des héros`. HTTP labels, YAML and native compatibility do not prove
+audible liaison quality.
+
+An explicit synthetic live check is available (three phrase requests):
+
+```sh
+VERSE_LECTURA_PROBE_OUTPUT_DIR=/path/to/new-output-directory \
+  cargo test --manifest-path src-tauri/Cargo.toml --locked --test french_phonetics \
+  live_lectura_synthetic_phrases_keep_millefeuille_phones -- --ignored
+```
+
+The optional output directory must not exist. It retains three USTX projects,
+never the HTTP request or response payloads. This test is ignored by the normal
+suite because it depends on the public provider's availability and behavior.
