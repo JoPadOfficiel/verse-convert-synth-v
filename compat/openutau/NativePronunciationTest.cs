@@ -7,6 +7,7 @@ using OpenUtau.Api;
 using OpenUtau.Classic;
 using OpenUtau.Core;
 using OpenUtau.Core.DiffSinger;
+using OpenUtau.Core.G2p;
 using OpenUtau.Core.Ustx;
 using OpenUtau.Core.Util;
 using Xunit;
@@ -102,6 +103,7 @@ namespace OpenUtau.App {
         [Theory]
         [InlineData("ciel", "fr/s fr/y fr/ae fr/l")]
         [InlineData("yeux", "fr/y fr/ee")]
+        [InlineData("yeux", "fr/z fr/y fr/ee")]
         [InlineData("blancs", "fr/b fr/l fr/en")]
         [InlineData("noel", "fr/n fr/oo fr/ae fr/l")]
         public void FrenchWholeWordHintSurvivesNativeLifecycle(string word, string hint) {
@@ -110,6 +112,17 @@ namespace OpenUtau.App {
             Assert.Equal(hint.Split(' '), result.phonemes.Select(p => p.phoneme));
             Assert.Equal(hint.Split(' ').Select(bank.Token),
                 result.phonemes.Select(p => bank.Singer.PhonemeTokenize(p.phoneme)));
+        }
+
+        [Theory]
+        [InlineData("yeux", "y ee")]
+        [InlineData("jeu", "j ee")]
+        public void FrenchEmbeddedDictionaryAttestsTheVowelBeforeContextualLiaison(string word, string expected) {
+            Assert.Equal(expected.Split(' '), new EmbeddedFrenchDictionary().DictionaryReading(word));
+        }
+
+        private sealed class EmbeddedFrenchDictionary : FrenchMillefeuilleG2p {
+            public string[] DictionaryReading(string word) => Dict.Query(word);
         }
 
         [Theory]
@@ -172,7 +185,7 @@ namespace OpenUtau.App {
                 string missingDuration = null, string missingAcoustic = null) {
                 Root = Path.Combine(Path.GetTempPath(), "verse-synthetic-singer-" + Guid.NewGuid());
                 prefix = prefixed ? language + "/" : "";
-                var symbols = (language == "fr" ? "SP AP s y ae l ee b en n oo" : language == "en" ? "SP AP r iy d" : "SP AP a e i o u b B d D g G s k l m t S").Split(' ');
+                var symbols = (language == "fr" ? "SP AP s y ae l ee b en n oo z" : language == "en" ? "SP AP r iy d" : "SP AP a e i o u b B d D g G s k l m t S").Split(' ');
                 inventory = symbols.Select(Alias).ToArray();
                 Directory.CreateDirectory(Root);
                 try {

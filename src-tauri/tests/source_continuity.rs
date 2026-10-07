@@ -19,6 +19,116 @@ use verse_lib::engine::target::{self, ExportTarget, PronunciationProfile};
 use verse_lib::stems::StemPlan;
 
 const ALTI_MAIN: &str = "mscx:staff:2:voice:1";
+
+#[test]
+fn liaison_uses_the_owner_of_a_continuation_moved_from_a_polyphonic_member() {
+    let xml = format!(
+        r#"<museScore version="4.0"><Score><Division>480</Division><Part><trackName>Alti</trackName><Staff id="2"/><Instrument id="voice"><instrumentId>voice.vocals</instrumentId></Instrument></Part><Staff id="2"><Measure len="4/4"><voice>{}{}{}{}</voice></Measure></Staff></Score></museScore>"#,
+        chord(
+            "quarter",
+            &[59, 68],
+            &lyric(0, "tes", "<ticks>480</ticks>"),
+            ""
+        ),
+        chord("quarter", &[68], "", ""),
+        chord("quarter", &[59, 68], &lyric(0, "yeux", ""), ""),
+        chord("quarter", &[59, 68], &lyric(0, "clairs", ""), "")
+    );
+    let midi = musescore::parse(xml.as_bytes()).unwrap();
+    let default = convert_midi_with_profile(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        PronunciationProfile::Default,
+    );
+    assert!(default.ok, "{:?}", default.msg);
+    let lane = default
+        .svp
+        .as_ref()
+        .unwrap()
+        .tracks
+        .iter()
+        .find(|t| {
+            t.notes
+                .iter()
+                .any(|n| matches!(&n.lyric, ProjectedLyric::Extension))
+                && t.notes
+                    .iter()
+                    .any(|n| matches!(&n.lyric, ProjectedLyric::Source(s) if s.raw == "tes"))
+        })
+        .unwrap();
+    let head = &lane.notes[0];
+    let held = &lane.notes[1];
+    let head_origin = head
+        .source_evidence
+        .as_ref()
+        .unwrap()
+        .origin
+        .as_ref()
+        .unwrap();
+    let held_origin = held
+        .source_evidence
+        .as_ref()
+        .unwrap()
+        .origin
+        .as_ref()
+        .unwrap();
+    assert_ne!(
+        head_origin.track_id, held_origin.track_id,
+        "fixture must exercise an actual planner relocation"
+    );
+    assert_eq!(
+        held_origin
+            .continuation
+            .as_ref()
+            .unwrap()
+            .destination_track_id,
+        lane.source_track_id
+    );
+    for profile in [
+        PronunciationProfile::FrenchMillefeuille,
+        PronunciationProfile::Automatic,
+    ] {
+        let result = convert_midi_with_profile(&midi, "english", None, ExportTarget::Ustx, profile);
+        assert!(result.ok, "{:?}", result.msg);
+        let notes = result
+            .svp
+            .as_ref()
+            .unwrap()
+            .tracks
+            .iter()
+            .flat_map(|t| &t.notes)
+            .collect::<Vec<_>>();
+        assert!(notes.iter().any(|n| matches!(&n.lyric, ProjectedLyric::Pronounced { text, phonemes, .. } if text == "yeux" && phonemes == "fr/z fr/y fr/ee")));
+        let actual = notes
+            .iter()
+            .copied()
+            .find(|n| {
+                n.source_evidence.as_ref().unwrap().note_id
+                    == held.source_evidence.as_ref().unwrap().note_id
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                held.onset_ticks,
+                held.duration_ticks,
+                held.pitch,
+                &held.lyric,
+                &held.source_evidence,
+                &held.performance
+            ),
+            (
+                actual.onset_ticks,
+                actual.duration_ticks,
+                actual.pitch,
+                &actual.lyric,
+                &actual.source_evidence,
+                &actual.performance
+            )
+        );
+    }
+}
 const ALTI_HIGH: &str = "mscx:staff:2:voice:1:polyphonic-member:2";
 const SOP: &str = "mscx:staff:1:voice:1";
 const TARGET_PROFILES: [(ExportTarget, PronunciationProfile); 4] = [

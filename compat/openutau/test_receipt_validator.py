@@ -36,7 +36,7 @@ class ReceiptValidatorTest(unittest.TestCase):
         for revision, total, root in self.receipts:
             rows = root.findall(".//t:UnitTestResult", NS)
             self.assertEqual(len(rows), total)
-            self.assertEqual(sum(row.get("testName", "").startswith(PREFIX) for row in rows), 43)
+            self.assertEqual(sum(row.get("testName", "").startswith(PREFIX) for row in rows), 46)
             for mode in ("full", "fixtures-only"):
                 with self.subTest(revision=revision, mode=mode):
                     self.validate(root, revision, mode, True)
@@ -53,7 +53,7 @@ class ReceiptValidatorTest(unittest.TestCase):
                         results.remove(next(r for r in results if r.get("testName") == name))
                         self.validate(root, revision, mode, False)
 
-    def test_twenty_three_deleted_results_are_refused(self):
+    def test_twenty_six_deleted_results_are_refused(self):
         for revision, total, original in self.receipts:
             root = copy.deepcopy(original)
             results = root.find("t:Results", NS)
@@ -76,7 +76,7 @@ class ReceiptValidatorTest(unittest.TestCase):
                 else:
                     results.remove(row)
             # Retain all 16 hint cases and every formerly checked >=1 method.
-            self.assertEqual(len(results), total - 23)
+            self.assertEqual(len(results), total - 26)
             self.assertEqual(sum(r.get("testName", "").startswith(PREFIX) for r in results), 20)
             for mode in ("full", "fixtures-only"):
                 with self.subTest(revision=revision, mode=mode):
@@ -108,8 +108,8 @@ if __name__ == "__main__":
     parser.add_argument("--beta-trx", type=Path, required=True)
     arguments = parser.parse_args()
     ReceiptValidatorTest.receipts = [
-        ("3f213e8993ca792c3e6f8958c92ab27eae78eac5", 65, ET.parse(arguments.baseline_trx).getroot()),
-        ("ec7ba520583173c67aabfc5feab33390b4f720a4", 67, ET.parse(arguments.beta_trx).getroot()),
+        ("3f213e8993ca792c3e6f8958c92ab27eae78eac5", 68, ET.parse(arguments.baseline_trx).getroot()),
+        ("ec7ba520583173c67aabfc5feab33390b4f720a4", 70, ET.parse(arguments.beta_trx).getroot()),
     ]
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(ReceiptValidatorTest)
     outcome = unittest.TextTestRunner(verbosity=2).run(suite)

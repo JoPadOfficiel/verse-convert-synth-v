@@ -524,6 +524,29 @@ A native score without a Part-specific timing modifier is expected to render
 stems identical to MuseScore's own Part render; a fermata or breath on only
 some Parts is the case the whole-score stem exists for.
 
+## Offline French dictionary inspection
+
+Run `python3 scripts/check-french-dictionary.py yeux jeu clairs` to inspect
+complete literal dictionary keys in the shipped French corpora. The JSON report
+retains source line numbers, original symbols, curated and community readings.
+Add `--millefeuille-pack /local/g2p-fr-millefeuille.zip` to compare against a local
+OpenUtau dictionary pack; pack, dictionary, inventory and corpus hashes are
+recorded, with source headers and row coordinates. Its ONNX graph is never run.
+The inspector follows the pinned native separator, inventory filtering and
+last-entry precedence; malformed rows and filtered symbols stay explicit.
+The tool distinguishes missing keys, absent native readings and conflicting
+readings without changing the input or guessing a replacement.
+
+This reports dictionary evidence only. Runtime aliases, ambiguous words, source
+syllables, language ownership, liaison and audible singing need separate checks.
+Inspect score-export `FRENCH_LIAISON_APPLIED` and
+`FRENCH_PRONUNCIATION_UNSUPPORTED` diagnostics for context. The `french_phonetics`
+integration suite covers `tes yeux clairs` in all vocal Parts, explicit French
+and Automatic, with direct contact and source-owned held syllables. It also
+refuses unowned, broken or conflicting hold chains and source-boundary crossing.
+Native qualification verifies both the embedded `yeux`/`jeu` readings and the
+contextual `fr/z fr/y fr/ee` hint; neither establishes acoustic quality.
+
 ## Interpreting a failure
 
 A parser or projection refusal is not automatically a regression. Verse

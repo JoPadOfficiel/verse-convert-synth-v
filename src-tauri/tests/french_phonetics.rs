@@ -1745,6 +1745,279 @@ fn vowel_fragments_outside_the_audited_layouts_stay_unsupported() {
 }
 
 #[test]
+fn yeux_keeps_its_dictionary_vowel_and_receives_only_the_attested_leading_liaison() {
+    let expected = [
+        "tes[fr/t fr/ae]",
+        "yeux[fr/z fr/y fr/ee]",
+        "clairs[fr/k fr/l fr/ae fr/r]",
+    ];
+    for native in [false, true] {
+        let midi = sab(&["tes", "yeux", "clairs"], native, false);
+        let source = format!("{midi:?}");
+        assert_lanes(&midi, &expected);
+        for profile in [FR, PronunciationProfile::Automatic] {
+            let outcome =
+                convert_midi_with_profile(&midi, "english", None, ExportTarget::Ustx, profile);
+            assert!(outcome.ok, "{:?}", outcome.msg);
+            for part in &model(&outcome).voice_parts {
+                assert_eq!(
+                    part.notes
+                        .iter()
+                        .map(|note| note.lyric.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+            assert!(outcome
+                .tracks
+                .iter()
+                .flat_map(|t| &t.warnings)
+                .any(|d| d.code == french::LIAISON));
+        }
+        assert_eq!(format!("{midi:?}"), source);
+    }
+    for (word, hint) in [
+        ("yeux", "fr/y fr/ee"),
+        ("jeu", "fr/j fr/ee"),
+        ("jeux", "fr/j fr/ee"),
+    ] {
+        let mut notes = direct_notes(&[word]);
+        direct_apply(&mut notes);
+        assert_eq!(phones(&notes[0]), Some(hint));
+    }
+}
+
+#[test]
+fn yeux_liaison_follows_source_owned_held_tes_in_every_voice() {
+    for native in [false, true] {
+        let expected = if native {
+            vec![
+                "tes[fr/t fr/ae]",
+                "+~",
+                "yeux[fr/z fr/y fr/ee]",
+                "clairs[fr/k fr/l fr/ae fr/r]",
+            ]
+        } else {
+            vec![
+                "tes[fr/t fr/ae]",
+                "+~",
+                "+~",
+                "yeux[fr/z fr/y fr/ee]",
+                "clairs[fr/k fr/l fr/ae fr/r]",
+            ]
+        };
+        let midi = if native {
+            sab_with_extension(&["tes", "", "yeux", "clairs"], true, false, Some(0))
+        } else {
+            let mut parts = String::new();
+            let mut staves = String::new();
+            for (index, name) in ["Soprano", "Alto", "Bass"].iter().enumerate() {
+                let id = index + 1;
+                parts.push_str(&format!(
+                    "<score-part id=\"P{id}\"><part-name>{name}</part-name></score-part>"
+                ));
+                staves.push_str(&format!(r#"<part id="P{id}"><measure number="1"><attributes><divisions>2</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+<note><pitch><step>C</step><octave>4</octave></pitch><duration>2</duration><lyric><text>tes</text><extend type="start"/></lyric></note>
+<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration></note>
+<note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><lyric><extend type="stop"/></lyric></note>
+<note><pitch><step>C</step><octave>4</octave></pitch><duration>2</duration><lyric><text>yeux</text></lyric></note>
+<note><pitch><step>C</step><octave>4</octave></pitch><duration>2</duration><lyric><text>clairs</text></lyric></note>
+</measure></part>"#));
+            }
+            musicxml::parse(format!("<score-partwise version=\"4.0\"><part-list>{parts}</part-list>{staves}</score-partwise>").as_bytes()).unwrap()
+        };
+        assert_lanes(&midi, &expected);
+        let automatic = convert_midi_with_profile(
+            &midi,
+            "english",
+            None,
+            ExportTarget::Ustx,
+            PronunciationProfile::Automatic,
+        );
+        assert!(automatic.ok, "{:?}", automatic.msg);
+        for part in &model(&automatic).voice_parts {
+            assert_eq!(
+                part.notes
+                    .iter()
+                    .map(|n| n.lyric.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn yeux_liaison_refuses_unowned_holds_and_source_boundaries() {
+    use verse_lib::engine::midi::LineBreak;
+    let midi = sab_with_extension(&["tes", "", "yeux", "clairs"], true, false, Some(0));
+    let baseline = convert_midi_with_profile(
+        &midi,
+        "english",
+        None,
+        ExportTarget::Ustx,
+        PronunciationProfile::Default,
+    );
+    for boundary in [
+        "gap",
+        "unknown_hold",
+        "missing_link",
+        "wrong_owner",
+        "wrong_predecessor",
+        "other_part",
+        "other_voice",
+        "other_occurrence",
+        "conflict",
+        "line_break",
+        "text_instead_of_hold",
+        "manual_left",
+    ] {
+        let mut notes = baseline.svp.as_ref().unwrap().tracks[0].notes.clone();
+        match boundary {
+            "gap" => notes[1].duration_ticks -= 1,
+            "unknown_hold" => notes[1].source_evidence = None,
+            "missing_link" => {
+                notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .continuation = None
+            }
+            "wrong_owner" => {
+                notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .continuation
+                    .as_mut()
+                    .unwrap()
+                    .lyric_owner_id = "other-owner".into()
+            }
+            "wrong_predecessor" => {
+                notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .continuation
+                    .as_mut()
+                    .unwrap()
+                    .predecessor_id = "other-note".into()
+            }
+            "other_part" => {
+                notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .source
+                    .part_id = Some("other-part".into())
+            }
+            "other_voice" => {
+                notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .source
+                    .voice = Some("other-voice".into())
+            }
+            "other_occurrence" => {
+                notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .source
+                    .occurrence += 1
+            }
+            "conflict" => {
+                notes[1]
+                    .source_evidence
+                    .as_mut()
+                    .unwrap()
+                    .origin
+                    .as_mut()
+                    .unwrap()
+                    .lyric_conflict = true
+            }
+            "line_break" => edit_source(&mut notes[2]).line_break = Some(LineBreak::Line),
+            "text_instead_of_hold" => {
+                notes[1].lyric = ProjectedLyric::Source(Box::new(
+                    verse_lib::engine::midi::Lyric::text("other", "mot".into()),
+                ))
+            }
+            "manual_left" => {
+                edit_source(&mut notes[0]).state =
+                    verse_lib::engine::midi::LyricState::Text("tes[fr/t fr/ae]".into())
+            }
+            _ => unreachable!(),
+        }
+        let original = notes.clone();
+        let diagnostics = direct_apply(&mut notes);
+        assert_eq!(phones(&notes[2]), Some("fr/y fr/ee"), "{boundary}");
+        assert!(
+            !diagnostics.iter().any(|d| d.code == french::LIAISON),
+            "{boundary}"
+        );
+        assert_eq!(
+            (
+                notes[2].onset_ticks,
+                notes[2].duration_ticks,
+                notes[2].pitch
+            ),
+            (
+                original[2].onset_ticks,
+                original[2].duration_ticks,
+                original[2].pitch
+            )
+        );
+    }
+    let mut notes = direct_notes(&["tes", "yeux[fr/y fr/ee]"]);
+    let manual = notes[1].clone();
+    direct_apply(&mut notes);
+    assert_eq!(notes[1], manual);
+}
+
+#[test]
+fn every_supported_plural_determiner_can_link_to_yeux_without_a_written_z() {
+    for left in ["mes", "tes", "ses", "les", "des", "nos", "vos", "ces"] {
+        let mut notes = direct_notes(&[left, "Yeux!"]);
+        let original = notes.clone();
+        let diagnostics = direct_apply(&mut notes);
+        assert_eq!(phones(&notes[1]), Some("fr/z fr/y fr/ee"), "{left}");
+        assert!(
+            diagnostics.iter().any(|d| d.code == french::LIAISON),
+            "{left}"
+        );
+        for (note, before) in notes.iter().zip(&original) {
+            assert_eq!(
+                (note.onset_ticks, note.duration_ticks, note.pitch),
+                (before.onset_ticks, before.duration_ticks, before.pitch)
+            );
+            let ProjectedLyric::Pronounced { source, .. } = &note.lyric else {
+                panic!("missing hint")
+            };
+            assert_eq!(ProjectedLyric::Source(source.clone()), before.lyric);
+        }
+    }
+}
+
+#[test]
 fn liaison_is_bounded_and_already_spelled_consonants_are_not_doubled() {
     let words = [
         "Tout", "au", "tout", "à", "tout", "tau", "mes", "amis", "un", "ami", "est", "un", "les",

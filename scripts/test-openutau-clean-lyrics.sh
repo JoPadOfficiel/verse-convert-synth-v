@@ -208,9 +208,11 @@ if sys.argv[3] != "native-only":
                 for method in ("MissingDurationPhoneRaisesNativeErrorWithoutApproximateFallback",
                                "MissingAcousticPhoneFailsAfterSuccessfulNativePhonemization"):
                     case(method, **arguments, missing=missing)
-    for word, hint in (("ciel", "fr/s fr/y fr/ae fr/l"), ("yeux", "fr/y fr/ee"),
+    for word, hint in (("ciel", "fr/s fr/y fr/ae fr/l"), ("yeux", "fr/y fr/ee"), ("yeux", "fr/z fr/y fr/ee"),
                        ("blancs", "fr/b fr/l fr/en"), ("noel", "fr/n fr/oo fr/ae fr/l")):
         case("FrenchWholeWordHintSurvivesNativeLifecycle", word=word, hint=hint)
+    for word, reading in (("yeux", "y ee"), ("jeu", "j ee")):
+        case("FrenchEmbeddedDictionaryAttestsTheVowelBeforeContextualLiaison", word=word, expected=reading)
     for alias in ("fr/i", "fr/el"):
         case("InvalidFrenchAliasIsRefused", alias=alias)
     for language, word, hint, phonemizer in (
@@ -223,9 +225,9 @@ if sys.argv[3] != "native-only":
     case("PortugueseExactHintSurvivesNativeParsingAndRoundTrip")
     case("VerseExportResolvesEveryNativeWordOverride")
     pronunciation_names = [name for name in names if name.startswith(prefix)]
-    assert len(expected) == 43
-    assert len(pronunciation_names) == 43 and set(pronunciation_names) == expected, "Incomplete or substituted native pronunciation case set"
-    assert len(results) == len(native_names) + 43, "Unexpected full native receipt count"
+    assert len(expected) == 46
+    assert len(pronunciation_names) == 46 and set(pronunciation_names) == expected, "Incomplete or substituted native pronunciation case set"
+    assert len(results) == len(native_names) + 46, "Unexpected full native receipt count"
 print(f"Qualified {sys.argv[2]}: {len(results)} passed native tests")
 PY_RECEIPT
   then
