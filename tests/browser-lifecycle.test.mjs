@@ -413,14 +413,14 @@ test("real browser assertion failure keeps a nonzero result and removes owned re
 });
 
 for (const [name, tests, reloads] of [
-  ["too few cases", Array.from({ length: 57 }, () => ({ passed: true })), 6],
-  ["nonpassing entry", Array.from({ length: 58 }, (_, i) => ({ passed: i !== 3 })), 6],
-  ["wrong reload count", Array.from({ length: 58 }, () => ({ passed: true })), 5],
+  ["too few cases", Array.from({ length: 63 }, () => ({ passed: true })), 6],
+  ["nonpassing entry", Array.from({ length: 64 }, (_, i) => ({ passed: i !== 3 })), 6],
+  ["wrong reload count", Array.from({ length: 64 }, () => ({ passed: true })), 5],
 ]) {
   test(`incomplete successful receipt fails closed: ${name}`, async (t) => {
     const result = await runHarness(t, { page: receiptPage({ passed: true, tests, reloads }) });
     assert.equal(result.code, 1);
-    assert.match(result.output, /Incomplete browser receipt: expected 58 passing cases and 6 reloads/);
+    assert.match(result.output, /Incomplete browser receipt: expected 64 passing cases and 6 reloads/);
   });
 }
 
