@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.10.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.4...v0.10.0) (2026-10-07)
+
+
+### Features
+
+* add Lectura API liaison prediction ([eaf0277](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/eaf027790239de4e12bbc6680a2c16692833a1f6))
+* add Lectura API liaison prediction ([59467da](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/59467daa4e4dfe01717767358d1cb03d4317d44b))
+
 ## [0.9.4](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.3...v0.9.4) (2026-10-07)
 
 
