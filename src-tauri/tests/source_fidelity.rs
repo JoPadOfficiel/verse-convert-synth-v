@@ -201,9 +201,22 @@ fn multi_tempo_musicxml() -> &'static str {
 fn mxl(xml: &str) -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut writer = zip::ZipWriter::new(cursor);
-    let options = zip::write::SimpleFileOptions::default();
+    let auxiliary = br#"<?xml version="1.0" encoding="UTF-8"?><metadata><entry/></metadata>"#;
     writer
-        .start_file("META-INF/container.xml", options)
+        .start_file(
+            "chordlist.xml",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .expect("MXL auxiliary XML entry");
+    writer
+        .write_all(auxiliary)
+        .expect("MXL auxiliary XML contents");
+    writer
+        .start_file(
+            "META-INF/container.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
         .expect("MXL container entry");
     writer
         .write_all(
@@ -211,7 +224,7 @@ fn mxl(xml: &str) -> Vec<u8> {
         )
         .expect("MXL container contents");
     writer
-        .start_file("score.musicxml", options)
+        .start_file("score.musicxml", zip::write::SimpleFileOptions::default())
         .expect("MXL score entry");
     writer
         .write_all(xml.as_bytes())
@@ -222,6 +235,28 @@ fn mxl(xml: &str) -> Vec<u8> {
 fn mscz(xml: &str) -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut writer = zip::ZipWriter::new(cursor);
+    let auxiliary = br#"<?xml version="1.0" encoding="UTF-8"?><museScore version="4.0"><ChordList/></museScore>"#;
+    writer
+        .start_file(
+            "chordlist.xml",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .expect("MSCZ auxiliary XML entry");
+    writer
+        .write_all(auxiliary)
+        .expect("MSCZ auxiliary XML contents");
+    writer
+        .start_file(
+            "META-INF/container.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("MSCZ container entry");
+    writer
+        .write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?><container><rootfiles><rootfile full-path="score.mscx"/></rootfiles></container>"#,
+        )
+        .expect("MSCZ container contents");
     writer
         .start_file("score.mscx", zip::write::SimpleFileOptions::default())
         .expect("MSCZ score entry");
@@ -396,6 +431,8 @@ fn every_supported_source_family_keeps_global_tempo_changes_for_openutau() {
         SourceFormat::MusicXml
     );
     let mxl_data = mxl(multi_tempo_musicxml());
+    assert!(!musicxml::looks_like_xml(&mxl_data));
+    assert!(musicxml::zip_has_musicxml(&mxl_data));
     assert_eq!(
         musicxml::parse(&mxl_data)
             .expect("parse multi-tempo MXL")
@@ -411,6 +448,9 @@ fn every_supported_source_family_keeps_global_tempo_changes_for_openutau() {
         SourceFormat::MuseScore
     );
     let mscz_data = mscz(multi_tempo_mscx());
+    assert!(!musicxml::looks_like_xml(&mscz_data));
+    assert!(!musicxml::zip_has_musicxml(&mscz_data));
+    assert!(musescore::zip_has_mscx(&mscz_data));
     assert_eq!(
         musescore::parse(&mscz_data)
             .expect("parse multi-tempo MSCZ")
@@ -428,6 +468,56 @@ fn every_supported_source_family_keeps_global_tempo_changes_for_openutau() {
     ] {
         assert_global_multi_tempo_across_targets(&data, label);
     }
+}
+
+#[test]
+fn conversion_rejects_xml_only_archives_with_the_stable_archive_diagnostic() {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    writer
+        .start_file(
+            "metadata.xml",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer
+        .write_all(b"<?xml version=\"1.0\"?><metadata/>")
+        .unwrap();
+    let data = writer.finish().unwrap().into_inner();
+
+    assert!(!musicxml::looks_like_xml(&data));
+    assert!(!musicxml::zip_has_musicxml(&data));
+    let outcome = convert_auto(&data, "english");
+    assert!(!outcome.ok);
+    assert_eq!(
+        outcome.msg.as_deref(),
+        Some("archive contains no recognized score (neither MusicXML nor MuseScore)")
+    );
+}
+
+#[test]
+fn conversion_rejects_archives_with_both_musescore_and_musicxml_scores() {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    writer
+        .start_file("score.mscx", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(multi_tempo_mscx().as_bytes()).unwrap();
+    writer
+        .start_file("score.musicxml", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(multi_tempo_musicxml().as_bytes()).unwrap();
+    let data = writer.finish().unwrap().into_inner();
+
+    assert!(musicxml::zip_has_musicxml(&data));
+    assert!(musescore::zip_has_mscx(&data));
+    let outcome = convert_auto(&data, "english");
+    assert!(!outcome.ok);
+    assert_eq!(
+        outcome.msg.as_deref(),
+        Some("archive contains ambiguous score formats (MusicXML and MuseScore)")
+    );
 }
 
 #[test]

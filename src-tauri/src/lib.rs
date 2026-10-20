@@ -679,21 +679,29 @@ fn parse_source_snapshot(data: &[u8], extension: &str) -> Result<Midi, String> {
     use engine::musescore as ms;
     use engine::musicxml as mx;
 
+    if mx::is_zip(data) {
+        match (mx::zip_has_musicxml(data), ms::zip_has_mscx(data)) {
+            (true, true) => {
+                return Err(
+                    "archive contains ambiguous score formats (MusicXML and MuseScore)".into(),
+                )
+            }
+            (true, false) => {
+                return mx::parse(data).map_err(|error| format!("unreadable MusicXML ({error})"));
+            }
+            (false, true) => {
+                return ms::parse(data).map_err(|error| format!("unreadable MuseScore ({error})"));
+            }
+            (false, false) => {}
+        }
+        return Err("archive contains no recognized score".into());
+    }
     if mx::looks_like_xml(data) {
         return if ms::is_musescore_xml(data) {
             ms::parse(data).map_err(|error| format!("unreadable MuseScore ({error})"))
         } else {
             mx::parse(data).map_err(|error| format!("unreadable MusicXML ({error})"))
         };
-    }
-    if mx::is_zip(data) {
-        if mx::zip_has_musicxml(data) {
-            return mx::parse(data).map_err(|error| format!("unreadable MusicXML ({error})"));
-        }
-        if ms::zip_has_mscx(data) {
-            return ms::parse(data).map_err(|error| format!("unreadable MuseScore ({error})"));
-        }
-        return Err("archive contains no recognized score".into());
     }
     if extension.eq_ignore_ascii_case("kar") {
         engine::midi::parse_with_karaoke_profile(data)
@@ -1012,6 +1020,7 @@ mod percussion_fixtures;
 #[cfg(test)]
 mod output_tests {
     use super::*;
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1026,6 +1035,33 @@ mod output_tests {
         path
     }
 
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        for (name, bytes) in entries {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn musescore_zip_with_auxiliary_xml() -> Vec<u8> {
+        let auxiliary = br#"<?xml version="1.0" encoding="UTF-8"?><museScore version="4.0"><ChordList/></museScore>"#;
+        let container = br#"<?xml version="1.0" encoding="UTF-8"?><container><rootfiles><rootfile full-path="score.mscx"/></rootfiles></container>"#;
+        let score = include_bytes!("../tests/support/score-audio-conflict.mscx");
+        stored_zip(&[
+            ("chordlist.xml", auxiliary),
+            ("META-INF/container.xml", container),
+            ("score.mscx", score),
+        ])
+    }
+
     #[test]
     fn source_and_existing_outputs_are_never_accepted() {
         let root = temp_dir();
@@ -1037,6 +1073,97 @@ mod output_tests {
         std::fs::write(&existing, b"mine").unwrap();
         assert!(validate_new_output_target(&source, &existing).is_err());
         assert_eq!(std::fs::read(&existing).unwrap(), b"mine");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analysis_dispatch_selects_declared_musescore_master_over_auxiliary_xml() {
+        let bytes = musescore_zip_with_auxiliary_xml();
+        assert!(!engine::musicxml::looks_like_xml(&bytes));
+        assert!(!engine::musicxml::zip_has_musicxml(&bytes));
+        assert!(engine::musescore::zip_has_mscx(&bytes));
+        let midi = parse_source_snapshot(&bytes, "mscz").expect("parse declared MuseScore master");
+        assert_eq!(midi.source_format, SourceFormat::MuseScore);
+
+        let root = temp_dir();
+        let source = root.join("source.mscz");
+        std::fs::write(&source, &bytes).unwrap();
+        let analysis = process_one(
+            source.to_str().unwrap(),
+            false,
+            None,
+            "english",
+            None,
+            ExportTarget::Svp,
+            PronunciationProfile::Default,
+        );
+        assert!(analysis.ok, "{:?}", analysis.msg);
+        assert!(analysis.out.is_none());
+
+        let unrecognized = stored_zip(&[("metadata.xml", b"<?xml version=\"1.0\"?><metadata/>")]);
+        assert_eq!(
+            parse_source_snapshot(&unrecognized, "mscz").unwrap_err(),
+            "archive contains no recognized score"
+        );
+
+        let musicxml = br#"<?xml version="1.0" encoding="UTF-8"?><score-partwise version="3.1"><part-list/><part id="P1"><measure number="1"><attributes><divisions>480</divisions></attributes></measure></part></score-partwise>"#;
+        let mixed = stored_zip(&[
+            (
+                "score.mscx",
+                include_bytes!("../tests/support/score-audio-conflict.mscx"),
+            ),
+            ("score.musicxml", musicxml),
+        ]);
+        assert!(engine::musicxml::zip_has_musicxml(&mixed));
+        assert!(engine::musescore::zip_has_mscx(&mixed));
+        assert_eq!(
+            parse_source_snapshot(&mixed, "mscz").unwrap_err(),
+            "archive contains ambiguous score formats (MusicXML and MuseScore)"
+        );
+        let mixed_source = root.join("mixed.mscz");
+        std::fs::write(&mixed_source, &mixed).unwrap();
+        let mixed_analysis = process_one(
+            mixed_source.to_str().unwrap(),
+            false,
+            None,
+            "english",
+            None,
+            ExportTarget::Svp,
+            PronunciationProfile::Default,
+        );
+        assert!(!mixed_analysis.ok);
+        assert_eq!(
+            mixed_analysis.msg.as_deref(),
+            Some("archive contains ambiguous score formats (MusicXML and MuseScore)")
+        );
+
+        if let Some(path) = std::env::var_os("VERSE_MSCZ_ARCHIVE_DISPATCH_GATE") {
+            let source = PathBuf::from(path);
+            let bytes = std::fs::read(&source).expect("read supplied MSCZ archive dispatch gate");
+            let midi = parse_source_snapshot(&bytes, "mscz")
+                .expect("supplied MSCZ selects the MuseScore parser");
+            assert_eq!(midi.source_format, SourceFormat::MuseScore);
+            let export = process_one(
+                source.to_str().expect("supplied MSCZ path is valid UTF-8"),
+                true,
+                Some(root.to_str().unwrap()),
+                "english",
+                None,
+                ExportTarget::Ustx,
+                PronunciationProfile::Default,
+            );
+            assert!(export.ok, "supplied MSCZ USTX export: {:?}", export.msg);
+            let output = export.out.expect("successful USTX export path");
+            let output_path = Path::new(&output);
+            assert!(
+                output_path.is_file(),
+                "USTX output was not created: {output}"
+            );
+            assert_eq!(
+                output_path.extension().and_then(|ext| ext.to_str()),
+                Some("ustx")
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
