@@ -5,6 +5,14 @@ All notable changes to Verse are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/), and release
 entries are maintained by Release Please from Conventional Commits.
 
+## [0.10.1](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.10.0...v0.10.1) (2026-10-20)
+
+
+### Bug Fixes
+
+* accept prefixed and case-varied score ZIPs ([b803c66](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/b803c660178a350b4b72bfc7f0c92cc2ae8789bf))
+* dispatch MuseScore archives by score root ([4d9ffe5](https://github.com/JoPadOfficiel/verse-convert-synth-v/commit/4d9ffe59834485932ee4ed05c4d0d2a0f53cd247))
+
 ## [0.10.0](https://github.com/JoPadOfficiel/verse-convert-synth-v/compare/v0.9.4...v0.10.0) (2026-10-07)
 
 
