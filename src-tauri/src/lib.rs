@@ -1100,6 +1100,24 @@ mod output_tests {
         assert!(analysis.ok, "{:?}", analysis.msg);
         assert!(analysis.out.is_none());
 
+        let mut prefixed = b"#!/bin/sh\nMSCZ launcher\n".to_vec();
+        prefixed.extend_from_slice(&bytes);
+        let prefixed_midi =
+            parse_source_snapshot(&prefixed, "mscz").expect("parse prefixed MuseScore master");
+        assert_eq!(prefixed_midi.source_format, SourceFormat::MuseScore);
+        let prefixed_source = root.join("prefixed.mscz");
+        std::fs::write(&prefixed_source, &prefixed).unwrap();
+        let prefixed_analysis = process_one(
+            prefixed_source.to_str().unwrap(),
+            false,
+            None,
+            "english",
+            None,
+            ExportTarget::Svp,
+            PronunciationProfile::Default,
+        );
+        assert!(prefixed_analysis.ok, "{:?}", prefixed_analysis.msg);
+
         let unrecognized = stored_zip(&[("metadata.xml", b"<?xml version=\"1.0\"?><metadata/>")]);
         assert_eq!(
             parse_source_snapshot(&unrecognized, "mscz").unwrap_err(),

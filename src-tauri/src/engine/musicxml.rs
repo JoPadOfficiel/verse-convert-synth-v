@@ -10,13 +10,15 @@ use crate::engine::midi::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek};
+use std::path::Path;
 
 type MusicXmlVoiceKey = (String, String, usize);
 type MusicXmlTieKey = (String, String, usize, String, Option<String>);
 type MusicXmlVoiceEvents = BTreeMap<MusicXmlVoiceKey, Vec<Event>>;
 
 pub fn is_zip(data: &[u8]) -> bool {
-    data.len() >= 2 && &data[0..2] == b"PK"
+    // The default ZIP reader detects a prepended self-extracting stub.
+    zip::ZipArchive::new(std::io::Cursor::new(data)).is_ok()
 }
 
 pub fn looks_like_xml(data: &[u8]) -> bool {
@@ -74,10 +76,7 @@ fn score_partwise_documents<R: Read + Seek>(
             continue;
         };
         let name = file.name().to_string();
-        if file.is_dir()
-            || name.starts_with("META-INF")
-            || !(name.ends_with(".xml") || name.ends_with(".musicxml"))
-        {
+        if file.is_dir() || name.starts_with("META-INF") || !is_musicxml_member_name(&name) {
             continue;
         }
         let (entry_bytes, xml_result) = read_zip_entry_capped_with_size(&mut file);
@@ -95,6 +94,15 @@ fn score_partwise_documents<R: Read + Seek>(
         }
     }
     Ok(documents)
+}
+
+fn is_musicxml_member_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("xml") || extension.eq_ignore_ascii_case("musicxml")
+        })
 }
 
 /// True if the ZIP archive contains an XML entry whose document is a MusicXML score.
@@ -2201,6 +2209,12 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn with_zip_preamble(archive: &[u8]) -> Vec<u8> {
+        let mut prefixed = b"#!/bin/sh\nMXL launcher\n".to_vec();
+        prefixed.extend_from_slice(archive);
+        prefixed
+    }
+
     fn windows_1252(value: &str) -> Vec<u8> {
         value
             .chars()
@@ -2476,6 +2490,34 @@ mod tests {
         let unrecognized_archive = zipped_entries(&[("metadata.xml", b"<metadata/>")]);
         assert!(!looks_like_xml(&unrecognized_archive));
         assert!(!zip_has_musicxml(&unrecognized_archive));
+    }
+
+    #[test]
+    fn containerless_mxl_accepts_uppercase_score_member_extensions() {
+        let score = mxl("<text>word</text>");
+        for name in ["score.XML", "score.MUSICXML"] {
+            let archive = zipped_score(name, score.as_bytes());
+            assert!(zip_has_musicxml(&archive), "{name} must be recognized");
+            assert_eq!(
+                lyrics_of(&parse(&archive).expect("parse uppercase MusicXML member")),
+                vec!["word"],
+                "{name} must reach the MusicXML parser"
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_musicxml_with_prepended_zip_data_is_detected_and_parsed() {
+        let score = mxl("<text>word</text>");
+        let archive = with_zip_preamble(&zipped_score("score.musicxml", score.as_bytes()));
+
+        assert!(is_zip(&archive));
+        assert!(!looks_like_xml(&archive));
+        assert!(zip_has_musicxml(&archive));
+        assert_eq!(
+            lyrics_of(&parse(&archive).expect("parse prefixed MXL archive")),
+            vec!["word"]
+        );
     }
 
     #[test]
