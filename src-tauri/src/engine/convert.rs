@@ -1851,6 +1851,31 @@ pub fn convert_auto_with(
         bundle_ready: false,
         projection: ProjectionEvidence::default(),
     };
+    if mx::is_zip(data) {
+        match (mx::zip_has_musicxml(data), ms::zip_has_mscx(data)) {
+            (true, true) => {
+                return fail(
+                    "archive contains ambiguous score formats (MusicXML and MuseScore)".into(),
+                )
+            }
+            (true, false) => {
+                return match mx::parse(data) {
+                    Ok(midi) => convert_midi_with(&midi, language, overrides),
+                    Err(e) => fail(format!("unreadable MusicXML ({})", e)),
+                };
+            }
+            (false, true) => {
+                return match ms::parse(data) {
+                    Ok(midi) => convert_midi_with(&midi, language, overrides),
+                    Err(e) => fail(format!("unreadable MuseScore ({})", e)),
+                };
+            }
+            (false, false) => {}
+        }
+        return fail(
+            "archive contains no recognized score (neither MusicXML nor MuseScore)".into(),
+        );
+    }
     if mx::looks_like_xml(data) {
         if ms::is_musescore_xml(data) {
             return match ms::parse(data) {
@@ -1862,23 +1887,6 @@ pub fn convert_auto_with(
             Ok(midi) => convert_midi_with(&midi, language, overrides),
             Err(e) => fail(format!("unreadable MusicXML ({})", e)),
         };
-    }
-    if mx::is_zip(data) {
-        if mx::zip_has_musicxml(data) {
-            return match mx::parse(data) {
-                Ok(midi) => convert_midi_with(&midi, language, overrides),
-                Err(e) => fail(format!("unreadable MusicXML ({})", e)),
-            };
-        }
-        if ms::zip_has_mscx(data) {
-            return match ms::parse(data) {
-                Ok(midi) => convert_midi_with(&midi, language, overrides),
-                Err(e) => fail(format!("unreadable MuseScore ({})", e)),
-            };
-        }
-        return fail(
-            "archive contains no recognized score (neither MusicXML nor MuseScore)".into(),
-        );
     }
     let midi = match midi::parse(data) {
         Ok(m) => m,

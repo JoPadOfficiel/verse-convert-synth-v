@@ -22,7 +22,7 @@ pub fn zip_has_mscx(data: &[u8]) -> bool {
     if let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(data)) {
         for i in 0..zip.len() {
             if let Ok(f) = zip.by_index(i) {
-                if f.name().ends_with(".mscx") {
+                if is_mscx_path(f.name()) {
                     return true;
                 }
             }
@@ -32,7 +32,7 @@ pub fn zip_has_mscx(data: &[u8]) -> bool {
 }
 
 pub fn parse(data: &[u8]) -> Result<Midi, String> {
-    let xml = if data.len() >= 2 && &data[0..2] == b"PK" {
+    let xml = if crate::engine::musicxml::is_zip(data) {
         extract_mscz(data)?
     } else {
         crate::engine::musicxml::decode_xml_bytes(data)?
@@ -4428,6 +4428,12 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn with_zip_preamble(archive: &[u8]) -> Vec<u8> {
+        let mut prefixed = b"#!/bin/sh\nMuseScore launcher\n".to_vec();
+        prefixed.extend_from_slice(archive);
+        prefixed
+    }
+
     fn zipped_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(cursor);
@@ -5072,6 +5078,19 @@ mod tests {
         let archive = zipped_score(&bytes);
         let zipped = parse(&archive).expect("zipped MSCX uses the entry declaration");
         assert_eq!(lyrics_of(&zipped), vec!["café"]);
+    }
+
+    #[test]
+    fn mscz_with_prepended_zip_data_is_detected_and_parsed() {
+        let score = mscx("<text>prefixed</text>");
+        let archive = with_zip_preamble(&zipped_score(score.as_bytes()));
+
+        assert!(crate::engine::musicxml::is_zip(&archive));
+        assert!(zip_has_mscx(&archive));
+        assert_eq!(
+            lyrics_of(&parse(&archive).expect("parse prefixed MSCZ archive")),
+            vec!["prefixed"]
+        );
     }
 
     #[test]

@@ -9,17 +9,22 @@ use crate::engine::midi::{
     UnpitchedInfo,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
+use std::io::{Read, Seek};
+use std::path::Path;
 
 type MusicXmlVoiceKey = (String, String, usize);
 type MusicXmlTieKey = (String, String, usize, String, Option<String>);
 type MusicXmlVoiceEvents = BTreeMap<MusicXmlVoiceKey, Vec<Event>>;
 
 pub fn is_zip(data: &[u8]) -> bool {
-    data.len() >= 2 && &data[0..2] == b"PK"
+    // The default ZIP reader detects a prepended self-extracting stub.
+    zip::ZipArchive::new(std::io::Cursor::new(data)).is_ok()
 }
 
 pub fn looks_like_xml(data: &[u8]) -> bool {
+    if is_zip(data) {
+        return false;
+    }
     xml_bytes_contain_ascii(data, b"<?xml")
         || xml_bytes_contain_ascii(data, b"<score-partwise")
         || xml_bytes_contain_ascii(data, b"<score-timewise")
@@ -43,26 +48,78 @@ pub(crate) fn xml_bytes_contain_ascii(data: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == utf16_le || window == utf16_be)
 }
 
-/// True if the ZIP archive contains a MusicXML (and not a native MuseScore .mscx).
-pub fn zip_has_musicxml(data: &[u8]) -> bool {
-    if let Ok(mut zip) = zip::ZipArchive::new(std::io::Cursor::new(data)) {
-        for i in 0..zip.len() {
-            if let Ok(f) = zip.by_index(i) {
-                let name = f.name().to_string();
-                if !name.starts_with("META-INF")
-                    && (name.ends_with(".xml") || name.ends_with(".musicxml"))
-                {
-                    return true;
-                }
+fn has_score_partwise_root(xml: &str) -> bool {
+    if check_nesting(xml).is_err() {
+        return false;
+    }
+    let Ok(safe_xml) = mask_external_musicxml_doctype(xml) else {
+        return false;
+    };
+    roxmltree::Document::parse_with_options(
+        &safe_xml,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 5_000_000,
+        },
+    )
+    .is_ok_and(|document| document.root_element().has_tag_name("score-partwise"))
+}
+
+fn score_partwise_documents<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Vec<String>, String> {
+    const MAX_DETECTION_XML_BYTES: usize = 64 * 1024 * 1024;
+    let mut inspected_xml_bytes = 0usize;
+    let mut documents = Vec::new();
+    for index in 0..zip.len() {
+        let Ok(mut file) = zip.by_index(index) else {
+            continue;
+        };
+        let name = file.name().to_string();
+        if file.is_dir() || name.starts_with("META-INF") || !is_musicxml_member_name(&name) {
+            continue;
+        }
+        let (entry_bytes, xml_result) = read_zip_entry_capped_with_size(&mut file);
+        let Some(total) = inspected_xml_bytes.checked_add(entry_bytes) else {
+            return Err("MusicXML archive exceeds the detection size limit".into());
+        };
+        if total > MAX_DETECTION_XML_BYTES {
+            return Err("MusicXML archive exceeds the detection size limit".into());
+        }
+        inspected_xml_bytes = total;
+        if let Ok(xml) = xml_result {
+            if has_score_partwise_root(&xml) {
+                documents.push(xml);
             }
         }
     }
-    false
+    Ok(documents)
+}
+
+fn is_musicxml_member_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("xml") || extension.eq_ignore_ascii_case("musicxml")
+        })
+}
+
+/// True if the ZIP archive contains an XML entry whose document is a MusicXML score.
+pub fn zip_has_musicxml(data: &[u8]) -> bool {
+    if !is_zip(data) {
+        return false;
+    }
+    zip::ZipArchive::new(std::io::Cursor::new(data))
+        .ok()
+        .and_then(|mut zip| score_partwise_documents(&mut zip).ok())
+        .is_some_and(|documents| !documents.is_empty())
 }
 
 fn extract_mxl(data: &[u8]) -> Result<String, String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
-    // rootfile via META-INF/container.xml, otherwise 1st .xml outside META-INF
+    // Use the declared rootfile, or the first score-partwise XML member when
+    // older archives omit the container declaration.
     let mut root: Option<String> = None;
     if let Ok(mut cf) = zip.by_name("META-INF/container.xml") {
         let s = read_zip_entry_capped(&mut cf)?;
@@ -88,16 +145,12 @@ fn extract_mxl(data: &[u8]) -> Result<String, String> {
     let name = match root {
         Some(r) => r,
         None => {
-            let mut found = None;
-            for i in 0..zip.len() {
-                let f = zip.by_index(i).map_err(|e| e.to_string())?;
-                let n = f.name().to_string();
-                if !n.starts_with("META-INF") && (n.ends_with(".xml") || n.ends_with(".musicxml")) {
-                    found = Some(n);
-                    break;
-                }
+            let mut documents = score_partwise_documents(&mut zip)?;
+            match documents.len() {
+                0 => return Err("no MusicXML in archive".into()),
+                1 => return Ok(documents.remove(0)),
+                _ => return Err("MusicXML archive has ambiguous score-partwise roots".into()),
             }
-            found.ok_or_else(|| "no MusicXML in archive".to_string())?
         }
     };
     let mut f = zip.by_name(&name).map_err(|e| e.to_string())?;
@@ -106,15 +159,25 @@ fn extract_mxl(data: &[u8]) -> Result<String, String> {
 
 /// Reads a ZIP entry with a decompressed-size cap (anti zip-bomb).
 pub(crate) fn read_zip_entry_capped(f: &mut impl Read) -> Result<String, String> {
+    let (_, result) = read_zip_entry_capped_with_size(f);
+    result
+}
+
+fn read_zip_entry_capped_with_size(f: &mut impl Read) -> (usize, Result<String, String>) {
     const MAX: u64 = 64 * 1024 * 1024; // 64 MB, far beyond any real score
     let mut bytes = Vec::new();
-    f.take(MAX + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX {
-        return Err("abnormally large archive (rejected for safety)".into());
+    let read_result = f.take(MAX + 1).read_to_end(&mut bytes);
+    let bytes_read = bytes.len();
+    if let Err(error) = read_result {
+        return (bytes_read, Err(error.to_string()));
     }
-    decode_xml_bytes(&bytes)
+    if bytes.len() as u64 > MAX {
+        return (
+            bytes_read,
+            Err("abnormally large archive (rejected for safety)".into()),
+        );
+    }
+    (bytes_read, decode_xml_bytes(&bytes))
 }
 
 fn xml_declared_encoding(data: &[u8]) -> Option<String> {
@@ -2130,6 +2193,28 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn zipped_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        for (name, bytes) in entries {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn with_zip_preamble(archive: &[u8]) -> Vec<u8> {
+        let mut prefixed = b"#!/bin/sh\nMXL launcher\n".to_vec();
+        prefixed.extend_from_slice(archive);
+        prefixed
+    }
+
     fn windows_1252(value: &str) -> Vec<u8> {
         value
             .chars()
@@ -2362,6 +2447,121 @@ mod tests {
             " ".repeat(2_000)
         );
         assert!(looks_like_xml(xml.as_bytes()));
+    }
+
+    #[test]
+    fn archive_detection_uses_score_roots_and_never_raw_sniffs_zip_bytes() {
+        let auxiliary_xml = br#"<?xml version="1.0" encoding="UTF-8"?><museScore version="4.0"><ChordList/></museScore>"#;
+        let musescore_archive = zipped_entries(&[
+            ("chordlist.xml", auxiliary_xml),
+            ("score.mscx", auxiliary_xml),
+        ]);
+        assert!(is_zip(&musescore_archive));
+        assert!(!looks_like_xml(&musescore_archive));
+        assert!(!zip_has_musicxml(&musescore_archive));
+
+        let musicxml = mxl("<text>word</text>");
+        let container = br#"<?xml version="1.0" encoding="UTF-8"?><container><rootfiles><rootfile full-path="score.musicxml"/></rootfiles></container>"#;
+        let musicxml_archive = zipped_entries(&[
+            ("chordlist.xml", auxiliary_xml),
+            ("META-INF/container.xml", container),
+            ("score.musicxml", musicxml.as_bytes()),
+        ]);
+        assert!(!looks_like_xml(&musicxml_archive));
+        assert!(zip_has_musicxml(&musicxml_archive));
+        assert_eq!(
+            lyrics_of(&parse(&musicxml_archive).expect("score-partwise member is MusicXML")),
+            vec!["word"]
+        );
+
+        let fallback_musicxml_archive = zipped_entries(&[
+            ("chordlist.xml", auxiliary_xml),
+            ("score.musicxml", musicxml.as_bytes()),
+        ]);
+        assert!(zip_has_musicxml(&fallback_musicxml_archive));
+        assert_eq!(
+            lyrics_of(
+                &parse(&fallback_musicxml_archive)
+                    .expect("fallback selects score-partwise after auxiliary XML")
+            ),
+            vec!["word"]
+        );
+
+        let unrecognized_archive = zipped_entries(&[("metadata.xml", b"<metadata/>")]);
+        assert!(!looks_like_xml(&unrecognized_archive));
+        assert!(!zip_has_musicxml(&unrecognized_archive));
+    }
+
+    #[test]
+    fn containerless_mxl_accepts_uppercase_score_member_extensions() {
+        let score = mxl("<text>word</text>");
+        for name in ["score.XML", "score.MUSICXML"] {
+            let archive = zipped_score(name, score.as_bytes());
+            assert!(zip_has_musicxml(&archive), "{name} must be recognized");
+            assert_eq!(
+                lyrics_of(&parse(&archive).expect("parse uppercase MusicXML member")),
+                vec!["word"],
+                "{name} must reach the MusicXML parser"
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_musicxml_with_prepended_zip_data_is_detected_and_parsed() {
+        let score = mxl("<text>word</text>");
+        let archive = with_zip_preamble(&zipped_score("score.musicxml", score.as_bytes()));
+
+        assert!(is_zip(&archive));
+        assert!(!looks_like_xml(&archive));
+        assert!(zip_has_musicxml(&archive));
+        assert_eq!(
+            lyrics_of(&parse(&archive).expect("parse prefixed MXL archive")),
+            vec!["word"]
+        );
+    }
+
+    #[test]
+    fn containerless_mxl_rejects_multiple_score_partwise_members() {
+        let first = mxl("<text>first</text>");
+        let second = mxl("<text>second</text>");
+        let archive = zipped_entries(&[
+            ("first.musicxml", first.as_bytes()),
+            ("second.musicxml", second.as_bytes()),
+        ]);
+
+        assert!(zip_has_musicxml(&archive));
+        assert_eq!(
+            extract_mxl(&archive).unwrap_err(),
+            "MusicXML archive has ambiguous score-partwise roots"
+        );
+    }
+
+    #[test]
+    fn undecodable_archive_entries_count_toward_the_aggregate_detection_limit() {
+        const ENTRY_BYTES: usize = 33 * 1024 * 1024;
+        const ENTRY_LIMIT: u64 = 64 * 1024 * 1024;
+        let malformed_xml = vec![0xff; ENTRY_BYTES];
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for name in ["first.xml", "second.xml"] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&malformed_xml).unwrap();
+        }
+        let archive_bytes = writer.finish().unwrap().into_inner();
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(&archive_bytes)).unwrap();
+        assert_eq!(archive.len(), 2);
+        for index in 0..archive.len() {
+            assert!(archive.by_index(index).unwrap().size() < ENTRY_LIMIT);
+        }
+        drop(archive);
+
+        assert_eq!(
+            extract_mxl(&archive_bytes).unwrap_err(),
+            "MusicXML archive exceeds the detection size limit"
+        );
     }
 
     #[test]
