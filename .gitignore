@@ -21,9 +21,12 @@ src-tauri/tests/fixtures/
 # Private local tooling (not part of the open-source project)
 _bmad/
 _bmad-output/
+/.v6-v7-migration-backup-*/
 .agent/
 .agents/
 .claude/
+/.codex/hooks.json
+/.bmad-loop/
 
 # Generated Python preparation caches
 __pycache__/

@@ -128,7 +128,7 @@ Les découpages reconnus, comme `chan- / ger`, `pres– / se`, `mê— / me` et
 Ce nettoyage d'écriture préserve les paroles sources et leurs métadonnées,
 les notes, le tempo, le pitch et le vibrato. Il s'applique aux exports directs
 et aux projets des bundles ; les chemins Default et SVP gardent leur
-comportement existant. [FR-003](../_bmad-output/implementation-artifacts/spec-fr-003-syllable-hyphen-cleanup.md) ne
+comportement existant. [FR-003](../_bmad-output/backlog/bug-fr-003-syllable-hyphen-cleanup-plan.md) ne
 prétend pas résoudre les fragments inconnus ni valider leur rendu à l'écoute.
 
 Le contexte écrit permet aussi de corriger les lectures de fragments : `rai`
@@ -155,7 +155,7 @@ dans la piste technique de son propriétaire prouvé. Un numéro devant une paro
 `2.Et`, est omis dans l'indication de prononciation uniquement s'il correspond
 au verset explicite ; le texte source reste intact.
 
-La vérification initiale [FR-004](../_bmad-output/implementation-artifacts/spec-fr-004-contextual-sung-readings.md)
+La vérification initiale [FR-004](../_bmad-output/backlog/bug-fr-004-contextual-sung-readings-plan.md)
 résout 480 des 482 avertissements de référence et corrige 51 lectures déjà
 appliquées mais incorrectes. Les deux `3.Et` associés au verset 1 restent
 signalés. Les 3 124 notes gardent leurs données musicales ; l'allocateur
@@ -163,7 +163,7 @@ Millefeuille installé conserve les 3 107 attaques attendues sans symbole
 rejeté. Pour une parole contenant deux voyelles sur une note, les deux restent
 dans le même groupe phonétique et une tenue suivante reste une tenue.
 Ces nombres décrivent cet export de référence, avant les réparations de tenues
-suivies dans [FID-002](../_bmad-output/implementation-artifacts/spec-fid-002-source-sung-continuity.md).
+suivies dans [FID-002](../_bmad-output/backlog/bug-fid-002-source-sung-continuity-plan.md).
 Cette vérification ne valide ni le minutage interne des phonèmes ni le rendu
 à l'écoute.
 
@@ -197,7 +197,7 @@ liaison de notes garde sa propre attaque.
 Cinq autres notes sans paroles du PB restent dans la source et les pistes
 d’accompagnement. La partition ne fournit pas de lien suffisant pour leur
 inventer une parole. Ces corrections de continuité sont suivies dans
-[FID-002](../_bmad-output/implementation-artifacts/spec-fid-002-source-sung-continuity.md).
+[FID-002](../_bmad-output/backlog/bug-fid-002-source-sung-continuity-plan.md).
 
 ## Hauteur et timbre
 
@@ -241,7 +241,7 @@ différents. Un silence écrit dans la partition doit rester un silence. Verse
 ne doit pas inventer un fondu ou un vibrato absent du fichier pour prétendre à
 une conversion identique.
 
-Le transfert [EXP-002](../_bmad-output/implementation-artifacts/spec-exp-002-midi-performance-curves.md)
+Le transfert [EXP-002](../_bmad-output/backlog/bug-exp-002-midi-performance-curves-plan.md)
 conserve maintenant les variations explicites de pitch bend et les contrôleurs
 MIDI/KAR de volume et d'expression dans les courbes **PITD** et **DYN** d'OpenUtau.
 Il tient compte du port, du canal et de la sensibilité de pitch bend déclarée.
@@ -259,7 +259,7 @@ expressions vers SVP n'est pas encore actif.
 Le volume global d'une piste et les nuances à l'intérieur du morceau restent
 deux réglages distincts. Monter toute la piste ne recrée pas un crescendo perdu.
 L'import des autres expressions demeure suivi dans
-[EXP-001](../_bmad-output/implementation-artifacts/spec-exp-001-expression-fidelity.md).
+[EXP-001](../_bmad-output/initiative-plugin-synth-v/archive-v6/spec-exp-001-expression-fidelity.md).
 
 L'inventaire des 22 partitions distinctes du corpus local a retrouvé des
 nuances et des vélocités explicites, mais pas de courbes de bend, de vibrato
@@ -267,7 +267,7 @@ ni de soufflets dans les corps de partition examinés. Il faut distinguer
 ces données écrites des valeurs générales du style ou de l'instrument.
 Leur absence dans ce corpus ne signifie pas que les formats ne peuvent pas
 les contenir. Verse transfère maintenant les nuances et soufflets pris en charge dans
-la courbe DYN d’OpenUtau, selon [EXP-003](../_bmad-output/implementation-artifacts/spec-exp-003-numeric-score-performance.md).
+la courbe DYN d’OpenUtau, selon [EXP-003](../_bmad-output/backlog/story-exp-003-numeric-score-performance-plan.md).
 Sa règle d'interprétation est explicite : `mf` sert de référence, `p` vaut
 −7,75 dB et `f` +4 dB. Les valeurs numériques écrites dans la source prennent
 la priorité prévue sur les symboles ; une vélocité de note et une nuance ne
