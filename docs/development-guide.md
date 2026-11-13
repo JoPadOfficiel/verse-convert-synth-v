@@ -318,10 +318,40 @@ Do not commit:
 - generated Tauri schemas under `src-tauri/gen/`;
 - private song fixtures under `src-tauri/tests/fixtures/`;
 - OpenScore checkouts or generated corpus reports;
-- local BMAD/agent working data under `_bmad/`, `_bmad-output/`, or `.agents/`.
+- local BMad and agent working data under `_bmad/`, `_bmad-output/`, or `.agents/`;
+- local V6 migration backups.
 
 Public tests should use synthetic bytes or sources with verified licenses.
 Every external corpus must pin its identity and retain license evidence.
+
+## BMad V7 developer tooling
+
+Verse uses the BMad V7 preview for local planning and development. The
+upstream Core Tools and Method modules report version `6.13.0-next`.
+With Node.js, Git, and `uv` installed, restore the project skills from the
+repository root:
+
+```sh
+npx --yes skills@1.5.18 experimental_install
+```
+
+The lock lists Core Tools, Method, CIS, TEA, and BMad Loop skills and records
+their installed hashes. The Skills CLI restores from the listed upstream
+sources, which can change as the V7 preview evolves. Open the checkout in
+your coding agent and run `bmad setup` followed by `bmad status`. A fresh
+checkout can create its own initiative through the `bmad` skill.
+
+In the migrated checkout, the active initiative is
+`_bmad-output/initiative-plugin-synth-v/`. Its OpenUtau epic is under
+`tickets/`, standalone work is under `_bmad-output/backlog/`, and the
+original implementation records are in the initiative's `archive-v6/`.
+The local migration record under `_bmad-output/migration-v6-v7/` maps the
+old paths and statuses to their V7 equivalents. Use `bmad-agent-po` to
+manage tickets and `bmad-build` to work on one.
+
+BMad Loop uses the V7 ticket tree when `[stories] source = "tickets"` is
+set in its local policy. Its CLI and agent hooks are set up separately
+from the skills. See the [BMad Loop setup guide](https://github.com/bmad-code-org/bmad-loop/blob/main/docs/setup-guide.md#installing-on-bmad-v7-bmad-setup).
 
 ## Version and release metadata
 
